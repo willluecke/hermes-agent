@@ -3,6 +3,18 @@
 import pytest
 
 from tools.terminal_tool import _interpret_exit_code
+from tools.environments.local import LocalEnvironment
+
+
+def test_terminal_pipeline_reports_upstream_failure(tmp_path):
+    """A failed upstream pipeline command must not be hidden by a final filter."""
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=5, env={})
+    try:
+        result = env.execute("false | cat")
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] != 0
 
 
 class TestInterpretExitCode:

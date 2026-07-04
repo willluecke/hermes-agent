@@ -22,6 +22,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 import os
+from pathlib import Path
+import re
 import threading
 import time
 from concurrent.futures import (
@@ -475,6 +477,7 @@ def _preserve_parent_mcp_toolsets(
 
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
+DEFAULT_PARENT_SUMMARY_MAX_CHARS = 4000
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -486,6 +489,157 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 _HEARTBEAT_STALE_CYCLES_IDLE = 5  # 5 * 30s = 150s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 20  # 20 * 30s = 600s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+
+_SECRET_PATTERNS = [
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"),
+    re.compile(r"\bsk-proj-[A-Za-z0-9_\-]{12,}\b"),
+    re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{12,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\b[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\b"),
+    re.compile(r"(?i)\b(api[_-]?key|token|password|passwd|secret)\s*[:=]\s*['\"]?[^'\"\s,;]{6,}"),
+]
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_WS_RE = re.compile(r"[ \t]+")
+_BASE64ISH_RE = re.compile(r"^[A-Za-z0-9+/=_-]{160,}$")
+
+
+def _redact_delegate_summary(text: str) -> str:
+    result = _ANSI_RE.sub("", text)
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub("[REDACTED_SECRET]", result)
+    return result
+
+
+def _summary_line_is_noise(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 900:
+        return True
+    if _BASE64ISH_RE.match(stripped):
+        return True
+    if stripped.startswith(("diff --git", "index ", "+++", "---", "@@", "```")):
+        return True
+    if stripped.startswith(("{", "}", "[", "]")) and len(stripped) > 180:
+        return True
+    if stripped.lower().startswith(("stdout:", "stderr:", "raw log:", "transcript:")):
+        return True
+    return False
+
+
+def _compact_delegate_summary(text: str, max_chars: int) -> str:
+    redacted = _redact_delegate_summary(text)
+    lines: List[str] = []
+    omitted = 0
+    blank = False
+    total = 0
+    for raw_line in redacted.splitlines():
+        line = _WS_RE.sub(" ", raw_line).strip()
+        if not line:
+            if not blank and lines:
+                lines.append("")
+                total += 1
+            blank = True
+            continue
+        blank = False
+        if _summary_line_is_noise(line):
+            omitted += 1
+            continue
+        if len(line) > 320:
+            line = line[:300].rstrip() + " [truncated line]"
+        projected = total + len(line) + 1
+        if projected > max_chars:
+            omitted += 1
+            break
+        lines.append(line)
+        total = projected
+
+    compact = "\n".join(lines).strip()
+    if omitted:
+        compact += f"\n\n[omitted {omitted} raw/log/diff/oversize line(s) from child summary]"
+    if not compact:
+        compact = "[child summary omitted because it looked like raw logs or oversized output]"
+    return compact[:max_chars].rstrip()
+
+
+def _summary_has_raw_output_markers(text: str) -> bool:
+    markers = 0
+    for line in text.splitlines()[:400]:
+        stripped = line.strip()
+        if _summary_line_is_noise(stripped):
+            markers += 1
+        if markers >= 3:
+            return True
+    return False
+
+
+def _get_parent_summary_max_chars() -> int:
+    cfg = _load_config()
+    value = cfg.get("parent_summary_max_chars")
+    if value is None:
+        value = os.getenv("DELEGATION_PARENT_SUMMARY_MAX_CHARS")
+    try:
+        return max(500, min(int(value), 12000)) if value is not None else DEFAULT_PARENT_SUMMARY_MAX_CHARS
+    except (TypeError, ValueError):
+        return DEFAULT_PARENT_SUMMARY_MAX_CHARS
+
+
+def _archive_child_summary(
+    *,
+    task_index: int,
+    child_task_id: str,
+    summary: str,
+) -> Optional[str]:
+    cfg = _load_config()
+    if not is_truthy_value(cfg.get("archive_raw_child_summaries", True), default=True):
+        return None
+    try:
+        try:
+            from hermes_constants import get_hermes_home
+
+            base = Path(get_hermes_home())
+        except Exception:
+            base = Path.home() / ".hermes"
+        out_dir = base / "delegation-results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_child = re.sub(r"[^A-Za-z0-9_.-]+", "_", child_task_id or "child")
+        path = out_dir / f"child_summary_{time.strftime('%Y%m%d_%H%M%S')}_{task_index}_{safe_child}.md"
+        path.write_text(summary, encoding="utf-8")
+        return str(path)
+    except Exception:
+        logger.debug("Failed to archive raw child summary", exc_info=True)
+        return None
+
+
+def _prepare_summary_for_parent(
+    *,
+    summary: str,
+    task_index: int,
+    child_task_id: str,
+) -> tuple[str, Dict[str, Any]]:
+    original = "" if summary is None else str(summary)
+    max_chars = _get_parent_summary_max_chars()
+    redacted = _redact_delegate_summary(original)
+    should_compact = len(redacted) > max_chars or _summary_has_raw_output_markers(redacted)
+    archive_path = None
+    if should_compact or redacted != original:
+        archive_path = _archive_child_summary(
+            task_index=task_index,
+            child_task_id=child_task_id,
+            summary=redacted,
+        )
+    compact = _compact_delegate_summary(redacted, max_chars) if should_compact else redacted
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 80].rstrip() + "\n\n[child summary truncated for parent context]"
+    meta: Dict[str, Any] = {
+        "parent_summary_policy": "compact_child_summary",
+        "raw_summary_chars": len(original),
+        "summary_chars": len(compact),
+        "summary_truncated": should_compact or len(redacted) > len(compact),
+    }
+    if archive_path:
+        meta["raw_summary_path"] = archive_path
+    return compact, meta
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +721,9 @@ def _build_child_system_prompt(
         "- What you found or accomplished\n"
         "- Any files you created or modified\n"
         "- Any issues encountered\n\n"
+        "Parent-context hygiene rule: your final answer is returned to the parent agent. "
+        "Keep it under about 3,000 characters when possible. Do NOT paste raw logs, full command output, full JSON payloads, full diffs, or transcripts. "
+        "If raw evidence matters, save it to a file and return the file path plus a short quoted excerpt or line reference.\n\n"
         "Important workspace rule: Never assume a repository lives at /workspace/... or any other container-style path unless the task/context explicitly gives that path. "
         "If no exact local path is provided, discover it first before issuing git/workdir-specific commands.\n\n"
         "Be thorough but concise -- your response is returned to the "
@@ -1538,7 +1695,16 @@ def _run_single_child(
 
         duration = round(time.monotonic() - child_start, 2)
 
-        summary = result.get("final_response") or ""
+        raw_summary = result.get("final_response") or ""
+        summary_meta: Dict[str, Any] = {}
+        if raw_summary:
+            summary, summary_meta = _prepare_summary_for_parent(
+                summary=raw_summary,
+                task_index=task_index,
+                child_task_id=child_task_id,
+            )
+        else:
+            summary = ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -1637,6 +1803,8 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if summary_meta:
+            entry.update(summary_meta)
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -1818,6 +1986,7 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    tier: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1887,7 +2056,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(cfg, parent_agent, tier=tier)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2226,8 +2395,11 @@ def _resolve_child_credential_pool(effective_provider: Optional[str], parent_age
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(cfg: dict, parent_agent, tier: Optional[str] = None) -> dict:
     """Resolve credentials for subagent delegation.
+
+    tier="swarm" routes to the cheap wide-fan-out model (delegation.swarm_*
+    config, default deepseek-v4-pro) instead of the primary executor.
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. Otherwise, if ``delegation.provider`` is
@@ -2241,6 +2413,26 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    if str(tier or "").strip().lower() == "swarm":
+        swarm_model = str(cfg.get("swarm_model") or "").strip() or "deepseek-v4-pro"
+        swarm_base = str(cfg.get("swarm_base_url") or "").strip() or "https://api.deepseek.com/v1"
+        swarm_key = (
+            str(cfg.get("swarm_api_key") or "").strip()
+            or os.getenv("DEEPSEEK_API_KEY", "").strip()
+        )
+        if not swarm_key:
+            raise ValueError(
+                "Swarm tier requested but no API key found. "
+                "Set delegation.swarm_api_key or DEEPSEEK_API_KEY."
+            )
+        return {
+            "model": swarm_model,
+            "provider": "custom",
+            "base_url": swarm_base,
+            "api_key": swarm_key,
+            "api_mode": "chat_completions",
+        }
+
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
@@ -2399,6 +2591,9 @@ DELEGATE_TASK_SCHEMA = {
         "delegation.orchestrator_enabled=false.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
+        "- Child final summaries are compacted before they enter your context. "
+        "Oversized or raw-log-like summaries are archived under "
+        "~/.hermes/delegation-results and the result includes raw_summary_path."
     ),
     "parameters": {
         "type": "object",
@@ -2417,6 +2612,19 @@ DELEGATE_TASK_SCHEMA = {
                     "Background information the subagent needs: file paths, "
                     "error messages, project structure, constraints. The more "
                     "specific you are, the better the subagent performs."
+                ),
+            },
+            "tier": {
+                "type": "string",
+                "enum": ["executor", "swarm"],
+                "description": (
+                    "Which model tier runs the subagent(s). "
+                    "'executor' (default): the primary high-reasoning executor -- use for "
+                    "deep, quality-sensitive work (implementation, debugging, careful edits). "
+                    "'swarm': the cheap fast model -- use for wide parallel fan-out like "
+                    "broad repo audits, searches, first-pass consolidation, and validation "
+                    "sweeps where volume matters more than depth. Applies to all tasks in "
+                    "this call."
                 ),
             },
             "toolsets": {
@@ -2511,11 +2719,8 @@ DELEGATE_TASK_SCHEMA = {
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="delegate_task",
-    toolset="delegation",
-    schema=DELEGATE_TASK_SCHEMA,
-    handler=lambda args, **kw: delegate_task(
+def _delegate_dispatch_debug(args, **kw):
+    return delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
         toolsets=args.get("toolsets"),
@@ -2524,8 +2729,17 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        tier=args.get("tier"),
         parent_agent=kw.get("parent_agent"),
-    ),
+    )
+
+
+
+registry.register(
+    name="delegate_task",
+    toolset="delegation",
+    schema=DELEGATE_TASK_SCHEMA,
+    handler=_delegate_dispatch_debug,
     check_fn=check_delegate_requirements,
     emoji="🔀",
 )

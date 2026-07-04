@@ -54,6 +54,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # GPT operator briefing
+    "gpt_operator_brief", "gpt_operator_review",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -195,6 +197,12 @@ TOOLSETS = {
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    "gpt_operator": {
+        "description": "Create sanitized GPT operator briefs and explicitly send only those briefs to OpenAI when requested",
+        "tools": ["gpt_operator_brief", "gpt_operator_review"],
         "includes": []
     },
 

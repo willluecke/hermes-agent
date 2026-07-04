@@ -122,6 +122,7 @@ from tools.terminal_tool import (
     _get_sudo_password_callback,
 )
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
+from tools.budget_config import BudgetConfig
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
@@ -1830,6 +1831,52 @@ class AIAgent:
             _api_retries = 3
         self._api_max_retries = _api_retries
 
+        # OpenAI/GPT models are expensive enough that they must fail closed
+        # before a long-running tool loop can repeatedly send a huge prompt.
+        # Defaults are intentionally conservative; callers can disable this
+        # only via config or HERMES_ALLOW_EXPENSIVE_OPENAI=1.
+        _openai_guard_cfg = _agent_section.get("openai_cost_guard", {})
+        if not isinstance(_openai_guard_cfg, dict):
+            _openai_guard_cfg = {}
+
+        def _int_guard(name: str, default: int) -> int:
+            try:
+                value = int(_openai_guard_cfg.get(name, default))
+                return value if value > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        self._openai_cost_guard_enabled = str(
+            _openai_guard_cfg.get("enabled", True)
+        ).lower() not in {"false", "0", "no", "off"}
+        self._openai_cost_guard_max_prompt_tokens = _int_guard(
+            "max_prompt_tokens", 20_000
+        )
+        self._openai_cost_guard_max_api_calls = _int_guard(
+            "max_api_calls_per_session", 3
+        )
+        self._openai_cost_guard_max_cache_read_tokens = _int_guard(
+            "max_cache_read_tokens", 150_000
+        )
+        self._openai_cost_guard_max_input_tokens = _int_guard(
+            "max_input_tokens", 75_000
+        )
+        self._openai_cost_guard_tool_result_chars = _int_guard(
+            "tool_result_chars", 2_000
+        )
+        self._openai_cost_guard_turn_tool_chars = _int_guard(
+            "turn_tool_chars", 8_000
+        )
+        self._openai_cost_guard_tool_preview_chars = _int_guard(
+            "tool_preview_chars", 600
+        )
+        self._openai_cost_guard_disable_tools = str(
+            _openai_guard_cfg.get("disable_tools_by_default", True)
+        ).lower() not in {"false", "0", "no", "off"}
+        self._openai_cost_guard_tools_override_env = str(
+            _openai_guard_cfg.get("tools_override_env", "HERMES_ALLOW_OPENAI_TOOLS")
+        )
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -2806,6 +2853,103 @@ class AIAgent:
         else:
             url = getattr(self, "_base_url_lower", "") or ""
         return "openai.azure.com" in url
+
+    def _is_openai_cost_guarded(self) -> bool:
+        """Return True for OpenAI/GPT traffic that needs a hard spend guard."""
+        if not getattr(self, "_openai_cost_guard_enabled", True):
+            return False
+        if os.getenv("HERMES_ALLOW_EXPENSIVE_OPENAI") == "1":
+            return False
+
+        provider = (self.provider or "").strip().lower()
+        model = (self.model or "").strip().lower()
+        base_url = (self.base_url or "").strip().lower()
+
+        direct_openai = self._is_direct_openai_url(base_url)
+        openai_provider = provider in {"openai", "openai-codex"}
+        custom_openai = provider == "custom" and "api.openai.com" in base_url
+        openai_model = (
+            model.startswith("gpt")
+            or model.startswith("openai/gpt")
+            or model.startswith("o1")
+            or model.startswith("o3")
+            or model.startswith("o4")
+            or model.startswith("o5")
+        )
+        return (direct_openai or openai_provider or custom_openai) and openai_model
+
+    def _tool_result_budget_config(self) -> BudgetConfig:
+        """Use very small in-context tool previews for guarded GPT sessions."""
+        if not self._is_openai_cost_guarded():
+            return BudgetConfig()
+        return BudgetConfig(
+            default_result_size=self._openai_cost_guard_tool_result_chars,
+            turn_budget=self._openai_cost_guard_turn_tool_chars,
+            preview_size=self._openai_cost_guard_tool_preview_chars,
+        )
+
+    def _tool_result_threshold_override(self) -> Optional[int]:
+        """Hard-cap every individual tool result for guarded GPT sessions."""
+        if not self._is_openai_cost_guarded():
+            return None
+        return self._openai_cost_guard_tool_result_chars
+
+    def _tools_for_current_request(self):
+        """Return the tool schema list allowed for this model request."""
+        if (
+            self._is_openai_cost_guarded()
+            and getattr(self, "_openai_cost_guard_disable_tools", True)
+            and os.getenv(
+                getattr(
+                    self,
+                    "_openai_cost_guard_tools_override_env",
+                    "HERMES_ALLOW_OPENAI_TOOLS",
+                )
+            ) != "1"
+        ):
+            return None
+        return self.tools
+
+    def _check_openai_cost_guard(self, approx_tokens: int) -> Optional[str]:
+        """Return a user-facing block message if an OpenAI call is unsafe."""
+        if not self._is_openai_cost_guarded():
+            return None
+
+        reasons = []
+        if approx_tokens > self._openai_cost_guard_max_prompt_tokens:
+            reasons.append(
+                f"request is ~{approx_tokens:,} tokens "
+                f"(limit {self._openai_cost_guard_max_prompt_tokens:,})"
+            )
+        if self.session_api_calls >= self._openai_cost_guard_max_api_calls:
+            reasons.append(
+                f"session already used {self.session_api_calls:,} OpenAI calls "
+                f"(limit {self._openai_cost_guard_max_api_calls:,})"
+            )
+        if self.session_cache_read_tokens >= self._openai_cost_guard_max_cache_read_tokens:
+            reasons.append(
+                f"session cache-read tokens are {self.session_cache_read_tokens:,} "
+                f"(limit {self._openai_cost_guard_max_cache_read_tokens:,})"
+            )
+        if self.session_input_tokens >= self._openai_cost_guard_max_input_tokens:
+            reasons.append(
+                f"session uncached input tokens are {self.session_input_tokens:,} "
+                f"(limit {self._openai_cost_guard_max_input_tokens:,})"
+            )
+
+        if not reasons:
+            return None
+
+        reason_text = "; ".join(reasons)
+        return (
+            "OpenAI/GPT cost guard blocked this request before sending it. "
+            f"Reason: {reason_text}.\n\n"
+            "Start a fresh GPT escalation with a short sanitized brief, or use "
+            "the default DeepSeek model for tool work. To override intentionally, "
+            "set HERMES_ALLOW_EXPENSIVE_OPENAI=1 for that process or adjust "
+            "agent.openai_cost_guard in config.yaml. To allow tools for a narrow "
+            "GPT review, set HERMES_ALLOW_OPENAI_TOOLS=1."
+        )
 
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
@@ -8260,6 +8404,7 @@ class AIAgent:
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
+        request_tools = self._tools_for_current_request()
         if self.api_mode == "anthropic_messages":
             _transport = self._get_transport()
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
@@ -8271,7 +8416,7 @@ class AIAgent:
             return _transport.build_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
-                tools=self.tools,
+                tools=request_tools,
                 max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
                 reasoning_config=self.reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
@@ -8291,7 +8436,7 @@ class AIAgent:
             return _bt.build_kwargs(
                 model=self.model,
                 messages=api_messages,
-                tools=self.tools,
+                tools=request_tools,
                 max_tokens=self.max_tokens or 4096,
                 region=region,
                 guardrail_config=guardrail,
@@ -8315,7 +8460,7 @@ class AIAgent:
             return _ct.build_kwargs(
                 model=self.model,
                 messages=_msgs_for_codex,
-                tools=self.tools,
+                tools=request_tools,
                 reasoning_config=self.reasoning_config,
                 session_id=getattr(self, "session_id", None),
                 max_tokens=self.max_tokens,
@@ -8401,7 +8546,7 @@ class AIAgent:
         return _ct.build_kwargs(
             model=self.model,
             messages=_msgs_for_chat,
-            tools=self.tools,
+            tools=request_tools,
             base_url=self.base_url,
             timeout=self._resolved_api_call_timeout(),
             max_tokens=self.max_tokens,
@@ -9258,6 +9403,7 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            tier=function_args.get("tier"),
             parent_agent=self,
         )
 
@@ -9719,6 +9865,8 @@ class AIAgent:
                 tool_name=name,
                 tool_use_id=tc.id,
                 env=get_active_env(effective_task_id),
+                config=self._tool_result_budget_config(),
+                threshold=self._tool_result_threshold_override(),
             )
 
             subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
@@ -9741,7 +9889,11 @@ class AIAgent:
         num_tools = len(parsed_calls)
         if num_tools > 0:
             turn_tool_msgs = messages[-num_tools:]
-            enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
+            enforce_turn_budget(
+                turn_tool_msgs,
+                env=get_active_env(effective_task_id),
+                config=self._tool_result_budget_config(),
+            )
 
         # ── /steer injection ──────────────────────────────────────────────
         # Append any pending user steer text to the last tool result so the
@@ -10105,6 +10257,8 @@ class AIAgent:
                 tool_name=function_name,
                 tool_use_id=tool_call.id,
                 env=get_active_env(effective_task_id),
+                config=self._tool_result_budget_config(),
+                threshold=self._tool_result_threshold_override(),
             )
 
             # Discover subdirectory context files from tool arguments
@@ -10152,7 +10306,11 @@ class AIAgent:
         # ── Per-turn aggregate budget enforcement ─────────────────────────
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
-            enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
+            enforce_turn_budget(
+                messages[-num_tools_seq:],
+                env=get_active_env(effective_task_id),
+                config=self._tool_result_budget_config(),
+            )
 
         # ── /steer injection ──────────────────────────────────────────────
         # See _execute_tool_calls_parallel for the rationale. Same hook,
@@ -10506,6 +10664,34 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+
+        # ── Two-model council: consult the GPT advisor once per user turn. ──
+        # The advisor block is API-only context for the main model; the
+        # persisted transcript keeps the clean original via the
+        # _persist_user_message_override mechanism (same rails as nudges).
+        # Failure of any kind falls through to a normal solo turn.
+        try:
+            from agent.council_advisor import get_advisor_block
+
+            _advisor_answer = get_advisor_block(user_message, messages)
+        except Exception:
+            _advisor_answer = None
+        if _advisor_answer:
+            if self._persist_user_message_override is None:
+                self._persist_user_message_override = original_user_message
+            _advisor_model = os.environ.get("HERMES_COUNCIL_MODEL", "gpt-5.5")
+            user_message = (
+                f"{user_message}\n\n"
+                f'<council-advisor model="{_advisor_model}">\n'
+                f"{_advisor_answer}\n"
+                "</council-advisor>\n"
+                "(Council protocol: the advisor block above is an independent "
+                "second opinion from another model — not the user's words. "
+                "Weigh it against your own analysis: adopt what is correct, "
+                "reject what is not, and note any significant disagreement in "
+                "one line. Your reply to the user is the final synthesis; do "
+                "not mention the council unless answers materially conflict.)"
+            )
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -10990,6 +11176,30 @@ class AIAgent:
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = estimate_messages_tokens_rough(api_messages)
+
+            _openai_guard_msg = self._check_openai_cost_guard(approx_tokens)
+            if _openai_guard_msg:
+                logger.warning(
+                    "OpenAI cost guard blocked API call: session=%s model=%s "
+                    "provider=%s approx_tokens=%s api_calls=%s cache_read=%s input=%s",
+                    self.session_id or "-",
+                    self.model,
+                    self.provider or "auto",
+                    approx_tokens,
+                    self.session_api_calls,
+                    self.session_cache_read_tokens,
+                    self.session_input_tokens,
+                )
+                self._emit_status("🛑 OpenAI/GPT cost guard blocked an unsafe request.")
+                self._persist_session(messages, conversation_history)
+                return {
+                    "final_response": _openai_guard_msg,
+                    "messages": messages,
+                    "api_calls": api_call_count - 1,
+                    "completed": False,
+                    "failed": True,
+                    "error": "openai_cost_guard_blocked",
+                }
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None
@@ -10997,7 +11207,8 @@ class AIAgent:
             if not self.quiet_mode:
                 self._vprint(f"\n{self.log_prefix}🔄 Making API call #{api_call_count}/{self.max_iterations}...")
                 self._vprint(f"{self.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-                self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
+                _request_tools = self._tools_for_current_request()
+                self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(_request_tools) if _request_tools else 0}")
             else:
                 # Animated thinking spinner in quiet mode
                 face = random.choice(KawaiiSpinner.get_thinking_faces())

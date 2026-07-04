@@ -60,6 +60,24 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+TOOL_PROGRESS_OUTPUT_PREVIEW_CHARS = 2_000
+
+
+def _tool_result_preview(result: Any, limit: int = TOOL_PROGRESS_OUTPUT_PREVIEW_CHARS) -> str:
+    """Return a bounded text preview for SSE tool-completion events."""
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        text = result
+    else:
+        try:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(result)
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
 
 
 def _normalize_chat_content(
@@ -915,12 +933,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
+        # If no stored transcript exists yet, keep the request history so a client
+        # can introduce a stable session id for an already-local conversation
+        # without losing context on the first keyed turn.
         #
         # Security: session continuation exposes conversation history, so it is
         # only allowed when the API key is configured and the request is
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        request_history = list(history)
         if provided_session_id:
             if not self._api_key:
                 logger.warning(
@@ -945,10 +967,11 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    stored_history = db.get_messages_as_conversation(session_id)
+                    history = stored_history or request_history
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
+                history = request_history
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -1027,6 +1050,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
+                    "output": _tool_result_preview(function_result),
                 }))
 
             # Start agent in background.  agent_ref is a mutable container
@@ -1152,6 +1176,8 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
             last_activity = time.monotonic()
 
+            sent_content = False
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -1163,12 +1189,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal sent_content
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    if item:
+                        sent_content = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -1206,11 +1235,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = {}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-            except Exception:
-                pass
+            except Exception as exc:
+                if not sent_content:
+                    last_activity = await _emit(f"Error running Hermes agent: {exc}")
+
+            final_response = ""
+            if isinstance(result, dict):
+                final_response = str(result.get("final_response") or result.get("error") or "")
+            if final_response and not sent_content:
+                last_activity = await _emit(final_response)
 
             # Finish chunk
             finish_chunk = {
@@ -2389,7 +2426,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        *,
+        emit_tool_lifecycle: bool = True,
+    ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
@@ -2408,6 +2451,8 @@ class APIServerAdapter(BasePlatformAdapter):
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
+                if not emit_tool_lifecycle:
+                    return
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -2416,6 +2461,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                if not emit_tool_lifecycle:
+                    return
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -2434,6 +2481,57 @@ class APIServerAdapter(BasePlatformAdapter):
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
+
+    def _make_run_tool_callbacks(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+        """Return structured tool callbacks with call ids and bounded output previews."""
+        started_tool_call_ids: set[str] = set()
+
+        def _push(event: Dict[str, Any]) -> None:
+            self._set_run_status(
+                run_id,
+                self._run_statuses.get(run_id, {}).get("status", "running"),
+                last_event=event.get("event"),
+            )
+            q = self._run_streams.get(run_id)
+            if q is None:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+            except Exception:
+                pass
+
+        def _on_tool_start(tool_call_id, function_name, function_args):
+            if not tool_call_id or str(function_name or "").startswith("_"):
+                return
+            started_tool_call_ids.add(tool_call_id)
+            from agent.display import build_tool_preview
+            label = build_tool_preview(function_name, function_args) or function_name
+            _push({
+                "event": "tool.started",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "tool": function_name,
+                "preview": label,
+                "tool_call_id": tool_call_id,
+            })
+
+        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            if not tool_call_id or tool_call_id not in started_tool_call_ids:
+                return
+            started_tool_call_ids.discard(tool_call_id)
+            from agent.display import _detect_tool_failure
+            is_error, _ = _detect_tool_failure(function_name, function_result)
+            _push({
+                "event": "tool.completed",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "tool": function_name,
+                "tool_call_id": tool_call_id,
+                "error": is_error,
+                "output": _tool_result_preview(function_result),
+            })
+
+        return _on_tool_start, _on_tool_complete
 
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -2517,7 +2615,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(
+            run_id,
+            loop,
+            emit_tool_lifecycle=False,
+        )
+        tool_start_cb, tool_complete_cb = self._make_run_tool_callbacks(run_id, loop)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -2549,6 +2652,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    tool_start_callback=tool_start_cb,
+                    tool_complete_callback=tool_complete_cb,
                 )
                 self._active_run_agents[run_id] = agent
                 def _run_sync():

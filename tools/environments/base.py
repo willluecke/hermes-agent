@@ -402,6 +402,11 @@ class BaseEnvironment(ABC):
                 f"source {self._snapshot_path} >/dev/null 2>&1 || true"
             )
 
+        # Make pipelines fail when any command in the pipeline fails, not just
+        # the final filter. This prevents `bad-command | tail` from looking
+        # successful to the agent because `tail` exited 0.
+        parts.append("set -o pipefail 2>/dev/null || true")
+
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
@@ -782,4 +787,3 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
-
