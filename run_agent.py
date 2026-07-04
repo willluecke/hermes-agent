@@ -3904,24 +3904,36 @@ class AIAgent:
                 self._ensure_db_session()
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
+            compact_api_session = self.platform == "api_server"
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                if compact_api_session:
+                    # Browser/API clients already own visible chat history and
+                    # receive live tool progress over SSE. Persisting raw tool
+                    # results here silently balloons future session context.
+                    if role not in {"user", "assistant"}:
+                        continue
+                    if role == "assistant" and not (
+                        isinstance(content, str) and content.strip()
+                    ):
+                        continue
                 tool_calls_data = None
-                if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
-                    tool_calls_data = [
-                        {"name": tc.function.name, "arguments": tc.function.arguments}
-                        for tc in msg.tool_calls
-                    ]
-                elif isinstance(msg.get("tool_calls"), list):
-                    tool_calls_data = msg["tool_calls"]
+                if not compact_api_session:
+                    if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
+                        tool_calls_data = [
+                            {"name": tc.function.name, "arguments": tc.function.arguments}
+                            for tc in msg.tool_calls
+                        ]
+                    elif isinstance(msg.get("tool_calls"), list):
+                        tool_calls_data = msg["tool_calls"]
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
-                    tool_name=msg.get("tool_name"),
+                    tool_name=None if compact_api_session else msg.get("tool_name"),
                     tool_calls=tool_calls_data,
-                    tool_call_id=msg.get("tool_call_id"),
+                    tool_call_id=None if compact_api_session else msg.get("tool_call_id"),
                     finish_reason=msg.get("finish_reason"),
                     reasoning=msg.get("reasoning") if role == "assistant" else None,
                     reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
