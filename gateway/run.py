@@ -8847,7 +8847,10 @@ class GatewayRunner:
             return EphemeralReply("⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval.")
         else:
             enable_session_yolo(session_key)
-            return EphemeralReply("⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution.")
+            return EphemeralReply(
+                "⚡ Guarded YOLO mode **ON** for this session — routine commands "
+                "are auto-approved, but destructive commands still require approval."
+            )
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
         """Handle /verbose command — cycle tool progress display mode.

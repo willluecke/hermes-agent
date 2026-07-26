@@ -171,6 +171,47 @@ class TestTirithAllowDangerous:
 
 
 # ---------------------------------------------------------------------------
+# guarded_yolo mode
+# ---------------------------------------------------------------------------
+
+class TestGuardedYoloMode:
+    @patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "guarded_yolo"}})
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("block", summary="should be bypassed"))
+    def test_guarded_yolo_bypasses_routine_dangerous_warning(self, mock_tirith, mock_config):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        result = check_all_command_guards("bash -lc 'echo ok'", "local")
+        assert result["approved"] is True
+        mock_tirith.assert_not_called()
+
+    @patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "guarded_yolo"}})
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_guarded_yolo_prompts_for_recursive_delete(self, mock_tirith, mock_config):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="deny")
+        result = check_all_command_guards("rm -rf /tmp/stuff", "local", approval_callback=cb)
+        assert result["approved"] is False
+        cb.assert_called_once()
+
+    @patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "guarded_yolo"}})
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_guarded_yolo_prompts_for_rsync_delete(self, mock_tirith, mock_config):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="deny")
+        result = check_all_command_guards("rsync -av --delete src/ dest/", "local", approval_callback=cb)
+        assert result["approved"] is False
+        assert "rsync" in cb.call_args[0][1].lower() or "delete" in cb.call_args[0][1].lower()
+
+    @patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "guarded_yolo"}})
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_guarded_yolo_prompts_for_git_clean(self, mock_tirith, mock_config):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="deny")
+        result = check_all_command_guards("git clean -fdx", "local", approval_callback=cb)
+        assert result["approved"] is False
+        assert "clean" in cb.call_args[0][1].lower()
+
+
+# ---------------------------------------------------------------------------
 # tirith warn + safe command
 # ---------------------------------------------------------------------------
 

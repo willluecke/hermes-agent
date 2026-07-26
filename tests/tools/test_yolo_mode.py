@@ -153,7 +153,7 @@ class TestYoloMode:
         assert not result["approved"]
 
     def test_session_scoped_yolo_only_bypasses_current_session(self, monkeypatch):
-        """Gateway /yolo should only bypass approvals for the active session."""
+        """Gateway /yolo should only bypass guarded-safe warnings in the active session."""
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 
@@ -161,10 +161,10 @@ class TestYoloMode:
         assert is_session_yolo_enabled("session-a") is True
         assert is_session_yolo_enabled("session-b") is False
 
-        # Dangerous-but-not-hardline — the yolo bypass applies here.
+        # Dangerous-looking, but not in the guarded destructive prompt floor.
         token_a = set_current_session_key("session-a")
         try:
-            approved = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            approved = check_dangerous_command("bash -lc 'echo ok'", "local")
             assert approved["approved"] is True
         finally:
             reset_current_session_key(token_a)
@@ -172,7 +172,7 @@ class TestYoloMode:
         token_b = set_current_session_key("session-b")
         try:
             blocked = check_dangerous_command(
-                "rm -rf /tmp/stuff",
+                "bash -lc 'echo ok'",
                 "local",
                 approval_callback=lambda *a: "deny",
             )
@@ -184,7 +184,7 @@ class TestYoloMode:
         assert is_session_yolo_enabled("session-a") is False
 
     def test_session_scoped_yolo_bypasses_combined_guard_only_for_current_session(self, monkeypatch):
-        """Combined guard should honor session-scoped YOLO without affecting others."""
+        """Combined guard should honor guarded session YOLO without affecting others."""
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 
@@ -192,7 +192,7 @@ class TestYoloMode:
 
         token_a = set_current_session_key("session-a")
         try:
-            approved = check_all_command_guards("rm -rf /tmp/stuff", "local")
+            approved = check_all_command_guards("bash -lc 'echo ok'", "local")
             assert approved["approved"] is True
         finally:
             reset_current_session_key(token_a)
@@ -200,13 +200,49 @@ class TestYoloMode:
         token_b = set_current_session_key("session-b")
         try:
             blocked = check_all_command_guards(
-                "rm -rf /tmp/stuff",
+                "bash -lc 'echo ok'",
                 "local",
                 approval_callback=lambda *a: "deny",
             )
             assert blocked["approved"] is False
         finally:
             reset_current_session_key(token_b)
+
+    def test_session_scoped_yolo_still_prompts_for_recursive_delete(self, monkeypatch):
+        """Gateway /yolo must not silently approve rm -rf style operations."""
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        enable_session_yolo("session-a")
+
+        token = set_current_session_key("session-a")
+        try:
+            result = check_dangerous_command(
+                "rm -rf /tmp/stuff",
+                "local",
+                approval_callback=lambda *a: "deny",
+            )
+            assert result["approved"] is False
+            assert "recursive" in result.get("description", "").lower() or "delete" in result["message"].lower()
+        finally:
+            reset_current_session_key(token)
+
+    def test_session_scoped_yolo_still_prompts_for_destructive_combined_guard(self, monkeypatch):
+        """Combined guard must not skip destructive prompts under session /yolo."""
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        enable_session_yolo("session-a")
+
+        token = set_current_session_key("session-a")
+        try:
+            result = check_all_command_guards(
+                "git reset --hard",
+                "local",
+                approval_callback=lambda *a: "deny",
+            )
+            assert result["approved"] is False
+            assert "denied" in result["message"].lower() or "blocked" in result["message"].lower()
+        finally:
+            reset_current_session_key(token)
 
     def test_clear_session_removes_session_yolo_state(self):
         """Session cleanup must remove YOLO bypass state."""

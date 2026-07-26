@@ -51,6 +51,8 @@ async def test_yolo_command_toggles_only_current_session(monkeypatch):
     result_on = await runner._handle_yolo_command(event_a)
 
     assert "ON" in result_on
+    assert "Guarded YOLO" in result_on
+    assert "destructive commands still require approval" in result_on
     assert is_session_yolo_enabled(session_a) is True
     assert is_session_yolo_enabled(session_b) is False
     assert os.environ.get("HERMES_YOLO_MODE") is None

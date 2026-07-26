@@ -11,6 +11,7 @@ from tools.approval import (
     _smart_approve,
     approve_session,
     detect_dangerous_command,
+    detect_guarded_yolo_prompt_command,
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
@@ -26,6 +27,14 @@ class TestApprovalModeParsing:
     def test_string_off_still_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "off"}}):
             assert _get_approval_mode() == "off"
+
+    def test_guarded_yolo_mode_parses(self):
+        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "guarded_yolo"}}):
+            assert _get_approval_mode() == "guarded_yolo"
+
+    def test_guarded_yolo_mode_accepts_dash_alias(self):
+        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "guarded-yolo"}}):
+            assert _get_approval_mode() == "guarded_yolo"
 
 
 class TestSmartApproval:
@@ -55,6 +64,36 @@ class TestDetectDangerousRm:
         assert is_dangerous is True
         assert key is not None
         assert "delete" in desc.lower()
+
+
+class TestDetectGuardedYoloPrompt:
+    def test_recursive_delete_requires_prompt(self):
+        must_prompt, desc = detect_guarded_yolo_prompt_command("rm -rf ./build")
+        assert must_prompt is True
+        assert "recursive" in desc.lower() or "delete" in desc.lower()
+
+    def test_git_reset_hard_requires_prompt(self):
+        must_prompt, desc = detect_guarded_yolo_prompt_command("git reset --hard")
+        assert must_prompt is True
+        assert "reset" in desc.lower()
+
+    def test_rsync_delete_requires_prompt_and_is_dangerous(self):
+        is_dangerous, key, desc = detect_dangerous_command("rsync -av --delete src/ dest/")
+        assert is_dangerous is True
+        assert key is not None
+        assert "delete" in desc.lower()
+
+        must_prompt, guarded_desc = detect_guarded_yolo_prompt_command("rsync -av --delete src/ dest/")
+        assert must_prompt is True
+        assert "delete" in guarded_desc.lower()
+
+    def test_bash_lc_does_not_require_guarded_prompt(self):
+        is_dangerous, _, _ = detect_dangerous_command("bash -lc 'echo ok'")
+        assert is_dangerous is True
+
+        must_prompt, desc = detect_guarded_yolo_prompt_command("bash -lc 'echo ok'")
+        assert must_prompt is False
+        assert desc is None
 
 
 class TestDetectDangerousSudo:

@@ -107,10 +107,10 @@ _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
 # =========================================================================
 #
 # Commands so catastrophic they should NEVER run via the agent, regardless
-# of --yolo, /yolo, approvals.mode=off, or cron approve mode.  This is a
-# floor below yolo: opting into yolo is the user trusting the agent with
-# their files and services, not trusting it to wipe the disk or power the
-# box off.
+# of --yolo, /yolo, approvals.mode=off, guarded_yolo, or cron approve mode.
+# This is a floor below yolo: opting into yolo is the user trusting the
+# agent with their files and services, not trusting it to wipe the disk or
+# power the box off.
 #
 # Hardline only applies to environments that can actually damage the host
 # (local, ssh, container-host cron).  Containerized backends (docker,
@@ -121,9 +121,9 @@ _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
 # The list is deliberately tiny — only things with no recovery path:
 # filesystem destruction rooted at /, raw block device overwrites, kernel
 # shutdown/reboot, and denial-of-service commands that take the host down.
-# Recoverable-but-costly operations (git reset --hard, rm -rf /tmp/x,
-# chmod -R 777, curl|sh) stay in DANGEROUS_PATTERNS where yolo can pass
-# them through — that's what yolo is for.
+# Recoverable-but-costly operations stay in DANGEROUS_PATTERNS.  Session
+# /yolo and approvals.mode=guarded_yolo can auto-approve routine false
+# positives while still prompting for the recoverable-but-destructive subset.
 #
 # Inspired by Mercury Agent's permission-hardened blocklist
 # (https://github.com/cosmicstack-labs/mercury-agent).
@@ -244,6 +244,7 @@ DANGEROUS_PATTERNS = [
     (r'\bxargs\s+.*\brm\b', "xargs with rm"),
     (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
+    (r'\brsync\b.*\s--delete(?:\s|$)', "rsync --delete (deletes destination files)"),
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
     # terminates all running agents mid-work.
@@ -286,6 +287,76 @@ DANGEROUS_PATTERNS = [
 DANGEROUS_PATTERNS_COMPILED = [
     (re.compile(pattern, _RE_FLAGS), description)
     for pattern, description in DANGEROUS_PATTERNS
+]
+
+
+# =========================================================================
+# Guarded YOLO prompt floor
+# =========================================================================
+#
+# `approvals.mode: guarded_yolo` and gateway `/yolo` are intended to remove
+# friction for common development commands that happen to match broad danger
+# heuristics (for example `bash -lc ...` used by tool wrappers), without
+# allowing the agent to perform data-loss, history-rewrite, secret/config
+# overwrite, or service-disruptive operations silently.
+#
+# Unlike HARDLINE_PATTERNS, these commands are not permanently forbidden; they
+# still go through the normal approval flow.  Unlike DANGEROUS_PATTERNS, this
+# set is deliberately narrower and represents "must ask even in guarded YOLO".
+
+GUARDED_YOLO_PROMPT_PATTERNS = [
+    # File/data deletion
+    (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
+    (r'\brm\s+-[^\s]*r', "recursive delete"),
+    (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
+    (r'\bxargs\s+.*\brm\b', "xargs with rm"),
+    (r'\bfind\b.*-exec\s+(/\S*/)?rm\b', "find -exec rm"),
+    (r'\bfind\b.*-delete\b', "find -delete"),
+    (r'\brsync\b.*\s--delete(?:\s|$)', "rsync --delete"),
+
+    # Destructive database operations
+    (r'\bDROP\s+(TABLE|DATABASE)\b', "SQL DROP"),
+    (r'\bDELETE\s+FROM\b(?!.*\bWHERE\b)', "SQL DELETE without WHERE"),
+    (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
+
+    # Secrets, config, and system writes
+    (rf'\btee\b.*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system/secrets file via tee"),
+    (rf'>>?\s*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system/secrets file via redirection"),
+    (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via tee"),
+    (rf'>>?\s*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config via redirection"),
+    (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
+    (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
+    (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
+    (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+
+    # History rewrite / uncommitted work loss
+    (r'\bgit\s+reset\s+--hard\b', "git reset --hard"),
+    (r'\bgit\s+push\b.*--force\b', "git force push"),
+    (r'\bgit\s+push\b.*-f\b', "git force push short flag"),
+    (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force"),
+    (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
+
+    # Service disruption and permission weakening
+    (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart hermes gateway"),
+    (r'\bhermes\s+update\b', "hermes update"),
+    (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process"),
+    (r'\bkill\b.*\$\(\s*pgrep\b', "kill process via pgrep expansion"),
+    (r'\bkill\b.*`\s*pgrep\b', "kill process via backtick pgrep expansion"),
+    (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
+    (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
+    (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable"),
+    (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
+    (r'\bchown\s+--recursive\b.*root', "recursive chown to root"),
+
+    # Remote code execution is not data-loss by itself, but it is high-risk
+    # enough that guarded YOLO should not run it silently.
+    (r'\b(curl|wget)\b.*\|\s*(ba)?sh\b', "pipe remote content to shell"),
+    (r'\b(bash|sh|zsh|ksh)\s+<\s*<?\s*\(\s*(curl|wget)\b', "execute remote script via process substitution"),
+]
+
+GUARDED_YOLO_PROMPT_PATTERNS_COMPILED = [
+    (re.compile(pattern, _RE_FLAGS), description)
+    for pattern, description in GUARDED_YOLO_PROMPT_PATTERNS
 ]
 
 
@@ -346,6 +417,19 @@ def detect_dangerous_command(command: str) -> tuple:
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)
+
+
+def detect_guarded_yolo_prompt_command(command: str) -> tuple:
+    """Return whether guarded YOLO must still require approval.
+
+    Returns:
+        (must_prompt, description) or (False, None)
+    """
+    command_lower = _normalize_command_for_detection(command).lower()
+    for pattern_re, description in GUARDED_YOLO_PROMPT_PATTERNS_COMPILED:
+        if pattern_re.search(command_lower):
+            return (True, description)
+    return (False, None)
 
 
 # =========================================================================
@@ -685,8 +769,21 @@ def _normalize_approval_mode(mode) -> str:
         return "off" if mode is False else "manual"
     if isinstance(mode, str):
         normalized = mode.strip().lower()
+        if normalized in ("guarded-yolo", "guarded yolo"):
+            return "guarded_yolo"
         return normalized or "manual"
     return "manual"
+
+
+def _is_guarded_yolo_mode(mode: str) -> bool:
+    """Return True when config requested guarded YOLO semantics."""
+    return mode == "guarded_yolo"
+
+
+def _can_bypass_with_guarded_yolo(command: str) -> bool:
+    """Return True if guarded YOLO may auto-approve this command."""
+    must_prompt, _description = detect_guarded_yolo_prompt_command(command)
+    return not must_prompt
 
 
 def _get_approval_config() -> dict:
@@ -701,7 +798,11 @@ def _get_approval_config() -> dict:
 
 
 def _get_approval_mode() -> str:
-    """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
+    """Read the approval mode from config.
+
+    Returns one of the configured modes, commonly 'manual', 'smart', 'off',
+    or 'guarded_yolo'.
+    """
     mode = _get_approval_config().get("mode", "manual")
     return _normalize_approval_mode(mode)
 
@@ -802,9 +903,18 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled():
+    approval_mode = _get_approval_mode()
+
+    # Break-glass bypass: process-level --yolo / env yolo and
+    # approvals.mode=off preserve the historical "approve everything except
+    # hardline" semantics for scripts that explicitly opt into that risk.
+    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or approval_mode == "off":
+        return {"approved": True, "message": None}
+
+    # Guarded YOLO: session /yolo and approvals.mode=guarded_yolo remove
+    # friction for broad-pattern false positives, but still require approval
+    # for recursive deletes, history rewrites, secret/config overwrites, etc.
+    if (is_current_session_yolo_enabled() or _is_guarded_yolo_mode(approval_mode)) and _can_bypass_with_guarded_yolo(command):
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -926,10 +1036,17 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # Break-glass bypass: process-level --yolo / env yolo and
+    # approvals.mode=off preserve the historical "approve everything except
+    # hardline" semantics for scripts that explicitly opt into that risk.
     approval_mode = _get_approval_mode()
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
+    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or approval_mode == "off":
+        return {"approved": True, "message": None}
+
+    # Guarded YOLO: session /yolo and approvals.mode=guarded_yolo bypass
+    # ordinary warnings but still fall through to the combined approval flow
+    # for the destructive/high-risk subset.
+    if (is_current_session_yolo_enabled() or _is_guarded_yolo_mode(approval_mode)) and _can_bypass_with_guarded_yolo(command):
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
