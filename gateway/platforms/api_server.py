@@ -603,9 +603,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
-        # Creation timestamps for orphaned-run TTL sweep
+        # Active run stream subscribers: run_id -> set of per-client SSE queues.
+        # Events themselves are retained in _run_events so reconnecting clients
+        # can replay history instead of consuming a single shared queue.
+        self._run_streams: Dict[str, set["asyncio.Queue[Dict]"]] = {}
+        self._run_events: Dict[str, List[Dict[str, Any]]] = {}
+        # Creation timestamps for run event/status TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
@@ -2410,6 +2413,44 @@ class APIServerAdapter(BasePlatformAdapter):
     _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_EVENT_HISTORY_LIMIT = 1000  # bounded replay buffer per run
+
+    @staticmethod
+    def _is_terminal_run_event(event: Dict[str, Any]) -> bool:
+        return event.get("event") in {"run.completed", "run.failed", "run.cancelled"}
+
+    @staticmethod
+    def _is_terminal_run_status(status: Optional[Dict[str, Any]]) -> bool:
+        return bool(status and status.get("status") in {"completed", "failed", "cancelled"})
+
+    def _append_run_event(self, run_id: str, event: Dict[str, Any]) -> None:
+        """Append a run event and fan it out to current SSE subscribers.
+
+        Every /events client has its own queue. The append-only history lets
+        Vercel/browser reconnects replay the same run without stealing events
+        from each other or deleting the only stream on disconnect.
+        """
+        history = self._run_events.setdefault(run_id, [])
+        history.append(event)
+        if len(history) > self._RUN_EVENT_HISTORY_LIMIT:
+            del history[: len(history) - self._RUN_EVENT_HISTORY_LIMIT]
+
+        for q in list(self._run_streams.get(run_id, set())):
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+    def _append_run_event_threadsafe(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        event: Dict[str, Any],
+    ) -> None:
+        try:
+            loop.call_soon_threadsafe(self._append_run_event, run_id, event)
+        except Exception:
+            pass
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -2426,6 +2467,99 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
+    def _persist_run_to_sync_store(self, session_id, user_message, conversation_history, output):
+        """Durably persist a completed app run's answer into the hermes-chat sync
+        store so it survives gateway restarts and an indefinitely-closed phone.
+
+        Interactive run status is in-memory only (1h TTL, wiped on restart). When
+        the app is open it writes the answer to sync itself; when it's closed the
+        answer would otherwise be lost. Best-effort: a sync-write failure must
+        never break the run.
+        """
+        try:
+            if not isinstance(session_id, str) or not session_id.startswith("hermes-chat-"):
+                return
+            convo_id = session_id[len("hermes-chat-"):]
+            if not convo_id:
+                return
+            out = output if isinstance(output, str) else ""
+            if not out.strip():
+                return
+
+            def _text(content):
+                if isinstance(content, str):
+                    return content
+                if isinstance(content, list):
+                    parts = []
+                    for p in content:
+                        if isinstance(p, dict):
+                            ty = p.get("type")
+                            if ty in ("text", "input_text", "output_text") and p.get("text"):
+                                parts.append(str(p["text"]))
+                            elif ty in ("image_url", "input_image"):
+                                parts.append("[image]")
+                        elif isinstance(p, str):
+                            parts.append(p)
+                    return "\n".join(parts)
+                return str(content) if content is not None else ""
+
+            import sqlite3, json as _json, time as _time
+            from pathlib import Path as _Path
+            db_path = str(_Path.home() / ".hermes-chat-sync" / "sync.db")
+            now_ms = int(_time.time() * 1000)
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=5000;")
+                row = conn.execute(
+                    "SELECT data FROM conversations WHERE id = ?", (convo_id,)
+                ).fetchone()
+                conv = None
+                if row:
+                    try:
+                        conv = _json.loads(row[0])
+                    except Exception:
+                        conv = None
+                if conv and isinstance(conv.get("messages"), list) and conv["messages"]:
+                    # Preserve the app's richer copy; only fill/append the answer.
+                    msgs = conv["messages"]
+                    last = msgs[-1]
+                    if isinstance(last, dict) and last.get("role") == "assistant":
+                        last["content"] = out
+                    else:
+                        msgs.append({"role": "assistant", "content": out})
+                    title = conv.get("title") or "New conversation"
+                    created = conv.get("createdAt", now_ms)
+                else:
+                    # App never pushed (closed mid-run) — reconstruct from input.
+                    msgs = []
+                    for m in (conversation_history or []):
+                        if isinstance(m, dict) and m.get("role"):
+                            msgs.append({"role": m["role"], "content": _text(m.get("content", ""))})
+                    msgs.append({"role": "user", "content": _text(user_message)})
+                    msgs.append({"role": "assistant", "content": out})
+                    first_user = next(
+                        (x["content"] for x in msgs if x["role"] == "user" and x["content"]), ""
+                    )
+                    title = (first_user.strip().split("\n")[0] or "New conversation")[:48]
+                    created = now_ms
+                conv_out = {
+                    "id": convo_id, "title": title, "createdAt": created,
+                    "updatedAt": now_ms, "messages": msgs,
+                }
+                conn.execute(
+                    "INSERT INTO conversations (id, updated_at, data) VALUES (?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at, data=excluded.data",
+                    (convo_id, now_ms, _json.dumps(conv_out)),
+                )
+                conn.execute("DELETE FROM tombstones WHERE id = ?", (convo_id,))
+                conn.commit()
+                logger.info("[api_server] persisted run answer to sync store for %s", convo_id)
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("[api_server] persist-to-sync failed (non-fatal)")
+
     def _make_run_event_callback(
         self,
         run_id: str,
@@ -2440,13 +2574,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
+            self._append_run_event_threadsafe(run_id, loop, event)
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
@@ -2492,13 +2620,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
+            self._append_run_event_threadsafe(run_id, loop, event)
 
         def _on_tool_start(tool_call_id, function_name, function_args):
             if not tool_call_id or str(function_name or "").startswith("_"):
@@ -2540,7 +2662,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
+        if len(self._active_run_tasks) >= self._MAX_CONCURRENT_RUNS:
             return web.json_response(
                 _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
                 status=429,
@@ -2610,9 +2732,9 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = body.get("session_id") or stored_session_id or run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
-        self._run_streams[run_id] = q
+        self._run_streams[run_id] = set()
+        self._run_events[run_id] = []
         self._run_streams_created[run_id] = created_at
 
         event_cb = self._make_run_event_callback(
@@ -2626,15 +2748,12 @@ class APIServerAdapter(BasePlatformAdapter):
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
+            self._append_run_event_threadsafe(run_id, loop, {
+                "event": "message.delta",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "delta": delta,
+            })
 
         self._set_run_status(
             run_id,
@@ -2672,7 +2791,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                q.put_nowait({
+                self._append_run_event(run_id, {
                     "event": "run.completed",
                     "run_id": run_id,
                     "timestamp": time.time(),
@@ -2686,6 +2805,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     usage=usage,
                     last_event="run.completed",
                 )
+                self._persist_run_to_sync_store(
+                    session_id, user_message, conversation_history, final_response
+                )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -2693,7 +2815,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.cancelled",
                 )
                 try:
-                    q.put_nowait({
+                    self._append_run_event(run_id, {
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -2710,7 +2832,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     last_event="run.failed",
                 )
                 try:
-                    q.put_nowait({
+                    self._append_run_event(run_id, {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
@@ -2719,11 +2841,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
-                # Sentinel: signal SSE stream to close
-                try:
-                    q.put_nowait(None)
-                except Exception:
-                    pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
 
@@ -2763,13 +2880,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
-            if run_id in self._run_streams:
+            if run_id in self._run_events:
                 break
             await asyncio.sleep(0.05)
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
+        q: "asyncio.Queue[Dict]" = asyncio.Queue()
+        self._run_streams.setdefault(run_id, set()).add(q)
+        replay = list(self._run_events.get(run_id, []))
 
         response = web.StreamResponse(
             status=200,
@@ -2782,23 +2901,31 @@ class APIServerAdapter(BasePlatformAdapter):
         await response.prepare(request)
 
         try:
+            for event in replay:
+                payload = f"data: {json.dumps(event)}\n\n"
+                await response.write(payload.encode())
+                if self._is_terminal_run_event(event):
+                    await response.write(b": stream closed\n\n")
+                    return response
+
             while True:
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
-                if event is None:
+                payload = f"data: {json.dumps(event)}\n\n"
+                await response.write(payload.encode())
+                if self._is_terminal_run_event(event):
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = f"data: {json.dumps(event)}\n\n"
-                await response.write(payload.encode())
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            subscribers = self._run_streams.get(run_id)
+            if subscribers is not None:
+                subscribers.discard(q)
 
         return response
 
@@ -2847,26 +2974,30 @@ class APIServerAdapter(BasePlatformAdapter):
         while True:
             await asyncio.sleep(60)
             now = time.time()
-            stale = [
-                run_id
-                for run_id, created_at in list(self._run_streams_created.items())
-                if now - created_at > self._RUN_STREAM_TTL
-            ]
-            for run_id in stale:
-                logger.debug("[api_server] sweeping orphaned run %s", run_id)
-                self._run_streams.pop(run_id, None)
-                self._run_streams_created.pop(run_id, None)
-                self._active_run_agents.pop(run_id, None)
-                self._active_run_tasks.pop(run_id, None)
-
-            stale_statuses = [
+            stale_terminal = [
                 run_id
                 for run_id, status in list(self._run_statuses.items())
-                if status.get("status") in {"completed", "failed", "cancelled"}
+                if self._is_terminal_run_status(status)
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
             ]
-            for run_id in stale_statuses:
+            for run_id in stale_terminal:
                 self._run_statuses.pop(run_id, None)
+                self._run_events.pop(run_id, None)
+                self._run_streams.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
+
+            stale_orphaned = [
+                run_id
+                for run_id, created_at in list(self._run_streams_created.items())
+                if run_id not in self._active_run_tasks
+                and run_id not in self._run_statuses
+                and now - created_at > self._RUN_STREAM_TTL
+            ]
+            for run_id in stale_orphaned:
+                logger.debug("[api_server] sweeping orphaned run %s", run_id)
+                self._run_streams.pop(run_id, None)
+                self._run_events.pop(run_id, None)
+                self._run_streams_created.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

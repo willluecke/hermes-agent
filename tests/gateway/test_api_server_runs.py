@@ -306,6 +306,65 @@ class TestRunEvents:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_events_replay_after_first_stream_closes(self, adapter):
+        """Reattaching to /events should replay history instead of returning 404."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "Replay me"}
+                mock_agent.session_prompt_tokens = 1
+                mock_agent.session_completion_tokens = 2
+                mock_agent.session_total_tokens = 3
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                first = await cli.get(f"/v1/runs/{run_id}/events")
+                assert first.status == 200
+                first_body = await first.text()
+                assert "run.completed" in first_body
+                assert "Replay me" in first_body
+
+                second = await cli.get(f"/v1/runs/{run_id}/events")
+                assert second.status == 200
+                second_body = await second.text()
+                assert "run.completed" in second_body
+                assert "Replay me" in second_body
+
+    @pytest.mark.asyncio
+    async def test_events_disconnect_does_not_delete_running_run_stream(self, adapter):
+        """A disconnected SSE client must not make an active run's events 404."""
+        run_id = "run_reconnecttest"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "created_at": _time.time(),
+            "updated_at": _time.time(),
+        }
+        adapter._run_events[run_id] = [{
+            "event": "tool.started",
+            "run_id": run_id,
+            "timestamp": _time.time(),
+            "tool": "browser_navigate",
+        }]
+        adapter._run_streams[run_id] = set()
+        adapter._run_streams_created[run_id] = _time.time()
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.get(f"/v1/runs/{run_id}/events")
+            assert first.status == 200
+            first.release()
+
+            second = await cli.get(f"/v1/runs/{run_id}/events")
+            assert second.status == 200
+            second.release()
+
+    @pytest.mark.asyncio
     async def test_events_not_found_returns_404(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
