@@ -1792,7 +1792,7 @@ def resolve_runtime_provider(
     #
     # Fail fast with a typed error so the fallback chain can advance to
     # the next provider instead of using a disabled one.
-    from hermes_cli.config import is_provider_enabled, load_config
+    from hermes_cli.config import is_provider_enabled
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
@@ -1802,6 +1802,29 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    # The app-server runtime authenticates through the native Codex CLI. Do
+    # not resolve, import, refresh, or copy an OpenAI API/OAuth credential into
+    # Hermes first: the child process owns subscription authentication through
+    # CODEX_HOME. Besides being unnecessary, touching a second OAuth token
+    # store here can race the CLI's refresh lifecycle.
+    _model_cfg = (
+        _full_cfg.get("model") if isinstance(_full_cfg, dict) else None
+    )
+    if (
+        requested_provider in {"openai", "openai-codex"}
+        and isinstance(_model_cfg, dict)
+        and str(_model_cfg.get("openai_runtime") or "").strip().lower()
+        == "codex_app_server"
+    ):
+        return {
+            "provider": requested_provider,
+            "api_mode": "codex_app_server",
+            "base_url": "codex-app-server://local",
+            "api_key": "codex-cli-subscription-auth",
+            "source": "codex-cli-subscription",
+            "requested_provider": requested_provider,
+        }
 
     if requested_provider == "moa":
         return {

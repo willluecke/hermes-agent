@@ -739,8 +739,21 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        from agent.reasoning_effort import requested_effort
+        from hermes_cli.config import load_config
+
+        runtime_cfg = load_config()
+        model_cfg = runtime_cfg.get("model", {}) if isinstance(runtime_cfg, dict) else {}
+        require_exact = bool(
+            model_cfg.get("openai_runtime_require_exact", False)
+            if isinstance(model_cfg, dict)
+            else False
+        )
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=getattr(agent, "model", ""),
+            effort=requested_effort(getattr(agent, "reasoning_config", None)),
+            require_exact=require_exact,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

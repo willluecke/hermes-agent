@@ -8,6 +8,40 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_codex_app_server_uses_cli_subscription_without_resolving_credentials(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "model": {
+                "provider": "openai-codex",
+                "default": "gpt-5.6-sol",
+                "openai_runtime": "codex_app_server",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("API credential resolution must be bypassed")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved == {
+        "provider": "openai-codex",
+        "api_mode": "codex_app_server",
+        "base_url": "codex-app-server://local",
+        "api_key": "codex-cli-subscription-auth",
+        "source": "codex-cli-subscription",
+        "requested_provider": "openai-codex",
+    }
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(

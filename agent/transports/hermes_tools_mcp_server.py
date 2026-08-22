@@ -19,6 +19,7 @@ Scope (what we expose):
   - vision_analyze                       — image inspection by vision model
   - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
+  - decision_log                         — append-only governed decisions
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
@@ -127,6 +128,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
+    "decision_log",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server
@@ -177,7 +179,7 @@ def _build_server() -> Any:
             "session. Use these for capabilities Codex's built-in toolset "
             "doesn't cover: web search/extract, browser automation, "
             "subagent delegation, vision, image generation, persistent "
-            "memory, skills, and cross-session search."
+            "memory, skills, cross-session search, and the governed decision log."
         ),
     )
 

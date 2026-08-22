@@ -57,6 +57,33 @@ def _empty_ctx(provider="orig", model="orig-model", base_url="orig-url"):
     )
 
 
+def test_codex_app_server_subscription_marks_current_provider_authenticated():
+    ctx = ConfigContext(
+        current_provider="openai-codex",
+        current_model="gpt-5.6-sol",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        openai_runtime="codex_app_server",
+    )
+    with _list_auth_returning([]):
+        payload = build_models_payload(
+            ctx,
+            include_unconfigured=True,
+            picker_hints=True,
+        )
+
+    row = next(
+        candidate
+        for candidate in payload["providers"]
+        if candidate["slug"] == "openai-codex"
+    )
+    assert row["authenticated"] is True
+    assert row["auth_type"] == "codex_cli_subscription"
+    assert row["source"] == "codex-app-server"
+    assert "warning" not in row
+
+
 
 
 
@@ -541,7 +568,6 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 
 
 

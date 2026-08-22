@@ -53,6 +53,7 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    openai_runtime: str = ""
 
     def with_overrides(
         self,
@@ -105,6 +106,11 @@ def load_picker_context() -> ConfigContext:
         user_providers=raw if isinstance(raw, dict) else {},
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        openai_runtime=(
+            str(model_cfg.get("openai_runtime") or "").strip().lower()
+            if isinstance(model_cfg, dict)
+            else ""
+        ),
     )
 
 
@@ -264,6 +270,7 @@ def build_models_payload(
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
     if picker_hints:
         _apply_picker_hints(rows)
+        _apply_subscription_runtime_hints(rows, ctx)
     if canonical_order:
         rows = _reorder_canonical(rows)
     if pricing:
@@ -792,6 +799,30 @@ def _apply_picker_hints(rows: list[dict]) -> None:
             if auth_type == "api_key" and key_env
             else f"run `hermes model` to configure ({auth_type})"
         )
+
+
+def _apply_subscription_runtime_hints(rows: list[dict], ctx: ConfigContext) -> None:
+    """Mark the selected Codex app-server subscription as the auth transport.
+
+    The generic provider inventory looks for an API credential or a Hermes
+    OAuth copy. The app-server runtime intentionally uses neither: Codex owns
+    its native subscription login. Keep the configured row selectable while
+    leaving exact login/model validation to app-server startup.
+    """
+    if (
+        str(ctx.current_provider or "").strip().lower() != "openai-codex"
+        or str(ctx.openai_runtime or "").strip().lower() != "codex_app_server"
+    ):
+        return
+    for row in rows:
+        if str(row.get("slug") or "").strip().lower() != "openai-codex":
+            continue
+        row["authenticated"] = True
+        row["auth_type"] = "codex_cli_subscription"
+        row["source"] = "codex-app-server"
+        row.pop("key_env", None)
+        row.pop("warning", None)
+        return
 
 
 def _reorder_canonical(rows: list[dict]) -> list[dict]:

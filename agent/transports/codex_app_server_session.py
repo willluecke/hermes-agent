@@ -277,6 +277,9 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        require_exact: bool = False,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -286,6 +289,10 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._model = str(model or "").strip()
+        self._effort = str(effort or "").strip().lower()
+        self._require_exact = bool(require_exact)
+        self._exact_runtime_validated = False
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -312,6 +319,61 @@ class CodexAppServerSession:
 
     # ---------- lifecycle ----------
 
+    def _validate_exact_runtime(self) -> None:
+        """Fail closed unless the configured model and effort are available."""
+        if not self._require_exact or self._exact_runtime_validated:
+            return
+        if not self._model or not self._effort:
+            raise CodexAppServerError(
+                code=-32602,
+                message=(
+                    "exact Codex runtime requires both an explicit model and "
+                    "reasoning effort"
+                ),
+            )
+        assert self._client is not None
+        cursor: Optional[str] = None
+        found: Optional[dict[str, Any]] = None
+        for _ in range(20):
+            params: dict[str, Any] = {"includeHidden": True}
+            if cursor:
+                params["cursor"] = cursor
+            response = self._client.request("model/list", params, timeout=15)
+            for candidate in response.get("data", response.get("models", [])):
+                candidate_id = str(
+                    candidate.get("id")
+                    or candidate.get("model")
+                    or candidate.get("slug")
+                    or ""
+                )
+                if candidate_id == self._model:
+                    found = candidate
+                    break
+            if found is not None:
+                break
+            cursor = response.get("nextCursor")
+            if not cursor:
+                break
+        if found is None:
+            raise CodexAppServerError(
+                code=-32602,
+                message=f"required Codex model {self._model!r} is unavailable",
+            )
+        efforts = {
+            str(item.get("reasoningEffort") or item.get("effort") or "").lower()
+            for item in found.get("supportedReasoningEfforts", [])
+            if isinstance(item, dict)
+        }
+        if self._effort not in efforts:
+            raise CodexAppServerError(
+                code=-32602,
+                message=(
+                    f"required reasoning effort {self._effort!r} is unavailable "
+                    f"for Codex model {self._model!r}"
+                ),
+            )
+        self._exact_runtime_validated = True
+
     def ensure_started(self) -> str:
         """Spawn the subprocess, do the initialize handshake, and start a
         thread. Returns the codex thread id. Idempotent — repeated calls
@@ -327,6 +389,7 @@ class CodexAppServerSession:
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
         )
+        self._validate_exact_runtime()
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi
@@ -343,6 +406,8 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._model:
+            params["model"] = self._model
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -524,6 +589,8 @@ class CodexAppServerSession:
                 {
                     "threadId": self._thread_id,
                     "input": [{"type": "text", "text": user_input_text}],
+                    **({"model": self._model} if self._model else {}),
+                    **({"effort": self._effort} if self._effort else {}),
                 },
                 timeout=10,
             )
