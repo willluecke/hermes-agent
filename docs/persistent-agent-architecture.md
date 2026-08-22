@@ -79,6 +79,29 @@ Direct Codex and Claude chat harnesses remain manual native-session surfaces.
 They bypass this automatic decision/worker/review loop and do not make Claude a
 decision authority.
 
+## RecCli Context Gate
+
+RecCli is active on the default Hermes path as the project-memory layer. For
+substantive work, Hermes resolves the requested project through
+`~/.reccli/projects.json` and loads that project's RecCli context before Sol
+makes a durable project decision or delegates to `opus_code_worker`. Ordinary
+non-project conversation does not trigger a project-selection prompt.
+
+The command-center Codex App Server starts with `/home/will` as its working
+directory. The host-level `/home/will/AGENTS.md` therefore carries the context
+gate into every new default Hermes Codex session. The deployed file is tracked
+as `ops/command-center/AGENTS.md`; the server registry is tracked as
+`ops/command-center/reccli-projects.json`.
+
+A context-load failure is fail-closed for durable project decisions and Opus
+delegation. Hermes may continue a clearly labeled read-only investigation, but
+must disclose that project history was unavailable. RecCli output is advisory:
+current code and primary evidence still control verification, Sol owns
+judgment, and project memory never grants promotion authority.
+
+Meaningful project outcomes are saved back to RecCli once at the end of work.
+A save failure is reported and does not cause an unbounded retry loop.
+
 ## Authority Matrix
 
 | Activity | Hermes / Sol 5.6 xhigh | Claude Opus 5 | Human |

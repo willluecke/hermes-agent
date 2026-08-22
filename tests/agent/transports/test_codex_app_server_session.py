@@ -506,6 +506,51 @@ class TestCompactThread:
 
 class TestServerRequestRouting:
 
+    @pytest.mark.parametrize("server_name", ["hermes-tools", "reccli"])
+    def test_local_runtime_mcp_elicitation_is_accepted(self, server_name):
+        client = FakeClient()
+        client.queue_server_request(
+            "mcpServer/elicitation/request",
+            request_id="mcp-approval",
+            serverName=server_name,
+            mode="form",
+            message="Allow this local MCP tool call?",
+            requestedSchema={"type": "object"},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        make_session(client).run_turn("hi", turn_timeout=1.0)
+
+        assert (
+            "mcp-approval",
+            {"action": "accept", "content": None, "_meta": None},
+        ) in client.responses
+
+    def test_untrusted_mcp_elicitation_is_declined(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "mcpServer/elicitation/request",
+            request_id="mcp-approval",
+            serverName="external-server",
+            mode="form",
+            message="Allow this external MCP tool call?",
+            requestedSchema={"type": "object"},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        make_session(client).run_turn("hi", turn_timeout=1.0)
+
+        assert (
+            "mcp-approval",
+            {"action": "decline", "content": None, "_meta": None},
+        ) in client.responses
+
 
 
     def test_unknown_server_request_replied_with_error(self):
@@ -895,4 +940,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

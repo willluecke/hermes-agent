@@ -1,0 +1,12 @@
+{
+  "projects": [
+    {
+      "path": "/home/will/coding-projects/hermes-chat",
+      "name": "hermes-chat"
+    },
+    {
+      "path": "/home/will/coding-projects/RecCli",
+      "name": "RecCli"
+    }
+  ]
+}

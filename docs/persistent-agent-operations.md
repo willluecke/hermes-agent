@@ -54,11 +54,28 @@ returns, the subscription worker materializes the review commit itself. A
 missing host Git identity therefore turns an otherwise valid implementation
 into a failed durable job.
 
+Install the tracked default-path RecCli policy and registry as user `will`:
+
+```bash
+install -m 0644 ops/command-center/AGENTS.md /home/will/AGENTS.md
+install -d -m 0700 /home/will/.reccli
+install -m 0600 ops/command-center/reccli-projects.json \
+  /home/will/.reccli/projects.json
+```
+
+Register only repositories that exist on command-center. Each registered
+project must retain its canonical `*.devproject` file and `devsession/`
+history. Synchronize those RecCli artifacts deliberately; do not copy a Mac
+registry containing Mac-only paths, and do not overwrite a tracked feature map
+with an unreviewed local proposal.
+
 ## Orchestration Runbook
 
 For an implementation request, Hermes should:
 
-1. Inspect current code and RecCli project memory.
+1. Resolve the registered project and call `load_project_context` before
+   inspecting current code. A failed load blocks durable decisions and worker
+   delegation.
 2. Resolve material product or architecture choices as Sol 5.6 at `xhigh`.
 3. Record a durable decision only when the result must survive the conversation.
 4. Call `opus_code_worker` with `action=run`, a registered project key, a
@@ -87,10 +104,38 @@ loginctl show-user will -p Linger
 git config --global --get user.name
 git config --global --get user.email
 codex mcp get hermes-tools --json
+codex mcp get reccli --json
+test -r /home/will/AGENTS.md
+jq -e '.projects | length > 0' /home/will/.reccli/projects.json
 ```
 
 All services must be `active`. The MCP record must whitelist
 `HERMES_GATEWAY_SESSION_ID`, `HERMES_HOME`, and `PYTHONPATH`.
+The RecCli MCP must be enabled, every registry path must exist, and a direct
+`load_project_context` call must return context for each registered project.
+Its Codex `enabled_tools` list should contain only the default-path memory
+surface: context loading, read/search/inspection tools, and
+`save_session_notes`. Do not expose RecCli organization launch, approval,
+promotion, deletion, recovery, or configuration tools through this automatic
+approval path.
+
+```toml
+[mcp_servers.reccli]
+command = "/home/will/.local/bin/reccli-mcp"
+enabled_tools = [
+  "doctor",
+  "expand_search_result",
+  "inspect_result_id",
+  "list_issues",
+  "list_sessions",
+  "load_project_context",
+  "preview_context",
+  "save_session_notes",
+  "search_by_file",
+  "search_by_time",
+  "search_history",
+]
+```
 
 Verify native authentication without displaying token files:
 
@@ -106,18 +151,22 @@ upgrade.
 
 ## Functional Canary
 
-1. Send a low-risk Hermes message that requires no file changes.
-2. Confirm the streamed response reaches Hermes Chat without reconnect gaps.
-3. Ask Hermes to list recent decision records.
-4. Queue a trivial Claude implementation job against a disposable test branch.
-5. Confirm its result identifies `claude-opus-5`, contains checks, and leaves a
+1. Start a fresh standard Hermes conversation and ask a read-only historical
+   question about one registered project without instructing Hermes to use
+   RecCli.
+2. Confirm the visible tool sequence contains `load_project_context` for the
+   matching absolute project path before project conclusions or worker calls.
+3. Confirm the streamed response reaches Hermes Chat without reconnect gaps.
+4. Ask Hermes to list recent decision records.
+5. Queue a trivial Claude implementation job against a disposable test branch.
+6. Confirm its result identifies `claude-opus-5`, contains checks, and leaves a
    local reviewable commit without push or deployment.
-6. In a standard Hermes conversation, request a disposable code change and
+7. In a standard Hermes conversation, request a disposable code change and
    confirm the visible tool call is `opus_code_worker` rather than a direct
    Claude harness conversation.
-7. Confirm the returned worker job has the same derived orchestration thread,
+8. Confirm the returned worker job has the same derived orchestration thread,
    exact model `claude-opus-5`, a local worktree/commit, and no release status.
-8. Confirm Hermes continues after the tool result and reviews evidence before
+9. Confirm Hermes continues after the tool result and reviews evidence before
    offering any promotion action.
 
 Do not restart `hermes-gateway.service` while a run is active. Wait for the run
