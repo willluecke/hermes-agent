@@ -92,7 +92,10 @@ The installer:
 3. creates or updates exactly one `Governed Agentic Loop Gate` cron job;
 4. pins it to `openai-codex`, `gpt-5.6-sol`, and `xhigh`;
 5. schedules a deterministic check every 15 minutes from 06:00 through 22:59
-   local time.
+   local time;
+6. pins the existing `Daily Founder Revenue Dispatcher` and `Daily Founder
+   Evening Review` checkpoints to the same exact Sol authority contract,
+   without changing their prompts or schedules.
 
 Polling frequency is not model frequency. The gate's final JSON line controls
 the scheduler before agent construction:
@@ -184,6 +187,16 @@ test -x /home/will/.hermes/scripts/agentic-loop-gate.py
 jq -e --arg name 'Governed Agentic Loop Gate' \
   '[(.jobs // .)[] | select(.name == $name and .enabled == true)] | length == 1' \
   /home/will/.hermes/cron/jobs.json
+jq -e '
+  [(.jobs // .)[]
+   | select(.name == "Governed Agentic Loop Gate"
+         or .name == "Daily Founder Revenue Dispatcher"
+         or .name == "Daily Founder Evening Review")
+   | select(.provider == "openai-codex"
+         and .model == "gpt-5.6-sol"
+         and .reasoning_effort == "xhigh")]
+  | length == 3
+' /home/will/.hermes/cron/jobs.json
 ```
 
 All services must be `active`. The MCP record must whitelist

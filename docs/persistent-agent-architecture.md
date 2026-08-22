@@ -26,13 +26,19 @@ The command-center policy is:
 - meaningful state changes are batched and may wake Sol, subject to a maximum
   of three autonomous gate wakes per local calendar day;
 - the deliberate 06:30 planning and 21:00 review jobs are separate named
-  checkpoints, not open-ended background thought;
+  checkpoints pinned to the same Sol authority contract, not open-ended
+  background thought;
 - user messages remain immediate and do not wait for the gate;
 - there is no unconditional two-hour model sweep.
 
 The 15-minute check is intentionally cheap. Its frequency controls detection
 latency, not inference frequency. Reducing the interval must never increase
 model usage when the observed state is unchanged.
+
+On an ordinary day, scheduled decision work is therefore bounded at two fixed
+checkpoint turns plus at most three event-driven turns. User conversations and
+separately reviewed weekly or monthly jobs are outside that bound. There is no
+hidden two-hour inference schedule.
 
 ## Runtime Contracts
 

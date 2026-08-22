@@ -8,6 +8,10 @@ JOB_NAME="Governed Agentic Loop Gate"
 SCHEDULE="*/15 6-22 * * *"
 MODEL="gpt-5.6-sol"
 PROVIDER="openai-codex"
+CHECKPOINT_NAMES=(
+  "Daily Founder Revenue Dispatcher"
+  "Daily Founder Evening Review"
+)
 
 install -d -m 0700 "$HERMES_HOME/scripts" "$HERMES_HOME/agentic-loop"
 install -m 0700 \
@@ -65,3 +69,21 @@ fi
 printf '%s\n' "$job_id" >"$HERMES_HOME/agentic-loop/job-id"
 chmod 0600 "$HERMES_HOME/agentic-loop/job-id"
 printf 'Governed agentic loop installed: %s (%s)\n' "$job_id" "$SCHEDULE"
+
+for checkpoint_name in "${CHECKPOINT_NAMES[@]}"; do
+  checkpoint_id=""
+  if [[ -f "$jobs_file" ]]; then
+    checkpoint_id=$(jq -r --arg name "$checkpoint_name" \
+      '[(.jobs // .)[] | select(.name == $name) | .id] | if length == 1 then .[0] elif length == 0 then "" else error("duplicate named checkpoints") end' \
+      "$jobs_file")
+  fi
+  if [[ -z "$checkpoint_id" ]]; then
+    printf 'Named checkpoint not present; skipped: %s\n' "$checkpoint_name"
+    continue
+  fi
+  "$HERMES_BIN" cron edit "$checkpoint_id" \
+    --provider "$PROVIDER" \
+    --model "$MODEL" \
+    --reasoning-effort xhigh >/dev/null
+  printf 'Pinned named checkpoint: %s (%s)\n' "$checkpoint_name" "$checkpoint_id"
+done
