@@ -38,11 +38,18 @@ class _FakeClient:
 
 def test_exact_runtime_validates_and_pins_thread_model():
     client = _FakeClient()
+    client_kwargs = {}
+
+    def client_factory(**kwargs):
+        client_kwargs.update(kwargs)
+        return client
+
     session = CodexAppServerSession(
+        hermes_session_id="hermes-chat-session_123",
         model="gpt-5.6-sol",
         effort="xhigh",
         require_exact=True,
-        client_factory=lambda **kwargs: client,
+        client_factory=client_factory,
     )
 
     assert session.ensure_started() == "thread-exact"
@@ -50,6 +57,9 @@ def test_exact_runtime_validates_and_pins_thread_model():
         ("model/list", {"includeHidden": True}),
         ("thread/start", {"cwd": session._cwd, "model": "gpt-5.6-sol"}),
     ]
+    assert client_kwargs["env"] == {
+        "HERMES_GATEWAY_SESSION_ID": "hermes-chat-session_123"
+    }
 
 
 def test_exact_runtime_rejects_unavailable_effort():

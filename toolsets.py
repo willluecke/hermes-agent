@@ -60,7 +60,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory", "decision_log",
+    "todo", "memory", "decision_log", "opus_code_worker",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -268,6 +268,12 @@ TOOLSETS = {
     "decision_log": {
         "description": "Append-only durable decision records owned by the configured authority",
         "tools": ["decision_log"],
+        "includes": []
+    },
+
+    "opus_worker": {
+        "description": "Governed native Claude Code Opus 5 implementation worker",
+        "tools": ["opus_code_worker"],
         "includes": []
     },
 

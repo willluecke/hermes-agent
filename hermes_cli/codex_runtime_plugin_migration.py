@@ -596,6 +596,15 @@ def _build_hermes_tools_mcp_entry() -> dict:
     out: dict[str, Any] = {
         "command": sys.executable,
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        # Codex starts stdio MCP servers with a restricted environment. These
+        # non-secret runtime values must be explicitly whitelisted so the
+        # callback can bind durable worker jobs to the originating Hermes turn
+        # and resolve the same profile/worktree paths as its parent process.
+        "env_vars": [
+            "HERMES_GATEWAY_SESSION_ID",
+            "HERMES_HOME",
+            "PYTHONPATH",
+        ],
     }
     if env:
         out["env"] = env

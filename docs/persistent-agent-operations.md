@@ -38,6 +38,45 @@ claude --model claude-opus-5 --effort high
 The worker ignores a queued Claude model override. This prevents old browser
 state or a stale job from silently selecting another model.
 
+The standard Hermes path exposes `opus_code_worker` through the Hermes tools
+MCP bridge. Its sync client uses the local bearer-gated management service at
+`http://127.0.0.1:8643`; the sync credential is read from
+`~/.hermes-api-key` and is never passed to either model. The Codex app-server
+process receives only a non-secret Hermes session identifier so worker jobs can
+be bound to the originating conversation. The managed Codex MCP entry
+whitelists `HERMES_GATEWAY_SESSION_ID` through `env_vars`; passing it only to
+the parent app-server is insufficient because Codex restricts the environment
+of stdio MCP children.
+
+The command-center Git configuration must also have a local author name and
+email. Claude does not need permission to commit: after the native session
+returns, the subscription worker materializes the review commit itself. A
+missing host Git identity therefore turns an otherwise valid implementation
+into a failed durable job.
+
+## Orchestration Runbook
+
+For an implementation request, Hermes should:
+
+1. Inspect current code and RecCli project memory.
+2. Resolve material product or architecture choices as Sol 5.6 at `xhigh`.
+3. Record a durable decision only when the result must survive the conversation.
+4. Call `opus_code_worker` with `action=run`, a registered project key, a
+   bounded specification, constraints, and at least one observable acceptance
+   check.
+5. If the returned status is `queued` or `running`, call `action=status` with
+   the returned job ID and a positive bounded wait.
+6. If the result contains `DECISION_NEEDED`, resolve it before issuing a new
+   attempt. Increment `attempt` only for an intentional rerun of the same
+   specification.
+7. Inspect the returned worktree and commit directly. Compare the actual diff
+   and test evidence with the accepted specification.
+8. Present push, merge, deploy, or release as a separate human authorization.
+
+An explicit stop may call `action=cancel`. Closing the browser, losing the SSE
+connection, or sleeping the Mac is not a stop; the command-center job continues
+and can be recovered by ID.
+
 ## Startup Checks
 
 ```bash
@@ -45,7 +84,13 @@ systemctl --user is-active hermes-gateway.service
 systemctl --user is-active hermes-sync.service
 systemctl --user is-active hermes-subscription-worker.service
 loginctl show-user will -p Linger
+git config --global --get user.name
+git config --global --get user.email
+codex mcp get hermes-tools --json
 ```
+
+All services must be `active`. The MCP record must whitelist
+`HERMES_GATEWAY_SESSION_ID`, `HERMES_HOME`, and `PYTHONPATH`.
 
 Verify native authentication without displaying token files:
 
@@ -67,6 +112,13 @@ upgrade.
 4. Queue a trivial Claude implementation job against a disposable test branch.
 5. Confirm its result identifies `claude-opus-5`, contains checks, and leaves a
    local reviewable commit without push or deployment.
+6. In a standard Hermes conversation, request a disposable code change and
+   confirm the visible tool call is `opus_code_worker` rather than a direct
+   Claude harness conversation.
+7. Confirm the returned worker job has the same derived orchestration thread,
+   exact model `claude-opus-5`, a local worktree/commit, and no release status.
+8. Confirm Hermes continues after the tool result and reviews evidence before
+   offering any promotion action.
 
 Do not restart `hermes-gateway.service` while a run is active. Wait for the run
 to complete or explicitly cancel it first.

@@ -277,6 +277,7 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        hermes_session_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
         require_exact: bool = False,
@@ -289,6 +290,7 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._hermes_session_id = str(hermes_session_id or "").strip()
         self._model = str(model or "").strip()
         self._effort = str(effort or "").strip().lower()
         self._require_exact = bool(require_exact)
@@ -381,9 +383,18 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+            client_env = (
+                {"HERMES_GATEWAY_SESSION_ID": self._hermes_session_id}
+                if self._hermes_session_id
+                else None
             )
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            if client_env is not None:
+                client_kwargs["env"] = client_env
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",

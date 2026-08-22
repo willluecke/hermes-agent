@@ -408,6 +408,16 @@ class TestHermesHomeLeakGuard:
         env = entry.get("env", {})
         assert env.get("HERMES_HOME") == real_path
 
+    def test_runtime_context_is_whitelisted_for_mcp_child(self):
+        """Codex must forward per-turn identity into the stdio MCP process."""
+        entry = _build_hermes_tools_mcp_entry()
+
+        assert entry["env_vars"] == [
+            "HERMES_GATEWAY_SESSION_ID",
+            "HERMES_HOME",
+            "PYTHONPATH",
+        ]
+
     def test_unset_hermes_home_omits_env_key(self, monkeypatch):
         """When HERMES_HOME is unset in the environment, the MCP entry MUST
         NOT bake in a resolved-default path. The codex subprocess should

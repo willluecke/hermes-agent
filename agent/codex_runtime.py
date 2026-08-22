@@ -751,6 +751,7 @@ def run_codex_app_server_turn(
         )
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            hermes_session_id=str(getattr(agent, "session_id", "") or ""),
             model=getattr(agent, "model", ""),
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
             require_exact=require_exact,

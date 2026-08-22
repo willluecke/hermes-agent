@@ -45,6 +45,40 @@ write the decision ledger, push, deploy, merge, access secrets, or perform
 irreversible external actions. Ambiguous specifications return to Hermes as a
 `decision_needed` result with evidence and options.
 
+## Standard Hermes Orchestration Loop
+
+The standard Hermes chat is the governed path. A coding request remains one
+Hermes conversation while execution crosses the native subscription boundary:
+
+```text
+user request
+  -> Hermes/Sol inspects evidence and resolves decisions
+  -> Hermes records a durable decision when warranted
+  -> Hermes pins specification, constraints, and acceptance checks
+  -> opus_code_worker queues exact Claude Opus 5
+  -> Claude edits/tests in an isolated worktree and creates a local commit
+  -> the durable result returns to the same Hermes turn
+  -> Hermes inspects the commit and test evidence
+  -> Hermes reports acceptance, revision, or DECISION_NEEDED
+  -> the human separately authorizes push, merge, deploy, or release
+```
+
+`opus_code_worker` supports `run`, `status`, and `cancel`. A run receives a
+deterministic job ID derived from the Hermes session, specification, and
+explicit attempt number. Retrying a lost request therefore recovers the same
+job rather than creating duplicate Opus work. Worker ownership is bound to the
+originating Hermes session; another conversation cannot inspect or cancel it.
+
+The tool waits for a bounded interval so one slow implementation cannot wedge
+the model tool transport. If the job remains queued or running, it returns its
+durable ID and progress. Hermes calls `status` to continue waiting in the same
+turn. Worker completion is not acceptance: Sol must inspect the worktree commit
+and test evidence before recommending promotion.
+
+Direct Codex and Claude chat harnesses remain manual native-session surfaces.
+They bypass this automatic decision/worker/review loop and do not make Claude a
+decision authority.
+
 ## Authority Matrix
 
 | Activity | Hermes / Sol 5.6 xhigh | Claude Opus 5 | Human |
@@ -93,6 +127,12 @@ Systemd user services and lingering keep Hermes and the subscription worker
 alive when SSH disconnects or the Mac sleeps. Persistence does not mean
 unbounded autonomy: scheduled triggers may start work, but irreversible or
 external promotion steps remain human-owned.
+
+Persistence applies at each orchestration boundary: the sync store owns the
+job queue and status, the worker owns worktrees and native Claude session IDs,
+Hermes owns conversation and run-event history, RecCli owns project memory, and
+the decision ledger owns accepted judgment. No model is continuously thinking
+between events.
 
 The Raspberry Pi is not part of this runtime and remains an independent
 rollback host until explicitly retired.
