@@ -68,6 +68,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # Local time lookup
+    "current_time",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -254,6 +256,12 @@ TOOLSETS = {
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
+        "includes": []
+    },
+
+    "current_time": {
+        "description": "Query the local system date and time",
+        "tools": ["current_time"],
         "includes": []
     },
 
@@ -485,6 +493,8 @@ TOOLSETS = {
             "todo", "memory",
             # Session history search
             "session_search",
+            # Local time lookup
+            "current_time",
             # Code execution + delegation
             "execute_code", "delegate_task",
             # Cronjob management
