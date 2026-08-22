@@ -15,6 +15,14 @@
     {
       "path": "/home/will/coding-projects/reg-watch",
       "name": "reg-watch"
+    },
+    {
+      "path": "/home/will/coding-projects/closure-engine",
+      "name": "closure-engine"
+    },
+    {
+      "path": "/home/will/coding-projects/llm-view",
+      "name": "llm-view"
     }
   ]
 }
