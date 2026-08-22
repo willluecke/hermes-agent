@@ -90,6 +90,26 @@ Inspect without invoking a model:
 /home/will/.hermes/scripts/agentic-loop-gate.py check
 ```
 
+## Verified End-To-End Path
+
+The governed loop passed a controlled read-only test on 2026-08-22:
+
+1. An explicit inbox event woke Sol through the deterministic gate.
+2. Sol loaded BRENUC RecCli context for `hermes-chat`.
+3. Sol queued exactly one Opus worker,
+   `job_751d5c7cedba3200cbe13ede3fdd89d2`.
+4. The subscription worker completed with marker
+   `HERMES_LOOP_E2E_WORKER_OK` and made no repository changes.
+5. The terminal result produced a second governed event.
+6. Sol reviewed and accepted the evidence, saved the review to RecCli, and
+   acknowledged the exact result batch. No pending batch or backlog remained.
+
+The first manual launch attempt failed before model construction because the
+non-interactive SSH test command omitted `/home/will/.local/bin` from `PATH`.
+The resident gateway service already had the correct path. Manual cron probes
+must either use a login shell or reproduce the gateway service `PATH`; this was
+not a resident-runtime failure.
+
 ## Human Gates
 
 The governed loop may inspect, analyze, edit local project files, run tests,
@@ -140,13 +160,12 @@ rg -n -F 'specific non-secret phrase' \
 
 ## Current Open Work
 
-- Observe and verify the first real actionable gate batch, exact
-  acknowledgement, Opus worker result, and Sol review.
 - Review the legacy monthly pipeline-audit and weekly auth-health prompts;
   they still contain Pi/Mac-era wording and assumptions.
 - RecCli context loading and session-note saving hung from the Mac Codex host
-  during the agentic-loop implementation. Verify the BRENUC MCP path directly
-  before relying on it for delegation.
+  during the agentic-loop implementation. The BRENUC MCP path subsequently
+  loaded project context and saved both E2E decisions successfully; investigate
+  the Mac MCP path separately if it is still needed.
 
 ## Source Documentation
 
