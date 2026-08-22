@@ -1453,6 +1453,53 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+class _ReplayableRunEventStream:
+    """Bounded run-event history with non-destructive subscriber cursors."""
+
+    def __init__(self, history_limit: int):
+        self._history_limit = max(1, history_limit)
+        self._events: List[Dict[str, Any]] = []
+        self._first_index = 0
+        self._next_index = 0
+        self._closed = False
+        self._changed = asyncio.Event()
+
+    @property
+    def first_index(self) -> int:
+        return self._first_index
+
+    def put_nowait(self, event: Optional[Dict[str, Any]]) -> None:
+        if self._closed:
+            return
+
+        if event is None:
+            self._closed = True
+        else:
+            self._events.append(event)
+            self._next_index += 1
+            overflow = len(self._events) - self._history_limit
+            if overflow > 0:
+                del self._events[:overflow]
+                self._first_index += overflow
+
+        changed = self._changed
+        self._changed = asyncio.Event()
+        changed.set()
+
+    def read_from(
+        self, cursor: int
+    ) -> tuple[List[Dict[str, Any]], int, bool]:
+        cursor = max(cursor, self._first_index)
+        offset = cursor - self._first_index
+        return list(self._events[offset:]), self._next_index, self._closed
+
+    async def wait_for_change(self, cursor: int, timeout: float) -> None:
+        if cursor < self._next_index or self._closed:
+            return
+        changed = self._changed
+        await asyncio.wait_for(changed.wait(), timeout=timeout)
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -1523,12 +1570,15 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
-        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
-        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        # Bounded, non-destructive SSE history for each run. Every subscriber
+        # reads with its own cursor so disconnecting clients cannot steal or
+        # delete events needed by a later reconnect.
+        self._run_streams: Dict[str, _ReplayableRunEventStream] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
-        # Runs with a connected SSE consumer; their queue is actively draining.
-        self._run_stream_subscribers: set[str] = set()
+        # Connected SSE consumer count per run. Counts, rather than a set,
+        # keep the TTL sweep from expiring a stream while any client remains.
+        self._run_stream_subscribers: Dict[str, int] = {}
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -7382,6 +7432,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_EVENT_HISTORY_LIMIT = 1000
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -7588,7 +7639,7 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_session_key = run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        q = _ReplayableRunEventStream(self._RUN_EVENT_HISTORY_LIMIT)
         created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
@@ -7950,8 +8001,11 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        q = self._run_streams[run_id]
-        self._run_stream_subscribers.add(run_id)
+        stream = self._run_streams[run_id]
+        cursor = stream.first_index
+        self._run_stream_subscribers[run_id] = (
+            self._run_stream_subscribers.get(run_id, 0) + 1
+        )
 
         response = web.StreamResponse(
             status=200,
@@ -7965,23 +8019,24 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             while True:
-                try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    await response.write(b": keepalive\n\n")
-                    continue
-                if event is None:
-                    # Run finished — send final SSE comment and close
+                events, cursor, closed = stream.read_from(cursor)
+                for event in events:
+                    await response.write(_sse_frame(event))
+                if closed:
                     await response.write(b": stream closed\n\n")
                     break
-                payload = _sse_frame(event)
-                await response.write(payload)
+                try:
+                    await stream.wait_for_change(cursor, timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
-            self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
+            subscribers = self._run_stream_subscribers.get(run_id, 0) - 1
+            if subscribers > 0:
+                self._run_stream_subscribers[run_id] = subscribers
+            else:
+                self._run_stream_subscribers.pop(run_id, None)
 
         return response
 

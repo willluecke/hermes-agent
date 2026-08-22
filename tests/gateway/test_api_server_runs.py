@@ -21,6 +21,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _ReplayableRunEventStream,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -332,6 +333,85 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_events_replay_after_first_stream_closes(self, adapter):
+        """A completed run remains attachable until its transport TTL expires."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "Replay me"
+                }
+                mock_agent.session_prompt_tokens = 1
+                mock_agent.session_completion_tokens = 2
+                mock_agent.session_total_tokens = 3
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+
+                first = await cli.get(f"/v1/runs/{run_id}/events")
+                first_body = await first.text()
+                second = await cli.get(f"/v1/runs/{run_id}/events")
+                second_body = await second.text()
+
+        assert first.status == 200
+        assert second.status == 200
+        assert "run.completed" in first_body
+        assert "Replay me" in first_body
+        assert second_body == first_body
+
+    @pytest.mark.asyncio
+    async def test_disconnect_keeps_history_for_running_run(self, adapter):
+        """Dropping one SSE reader must not remove the run transport."""
+        run_id = "run_reconnecttest"
+        stream = _ReplayableRunEventStream(adapter._RUN_EVENT_HISTORY_LIMIT)
+        stream.put_nowait({
+            "event": "message.delta",
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "delta": "before-",
+        })
+        adapter._run_streams[run_id] = stream
+        adapter._run_streams_created[run_id] = time.time()
+        adapter._set_run_status(run_id, "running")
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.get(f"/v1/runs/{run_id}/events")
+            line = await first.content.readline()
+            assert b"before-" in line
+            first.close()
+            await asyncio.sleep(0)
+
+            assert run_id in adapter._run_streams
+            stream.put_nowait({
+                "event": "run.completed",
+                "run_id": run_id,
+                "timestamp": time.time(),
+                "output": "before-after",
+            })
+            stream.put_nowait(None)
+
+            second = await cli.get(f"/v1/runs/{run_id}/events")
+            body = await second.text()
+
+        assert second.status == 200
+        assert "before-" in body
+        assert "before-after" in body
+
+    def test_event_history_is_bounded(self, adapter):
+        stream = _ReplayableRunEventStream(history_limit=2)
+        for index in range(3):
+            stream.put_nowait({"event": "message.delta", "delta": str(index)})
+
+        events, cursor, closed = stream.read_from(0)
+
+        assert [event["delta"] for event in events] == ["1", "2"]
+        assert cursor == 3
+        assert closed is False
 
 
     @pytest.mark.asyncio
