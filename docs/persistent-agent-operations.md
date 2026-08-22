@@ -11,6 +11,10 @@ Host: `command-center` (`will@192.168.1.243`)
 
 All agent services run as user `will`. User lingering must remain enabled.
 
+The process-driven agentic loop does not add another resident service. It uses
+the existing Hermes cron ticker and a deterministic pre-check script. A
+suppressed tick never constructs an agent.
+
 ## Required Configuration
 
 `~/.hermes/config.yaml` must contain the following authority contract:
@@ -69,6 +73,74 @@ history. Synchronize those RecCli artifacts deliberately; do not copy a Mac
 registry containing Mac-only paths, and do not overwrite a tracked feature map
 with an unreviewed local proposal.
 
+## Agentic Loop Gate
+
+Install or update the tracked gate idempotently from the deployed migration
+checkout:
+
+```bash
+cd /home/will/src/hermes-agent-migration
+ops/command-center/install-agentic-loop.sh
+```
+
+The installer:
+
+1. installs the gate under `~/.hermes/scripts/` and its governed prompt under
+   `~/.hermes/agentic-loop/` with private permissions;
+2. primes a baseline only when no prior gate state exists, preventing replay
+   of historical jobs, work items, or metrics;
+3. creates or updates exactly one `Governed Agentic Loop Gate` cron job;
+4. pins it to `openai-codex`, `gpt-5.6-sol`, and `xhigh`;
+5. schedules a deterministic check every 15 minutes from 06:00 through 22:59
+   local time.
+
+Polling frequency is not model frequency. The gate's final JSON line controls
+the scheduler before agent construction:
+
+```json
+{"reason":"no_actionable_change","wakeAgent":false}
+```
+
+Only `wakeAgent: true` spends a Sol turn. The gate allows at most three such
+autonomous wakes per local day. The cap and six-hour unacknowledged-batch retry
+are tracked policy, not environment overrides or event fields. Changing either
+requires a reviewed source change and redeployment.
+
+Inspect state without invoking a model:
+
+```bash
+~/.hermes/scripts/agentic-loop-gate.py status
+```
+
+Queue an explicit process-owned trigger:
+
+```bash
+~/.hermes/scripts/agentic-loop-gate.py enqueue \
+  --id regwatch-source-audit-20260822 \
+  --project reg-watch \
+  --priority High \
+  --task "Inspect the new source-monitor failure and propose one bounded next action."
+```
+
+Run a token-free check directly:
+
+```bash
+~/.hermes/scripts/agentic-loop-gate.py check
+```
+
+Do not delete `gate-state.json` to force a rerun. Use a new inbox ID for a new
+intentional event. A woken Sol turn receives an exact batch ID and an
+`ackCommand`. It acknowledges only after inspecting the batch and making its
+action or no-action disposition durable. Until acknowledgment, the same batch
+is suppressed for six hours and then retried within the daily budget. New
+events supersede the batch ID when they fit in the current 24-event batch. Any
+overflow remains durable and is promoted after acknowledgment, so a late
+acknowledgment cannot discard unseen events.
+
+The private inbox is an input queue, not authorization. It cannot grant push,
+merge, deploy, production-data, credential, spending, or external-contact
+permission.
+
 ## Orchestration Runbook
 
 For an implementation request, Hermes should:
@@ -107,6 +179,11 @@ codex mcp get hermes-tools --json
 codex mcp get reccli --json
 test -r /home/will/AGENTS.md
 jq -e '.projects | length > 0' /home/will/.reccli/projects.json
+test -x /home/will/.hermes/scripts/agentic-loop-gate.py
+/home/will/.hermes/scripts/agentic-loop-gate.py status
+jq -e --arg name 'Governed Agentic Loop Gate' \
+  '[(.jobs // .)[] | select(.name == $name and .enabled == true)] | length == 1' \
+  /home/will/.hermes/cron/jobs.json
 ```
 
 All services must be `active`. The MCP record must whitelist
@@ -208,6 +285,31 @@ Streaming interruption:
 
 - Reconnect by run ID and replay persisted run events.
 - Do not start a duplicate run until the original run status is known.
+
+Gate database unavailable or state unreadable:
+
+- The scheduled check emits `reason: gate_error` with `wakeAgent: false` and
+  exits successfully so Hermes cannot turn an infrastructure failure into a
+  recurring model call.
+- Run the check directly to see its bounded error field. Install-time `prime`
+  and interactive mutation commands still exit non-zero on failure.
+- Repair the database path or private state file; do not replace the gate with
+  an unconditional model schedule.
+
+Gate batch not acknowledged:
+
+- Inspect `agentic-loop-gate.py status` and the corresponding cron execution.
+- The gate suppresses duplicates for six hours, then retries within its daily
+  budget. A new event changes the batch ID immediately.
+- Acknowledge manually only after verifying that the event batch was actually
+  handled; clearing state is not acknowledgment.
+
+Daily gate budget exhausted:
+
+- Pending events remain durable and become eligible after the local date rolls
+  over. User messages and separately named checkpoints are unaffected.
+- Do not raise the budget as an incident workaround. Inspect whether an input
+  source is producing unstable semantic state.
 
 ## Upgrade Procedure
 
