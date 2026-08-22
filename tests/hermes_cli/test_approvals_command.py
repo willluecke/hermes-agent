@@ -31,12 +31,16 @@ def test_approvals_registry_drives_help_menu_and_autocomplete():
     command = resolve_command("approvals")
     assert command is not None
     assert command.category == "Configuration"
-    assert command.args_hint == "[manual|smart|off]"
-    assert SUBCOMMANDS["/approvals"] == ["manual", "smart", "off"]
+    assert command.args_hint == "[manual|smart|guarded_yolo|off]"
+    assert SUBCOMMANDS["/approvals"] == [
+        "manual", "smart", "guarded_yolo", "off"
+    ]
     assert "approvals" in GATEWAY_KNOWN_COMMANDS
     assert any("/approvals" in line for line in gateway_help_lines())
     assert "approvals" in {name for name, _ in telegram_bot_commands()}
-    assert _completions("/approvals ") == {"manual", "smart", "off"}
+    assert _completions("/approvals ") == {
+        "manual", "smart", "guarded_yolo", "off"
+    }
 
 
 def _isolate_config(monkeypatch, home):
@@ -74,7 +78,6 @@ def test_shared_command_refuses_managed_mode_override(tmp_path, monkeypatch):
     assert result.changed is False
     assert "managed" in result.message.lower()
     assert not (home / "config.yaml").exists()
-
 
 
 

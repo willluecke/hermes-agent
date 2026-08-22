@@ -4494,7 +4494,7 @@ def _write_config_key(key_path: str, value):
 
 
 _STATUSBAR_MODES = frozenset({"off", "top", "bottom"})
-_APPROVAL_MODES = frozenset({"manual", "smart", "off"})
+_APPROVAL_MODES = frozenset({"manual", "smart", "guarded_yolo", "off"})
 
 
 def _load_approval_mode() -> str:
@@ -12306,7 +12306,8 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid,
                 4002,
-                f"unknown approval mode: {value}; pick one of manual|smart|off",
+                f"unknown approval mode: {value}; pick one of "
+                "manual|smart|guarded_yolo|off",
             )
 
         _write_config_key("approvals.mode", raw)

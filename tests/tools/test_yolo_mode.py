@@ -143,7 +143,7 @@ class TestYoloMode:
         assert not result["approved"]
 
     def test_session_scoped_yolo_only_bypasses_current_session(self, monkeypatch):
-        """Gateway /yolo should only bypass approvals for the active session."""
+        """Gateway /yolo only bypasses routine wrappers in its active session."""
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 
@@ -151,10 +151,10 @@ class TestYoloMode:
         assert is_session_yolo_enabled("session-a") is True
         assert is_session_yolo_enabled("session-b") is False
 
-        # Dangerous-but-not-hardline — the yolo bypass applies here.
+        # Wrapper execution is the guarded mode's low-friction case.
         token_a = set_current_session_key("session-a")
         try:
-            approved = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            approved = check_dangerous_command("bash -lc 'echo ok'", "local")
             assert approved["approved"] is True
         finally:
             reset_current_session_key(token_a)
@@ -162,7 +162,7 @@ class TestYoloMode:
         token_b = set_current_session_key("session-b")
         try:
             blocked = check_dangerous_command(
-                "rm -rf /tmp/stuff",
+                "bash -lc 'echo ok'",
                 "local",
                 approval_callback=lambda *a: "deny",
             )
@@ -173,18 +173,18 @@ class TestYoloMode:
         disable_session_yolo("session-a")
         assert is_session_yolo_enabled("session-a") is False
 
-    def test_bypass_query_uses_the_requested_session(self, monkeypatch):
-        """Backend mode selection must not leak YOLO across sessions."""
+    def test_session_yolo_is_not_reported_as_full_bypass(self, monkeypatch):
+        """Command-less backends must fail closed under guarded session YOLO."""
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 
         enable_session_yolo("session-a")
 
-        assert is_approval_bypass_active_for_session("session-a") is True
+        assert is_approval_bypass_active_for_session("session-a") is False
         assert is_approval_bypass_active_for_session("session-b") is False
 
     def test_session_scoped_yolo_bypasses_combined_guard_only_for_current_session(self, monkeypatch):
-        """Combined guard should honor session-scoped YOLO without affecting others."""
+        """Combined guard applies guarded session YOLO only to its session."""
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
 
@@ -192,7 +192,7 @@ class TestYoloMode:
 
         token_a = set_current_session_key("session-a")
         try:
-            approved = check_all_command_guards("rm -rf /tmp/stuff", "local")
+            approved = check_all_command_guards("bash -lc 'echo ok'", "local")
             assert approved["approved"] is True
         finally:
             reset_current_session_key(token_a)
@@ -207,6 +207,25 @@ class TestYoloMode:
             assert blocked["approved"] is False
         finally:
             reset_current_session_key(token_b)
+
+    def test_session_scoped_yolo_still_prompts_for_destructive_command(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        enable_session_yolo("session-a")
+
+        token = set_current_session_key("session-a")
+        try:
+            result = check_all_command_guards(
+                "git reset --hard",
+                "local",
+                approval_callback=lambda *args, **kwargs: "deny",
+            )
+        finally:
+            reset_current_session_key(token)
+
+        assert result["approved"] is False
 
     def test_clear_session_removes_session_yolo_state(self):
         """Session cleanup must remove YOLO bypass state."""

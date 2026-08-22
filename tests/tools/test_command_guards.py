@@ -154,6 +154,66 @@ class TestTirithAllowDangerous:
         assert cb.call_args[1]["allow_permanent"] is True
 
 
+class TestGuardedYoloMode:
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_routine_wrapper_is_auto_approved(self, mock_tirith, monkeypatch):
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "guarded_yolo"
+        )
+        os.environ["HERMES_INTERACTIVE"] = "1"
+
+        result = check_all_command_guards("bash -lc 'echo ok'", "local")
+
+        assert result["approved"] is True
+        mock_tirith.assert_called_once()
+
+    @patch(
+        _TIRITH_PATCH,
+        return_value=_tirith_result(
+            "warn", [{"rule_id": "wrapper-risk"}], "wrapper risk"
+        ),
+    )
+    def test_tirith_warning_still_prompts(self, mock_tirith, monkeypatch):
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "guarded_yolo"
+        )
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        callback = MagicMock(return_value="deny")
+
+        result = check_all_command_guards(
+            "bash -lc 'echo ok'", "local", approval_callback=callback
+        )
+
+        assert result["approved"] is False
+        callback.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -rf ./build",
+            "git reset --hard",
+            "git clean -fdx",
+            "rsync -av --delete src/ dest/",
+        ],
+    )
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_destructive_command_still_prompts(
+        self, mock_tirith, command, monkeypatch
+    ):
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "guarded_yolo"
+        )
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        callback = MagicMock(return_value="deny")
+
+        result = check_all_command_guards(
+            command, "local", approval_callback=callback
+        )
+
+        assert result["approved"] is False
+        callback.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # tirith warn + safe command
 # ---------------------------------------------------------------------------

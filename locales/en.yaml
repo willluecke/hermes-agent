@@ -447,7 +447,7 @@ gateway:
 
   yolo:
     disabled:                   "⚠️ YOLO mode **OFF** for this session — dangerous commands will require approval."
-    enabled:                    "⚡ YOLO mode **ON** for this session — all commands auto-approved. Use with caution."
+    enabled:                    "Guarded YOLO mode **ON** for this session. Routine command wrappers are auto-approved; destructive commands still require approval."
 
   shared:
     session_db_unavailable:      "Session database not available."

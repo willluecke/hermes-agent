@@ -913,6 +913,7 @@ DANGEROUS_PATTERNS = [
     # approving -exec / -delete flags.
     (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
+    (r'\brsync\b[^\n]*\s--delete(?:\s|$)', "rsync --delete (deletes destination files)"),
     # Gateway lifecycle protection: prevent the agent from killing its own
     # gateway process.  These commands trigger a gateway restart/stop that
     # terminates all running agents mid-work.  Allow global flags between
@@ -2341,6 +2342,27 @@ def detect_dangerous_command(command: str) -> tuple:
     return (False, None, None)
 
 
+_GUARDED_YOLO_ROUTINE_DESCRIPTIONS = frozenset({
+    "shell command via -c/-lc flag",
+    "script execution via -e/-c flag",
+    "script execution via heredoc",
+})
+
+
+def detect_guarded_yolo_prompt_command(command: str) -> tuple:
+    """Return whether guarded YOLO must retain the normal approval gate.
+
+    Guarded YOLO removes wrapper-related false positives only. Every other
+    dangerous-command category, including data deletion, history rewrites,
+    secret/config writes, remote code execution, and service disruption,
+    continues through the existing approval flow.
+    """
+    is_dangerous, _pattern_key, description = detect_dangerous_command(command)
+    if not is_dangerous or description in _GUARDED_YOLO_ROUTINE_DESCRIPTIONS:
+        return (False, None)
+    return (True, description)
+
+
 # =========================================================================
 # Per-session approval state (thread-safe)
 # =========================================================================
@@ -3148,15 +3170,17 @@ def _normalize_approval_mode(mode) -> str:
 
     Unknown string values (e.g. 'auto') are rejected with a warning rather than
     being silently accepted and falling through every mode check downstream.
-    Always returns one of 'manual', 'smart', or 'off'.
+    Always returns one of 'manual', 'smart', 'guarded_yolo', or 'off'.
     """
-    _VALID_MODES = ("manual", "smart", "off")
+    _VALID_MODES = ("manual", "smart", "guarded_yolo", "off")
     if isinstance(mode, bool):
         return "off" if mode is False else "manual"
     if isinstance(mode, str):
         normalized = mode.strip().lower()
         if not normalized:
             return "manual"
+        if normalized in {"guarded-yolo", "guarded yolo"}:
+            normalized = "guarded_yolo"
         if normalized in _VALID_MODES:
             return normalized
         logger.warning(
@@ -3185,7 +3209,7 @@ def _get_approval_config() -> dict:
 
 
 def _get_approval_mode() -> str:
-    """Read the approval mode from config. Returns 'manual', 'smart', or 'off'."""
+    """Read the normalized approval mode from config."""
     mode = _get_approval_config().get("mode", "manual")
     return _normalize_approval_mode(mode)
 
@@ -3193,20 +3217,21 @@ def _get_approval_mode() -> str:
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Return whether one exact session bypasses Hermes approval prompts.
 
-    Collapses the canonical three-source bypass check used across the codebase
+    Collapses the canonical full-bypass check used across the codebase
     into one place:
       - process-scoped ``--yolo`` / ``HERMES_YOLO_MODE`` (frozen at import time
         so a mid-process skill can't flip it — a prompt-injection escalation
         path; see ``_YOLO_MODE_FROZEN`` above),
-      - the session-scoped gateway ``/yolo`` toggle,
       - ``approvals.mode: off`` in config.
+
+    Session ``/yolo`` is deliberately absent: it is guarded and command-aware,
+    so callers without a command to classify must fail closed.
 
     This is the pure-bypass sub-expression only. Callers that also honor a
     hardline blocklist / permanent allowlist must check those separately.
     """
     return (
         _YOLO_MODE_FROZEN
-        or is_session_yolo_enabled(session_key)
         or _get_approval_mode() == "off"
     )
 
@@ -3466,10 +3491,10 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
-    # Hardline blocks are handled by the caller BEFORE this gate, so yolo
-    # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # Only process-level --yolo and persistent mode=off are full bypasses.
+    # Session /yolo is guarded and cannot safely bypass an arbitrary plugin
+    # escalation without a command to classify.
+    if _YOLO_MODE_FROZEN or _get_approval_mode() == "off":
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -3754,9 +3779,10 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    approval_mode = _get_approval_mode()
+
+    # Process --yolo and persistent mode=off retain break-glass semantics.
+    if _YOLO_MODE_FROZEN or approval_mode == "off":
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -3764,6 +3790,13 @@ def check_dangerous_command(command: str, env_type: str,
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
+        return {"approved": True, "message": None}
+
+    guarded_yolo = (
+        is_current_session_yolo_enabled() or approval_mode == "guarded_yolo"
+    )
+    must_prompt, _guarded_description = detect_guarded_yolo_prompt_command(command)
+    if guarded_yolo and not must_prompt:
         return {"approved": True, "message": None}
 
     return _run_approval_gate(
@@ -4387,10 +4420,10 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # Process --yolo and persistent mode=off are full break-glass bypasses.
+    # Session /yolo and mode=guarded_yolo are handled after classification.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _YOLO_MODE_FROZEN or approval_mode == "off":
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -4594,6 +4627,9 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Dangerous command check (detection only, no approval)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    guarded_yolo = (
+        is_current_session_yolo_enabled() or approval_mode == "guarded_yolo"
+    )
 
     # --- Phase 2: Decide ---
 
@@ -4614,7 +4650,12 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
-    if is_dangerous:
+    must_prompt_in_guarded_yolo, _guarded_description = (
+        detect_guarded_yolo_prompt_command(command)
+    )
+    if is_dangerous and not (
+        guarded_yolo and not must_prompt_in_guarded_yolo
+    ):
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
@@ -5022,9 +5063,10 @@ def check_execute_code_guard(code: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass (session- or process-scoped).
+    # Only process --yolo and persistent mode=off bypass arbitrary code.
+    # Guarded session/config modes retain this whole-script approval gate.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if _YOLO_MODE_FROZEN or approval_mode == "off":
         return {"approved": True, "message": None}
 
     is_gateway = _is_gateway_approval_context()
