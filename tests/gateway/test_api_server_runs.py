@@ -149,6 +149,44 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("raises", [False, True])
+    async def test_run_releases_codex_writer_before_terminal_status(
+        self, adapter, raises
+    ):
+        app = _create_runs_app(adapter)
+        codex_session = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent._codex_session = codex_session
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        if raises:
+            mock_agent.run_conversation.side_effect = RuntimeError("turn failed")
+            terminal_status = "failed"
+        else:
+            mock_agent.run_conversation.return_value = {"final_response": "done"}
+            terminal_status = "completed"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "codex-writer-release"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(80):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] in {"completed", "failed"}:
+                        break
+                    await asyncio.sleep(0.025)
+
+        assert status["status"] == terminal_status
+        codex_session.close.assert_called_once_with()
+        assert mock_agent._codex_session is None
+
+    @pytest.mark.asyncio
     async def test_start_preserves_latest_multimodal_user_message(self, adapter):
         app = _create_runs_app(adapter)
         captured = {}

@@ -8072,6 +8072,26 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
+                            # Every /v1/runs request owns a fresh AIAgent. Its
+                            # Codex app-server child therefore cannot remain
+                            # open for a later turn on this agent instance. If
+                            # it does, Codex keeps the durable thread's writer
+                            # lock and the next request cannot thread/resume.
+                            # Close only this native transport here: agent.close
+                            # also finalizes the durable Hermes session, which
+                            # must remain available across browser turns.
+                            codex_session = getattr(agent, "_codex_session", None)
+                            if codex_session is not None:
+                                agent._codex_session = None
+                                try:
+                                    codex_session.close()
+                                except Exception:
+                                    logger.warning(
+                                        "Codex app-server cleanup failed for "
+                                        "run=%s",
+                                        run_id,
+                                        exc_info=True,
+                                    )
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
