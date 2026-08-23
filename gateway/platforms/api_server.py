@@ -7435,6 +7435,8 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
     _RUN_EVENT_HISTORY_LIMIT = 1000
+    # Cap on the redacted tool-result text attached to tool.completed events.
+    _RUN_TOOL_OUTPUT_EVENT_CHARS = 8_000
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -7467,6 +7469,62 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Stable per-run tool-call identity. Reattaching clients replay the
+        # whole event history; without a stable ``tool_call_id`` on every
+        # tool event, each replay mints fresh client-side IDs and the same
+        # tool run appears once per reconnect in the activity timeline.
+        # Callers that know their canonical id (tool executor ``tc.id``,
+        # codex bridge item ids) pass ``tool_call_id=``; otherwise a
+        # monotonically numbered ``{run_id}:tool:{n}`` is minted at emission
+        # time, and completions pair with the oldest unfinished start of the
+        # same tool name — the pairing happens once here, so the emitted
+        # history (and therefore every replay) carries one fixed id.
+        tool_seq = [0]
+        pending_tool_ids: Dict[str, list] = {}
+
+        def _tool_id_for_start(tool_name: str, explicit: Any) -> str:
+            if isinstance(explicit, str) and explicit:
+                call_id = explicit
+            else:
+                tool_seq[0] += 1
+                call_id = f"{run_id}:tool:{tool_seq[0]}"
+            pending_tool_ids.setdefault(tool_name or "tool", []).append(call_id)
+            return call_id
+
+        def _tool_id_for_completion(tool_name: str, explicit: Any) -> str:
+            queue = pending_tool_ids.get(tool_name or "tool", [])
+            if isinstance(explicit, str) and explicit:
+                if explicit in queue:
+                    queue.remove(explicit)
+                return explicit
+            if queue:
+                return queue.pop(0)
+            tool_seq[0] += 1
+            return f"{run_id}:tool:{tool_seq[0]}"
+
+        def _tool_output_text(result: Any) -> Optional[str]:
+            if result is None:
+                return None
+            try:
+                from agent.tool_dispatch_helpers import _multimodal_text_summary
+
+                text = _multimodal_text_summary(result)
+            except Exception:
+                text = result if isinstance(result, str) else str(result)
+            if not isinstance(text, str) or not text.strip():
+                return None
+            # Tool results can carry terminal output with credentials —
+            # apply the same forced egress redaction as subagent events
+            # before the text leaves the process on a public stream.
+            text = redact_sensitive_text(text, force=True)
+            if len(text) > self._RUN_TOOL_OUTPUT_EVENT_CHARS:
+                omitted = len(text) - self._RUN_TOOL_OUTPUT_EVENT_CHARS
+                text = (
+                    text[:self._RUN_TOOL_OUTPUT_EVENT_CHARS]
+                    + f"\n... (truncated, {omitted} more chars)"
+                )
+            return text
+
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
@@ -7475,17 +7533,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
+                    "tool_call_id": _tool_id_for_start(
+                        tool_name, kwargs.get("tool_call_id")
+                    ),
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
-                _push({
+                event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "duration": round(kwargs.get("duration", 0), 3),
+                    "tool_call_id": _tool_id_for_completion(
+                        tool_name, kwargs.get("tool_call_id")
+                    ),
+                    "duration": round(kwargs.get("duration") or 0, 3),
                     "error": kwargs.get("is_error", False),
-                })
+                }
+                output = _tool_output_text(kwargs.get("result"))
+                if output is not None:
+                    event["output"] = output
+                _push(event)
             elif event_type == "reasoning.available":
                 _push({
                     "event": "reasoning.available",
@@ -8265,15 +8333,39 @@ class APIServerAdapter(BasePlatformAdapter):
             self._sweep_orphaned_runs_once(time.time())
 
     def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
-        """Expire old SSE buffers without treating transport age as run age."""
+        """Expire old SSE buffers without treating transport age as run age.
+
+        The transport (replay ring) of a run whose task is still executing is
+        never swept: every event dropped after a transport sweep would be
+        silently unrecoverable for clients that reattach later, even though
+        the run itself is alive and well.  Memory stays bounded regardless —
+        each ring holds at most ``_RUN_EVENT_HISTORY_LIMIT`` events and the
+        concurrent-run cap bounds how many rings exist at once.
+
+        Once the run reaches a terminal status, the transport is retained for
+        ``_RUN_STREAM_TTL`` seconds after that terminal transition (not after
+        run creation) so a briefly-disconnected client can still replay the
+        full history, then swept when no subscriber remains.
+        """
         if now is None:
             now = time.time()
-        stale = [
-            run_id
-            for run_id, created_at in list(self._run_streams_created.items())
-            if now - created_at > self._RUN_STREAM_TTL
-            and run_id not in self._run_stream_subscribers
-        ]
+        stale = []
+        for run_id, created_at in list(self._run_streams_created.items()):
+            if run_id in self._run_stream_subscribers:
+                continue
+            task = self._active_run_tasks.get(run_id)
+            if task is not None and not task.done():
+                # Live run: the transport lives exactly as long as the run.
+                continue
+            status = self._run_statuses.get(run_id, {})
+            if status.get("status") in {"completed", "failed", "cancelled"}:
+                terminal_at = float(status.get("updated_at", created_at) or created_at)
+            else:
+                # No task and no terminal status: an orphaned registration
+                # (e.g. the run task never started). Age from creation.
+                terminal_at = created_at
+            if now - terminal_at > self._RUN_STREAM_TTL:
+                stale.append(run_id)
         for run_id in stale:
             logger.debug("[api_server] sweeping expired run transport %s", run_id)
             task = self._active_run_tasks.get(run_id)

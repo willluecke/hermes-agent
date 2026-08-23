@@ -550,7 +550,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.started", name, _codex_item_to_preview(item), args)
+                cb("tool.started", name, _codex_item_to_preview(item), args,
+                   tool_call_id=_stable_call_id(item, name))
             except Exception:
                 logger.debug(
                     "tool_progress_callback raised on tool.started for %s",
@@ -588,7 +589,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if cb is not None:
             try:
                 cb("tool.completed", name, None, None,
-                   duration=duration, is_error=is_error, result=result)
+                   duration=duration, is_error=is_error, result=result,
+                   tool_call_id=_stable_call_id(item, name))
             except Exception:
                 logger.debug(
                     "tool_progress_callback raised on tool.completed for %s",

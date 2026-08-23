@@ -221,6 +221,9 @@ class TestToolProgressDispatch:
         assert call.args[1] == "exec_command"
         assert "ls /tmp" in call.args[2]  # preview
         assert call.args[3] == {"command": "ls /tmp", "cwd": "/tmp"}
+        # Stable id: replayed/api-server tool events must correlate started
+        # and completed to one timeline entry across reattaches.
+        assert call.kwargs["tool_call_id"] == "codex_exec_exec-1"
 
     def test_command_completed_fires_tool_completed_with_result(self):
         agent = _make_stub_agent()

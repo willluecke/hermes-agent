@@ -755,6 +755,154 @@ class TestSteerRun:
 
 
 # ---------------------------------------------------------------------------
+# Tool event identity and output on /v1/runs
+# ---------------------------------------------------------------------------
+
+
+class TestRunToolEventIdentity:
+
+    @staticmethod
+    def _agent_factory(script):
+        """create_agent side_effect that runs `script(tool_progress_callback)`
+        inside run_conversation and then returns a final response."""
+
+        def create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def run_conversation(**_run_kwargs):
+                script(kwargs["tool_progress_callback"])
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        return create_agent
+
+    @pytest.mark.asyncio
+    async def test_tool_events_carry_stable_ids_and_output(self, adapter):
+        """Without caller ids, emission mints {run_id}:tool:{n} and pairs
+        completions FIFO by tool name, so replays carry one fixed id."""
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb("tool.started", "terminal", "ls -la", {"command": "ls -la"})
+            cb("tool.started", "terminal", "pwd", {"command": "pwd"})
+            cb("tool.completed", "terminal", None, None,
+               duration=0.25, is_error=False, result="file-a\nfile-b")
+            cb("tool.completed", "terminal", None, None,
+               duration=0.05, is_error=True, result="[exit 1]\nboom")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        import json as _json
+        events = [
+            _json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        tool_events = [e for e in events if e.get("event", "").startswith("tool.")]
+        assert [e["event"] for e in tool_events] == [
+            "tool.started", "tool.started", "tool.completed", "tool.completed",
+        ]
+        assert tool_events[0]["tool_call_id"] == f"{run_id}:tool:1"
+        assert tool_events[1]["tool_call_id"] == f"{run_id}:tool:2"
+        # FIFO pairing: first completion belongs to the first start.
+        assert tool_events[2]["tool_call_id"] == f"{run_id}:tool:1"
+        assert tool_events[3]["tool_call_id"] == f"{run_id}:tool:2"
+        assert tool_events[2]["output"] == "file-a\nfile-b"
+        assert tool_events[2]["duration"] == 0.25
+        assert tool_events[2]["error"] is False
+        assert tool_events[3]["output"] == "[exit 1]\nboom"
+        assert tool_events[3]["error"] is True
+
+    @pytest.mark.asyncio
+    async def test_tool_events_use_caller_supplied_tool_call_id(self, adapter):
+        """Executor/codex callers pass their canonical id; it must survive
+        verbatim on both started and completed events."""
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb("tool.started", "exec_command", "npm test", {"command": "npm test"},
+               tool_call_id="call_abc123")
+            cb("tool.completed", "exec_command", None, None,
+               duration=1.5, is_error=False, result="ok",
+               tool_call_id="call_abc123")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert body.count('"tool_call_id": "call_abc123"') == 2
+
+    @pytest.mark.asyncio
+    async def test_tool_completed_output_is_redacted_and_capped(self, adapter):
+        """Tool results carry terminal output: secrets must be redacted and
+        oversized text truncated with disclosure, never silently."""
+        app = _create_runs_app(adapter)
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        big = "x" * (adapter._RUN_TOOL_OUTPUT_EVENT_CHARS + 500)
+
+        def script(cb):
+            cb("tool.started", "terminal", "env", {"command": "env"})
+            cb("tool.completed", "terminal", None, None,
+               duration=0.1, is_error=False,
+               result=f"key={secret}\n{big}")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert secret not in body
+        assert "truncated" in body
+
+    @pytest.mark.asyncio
+    async def test_replayed_tool_events_keep_identical_ids(self, adapter):
+        """Two attaches must serve byte-identical tool ids — the property
+        that makes client-side replay dedupe possible at all."""
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb("tool.started", "terminal", "ls", {"command": "ls"})
+            cb("tool.completed", "terminal", None, None,
+               duration=0.1, is_error=False, result="out")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                first = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+                second = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        import re as _re
+        ids_first = _re.findall(r'"tool_call_id": "([^"]+)"', first)
+        ids_second = _re.findall(r'"tool_call_id": "([^"]+)"', second)
+        assert ids_first == ids_second == [f"{run_id}:tool:1", f"{run_id}:tool:1"]
+
+
+# ---------------------------------------------------------------------------
 # Run lifecycle TTL sweeping
 # ---------------------------------------------------------------------------
 
@@ -762,8 +910,12 @@ class TestSteerRun:
 class TestRunLifecycleSweep:
 
     @pytest.mark.asyncio
-    async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
-        """Stream TTL bounds buffering without detaching a live run."""
+    async def test_live_run_transport_survives_sweep(self, adapter):
+        """A live run's replay ring is never swept — every event emitted
+        after a transport sweep would be silently unrecoverable for clients
+        that reattach later, even though the run is still executing. Memory
+        stays bounded by the per-run event ring, not by dropping transports.
+        Control state (approvals, stop, concurrency) is unaffected."""
         app = _create_runs_app(adapter)
         adapter._max_concurrent_runs = 1
 
@@ -800,8 +952,8 @@ class TestRunLifecycleSweep:
 
                 assert adapter._active_run_tasks[run_id] is task
                 assert adapter._active_run_agents[run_id] is mock_agent
-                assert run_id not in adapter._run_streams
-                assert run_id not in adapter._run_streams_created
+                assert run_id in adapter._run_streams
+                assert run_id in adapter._run_streams_created
                 assert adapter._run_approval_sessions[run_id] == run_id
 
                 limited = adapter._concurrency_limited_response()
@@ -819,6 +971,45 @@ class TestRunLifecycleSweep:
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
                 mock_agent.interrupt.assert_called_once_with("Stop requested via API")
+
+
+    @pytest.mark.asyncio
+    async def test_terminal_run_transport_expires_on_post_terminal_grace(self, adapter):
+        """After the run ends, replay stays available for _RUN_STREAM_TTL
+        seconds measured from the terminal transition (not run creation),
+        then is swept; the pollable status survives on its own longer TTL."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                # Drain to completion so the task settles.
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+                assert "run.completed" in body
+
+        terminal_at = adapter._run_statuses[run_id]["updated_at"]
+
+        # Old transport age alone must not sweep a freshly-terminal run:
+        # age the creation stamp past the TTL but keep terminal recent.
+        adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL * 10
+        adapter._sweep_orphaned_runs_once(terminal_at + adapter._RUN_STREAM_TTL - 5)
+        assert run_id in adapter._run_streams
+
+        # Past the post-terminal grace the transport goes; status remains.
+        adapter._sweep_orphaned_runs_once(terminal_at + adapter._RUN_STREAM_TTL + 5)
+        assert run_id not in adapter._run_streams
+        assert adapter._run_statuses[run_id]["status"] == "completed"
+
+        # Status expires on its own, longer TTL.
+        adapter._sweep_orphaned_runs_once(terminal_at + adapter._RUN_STATUS_TTL + 5)
+        assert run_id not in adapter._run_statuses
 
 
 # ---------------------------------------------------------------------------
