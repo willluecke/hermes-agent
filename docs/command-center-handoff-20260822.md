@@ -75,25 +75,16 @@ work. They are not automatically fed into the governed loop.
 
 ## Process-Driven Agentic Loop
 
-Cron job: `76892ed9e451` (`Governed Agentic Loop Gate`)
+The canonical concept and meaningful-change contract live in the regular
+Hermes guide:
 
-- Deterministic checks run every 15 minutes from 06:00 through 22:45 Pacific.
-- An unchanged check returns `wakeAgent: false` before model construction.
-- Event-driven Sol wakes are capped at three per local calendar day.
-- Unacknowledged batches are suppressed for six hours before a bounded retry.
-- A turn receives at most 24 events; overflow remains in a durable backlog.
-- A wake may select at most one bounded action and queue at most one Opus job.
-- Infrastructure errors fail closed and cannot become recurring model calls.
+[Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md)
 
-Fixed checkpoints:
-
-- `Daily Founder Revenue Dispatcher`, 06:30 Pacific
-- `Daily Founder Evening Review`, 21:00 Pacific
-
-Both checkpoints are pinned to the same exact Sol 5.6 `xhigh` authority
-contract. Therefore, an ordinary day's scheduled decision ceiling is two
-fixed turns plus at most three event-driven turns. There is no unconditional
-two-hour inference loop.
+Command-center currently deploys that pattern as cron job `76892ed9e451`
+(`Governed Agentic Loop Gate`), checking every 15 minutes from 06:00 through
+22:45 Pacific with a three-wake daily budget. Its fixed checkpoints are the
+06:30 `Daily Founder Revenue Dispatcher` and 21:00 `Daily Founder Evening
+Review`, all pinned to the exact Sol 5.6 `xhigh` authority contract.
 
 The legacy monthly pipeline audit was rewritten for command-center-local
 checkouts and the Opus subscription worker. The weekly auth-health job is now
@@ -235,6 +226,7 @@ separate storage before treating disaster recovery as complete.
 
 ## Source Documentation
 
+- `website/docs/guides/process-driven-persistent-agent.md` (canonical concept)
 - `docs/persistent-agent-architecture.md`
 - `docs/persistent-agent-operations.md`
 - `ops/command-center/agentic-loop-prompt.md`

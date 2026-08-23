@@ -27,6 +27,11 @@ They look similar but serve different jobs:
 
 Rule of thumb: if the recurring prompt needs the conversation's context, use `/heartbeat`. If it's a self-contained job, use cron.
 
+If most checks should consume no model turn at all, use the
+[process-driven persistent-agent pattern](/guides/process-driven-persistent-agent):
+a deterministic cron script emits `wakeAgent: false` until defined state
+actually changes.
+
 ## Commands
 
 | Command | What it does |

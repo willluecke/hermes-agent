@@ -1,5 +1,9 @@
 # Persistent Agent Operations
 
+> **Command-center runbook.** The canonical, reusable persistent-agent pattern
+> lives in
+> [Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md).
+
 ## Service Layout
 
 Host: `command-center` (`will@192.168.1.243`)
@@ -87,6 +91,10 @@ with an unreviewed local proposal.
 
 ## Agentic Loop Gate
 
+The reusable state-gated cron design is documented in
+[Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md).
+This section contains only command-center deployment commands.
+
 Install or update the tracked gate idempotently from the deployed migration
 checkout:
 
@@ -95,31 +103,9 @@ cd /home/will/src/hermes-agent-migration
 ops/command-center/install-agentic-loop.sh
 ```
 
-The installer:
-
-1. installs the gate under `~/.hermes/scripts/` and its governed prompt under
-   `~/.hermes/agentic-loop/` with private permissions;
-2. primes a baseline only when no prior gate state exists, preventing replay
-   of historical jobs, work items, or metrics;
-3. creates or updates exactly one `Governed Agentic Loop Gate` cron job;
-4. pins it to `openai-codex`, `gpt-5.6-sol`, and `xhigh`;
-5. schedules a deterministic check every 15 minutes from 06:00 through 22:59
-   local time;
-6. pins the existing `Daily Founder Revenue Dispatcher` and `Daily Founder
-   Evening Review` checkpoints to the same exact Sol authority contract,
-   without changing their prompts or schedules.
-
-Polling frequency is not model frequency. The gate's final JSON line controls
-the scheduler before agent construction:
-
-```json
-{"reason":"no_actionable_change","wakeAgent":false}
-```
-
-Only `wakeAgent: true` spends a Sol turn. The gate allows at most three such
-autonomous wakes per local day. The cap and six-hour unacknowledged-batch retry
-are tracked policy, not environment overrides or event fields. Changing either
-requires a reviewed source change and redeployment.
+The installer deploys private gate state and prompt files, primes only a new
+installation, creates or updates exactly one cron job, and pins the gate plus
+the morning/evening checkpoints to `openai-codex`, `gpt-5.6-sol`, and `xhigh`.
 
 Inspect state without invoking a model:
 
@@ -144,17 +130,8 @@ Run a token-free check directly:
 ```
 
 Do not delete `gate-state.json` to force a rerun. Use a new inbox ID for a new
-intentional event. A woken Sol turn receives an exact batch ID and an
-`ackCommand`. It acknowledges only after inspecting the batch and making its
-action or no-action disposition durable. Until acknowledgment, the same batch
-is suppressed for six hours and then retried within the daily budget. New
-events supersede the batch ID when they fit in the current 24-event batch. Any
-overflow remains durable and is promoted after acknowledgment, so a late
-acknowledgment cannot discard unseen events.
-
-The private inbox is an input queue, not authorization. It cannot grant push,
-merge, deploy, production-data, credential, spending, or external-contact
-permission.
+intentional event, and acknowledge a batch manually only after verifying that
+its exact events were handled durably.
 
 ## Orchestration Runbook
 

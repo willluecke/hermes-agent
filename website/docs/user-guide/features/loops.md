@@ -19,6 +19,11 @@ It's Hermes' take on **Claude Code's `/loop`** (and its `/proactive` alias, whic
 
 When the work should run **unattended** — overnight, on a real schedule, surviving restarts of your terminal — use a [cron job](./cron.md) instead. `/loop` lives inside a session; cron lives outside all of them. And when the task is a single objective with a definition of done, [`/goal`](./goals.md) is usually the better fit.
 
+For an unattended workflow where quiet checks should use no model tokens, see
+[Build a Process-Driven Persistent Agent](/guides/process-driven-persistent-agent).
+That pattern gates cron turns on deterministic state changes instead of running
+the LLM on every tick.
+
 ## Quick start
 
 ```

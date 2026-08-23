@@ -727,6 +727,7 @@ const sidebars: SidebarsConfig = {
         'guides/use-soul-with-hermes',
         'guides/use-voice-mode-with-hermes',
         'guides/automate-with-cron',
+        'guides/process-driven-persistent-agent',
         'guides/cron-script-only',
         'guides/automation-blueprints',
         'guides/cron-troubleshooting',

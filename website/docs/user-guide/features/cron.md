@@ -857,6 +857,10 @@ If your cron job attaches a pre-check script (via `script=`), the script can dec
 
 …and cron skips the agent run entirely for this tick. Useful for frequent polls (every 1–5 min) that only need to wake the LLM when state actually changed — otherwise you pay for zero-content agent turns over and over.
 
+For a complete design that adds durable event batches, daily wake budgets,
+acknowledgments, and fixed planning/review checkpoints, see
+[Build a Process-Driven Persistent Agent](/guides/process-driven-persistent-agent).
+
 ```python
 # pre-check script
 import json, sys

@@ -1,5 +1,9 @@
 # Persistent Agent Architecture
 
+> **Command-center deployment record.** The canonical, reusable persistent
+> agent concept lives in
+> [Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md).
+
 ## Purpose
 
 Hermes is the always-on control layer on `command-center`. It preserves
@@ -12,33 +16,16 @@ output is evidence or a proposal until the designated authority accepts it.
 
 ## Always On Means Available, Not Always Inferring
 
-No model runs a continuous reasoning loop. The services, durable state, and
-work queues remain available at all times; model inference is episodic and must
-have a concrete trigger. A timer is allowed to inspect state, but elapsed time
-alone is not enough to invoke Sol.
+No model runs a continuous reasoning loop. Services and durable queues remain
+available at all times; inference is episodic and has a concrete trigger. The
+canonical reusable pattern, meaningful-change rules, batching contract,
+budgets, and comparison with heartbeat/loop/cron now live in the regular
+Hermes guide:
 
-The command-center policy is:
+[Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md)
 
-- a deterministic gate checks durable state every 15 minutes from 06:00
-  through 22:59 America/Los_Angeles;
-- an unchanged or unactionable check returns `{"wakeAgent": false}` before
-  Hermes constructs an agent, consuming no model quota;
-- meaningful state changes are batched and may wake Sol, subject to a maximum
-  of three autonomous gate wakes per local calendar day;
-- the deliberate 06:30 planning and 21:00 review jobs are separate named
-  checkpoints pinned to the same Sol authority contract, not open-ended
-  background thought;
-- user messages remain immediate and do not wait for the gate;
-- there is no unconditional two-hour model sweep.
-
-The 15-minute check is intentionally cheap. Its frequency controls detection
-latency, not inference frequency. Reducing the interval must never increase
-model usage when the observed state is unchanged.
-
-On an ordinary day, scheduled decision work is therefore bounded at two fixed
-checkpoint turns plus at most three event-driven turns. User conversations and
-separately reviewed weekly or monthly jobs are outside that bound. There is no
-hidden two-hour inference schedule.
+This document records only the command-center authority and worker
+architecture that consumes that pattern.
 
 ## Runtime Contracts
 
@@ -111,46 +98,12 @@ decision authority.
 
 ## Deterministic Wake Gate
 
-The tracked gate is `ops/command-center/agentic-loop-gate.py`. It runs as the
-pre-check script for one Hermes cron job pinned to the exact Sol authority
-contract. The script reads the command-center management database read-only and
-recognizes only bounded event classes:
-
-- a terminal result from a job whose `contextType` is
-  `hermes-orchestration`;
-- a queued or running native job that crossed its stale threshold;
-- a changed management work item in `Review`, or a critical/high work item
-  explicitly owned by Hermes, Command Center, or Agent;
-- a changed warning metric;
-- an explicit record appended to the private agentic-loop inbox.
-
-Human-owned `Ready` work does not become autonomous merely because it appears
-in the dashboard. Existing terminal results are baselined at installation, so
-deploying the gate does not replay historical jobs or warning metrics.
-
-An actionable set becomes one durable batch. Sol inspects every event but may
-select at most one bounded action and queue at most one Opus implementation job
-per wake. The batch remains pending until Sol executes the supplied exact
-acknowledgment command. An unacknowledged batch is suppressed for six hours,
-then becomes eligible for a bounded retry; the daily wake budget still applies.
-New events merge into the pending batch and change its ID, preventing a late
-acknowledgment from discarding state that Sol never saw.
-
-A model turn receives at most 24 events. Larger bursts remain in a durable
-backlog and are promoted to a new exact-ID batch only after the current batch
-is acknowledged. No event is discarded to satisfy the prompt-size bound.
-
-The gate state and inbox live under `~/.hermes/agentic-loop/` with private
-permissions. They contain bounded metadata, not credentials or full terminal
-transcripts. The synchronization database is opened in SQLite read-only mode.
-If the scheduled check cannot read its database or state, it fails closed with
-`wakeAgent: false`; infrastructure failure is never converted into a model
-wake. Installation and operator commands still return non-zero on errors.
-
-The wake prompt is tracked in
-`ops/command-center/agentic-loop-prompt.md`. It treats event fields as
-untrusted data, requires RecCli context for project decisions, allows a correct
-no-op, and preserves the human promotion boundary.
+Command-center deploys the guide's state-gated cron pattern through
+`ops/command-center/agentic-loop-gate.py` and
+`ops/command-center/agentic-loop-prompt.md`. Those files are the deployment's
+executable policy; the regular guide is the canonical explanation of the
+pattern. Command-center-specific installation and incident commands remain in
+`docs/persistent-agent-operations.md`.
 
 ## RecCli Context Gate
 
