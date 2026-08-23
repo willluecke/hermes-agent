@@ -500,6 +500,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
       * ``item/completed`` for tool-shaped items → ``tool_progress_callback(
         "tool.completed", name, None, None, duration=..., is_error=...,
         result=...)``
+      * ``item/commandExecution/outputDelta`` → ``tool_progress_callback(
+        "tool.output.delta", "exec_command", ..., chunk=...)``
       * ``item/agentMessage/delta`` for ``phase=final_answer`` →
         ``_fire_stream_delta(text)`` so chat adapters render only the
         authoritative answer in the answer slot. Commentary deltas are held
@@ -642,6 +644,32 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         except Exception:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
 
+    def _fire_command_output_delta(params: dict) -> None:
+        delta = params.get("delta") or ""
+        item_id = params.get("itemId") or params.get("item_id") or ""
+        if not isinstance(delta, str) or not delta or not item_id:
+            return
+        name = "exec_command"
+        cb = getattr(agent, "tool_progress_callback", None)
+        if cb is None:
+            return
+        item = {"type": "commandExecution", "id": item_id}
+        try:
+            cb(
+                "tool.output.delta",
+                name,
+                None,
+                None,
+                chunk=delta,
+                channel="combined",
+                tool_call_id=_stable_call_id(item, name),
+            )
+        except Exception:
+            logger.debug(
+                "tool_progress_callback raised on command output delta",
+                exc_info=True,
+            )
+
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
         if not isinstance(text, str) or not text.strip():
@@ -672,6 +700,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             params = {}
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
+            return
+        if method == "item/commandExecution/outputDelta":
+            _fire_command_output_delta(params)
             return
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)

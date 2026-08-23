@@ -501,8 +501,8 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "browser_exec",
-            # Planning, memory, and durable decisions
-            "todo", "memory", "decision_log",
+            # Planning, memory, durable decisions, and governed implementation
+            "todo", "memory", "decision_log", "opus_code_worker",
             # Session history search
             "session_search",
             # Local time lookup

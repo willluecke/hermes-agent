@@ -307,6 +307,72 @@ class TestStartRun:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+        assert kwargs["single_model"] is False
+
+    @pytest.mark.asyncio
+    async def test_single_model_start_locks_explicit_provider_and_model(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create, patch.object(
+                adapter, "_resolve_route"
+            ) as route_resolver:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "model": "new/openrouter-model",
+                        "provider": "openrouter",
+                        "execution_mode": "single_model",
+                    },
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(20):
+                    if mock_create.call_args is not None:
+                        break
+                    await asyncio.sleep(0.05)
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+
+        kwargs = mock_create.call_args.kwargs
+        assert kwargs["requested_model"] == "new/openrouter-model"
+        assert kwargs["requested_provider"] == "openrouter"
+        assert kwargs["single_model"] is True
+        assert status["execution_mode"] == "single_model"
+        route_resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"execution_mode": "single_model", "provider": "openrouter"},
+            {"execution_mode": "single_model", "model": "new/model"},
+            {
+                "execution_mode": "automatic",
+                "provider": "openrouter",
+                "model": "new/model",
+            },
+        ],
+    )
+    async def test_single_model_start_fails_closed_on_incomplete_contract(
+        self, adapter, payload
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", **payload},
+                )
+
+        assert resp.status == 400
+        mock_create.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +914,97 @@ class TestRunToolEventIdentity:
                 body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
 
         assert body.count('"tool_call_id": "call_abc123"') == 2
+
+    @pytest.mark.asyncio
+    async def test_live_tool_output_is_ordered_redacted_capped_and_replayable(
+        self, adapter
+    ):
+        """Output deltas are first-class replay events. Redaction must see
+        across producer chunk boundaries, and the display cap is disclosed."""
+        app = _create_runs_app(adapter)
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        big = "x" * (adapter._RUN_TOOL_OUTPUT_EVENT_CHARS + 5000)
+
+        def script(cb):
+            cb(
+                "tool.started",
+                "exec_command",
+                "run checks",
+                {"command": "run checks"},
+                tool_call_id="call_stream1",
+            )
+            cb(
+                "tool.output.delta",
+                "exec_command",
+                chunk="key=AKIAIOS",
+                channel="combined",
+                tool_call_id="call_stream1",
+            )
+            cb(
+                "tool.output.delta",
+                "exec_command",
+                chunk="FODNN7EXAMPLE\nfirst line\n",
+                channel="combined",
+                tool_call_id="call_stream1",
+            )
+            cb(
+                "tool.output.delta",
+                "exec_command",
+                chunk=big,
+                channel="combined",
+                tool_call_id="call_stream1",
+            )
+            cb(
+                "tool.completed",
+                "exec_command",
+                duration=1.5,
+                is_error=False,
+                result=f"key={secret}\nfirst line\n{big}",
+                tool_call_id="call_stream1",
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent", side_effect=self._agent_factory(script)
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                first = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+                second = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+
+        import json as _json
+
+        events = [
+            _json.loads(line[len("data: "):])
+            for line in first.splitlines()
+            if line.startswith("data: ")
+        ]
+        tool_events = [
+            event for event in events if event.get("event", "").startswith("tool.")
+        ]
+        assert [event["event"] for event in tool_events] == [
+            "tool.started",
+            "tool.output.delta",
+            "tool.output.delta",
+            "tool.completed",
+        ]
+        assert [event["tool_call_id"] for event in tool_events] == [
+            "call_stream1"
+        ] * 4
+        output_events = tool_events[1:3]
+        assert [event["sequence"] for event in output_events] == [1, 2]
+        assert [event["event_id"] for event in output_events] == [
+            "call_stream1:output:1",
+            "call_stream1:output:2",
+        ]
+        assert secret not in first
+        assert "first line" in first
+        assert "live tool output truncated at" in first
+        assert second == first, "reattach must replay byte-identical output events"
 
     @pytest.mark.asyncio
     async def test_tool_completed_output_is_redacted_and_capped(self, adapter):

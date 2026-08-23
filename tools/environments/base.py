@@ -44,6 +44,7 @@ if _DEBUG_INTERRUPT:
 # Thread-local activity callback.  The agent sets this before a tool call so
 # long-running _wait_for_process loops can report liveness to the gateway.
 _activity_callback_local = threading.local()
+_output_callback_local = threading.local()
 
 
 # Sentinel capacity for full-fidelity capture (internal consumers). Large
@@ -251,6 +252,16 @@ def get_activity_callback() -> Callable[[str], None] | None:
     back) — e.g. the manual cron-run heartbeat (#76502).
     """
     return getattr(_activity_callback_local, "callback", None)
+
+
+def set_output_callback(cb: Callable[[str], None] | None) -> None:
+    """Register a callback for foreground process-output chunks."""
+    _output_callback_local.callback = cb
+
+
+def get_output_callback() -> Callable[[str], None] | None:
+    """Return the calling tool worker's process-output callback."""
+    return getattr(_output_callback_local, "callback", None)
 
 
 def touch_activity_if_due(
@@ -1033,6 +1044,17 @@ class BaseEnvironment(ABC):
             except Exception:
                 spill_path = None
         output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
+        output_callback = get_output_callback()
+
+        def _append_output(text: str) -> None:
+            if not text:
+                return
+            output.append(text)
+            if output_callback is not None:
+                try:
+                    output_callback(text)
+                except Exception:
+                    pass
 
         # Non-blocking drain via select().
         #
@@ -1073,16 +1095,16 @@ class BaseEnvironment(ABC):
                     if piece is None:
                         continue
                     if isinstance(piece, bytes):
-                        output.append(decoder.decode(piece))
+                        _append_output(decoder.decode(piece))
                     else:
-                        output.append(str(piece))
+                        _append_output(str(piece))
             except Exception:
                 pass
             finally:
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
 
@@ -1113,14 +1135,14 @@ class BaseEnvironment(ABC):
                         chunk = os.read(fd, 4096)
                         if not chunk:
                             break
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                 except (ValueError, OSError):
                     pass
                 finally:
                     try:
                         tail = decoder.decode(b"", final=True)
                         if tail:
-                            output.append(tail)
+                            _append_output(tail)
                     except Exception:
                         pass
                 return
@@ -1138,7 +1160,7 @@ class BaseEnvironment(ABC):
                             break
                         if not chunk:
                             break  # true EOF — all writers closed
-                        output.append(decoder.decode(chunk))
+                        _append_output(decoder.decode(chunk))
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
@@ -1154,7 +1176,7 @@ class BaseEnvironment(ABC):
                 try:
                     tail = decoder.decode(b"", final=True)
                     if tail:
-                        output.append(tail)
+                        _append_output(tail)
                 except Exception:
                     pass
 

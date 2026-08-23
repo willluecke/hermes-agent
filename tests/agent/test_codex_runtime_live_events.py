@@ -104,5 +104,48 @@ def test_failed_command_result_and_error_flag_are_preserved():
     assert calls["tool_complete"][0][3] == "[exit 2]\nboom"
 
 
+def test_command_output_delta_keeps_stable_id_and_wire_order():
+    agent, calls = _recording_agent()
+    bridge = make_codex_app_server_event_bridge(agent)
+    started = {
+        "type": "commandExecution",
+        "id": "cmd-live-1",
+        "command": "printf hello",
+    }
+    completed = {
+        **started,
+        "aggregatedOutput": "hello",
+        "exitCode": 0,
+        "durationMs": 25,
+    }
+
+    bridge({"method": "item/started", "params": {"item": started}})
+    bridge({
+        "method": "item/commandExecution/outputDelta",
+        "params": {"itemId": "cmd-live-1", "delta": "hel"},
+    })
+    bridge({
+        "method": "item/commandExecution/outputDelta",
+        "params": {"itemId": "cmd-live-1", "delta": "lo"},
+    })
+    bridge({"method": "item/completed", "params": {"item": completed}})
+
+    event_types = [args[0] for args, _kwargs in calls["tool_progress"]]
+    assert event_types == [
+        "tool.started",
+        "tool.output.delta",
+        "tool.output.delta",
+        "tool.completed",
+    ]
+    stable_id = _deterministic_call_id("exec", "cmd-live-1")
+    assert [
+        kwargs["tool_call_id"] for _args, kwargs in calls["tool_progress"]
+    ] == [stable_id] * 4
+    assert [
+        kwargs["chunk"]
+        for args, kwargs in calls["tool_progress"]
+        if args[0] == "tool.output.delta"
+    ] == ["hel", "lo"]
+
 
 

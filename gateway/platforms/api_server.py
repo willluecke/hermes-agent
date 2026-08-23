@@ -2841,6 +2841,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        single_model: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2874,6 +2875,13 @@ class APIServerAdapter(BasePlatformAdapter):
         session ``/model`` override, disables the global fallback model
         chain, and fails closed if the locked provider's credentials cannot
         be resolved.
+
+        ``single_model`` is the stricter direct-model contract used by the
+        Hermes Chat model picker. It requires an explicit provider and model,
+        bypasses session/global model selection and identity/context files,
+        disables model-spawning tools and background review, and carries no
+        fallback chain. The selected provider/model is therefore the only LLM
+        runtime that can answer or delegate work for the turn.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2886,19 +2894,41 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        # Catch RuntimeError ONLY around this call, not the wider
-        # _create_agent()+run_conversation() span --
-        # _resolve_runtime_agent_kwargs() is the sole raiser of
-        # RuntimeError(format_runtime_provider_error(...)) for provider
-        # auth/credential failure.  Re-raising as
-        # _ProviderAuthResolutionError lets _run_agent() (and
-        # _handle_runs()) distinguish this from an unrelated RuntimeError
-        # elsewhere in the call graph.
-        try:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
-        except RuntimeError as exc:
-            raise _ProviderAuthResolutionError(str(exc)) from exc
-        model = _resolve_gateway_model()
+        request_model = _clean_request_string(requested_model)
+        request_provider = _clean_request_string(requested_provider)
+        if single_model and (not request_model or not request_provider):
+            raise ValueError(
+                "single_model execution requires an explicit provider and model"
+            )
+
+        # Direct model runs must not need the configured orchestration model to
+        # be healthy before their selected provider can start. Resolve that
+        # provider directly; the default path retains the normal global and
+        # fallback-provider resolution behavior.
+        if single_model:
+            try:
+                runtime_kwargs = _resolve_request_runtime_agent_kwargs(
+                    request_provider,
+                    target_model=request_model,
+                )
+            except Exception as exc:
+                raise _ProviderAuthResolutionError(str(exc)) from exc
+            model = request_model
+            confirmed_runtime_lock = True
+        else:
+            # Catch RuntimeError ONLY around this call, not the wider
+            # _create_agent()+run_conversation() span --
+            # _resolve_runtime_agent_kwargs() is the sole raiser of
+            # RuntimeError(format_runtime_provider_error(...)) for provider
+            # auth/credential failure.  Re-raising as
+            # _ProviderAuthResolutionError lets _run_agent() (and
+            # _handle_runs()) distinguish this from an unrelated RuntimeError
+            # elsewhere in the call graph.
+            try:
+                runtime_kwargs = _resolve_runtime_agent_kwargs()
+            except RuntimeError as exc:
+                raise _ProviderAuthResolutionError(str(exc)) from exc
+            model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
         # cap), _resolve_runtime_agent_kwargs() falls through to the fallback
@@ -2915,8 +2945,6 @@ class APIServerAdapter(BasePlatformAdapter):
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
 
-        request_model = _clean_request_string(requested_model)
-        request_provider = _clean_request_string(requested_provider)
         route_model = _clean_request_string(route.get("model")) if isinstance(route, dict) else None
         route_provider = _clean_request_string(route.get("provider")) if isinstance(route, dict) else None
         route_api_key = _clean_request_string(route.get("api_key")) if isinstance(route, dict) else None
@@ -3107,6 +3135,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        disabled_toolsets = ["delegation", "opus_worker"] if single_model else None
 
         max_iterations = _current_max_iterations()
 
@@ -3141,6 +3170,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -3152,6 +3182,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "skip_context_files": bool(single_model),
+            "skip_background_review": bool(single_model),
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3160,8 +3192,11 @@ class APIServerAdapter(BasePlatformAdapter):
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
+            "execution_mode": "single_model" if single_model else "orchestrated",
             "route_source": (
-                "session_model_lock"
+                "direct_model"
+                if single_model
+                else "session_model_lock"
                 if confirmed_runtime_lock
                 else "session_model_override"
                 if session_override
@@ -7481,6 +7516,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # history (and therefore every replay) carries one fixed id.
         tool_seq = [0]
         pending_tool_ids: Dict[str, list] = {}
+        output_seq_by_tool_id: Dict[str, int] = {}
+        streamed_output_chars_by_tool_id: Dict[str, int] = {}
+        pending_output_by_tool_id: Dict[str, str] = {}
+        output_capped_tool_ids = set()
 
         def _tool_id_for_start(tool_name: str, explicit: Any) -> str:
             if isinstance(explicit, str) and explicit:
@@ -7501,6 +7540,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 return queue.pop(0)
             tool_seq[0] += 1
             return f"{run_id}:tool:{tool_seq[0]}"
+
+        def _tool_id_for_output(tool_name: str, explicit: Any) -> str:
+            if isinstance(explicit, str) and explicit:
+                return explicit
+            queue = pending_tool_ids.get(tool_name or "tool", [])
+            if queue:
+                return queue[0]
+            tool_seq[0] += 1
+            call_id = f"{run_id}:tool:{tool_seq[0]}"
+            pending_tool_ids.setdefault(tool_name or "tool", []).append(call_id)
+            return call_id
 
         def _tool_output_text(result: Any) -> Optional[str]:
             if result is None:
@@ -7525,6 +7575,77 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             return text
 
+        def _emit_tool_output(
+            call_id: str,
+            tool_name: str,
+            chunk: Any,
+            channel: str,
+            ts: float,
+            *,
+            final: bool = False,
+        ) -> None:
+            """Redact and emit ordered output without splitting credentials."""
+            if call_id in output_capped_tool_ids:
+                pending_output_by_tool_id.pop(call_id, None)
+                return
+
+            incoming = chunk if isinstance(chunk, str) else str(chunk or "")
+            buffered = pending_output_by_tool_id.get(call_id, "") + incoming
+            if final:
+                ready = buffered
+                pending_output_by_tool_id.pop(call_id, None)
+            else:
+                boundary = buffered.rfind("\n")
+                if boundary >= 0:
+                    ready = buffered[: boundary + 1]
+                    pending_output_by_tool_id[call_id] = buffered[boundary + 1 :]
+                elif len(buffered) > self._RUN_TOOL_OUTPUT_EVENT_CHARS + 4096:
+                    # A command can emit an arbitrarily long line. Once enough
+                    # context is present to redact across chunk boundaries,
+                    # process it and let the disclosed output cap bound memory.
+                    ready = buffered
+                    pending_output_by_tool_id.pop(call_id, None)
+                else:
+                    pending_output_by_tool_id[call_id] = buffered
+                    return
+
+            if not ready:
+                return
+            output = redact_sensitive_text(ready, force=True)
+            already_sent = streamed_output_chars_by_tool_id.get(call_id, 0)
+            remaining = self._RUN_TOOL_OUTPUT_EVENT_CHARS - already_sent
+            marker = (
+                f"\n... (live tool output truncated at "
+                f"{self._RUN_TOOL_OUTPUT_EVENT_CHARS} chars)\n"
+            )
+            capped = len(output) > remaining
+            if remaining <= 0:
+                output = marker
+                capped = True
+            elif capped:
+                output = output[:remaining] + marker
+            if not output:
+                return
+            streamed_output_chars_by_tool_id[call_id] = (
+                already_sent + min(len(output), max(remaining, 0))
+            )
+            if capped:
+                output_capped_tool_ids.add(call_id)
+                pending_output_by_tool_id.pop(call_id, None)
+            sequence = output_seq_by_tool_id.get(call_id, 0) + 1
+            output_seq_by_tool_id[call_id] = sequence
+            _push({
+                "event": "tool.output.delta",
+                "event_id": f"{call_id}:output:{sequence}",
+                "run_id": run_id,
+                "timestamp": ts,
+                "tool": tool_name,
+                "tool_call_id": call_id,
+                "sequence": sequence,
+                "channel": channel or "combined",
+                "delta": output,
+            })
+
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
             if event_type == "tool.started":
@@ -7538,15 +7659,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                     "preview": preview,
                 })
+            elif event_type == "tool.output.delta":
+                call_id = _tool_id_for_output(
+                    tool_name, kwargs.get("tool_call_id")
+                )
+                _emit_tool_output(
+                    call_id,
+                    tool_name,
+                    kwargs.get("chunk"),
+                    kwargs.get("channel") or "combined",
+                    ts,
+                )
             elif event_type == "tool.completed":
+                call_id = _tool_id_for_completion(
+                    tool_name, kwargs.get("tool_call_id")
+                )
+                _emit_tool_output(
+                    call_id,
+                    tool_name,
+                    "",
+                    kwargs.get("channel") or "combined",
+                    ts,
+                    final=True,
+                )
                 event = {
                     "event": "tool.completed",
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "tool_call_id": _tool_id_for_completion(
-                        tool_name, kwargs.get("tool_call_id")
-                    ),
+                    "tool_call_id": call_id,
                     "duration": round(kwargs.get("duration") or 0, 3),
                     "error": kwargs.get("is_error", False),
                 }
@@ -7687,8 +7828,30 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
-        route = self._resolve_route(body.get("model"))
+        execution_mode = _clean_request_string(body.get("execution_mode")) or "orchestrated"
+        if execution_mode not in {"orchestrated", "single_model"}:
+            return web.json_response(
+                _openai_error(
+                    "'execution_mode' must be 'orchestrated' or 'single_model'"
+                ),
+                status=400,
+            )
+        single_model = execution_mode == "single_model"
+        # A direct catalog model is a literal provider model ID, never a
+        # model_routes alias. Otherwise a coincidentally matching alias could
+        # replace the user's selected model after the picker had locked it.
+        route = None if single_model else self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
+        if single_model and not (
+            agent_overrides.get("requested_model")
+            and agent_overrides.get("requested_provider")
+        ):
+            return web.json_response(
+                _openai_error(
+                    "single_model execution requires an explicit provider and model"
+                ),
+                status=400,
+            )
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -7768,6 +7931,7 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            execution_mode=execution_mode,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -7807,6 +7971,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        single_model=single_model,
                     )
                 self._active_run_agents[run_id] = agent
 

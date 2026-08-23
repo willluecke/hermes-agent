@@ -21,7 +21,7 @@ class TestHermesApiServerToolset:
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze", "image_generate",
             "execute_code", "delegate_task",
-            "todo", "memory", "session_search", "cronjob",
+            "todo", "memory", "opus_code_worker", "session_search", "cronjob",
         ]
         for tool in expected:
             assert tool in tools, f"Missing expected tool: {tool}"
@@ -46,7 +46,9 @@ class TestApiServerPlatformConfig:
         from tools.registry import discover_builtin_tools
         from hermes_cli.tools_config import _get_platform_tools
         discover_builtin_tools()
-        assert "terminal" in _get_platform_tools({}, "api_server")
+        toolsets = _get_platform_tools({}, "api_server")
+        assert "terminal" in toolsets
+        assert "opus_worker" in toolsets
 
 
 class TestApiServerAdapterToolset:
@@ -79,4 +81,81 @@ class TestApiServerAdapterToolset:
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
+            assert call_kwargs.kwargs.get("disabled_toolsets") is None
+            assert call_kwargs.kwargs.get("skip_context_files") is False
+            assert call_kwargs.kwargs.get("skip_background_review") is False
 
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_single_model_agent_isolated_from_orchestrator_runtime(self):
+        """A direct picker choice must not bootstrap through the configured
+        Sol runtime or retain any model-spawning surface."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        selected_runtime = {
+            "api_key": "selected-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "openrouter",
+            "api_mode": "openai",
+            "command": None,
+            "args": [],
+        }
+
+        with patch(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            return_value=selected_runtime,
+        ) as selected_resolver, patch(
+            "gateway.run._resolve_runtime_agent_kwargs"
+        ) as global_resolver, patch(
+            "gateway.run._resolve_gateway_model"
+        ) as global_model, patch(
+            "gateway.run._load_gateway_config", return_value={}
+        ), patch(
+            "gateway.run.GatewayRunner._load_fallback_model"
+        ) as fallback_loader, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            agent_cls.return_value = MagicMock()
+
+            adapter._create_agent(
+                requested_model="new/openrouter-model",
+                requested_provider="openrouter",
+                single_model=True,
+                session_id="direct-session",
+            )
+
+        assert selected_resolver.call_count >= 1
+        assert selected_resolver.call_args_list[0].args == ("openrouter",)
+        assert selected_resolver.call_args_list[0].kwargs == {
+            "target_model": "new/openrouter-model"
+        }
+        global_resolver.assert_not_called()
+        global_model.assert_not_called()
+        fallback_loader.assert_not_called()
+
+        kwargs = agent_cls.call_args.kwargs
+        assert kwargs["model"] == "new/openrouter-model"
+        assert kwargs["provider"] == "openrouter"
+        assert kwargs["fallback_model"] is None
+        assert kwargs["disabled_toolsets"] == ["delegation", "opus_worker"]
+        assert kwargs["skip_context_files"] is True
+        assert kwargs["skip_background_review"] is True
+        runtime = agent_cls.return_value._hermes_api_runtime
+        assert runtime["execution_mode"] == "single_model"
+        assert runtime["route_source"] == "direct_model"
+
+    def test_direct_mode_denylist_removes_every_model_spawning_tool(self):
+        from model_tools import get_tool_definitions
+        from tools.registry import discover_builtin_tools
+
+        discover_builtin_tools()
+        tools = get_tool_definitions(
+            enabled_toolsets=["hermes-api-server"],
+            disabled_toolsets=["delegation", "opus_worker"],
+            quiet_mode=True,
+        )
+        names = {tool["function"]["name"] for tool in tools}
+        assert "delegate_task" not in names
+        assert "opus_code_worker" not in names
+        assert "terminal" in names

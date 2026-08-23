@@ -699,6 +699,32 @@ def _run_agent_tool_execution_middleware(
         # in flight, not just at start/completion. Both the sequential and
         # the concurrent paths funnel through here, so a single heartbeat
         # covers every tool.
+        if function_name == "terminal" and agent.tool_progress_callback:
+            try:
+                from tools.environments.base import set_output_callback
+
+                def _relay_output(chunk: str) -> None:
+                    if not chunk:
+                        return
+                    try:
+                        agent.tool_progress_callback(
+                            "tool.output.delta",
+                            function_name,
+                            None,
+                            None,
+                            chunk=chunk,
+                            channel="combined",
+                            tool_call_id=tool_call_id,
+                        )
+                    except Exception as callback_error:
+                        logging.debug(
+                            "Tool output callback error: %s", callback_error
+                        )
+
+                set_output_callback(_relay_output)
+            except Exception:
+                pass
+
         _hb_stop = threading.Event()
         _hb_thread = threading.Thread(
             target=_run_tool_activity_heartbeat,
@@ -711,6 +737,12 @@ def _run_agent_tool_execution_middleware(
         try:
             return execute(final_args)
         finally:
+            try:
+                from tools.environments.base import set_output_callback
+
+                set_output_callback(None)
+            except Exception:
+                pass
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
 
