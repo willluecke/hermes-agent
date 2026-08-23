@@ -24,8 +24,11 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -59,6 +62,15 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+_DATA_IMAGE_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+_MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 @dataclass
@@ -165,37 +177,139 @@ def _notification_belongs_to_turn(
     return True
 
 
-def _coerce_turn_input_text(user_input: Any) -> str:
-    """Collapse Hermes/OpenAI rich content into app-server text input.
+def _image_url_from_content_part(item: dict[str, Any]) -> str:
+    image_value = item.get("image_url")
+    if isinstance(image_value, dict):
+        image_value = image_value.get("url")
+    if not isinstance(image_value, str) or not image_value.strip():
+        image_value = item.get("url")
+    return image_value.strip() if isinstance(image_value, str) else ""
 
-    The current `turn/start` path sends text items only. TUI image attachment
-    can hand us OpenAI-style content parts, so keep the text/path hints and
-    replace opaque image payloads with a small marker instead of putting a
-    Python list into the `text` field.
+
+def _image_bytes_match_type(data: bytes, media_type: str) -> bool:
+    if media_type == "image/png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n")
+    if media_type in {"image/jpeg", "image/jpg"}:
+        return data.startswith(b"\xff\xd8\xff")
+    if media_type == "image/gif":
+        return data.startswith((b"GIF87a", b"GIF89a"))
+    if media_type == "image/webp":
+        return (
+            len(data) >= 12
+            and data.startswith(b"RIFF")
+            and data[8:12] == b"WEBP"
+        )
+    return False
+
+
+def _materialize_data_image(
+    url: str,
+    *,
+    directory: str,
+    index: int,
+) -> str:
+    header, separator, encoded = url.partition(",")
+    header_parts = header.split(";")
+    if (
+        separator != ","
+        or len(header_parts) != 2
+        or header_parts[1].lower() != "base64"
+    ):
+        raise ValueError("image data URL must contain a base64 payload")
+    media_type = (
+        header_parts[0][5:].lower()
+        if header_parts[0].lower().startswith("data:")
+        else ""
+    )
+    extension = _DATA_IMAGE_EXTENSIONS.get(media_type)
+    if extension is None:
+        raise ValueError(f"unsupported image media type: {media_type or 'unknown'}")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("image data URL contains invalid base64") from exc
+    if not data:
+        raise ValueError("image attachment is empty")
+    if len(data) > _MAX_LOCAL_IMAGE_BYTES:
+        raise ValueError("image attachment exceeds the 10 MiB runtime limit")
+    if not _image_bytes_match_type(data, media_type):
+        raise ValueError(f"image bytes do not match declared media type {media_type}")
+
+    path = os.path.join(directory, f"attachment-{index}.{extension}")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _prepare_turn_input_items(
+    user_input: Any,
+) -> tuple[list[dict[str, str]], Optional[tempfile.TemporaryDirectory]]:
+    """Translate Hermes/OpenAI content parts to native Codex user inputs.
+
+    Codex app-server accepts remote images as ``image`` items and local files
+    as ``localImage`` items. Inline data URLs are decoded into a private
+    temporary directory that remains alive for the whole turn.
     """
     if isinstance(user_input, str):
-        return user_input
-    if isinstance(user_input, list):
-        parts: list[str] = []
+        return [{"type": "text", "text": user_input}], None
+    if not isinstance(user_input, list):
+        text = "" if user_input is None else str(user_input)
+        return [{"type": "text", "text": text}], None
+
+    prepared: list[dict[str, str]] = []
+    temp_dir: Optional[tempfile.TemporaryDirectory] = None
+    try:
         for item in user_input:
             if isinstance(item, str):
                 if item.strip():
-                    parts.append(item)
+                    prepared.append({"type": "text", "text": item})
                 continue
             if not isinstance(item, dict):
                 if item is not None:
-                    parts.append(str(item))
+                    prepared.append({"type": "text", "text": str(item)})
                 continue
-            item_type = item.get("type")
+
+            item_type = str(item.get("type") or "")
             if item_type in {"text", "input_text"}:
                 text = item.get("text") or item.get("content") or ""
                 if text:
-                    parts.append(str(text))
-            elif item_type in {"image", "image_url", "input_image"}:
-                parts.append("[image attached]")
-        text = "\n\n".join(p for p in parts if p).strip()
-        return text or "What do you see in this image?"
-    return "" if user_input is None else str(user_input)
+                    prepared.append({"type": "text", "text": str(text)})
+                continue
+            if item_type not in {"image", "image_url", "input_image"}:
+                continue
+
+            image_url = _image_url_from_content_part(item)
+            if not image_url:
+                raise ValueError("image content part is missing its URL")
+            if image_url.lower().startswith("data:"):
+                if temp_dir is None:
+                    temp_dir = tempfile.TemporaryDirectory(prefix="hermes-codex-image-")
+                path = _materialize_data_image(
+                    image_url,
+                    directory=temp_dir.name,
+                    index=len(prepared),
+                )
+                prepared.append({"type": "localImage", "path": path})
+            elif image_url.lower().startswith(("https://", "http://")):
+                prepared.append({"type": "image", "url": image_url})
+            else:
+                raise ValueError("image URL must use http(s) or data:image/...;base64")
+
+        if not prepared:
+            prepared.append({"type": "text", "text": "What do you see in this image?"})
+        return prepared, temp_dir
+    except Exception:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+        raise
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -590,22 +704,30 @@ class CodexAppServerSession:
             return result
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        try:
+            turn_input, image_temp_dir = _prepare_turn_input_items(user_input)
+        except ValueError as exc:
+            result.error = f"invalid image attachment: {exc}"
+            self._interrupt_event.clear()
+            return result
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Keep image_temp_dir alive until the terminal notification. Codex
+        # app-server receives real image/localImage items rather than a text
+        # placeholder, so the model can inspect browser uploads natively.
         try:
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": turn_input,
                     **({"model": self._model} if self._model else {}),
                     **({"effort": self._effort} if self._effort else {}),
                 },
                 timeout=10,
             )
         except CodexAppServerError as exc:
+            if image_temp_dir is not None:
+                image_temp_dir.cleanup()
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
@@ -624,6 +746,8 @@ class CodexAppServerSession:
             self._interrupt_event.clear()
             return result
         except TimeoutError as exc:
+            if image_temp_dir is not None:
+                image_temp_dir.cleanup()
             # turn/start hanging is a strong signal the subprocess is wedged.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
             hint = _classify_oauth_failure(stderr_blob)
@@ -864,6 +988,8 @@ class CodexAppServerSession:
         with self._active_turn_lock:
             self._active_turn_id = None
         self._interrupt_event.clear()
+        if image_temp_dir is not None:
+            image_temp_dir.cleanup()
         return result
 
     def compact_thread(

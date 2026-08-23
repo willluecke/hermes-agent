@@ -8,6 +8,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from unittest.mock import patch
 from typing import Any, Optional
 
@@ -18,7 +19,7 @@ from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
-    _coerce_turn_input_text,
+    _prepare_turn_input_items,
 )
 
 
@@ -141,12 +142,47 @@ class TestApprovalChoiceMapping:
 
 
 class TestTurnInputCoercion:
-    def test_list_content_keeps_text_and_marks_images(self):
-        text = _coerce_turn_input_text([
+    _PNG_DATA_URL = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/"
+        "5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+    )
+
+    def test_inline_image_becomes_private_local_image(self):
+        items, temp_dir = _prepare_turn_input_items([
             {"type": "text", "text": "caption"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            {"type": "image_url", "image_url": {"url": self._PNG_DATA_URL}},
         ])
-        assert text == "caption\n\n[image attached]"
+        assert temp_dir is not None
+        path = Path(items[1]["path"])
+        try:
+            assert items[0] == {"type": "text", "text": "caption"}
+            assert items[1]["type"] == "localImage"
+            assert path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+            assert path.stat().st_mode & 0o777 == 0o600
+        finally:
+            temp_dir.cleanup()
+        assert not path.exists()
+
+    def test_remote_image_keeps_native_url(self):
+        items, temp_dir = _prepare_turn_input_items([
+            {"type": "input_image", "image_url": "https://example.com/shot.png"},
+        ])
+        assert items == [
+            {"type": "image", "url": "https://example.com/shot.png"}
+        ]
+        assert temp_dir is None
+
+    def test_declared_media_type_must_match_bytes(self):
+        with pytest.raises(ValueError, match="do not match"):
+            _prepare_turn_input_items([
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/jpeg;base64,iVBORw0KGgoAAAANSUhEUg=="
+                    },
+                }
+            ])
 
 
 # ---- lifecycle ----
@@ -208,6 +244,42 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    def test_inline_image_reaches_turn_start_and_is_cleaned_up(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "I see it"},
+            threadId="t", turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        result = session.run_turn(
+            [
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": TestTurnInputCoercion._PNG_DATA_URL},
+                },
+            ],
+            turn_timeout=2.0,
+        )
+
+        turn_params = next(
+            params for method, params in client.requests if method == "turn/start"
+        )
+        local_image = turn_params["input"][1]
+        assert turn_params["input"][0] == {
+            "type": "text",
+            "text": "Describe this image",
+        }
+        assert local_image["type"] == "localImage"
+        assert result.final_text == "I see it"
+        assert not Path(local_image["path"]).exists()
 
 
 

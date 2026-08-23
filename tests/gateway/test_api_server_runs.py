@@ -149,6 +149,53 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_start_preserves_latest_multimodal_user_message(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(
+                    user_message=None,
+                    conversation_history=None,
+                    task_id=None,
+                ):
+                    captured["user_message"] = user_message
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                image_content = [
+                    {"type": "text", "text": "Describe this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                    },
+                ]
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": [{"role": "user", "content": image_content}],
+                        "session_id": "multimodal-run",
+                    },
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert captured["user_message"] == image_content
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
