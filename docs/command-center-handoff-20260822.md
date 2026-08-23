@@ -1,6 +1,6 @@
 # Command Center Bootstrap Handoff
 
-Status date: 2026-08-22
+Status date: 2026-08-23
 
 This is the compact operating handoff for Hermes on the BRENUC N7P. It records
 the state that should survive the Mac Codex conversation without injecting the
@@ -15,7 +15,8 @@ against the live host.
 - Hardware: Ryzen 7 8845HS, 32 GB RAM, 1 TB NVMe
 - Primary checkout: `/home/will/src/hermes-agent-migration`
 - Branch: `migration/command-center-20260822`
-- Agentic-loop baseline commit: `acb021b8d89020466aa5f8e1e2cd16125b420c9e`
+- Verified operational baseline commit: `4ba7eb630`
+- Hermes Chat production-smoke commit: `0e90d5b`
 - The Raspberry Pi is not the active Hermes host. Do not change it without an
   explicit migration or rollback request.
 
@@ -27,6 +28,9 @@ lingering enabled:
 - `hermes-gateway.service`
 - `hermes-sync.service`
 - `hermes-subscription-worker.service`
+- `cloudflared-hermes.service`
+- `hermes-command-center-backup.timer`
+- `hermes-command-center-full-backup.timer`
 
 The Hermes chat application and its synchronization path run from
 `command-center`. Do not restart the gateway while a run is active.
@@ -37,8 +41,16 @@ Verify:
 systemctl --user is-active \
   hermes-gateway.service \
   hermes-sync.service \
-  hermes-subscription-worker.service
+  hermes-subscription-worker.service \
+  cloudflared-hermes.service \
+  hermes-command-center-backup.timer \
+  hermes-command-center-full-backup.timer
 ```
+
+The gateway is deliberately bound to `127.0.0.1:8642`, not a LAN address.
+Cloudflare publishes `https://hermes-api.devsession.org` and forwards to that
+loopback listener. The sync service is likewise local on `127.0.0.1:8643` and
+published separately through `https://hermes-sync.devsession.org`.
 
 ## Decision And Worker Contract
 
@@ -83,6 +95,11 @@ contract. Therefore, an ordinary day's scheduled decision ceiling is two
 fixed turns plus at most three event-driven turns. There is no unconditional
 two-hour inference loop.
 
+The legacy monthly pipeline audit was rewritten for command-center-local
+checkouts and the Opus subscription worker. The weekly auth-health job is now
+a deterministic no-agent script. Neither prompt carries Pi, Mac,
+`consult-claude`, Fable, or stale worker assumptions.
+
 Inspect without invoking a model:
 
 ```bash
@@ -109,6 +126,57 @@ non-interactive SSH test command omitted `/home/will/.local/bin` from `PATH`.
 The resident gateway service already had the correct path. Manual cron probes
 must either use a login shell or reproduce the gateway service `PATH`; this was
 not a resident-runtime failure.
+
+The corrected morning checkpoint then completed in 5 minutes 26 seconds,
+crossing the former 90-second watchdog boundary and writing the founder plan,
+daily log, and notification successfully.
+
+## Production Chat Verification
+
+Production is served at `https://hermes-chat-rust.vercel.app`. From a trusted
+operator checkout with Playwright installed and `APP_PASSWORD` in its private
+`.env.local`, the repeatable smoke test is:
+
+```bash
+npm run test:production-smoke
+```
+
+The 2026-08-23 live test proved both execution paths:
+
+- Default Hermes orchestration streamed a real command, accepted an image,
+  survived a forced browser disconnect, and reconstructed the ordered
+  tool/final timeline from the durable archive after reload.
+- Selecting `openrouter::stealth/ox-alpha` produced
+  `execution_mode=single_model`; the Codex/Opus orchestrator was bypassed.
+- Temporary smoke conversations were removed after verification. Their run
+  archives completed without truncation.
+
+Vercel reports the production deployment behind the canonical alias as
+`READY`.
+
+## Backups
+
+Automated private backups live under:
+
+`~/.local/state/command-center-backups/`
+
+- Daily quick backup: keep 14; Hermes critical-state snapshot plus an online
+  backup of the chat-sync database and recovery configuration.
+- Weekly full backup: keep 4; full Hermes export ZIP plus the same sync and
+  recovery material.
+- Both modes write atomically, serialize with `flock`, record SHA-256
+  manifests, verify SQLite through Hermes' own SQLite runtime, and remove all
+  group/other permissions.
+
+Install or refresh the timers with:
+
+```bash
+bash /home/will/src/hermes-agent-migration/ops/command-center/install-command-center-backups.sh
+```
+
+Both modes passed manual restore-artifact checks on 2026-08-23: every manifest
+entry verified, both copied SQLite databases returned `integrity_check=ok`,
+and the full ZIP's 5,754 members passed `ZipFile.testzip()`.
 
 ## Human Gates
 
@@ -158,14 +226,12 @@ rg -n -F 'specific non-secret phrase' \
   /home/will/.hermes/handoffs/archive/codex-session-01a02750-154b-7322-b418-dea4cf7ad601.snapshot.jsonl
 ```
 
-## Current Open Work
+## Remaining Risk
 
-- Review the legacy monthly pipeline-audit and weekly auth-health prompts;
-  they still contain Pi/Mac-era wording and assumptions.
-- RecCli context loading and session-note saving hung from the Mac Codex host
-  during the agentic-loop implementation. The BRENUC MCP path subsequently
-  loaded project context and saved both E2E decisions successfully; investigate
-  the Mac MCP path separately if it is still needed.
+The automated backups are stored on the same NVMe as the live data. They
+protect against application mistakes, bad migrations, and logical corruption,
+but not NVMe failure, theft, or host loss. Copy verified backup directories to
+separate storage before treating disaster recovery as complete.
 
 ## Source Documentation
 
@@ -173,6 +239,8 @@ rg -n -F 'specific non-secret phrase' \
 - `docs/persistent-agent-operations.md`
 - `ops/command-center/agentic-loop-prompt.md`
 - `ops/command-center/agentic-loop-gate.py`
+- `ops/command-center/backup-command-center.sh`
+- `ops/command-center/install-command-center-backups.sh`
 
 If this handoff conflicts with current service state, current code, or current
 user instructions, those newer primary sources win. Update the handoff after a

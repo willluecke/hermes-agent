@@ -8,8 +8,20 @@ Host: `command-center` (`will@192.168.1.243`)
 - `hermes-sync.service`: Hermes Chat synchronization
 - `hermes-subscription-worker.service`: native Codex and Claude Code jobs
 - `cloudflared-hermes.service`: public tunnel, when enabled
+- `hermes-command-center-backup.timer`: daily critical-state backup
+- `hermes-command-center-full-backup.timer`: weekly full-state backup
 
 All agent services run as user `will`. User lingering must remain enabled.
+
+The gateway and sync listeners are loopback-only:
+
+```text
+127.0.0.1:8642  Hermes API (Cloudflare: hermes-api.devsession.org)
+127.0.0.1:8643  Hermes sync (Cloudflare: hermes-sync.devsession.org)
+```
+
+Do not change either listener to `0.0.0.0` for LAN convenience. SSH and the
+authenticated Cloudflare routes are the supported remote access paths.
 
 The process-driven agentic loop does not add another resident service. It uses
 the existing Hermes cron ticker and a deterministic pre-check script. A
@@ -175,6 +187,10 @@ and can be recovered by ID.
 systemctl --user is-active hermes-gateway.service
 systemctl --user is-active hermes-sync.service
 systemctl --user is-active hermes-subscription-worker.service
+systemctl --user is-active cloudflared-hermes.service
+systemctl --user is-active hermes-command-center-backup.timer
+systemctl --user is-active hermes-command-center-full-backup.timer
+ss -ltn 'sport = :8642 or sport = :8643'
 loginctl show-user will -p Linger
 git config --global --get user.name
 git config --global --get user.email
@@ -208,6 +224,9 @@ surface: context loading, read/search/inspection tools, and
 `save_session_notes`. Do not expose RecCli organization launch, approval,
 promotion, deletion, recovery, or configuration tools through this automatic
 approval path.
+
+The `ss` output must show only `127.0.0.1:8642` and `127.0.0.1:8643`, never
+`0.0.0.0` or `[::]` for either listener.
 
 ```toml
 [mcp_servers.reccli]
@@ -261,6 +280,48 @@ upgrade.
 
 Do not restart `hermes-gateway.service` while a run is active. Wait for the run
 to complete or explicitly cancel it first.
+
+## Backups
+
+Install the tracked backup services from the deployed migration checkout:
+
+```bash
+bash ops/command-center/install-command-center-backups.sh
+```
+
+Backups are private, atomic directories under
+`~/.local/state/command-center-backups/`:
+
+- `quick-*`: daily Hermes critical-state snapshot plus chat-sync SQLite and
+  recovery configuration; 14 retained.
+- `full-*`: weekly full Hermes export plus chat-sync SQLite and recovery
+  configuration; 4 retained.
+
+The script must use the migration virtual environment's Python/SQLite runtime.
+The Debian `sqlite3` CLI is older and can falsely report Hermes' newer trigram
+FTS index as malformed. Override `COMMAND_CENTER_SQLITE_PYTHON` only with a
+runtime whose SQLite compatibility has been verified against the live DB.
+
+Run and inspect a manual quick backup:
+
+```bash
+systemctl --user start hermes-command-center-backup.service
+systemctl --user status hermes-command-center-backup.service --no-pager
+```
+
+Run the full mode only when there is enough local disk space:
+
+```bash
+systemctl --user start hermes-command-center-full-backup.service
+systemctl --user status hermes-command-center-full-backup.service --no-pager
+```
+
+For either artifact, run `sha256sum --check SHA256SUMS` inside its directory.
+The timer succeeds only after SQLite integrity and ZIP checks pass, but the
+manifest check independently detects later storage damage.
+
+These backups share the host NVMe with the live data. Replicate verified
+artifacts to separate storage for hardware-loss recovery.
 
 ## Decision Review
 
@@ -327,7 +388,7 @@ Daily gate budget exhausted:
 ## Upgrade Procedure
 
 1. Confirm no active Hermes or subscription-worker jobs.
-2. Back up `config.yaml`, `SOUL.md`, `PIPELINE.md`, and both decision ledgers.
+2. Run and verify a command-center quick backup.
 3. Update source in the migration branch and run targeted tests.
 4. Update one native CLI at a time.
 5. Reapply the Hermes tools MCP migration to Codex configuration if needed.
@@ -336,7 +397,7 @@ Daily gate budget exhausted:
 
 ## Rollback
 
-Restore the timestamped Hermes configuration and policy files, then restart the
-gateway after confirming no run is active. Source rollback should use the last
-known-good migration commit. Do not alter or stop the Raspberry Pi as part of
+Restore a verified command-center backup, then restart the gateway after
+confirming no run is active. Source rollback should use the commit recorded in
+the backup's `metadata.txt`. Do not alter or stop the Raspberry Pi as part of
 this rollback; it remains separate until a later decommission decision.
