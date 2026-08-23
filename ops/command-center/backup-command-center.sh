@@ -20,6 +20,9 @@ hermes_home=${HERMES_HOME:-$home_dir/.hermes}
 sync_db=${HERMES_SYNC_DB:-$home_dir/.hermes-chat-sync/sync.db}
 backup_root=${COMMAND_CENTER_BACKUP_ROOT:-$home_dir/.local/state/command-center-backups}
 hermes_bin=${HERMES_BIN:-$home_dir/.local/bin/hermes}
+# Keep backup and integrity semantics aligned with the SQLite build Hermes uses.
+# Debian's system sqlite3 can misclassify newer trigram FTS indexes as malformed.
+sqlite_python=${COMMAND_CENTER_SQLITE_PYTHON:-$home_dir/src/hermes-agent-migration/venv/bin/python}
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 final_dir=$backup_root/$mode-$timestamp
 staging_dir=$backup_root/.$mode-$timestamp-$$.partial
@@ -49,9 +52,12 @@ require_command flock
 require_command git
 require_command python3
 require_command sha256sum
-require_command sqlite3
 if [[ ! -x $hermes_bin ]]; then
   printf 'Hermes CLI is not executable: %s\n' "$hermes_bin" >&2
+  exit 1
+fi
+if [[ ! -x $sqlite_python ]]; then
+  printf 'Hermes SQLite runtime is not executable: %s\n' "$sqlite_python" >&2
   exit 1
 fi
 if [[ ! -f $sync_db ]]; then
@@ -71,16 +77,44 @@ sqlite_backup() {
   local source=$1
   local destination=$2
   install -d -m 0700 "$(dirname "$destination")"
-  sqlite3 "$source" <<SQL
-.timeout 30000
-.backup '$destination'
-SQL
-  local integrity
-  integrity=$(sqlite3 "$destination" 'PRAGMA integrity_check;')
-  if [[ $integrity != ok ]]; then
-    printf 'SQLite integrity check failed for %s: %s\n' "$destination" "$integrity" >&2
-    exit 1
-  fi
+  "$sqlite_python" - "$source" "$destination" <<'PY'
+import sqlite3
+import sys
+
+source_path, destination_path = sys.argv[1:]
+with sqlite3.connect(source_path, timeout=30) as source:
+    with sqlite3.connect(destination_path, timeout=30) as destination:
+        source.backup(destination)
+        problems = [
+            str(row[0])
+            for row in destination.execute("PRAGMA integrity_check")
+            if row and str(row[0]).lower() != "ok"
+        ]
+if problems:
+    raise SystemExit(
+        f"SQLite integrity check failed for {destination_path}: "
+        + "; ".join(problems[:3])
+    )
+PY
+}
+
+sqlite_verify() {
+  "$sqlite_python" - "$1" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1], timeout=30) as database:
+    problems = [
+        str(row[0])
+        for row in database.execute("PRAGMA integrity_check")
+        if row and str(row[0]).lower() != "ok"
+    ]
+if problems:
+    raise SystemExit(
+        f"SQLite integrity check failed for {sys.argv[1]}: "
+        + "; ".join(problems[:3])
+    )
+PY
 }
 
 if [[ $mode == quick ]]; then
@@ -99,10 +133,7 @@ if [[ $mode == quick ]]; then
     printf 'Hermes quick snapshot is incomplete: %s\n' "$latest_snapshot" >&2
     exit 1
   fi
-  if [[ $(sqlite3 "$latest_snapshot/state.db" 'PRAGMA integrity_check;') != ok ]]; then
-    printf 'Hermes quick state.db failed integrity verification\n' >&2
-    exit 1
-  fi
+  sqlite_verify "$latest_snapshot/state.db"
   cp -a "$latest_snapshot" "$staging_dir/hermes-quick"
 else
   "$hermes_bin" backup --output "$staging_dir/hermes-full.zip"
@@ -159,6 +190,8 @@ chat_repo=$home_dir/coding-projects/hermes-chat
   printf 'hostname=%s\n' "$(hostname)"
   printf 'hermes_agent_commit=%s\n' "$(git -C "$agent_repo" rev-parse HEAD 2>/dev/null || printf unknown)"
   printf 'hermes_chat_commit=%s\n' "$(git -C "$chat_repo" rev-parse HEAD 2>/dev/null || printf unknown)"
+  printf 'sqlite_runtime=%s\n' "$sqlite_python"
+  printf 'sqlite_version=%s\n' "$($sqlite_python -c 'import sqlite3; print(sqlite3.sqlite_version)')"
   printf 'sync_integrity=ok\n'
 } >"$staging_dir/metadata.txt"
 
