@@ -335,6 +335,40 @@ class TestRunEvents:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_interim_assistant_text_has_its_own_run_event(self, adapter):
+        """Tool-call commentary must not masquerade as final answer text."""
+        app = _create_runs_app(adapter)
+
+        def create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def run_conversation(**_run_kwargs):
+                kwargs["interim_assistant_callback"](
+                    "I will inspect the files now.",
+                    already_streamed=True,
+                )
+                return {"final_response": "Inspection complete."}
+
+            mock_agent.run_conversation.side_effect = run_conversation
+            mock_agent.session_prompt_tokens = 10
+            mock_agent.session_completion_tokens = 5
+            mock_agent.session_total_tokens = 15
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "inspect"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert '"event": "message.interim"' in body
+        assert '"text": "I will inspect the files now."' in body
+        assert '"already_streamed": true' in body
+        assert '"event": "run.completed"' in body
+        assert "Inspection complete." in body
+
+    @pytest.mark.asyncio
     async def test_events_replay_after_first_stream_closes(self, adapter):
         """A completed run remains attachable until its transport TTL expires."""
         app = _create_runs_app(adapter)

@@ -2830,6 +2830,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        interim_assistant_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -3143,6 +3144,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
+            "interim_assistant_callback": interim_assistant_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
@@ -7668,6 +7670,25 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Codex and Hermes can produce real mid-turn assistant commentary
+        # before tool execution. Keep it separate from final-answer deltas so
+        # API clients do not have to guess which streamed text is canonical.
+        def _interim_cb(text: str, *, already_streamed: bool = False) -> None:
+            if not isinstance(text, str) or not text.strip():
+                return
+            if run_id not in self._run_streams:
+                return
+            try:
+                loop.call_soon_threadsafe(_put_event_if_active, {
+                    "event": "message.interim",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "text": text,
+                    "already_streamed": bool(already_streamed),
+                })
+            except Exception:
+                pass
+
         self._set_run_status(
             run_id,
             "queued",
@@ -7706,6 +7727,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
+                        interim_assistant_callback=_interim_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
