@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -52,6 +53,22 @@ MIGRATION_MARKER = (
 )
 MIGRATION_END_MARKER = (
     "# end hermes-agent managed section"
+)
+
+_BUILTIN_PERMISSION_PROFILES = {
+    "read-only",
+    "workspace",
+    "danger-full-access",
+    # Retain the historical spelling so an explicit legacy caller continues
+    # to receive a built-in profile rather than a custom-name interpretation.
+    "danger-no-sandbox",
+}
+_SAFE_PERMISSION_PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_UNSAFE_PERMISSION_PROFILE_NAME_PARTS = (
+    "danger",
+    "full-access",
+    "no-sandbox",
+    "sudo",
 )
 
 
@@ -247,6 +264,7 @@ def render_codex_toml_section(
     servers: dict[str, dict],
     plugins: Optional[list[dict]] = None,
     default_permission_profile: Optional[str] = None,
+    custom_permission_profile: Optional[dict[str, Any]] = None,
 ) -> str:
     """Render the managed [mcp_servers.<n>] / [plugins.<id>] / [permissions]
     block for ~/.codex/config.toml.
@@ -256,13 +274,21 @@ def render_codex_toml_section(
         plugins: optional list of {name, marketplace, enabled} for native
             Codex plugins to enable. (E.g. the Linear / Atlassian / Asana
             curated plugins, or per-account ChatGPT apps.)
-        default_permission_profile: when set, write `[permissions] default`
-            so the user doesn't get an approval prompt on every write
-            attempt. Common values: "workspace-write", "read-only",
-            "full-access".
+        default_permission_profile: when set, write top-level
+            ``default_permissions``. Built-in names may be supplied with or
+            without their leading colon; custom names remain unprefixed.
+        custom_permission_profile: optional validated ``{"name": str,
+            "network_access": bool}`` profile. It always extends Codex's
+            sandboxed ``:workspace`` built-in; callers cannot select a danger
+            profile through this surface.
     """
     out = [MIGRATION_MARKER]
-    if not servers and not plugins and not default_permission_profile:
+    if (
+        not servers
+        and not plugins
+        and not default_permission_profile
+        and not custom_permission_profile
+    ):
         out.append("# (no MCP servers, plugins, or permissions configured by Hermes)")
         out.append(MIGRATION_END_MARKER)
         return "\n".join(out) + "\n"
@@ -273,13 +299,27 @@ def render_codex_toml_section(
         # with ":" (":workspace-write", ":read-only", ":full-access"). The
         # [permissions] table is for *user-defined* named profiles with
         # structured fields — not what we want.
-        normalized = (
-            default_permission_profile
-            if default_permission_profile.startswith(":")
-            else f":{default_permission_profile}"
-        )
+        normalized = default_permission_profile
+        if (
+            not normalized.startswith(":")
+            and normalized in _BUILTIN_PERMISSION_PROFILES
+        ):
+            normalized = f":{normalized}"
         out.append("")
         out.append(f"default_permissions = {_format_toml_value(normalized)}")
+
+    if custom_permission_profile:
+        profile_name = str(custom_permission_profile["name"])
+        profile_key = _quote_key(profile_name)
+        out.append("")
+        out.append(f"[permissions.{profile_key}]")
+        out.append('extends = ":workspace"')
+        out.append("")
+        out.append(f"[permissions.{profile_key}.network]")
+        out.append(
+            "enabled = "
+            + _format_toml_value(bool(custom_permission_profile["network_access"]))
+        )
 
     if servers:
         for name in sorted(servers.keys()):
@@ -302,6 +342,59 @@ def render_codex_toml_section(
     out.append("")
     out.append(MIGRATION_END_MARKER)
     return "\n".join(out) + "\n"
+
+
+def _configured_permission_profile(
+    hermes_config: dict,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Validate the optional Hermes-managed Codex permission profile.
+
+    The profile deliberately has a very small schema: a safe local name and a
+    network boolean.  Its parent is fixed to ``:workspace`` in the renderer,
+    so config cannot turn this convenience into a no-sandbox or sudo escape.
+    """
+    runtime_config = (hermes_config or {}).get("codex_runtime")
+    if runtime_config is None:
+        return None, None
+    if not isinstance(runtime_config, dict):
+        return None, "codex_runtime must be a mapping"
+
+    raw_profile = runtime_config.get("permission_profile")
+    if raw_profile is None:
+        return None, None
+    if not isinstance(raw_profile, dict):
+        return None, "codex_runtime.permission_profile must be a mapping or null"
+
+    unknown = sorted(set(raw_profile) - {"name", "network_access"})
+    if unknown:
+        return None, (
+            "codex_runtime.permission_profile has unsupported keys: "
+            + ", ".join(unknown)
+        )
+
+    name = raw_profile.get("name")
+    if not isinstance(name, str) or not _SAFE_PERMISSION_PROFILE_NAME.fullmatch(name):
+        return None, (
+            "codex_runtime.permission_profile.name must match "
+            "[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+        )
+    lowered_name = name.lower()
+    if (
+        lowered_name in _BUILTIN_PERMISSION_PROFILES
+        or any(part in lowered_name for part in _UNSAFE_PERMISSION_PROFILE_NAME_PARTS)
+    ):
+        return None, (
+            "codex_runtime.permission_profile.name must be a custom, "
+            "non-dangerous profile name"
+        )
+
+    network_access = raw_profile.get("network_access", False)
+    if not isinstance(network_access, bool):
+        return None, (
+            "codex_runtime.permission_profile.network_access must be a boolean"
+        )
+
+    return {"name": name, "network_access": network_access}, None
 
 
 def _insert_managed_block_at_top_level(user_text: str, managed_block: str) -> str:
@@ -655,6 +748,18 @@ def migrate(
     target = codex_home / "config.toml"
     report.target_path = target
 
+    custom_permission_profile, permission_error = _configured_permission_profile(
+        hermes_config
+    )
+    if permission_error:
+        report.errors.append(permission_error)
+        return report
+    if custom_permission_profile is not None:
+        # A configured custom profile is the operator's explicit choice and
+        # therefore becomes the managed default.  It remains sandboxed because
+        # the renderer fixes its parent to :workspace.
+        default_permission_profile = custom_permission_profile["name"]
+
     hermes_servers = (hermes_config or {}).get("mcp_servers") or {}
     if not isinstance(hermes_servers, dict):
         report.errors.append(
@@ -711,6 +816,7 @@ def migrate(
     managed_block = render_codex_toml_section(
         translated, plugins=plugins,
         default_permission_profile=default_permission_profile,
+        custom_permission_profile=custom_permission_profile,
     )
 
     # Read existing codex config if any, strip the prior managed block,

@@ -6,6 +6,13 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 
 DEFAULT_CONFIG = {
     "model": "",
+    # Optional managed Codex permission profile.  ``None`` preserves Codex's
+    # built-in :workspace profile; operators that need sandboxed outbound
+    # networking can configure a named profile which the migration generator
+    # renders into ~/.codex/config.toml.
+    "codex_runtime": {
+        "permission_profile": None,
+    },
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},

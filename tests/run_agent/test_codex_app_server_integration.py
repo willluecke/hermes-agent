@@ -573,6 +573,9 @@ class TestRunConversationCodexPath:
         routing = captured["request_routing"]
         assert routing.auto_approve_exec is False
         assert routing.auto_approve_apply_patch is False
+        from tools.approval import request_codex_approval
+
+        assert captured["approval_callback"] is request_codex_approval
 
     def test_frozen_yolo_env_auto_approves_codex_server_requests(
         self, monkeypatch

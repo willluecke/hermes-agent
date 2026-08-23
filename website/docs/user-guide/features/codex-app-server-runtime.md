@@ -244,12 +244,34 @@ Codex requests approval before executing commands or applying patches. These get
 
 For `apply_patch` (file edit) approvals, Hermes shows a summary of what changed (`1 add, 1 update: /tmp/new.py, /tmp/old.py`) when codex provides the data via the corresponding `fileChange` item.
 
+Gateway and `/v1/runs` clients receive the same redacted
+`approval.request` event and answer through the existing approval response
+endpoint. Hermes waits for that real response. A disconnected client, missing
+approval channel, notification failure, or timeout cancels the Codex request;
+only an explicit **Deny** is sent to Codex as a user rejection.
+
 ## Permission profiles
 
 Codex has three built-in permission profiles:
 - `:read-only` — no writes; every shell command requires approval
 - `:workspace` — writes within the current workspace allowed without prompts (Hermes' default when you enable the runtime)
-- `:danger-no-sandbox` — no sandbox at all (don't use this unless you understand it)
+- `:danger-full-access` — no sandbox at all (not recommended)
+
+For a development host that needs outbound Git or package-registry access,
+configure a Hermes-managed custom profile instead of disabling the sandbox:
+
+```yaml
+codex_runtime:
+  permission_profile:
+    name: command-center-development
+    network_access: true
+```
+
+Running `hermes codex-runtime migrate` then generates a profile with that name,
+fixed to `extends = ":workspace"`, and enables its sandboxed network access.
+The configuration surface cannot select a danger profile or sudo mode. When
+the section is absent or `permission_profile` is `null`, Hermes keeps the
+built-in `:workspace` default with outbound command networking disabled.
 
 You can override the default in `~/.codex/config.toml` outside Hermes' managed block:
 
@@ -258,6 +280,18 @@ default_permissions = ":read-only"
 ```
 
 (Hermes will preserve your override on re-migration as long as it lives outside the `# managed by hermes-agent` markers.)
+
+## Turn liveness
+
+Hermes waits for Codex's authoritative `turn/completed` event. A tool result
+does not start a shorter deadline: reasoning models can legitimately remain
+quiet for several minutes while processing a large result. The app-server
+runtime instead uses one 10-minute inactivity timeout across the entire turn,
+reset by every matching notification, plus a two-hour wall-clock ceiling.
+
+Subprocess exit, protocol failure, an explicit Codex failure, and user
+interruption remain immediate terminal signals. Browser or SSE disconnection
+does not cancel the command-center turn.
 
 ## Auxiliary tasks and ChatGPT subscription token cost
 

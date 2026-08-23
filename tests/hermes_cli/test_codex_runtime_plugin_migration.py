@@ -162,6 +162,74 @@ class TestStripExistingManagedBlock:
 
 class TestMigrate:
 
+    def test_default_permissions_remain_workspace_without_custom_profile(
+        self, tmp_path
+    ):
+        migrate(
+            {},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        import tomllib
+
+        parsed = tomllib.loads((tmp_path / "config.toml").read_text())
+        assert parsed["default_permissions"] == ":workspace"
+        assert "permissions" not in parsed
+
+    def test_custom_workspace_profile_enables_network_without_danger_mode(
+        self, tmp_path
+    ):
+        report = migrate(
+            {
+                "codex_runtime": {
+                    "permission_profile": {
+                        "name": "command-center-development",
+                        "network_access": True,
+                    }
+                }
+            },
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        import tomllib
+
+        parsed = tomllib.loads((tmp_path / "config.toml").read_text())
+        profile = parsed["permissions"]["command-center-development"]
+        assert report.errors == []
+        assert report.wrote_permissions_default == "command-center-development"
+        assert parsed["default_permissions"] == "command-center-development"
+        assert profile == {
+            "extends": ":workspace",
+            "network": {"enabled": True},
+        }
+
+    @pytest.mark.parametrize(
+        "permission_profile",
+        [
+            {"name": ":workspace", "network_access": True},
+            {"name": "danger-full-access", "network_access": True},
+            {"name": "dev", "network_access": "yes"},
+            {"name": "dev", "network_access": True, "sudo": True},
+        ],
+    )
+    def test_unsafe_or_malformed_custom_profile_fails_before_write(
+        self, tmp_path, permission_profile
+    ):
+        report = migrate(
+            {"codex_runtime": {"permission_profile": permission_profile}},
+            codex_home=tmp_path,
+            discover_plugins=False,
+            expose_hermes_tools=False,
+        )
+
+        assert report.errors
+        assert report.written is False
+        assert not (tmp_path / "config.toml").exists()
+
 
 
     def test_plugin_discovery_writes_plugin_blocks(self, tmp_path, monkeypatch):

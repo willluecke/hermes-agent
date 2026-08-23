@@ -4372,6 +4372,81 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def request_codex_approval(
+    command: str,
+    description: str,
+    *,
+    allow_permanent: bool = False,
+    smart_denied: bool = False,
+) -> str:
+    """Route a native Codex approval through the attached Hermes surface.
+
+    ``codex app-server`` initiates approvals on its JSON-RPC channel rather
+    than through Hermes' terminal guard.  Gateway and API runs already expose
+    a per-run approval queue; this adapter lets the native runtime use that
+    same redacted, blocking round trip.
+
+    Returns one of ``once``, ``session``, ``always``, ``deny``, ``timeout``,
+    or ``unavailable``.  The final two are deliberately distinct from a human
+    denial so the Codex protocol layer can cancel rather than falsely report
+    that the user rejected a request.
+    """
+    del smart_denied  # Codex owns the risk reason; no Smart-DENY override here.
+
+    session_key = get_current_session_key(default="")
+    if not session_key:
+        logger.warning(
+            "Codex approval channel unavailable: no Hermes approval session"
+        )
+        return "unavailable"
+
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        logger.warning(
+            "Codex approval channel unavailable for session %s: no attached "
+            "gateway/API notifier",
+            session_key,
+        )
+        return "unavailable"
+
+    from agent.redact import redact_sensitive_text
+
+    display_command = redact_sensitive_text(command)
+    display_description = redact_sensitive_text(description)
+    pattern_key = (
+        "codex_app_server:"
+        + hashlib.sha256(command.encode("utf-8", errors="replace")).hexdigest()[:16]
+    )
+    decision = _await_gateway_decision(
+        session_key,
+        notify_cb,
+        {
+            "command": display_command,
+            "description": display_description,
+            "pattern_key": pattern_key,
+            "pattern_keys": [pattern_key],
+            "allow_permanent": bool(allow_permanent),
+            "allow_session": True,
+        },
+        surface="codex_app_server",
+    )
+    if decision.get("notify_failed"):
+        return "unavailable"
+    if not decision.get("resolved") or decision.get("choice") is None:
+        return "timeout"
+
+    choice = str(decision["choice"])
+    if choice in {"once", "session", "always", "deny"}:
+        return choice
+    logger.warning(
+        "Codex approval channel returned unsupported choice %r for session %s",
+        choice,
+        session_key,
+    )
+    return "unavailable"
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:

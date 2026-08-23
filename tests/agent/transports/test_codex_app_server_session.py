@@ -138,7 +138,9 @@ class TestApprovalChoiceMapping:
         ("session", "acceptForSession"),
         ("always", "acceptForSession"),
         ("deny", "decline"),
-        ("anything-else", "decline"),
+        ("timeout", "cancel"),
+        ("unavailable", "cancel"),
+        ("anything-else", "cancel"),
     ])
     def test_mapping(self, choice, expected):
         assert _approval_choice_to_codex_decision(choice) == expected
@@ -615,6 +617,59 @@ class TestCompactThread:
 
 class TestServerRequestRouting:
 
+    @pytest.mark.parametrize(
+        "choice,expected",
+        [
+            ("once", "accept"),
+            ("deny", "decline"),
+            ("timeout", "cancel"),
+            ("unavailable", "cancel"),
+        ],
+    )
+    def test_exec_approval_outcome_reaches_codex(self, choice, expected):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="exec-approval",
+            command="git push origin main",
+            cwd="/workspace",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        def callback(command, description, *, allow_permanent=True):
+            return choice
+
+        make_session(client, approval_callback=callback).run_turn(
+            "continue", turn_timeout=1.0
+        )
+
+        assert ("exec-approval", {"decision": expected}) in client.responses
+
+    def test_missing_approval_callback_cancels_instead_of_declining(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="exec-unavailable",
+            command="git push origin main",
+            cwd="/workspace",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        make_session(client).run_turn("continue", turn_timeout=1.0)
+
+        assert (
+            "exec-unavailable",
+            {"decision": "cancel"},
+        ) in client.responses
+
     @pytest.mark.parametrize("server_name", ["hermes-tools", "reccli"])
     def test_local_runtime_mcp_elicitation_is_accepted(self, server_name):
         client = FakeClient()
@@ -847,8 +902,7 @@ class TestApprovalPromptEnrichment:
 class TestSessionRetirement:
     """Mirrors openclaw beta.8's resilience fixes:
       - retire timed-out app-server clients (should_retire on deadline)
-      - post-tool completion watchdog (don't burn the full deadline after a
-        tool result if codex goes silent)
+      - bounded turn inactivity and absolute deadlines
       - <turn_aborted> raw marker as terminal (don't wait for turn/completed
         that never comes)
       - OAuth refresh failure classification (suggest `codex login` instead
@@ -1016,38 +1070,13 @@ class TestSessionRetirement:
         assert r.interrupted is False
 
 
-    def test_post_tool_watchdog_uses_monotonic_clock(self):
-        client = FakeClient()
-        client.queue_notification(
-            "item/completed",
-            item={
-                "type": "commandExecution", "id": "ex1",
-                "command": "echo hi", "cwd": "/tmp",
-                "status": "completed", "aggregatedOutput": "hi",
-                "exitCode": 0, "commandActions": [],
-            },
-            threadId="t", turnId="tu1",
-        )
-        s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
-        with patch.object(
-            session_mod.time,
-            "monotonic",
-            side_effect=lambda: next(monotonic_values),
-        ):
-            r = s.run_turn(
-                "tool then silence",
-                turn_timeout=5.0,
-                notification_poll_timeout=0.0,
-                post_tool_quiet_timeout=0.15,
-            )
-        assert r.interrupted is True
-        assert r.should_retire is True
-        assert r.error and "silent" in r.error
+    def test_tool_completion_does_not_shorten_inactivity_timeout(self):
+        """A quiet reasoning phase after a tool uses the normal turn timeout.
 
-    def test_post_tool_watchdog_resets_on_further_activity(self):
-        """A tool completion followed by an agent message should NOT trip
-        the watchdog — further activity = codex still alive."""
+        The former 90-second post-tool watchdog interrupted xhigh reasoning
+        before Codex could emit its next item. Advance the monotonic clock by
+        100 seconds between the tool and final answer to pin the regression.
+        """
         client = FakeClient()
         client.queue_notification(
             "item/completed",
@@ -1059,10 +1088,14 @@ class TestSessionRetirement:
             },
             threadId="t", turnId="tu1",
         )
-        # Non-tool activity immediately after — resets watchdog.
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "tool finished"},
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "text": "reasoning finished",
+                "phase": "final_answer",
+            },
             threadId="t", turnId="tu1",
         )
         client.queue_notification(
@@ -1070,17 +1103,44 @@ class TestSessionRetirement:
             turn={"id": "tu1", "status": "completed", "error": None},
         )
         s = make_session(client)
-        r = s.run_turn(
-            "tool then talk", turn_timeout=2.0,
-            notification_poll_timeout=0.01,
-            post_tool_quiet_timeout=0.05,
-        )
-        # Tool ran, then text reset the watchdog, then turn/completed.
-        # Should NOT be a retirement case.
-        assert r.tool_iterations == 1
-        assert r.final_text == "tool finished"
-        assert r.should_retire is False
+        monotonic_values = iter([
+            1000.0, 1000.0, 1000.0,
+            1100.0, 1100.0,
+            1100.0, 1100.0,
+        ])
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            r = s.run_turn(
+                "tool then silence",
+                turn_timeout=600.0,
+                notification_poll_timeout=0.0,
+            )
+        assert r.final_text == "reasoning finished"
         assert r.interrupted is False
+        assert r.should_retire is False
+        assert r.error is None
+
+    def test_absolute_turn_timeout_interrupts_runaway_turn(self):
+        client = FakeClient()
+        s = make_session(client)
+        monotonic_values = iter([1000.0, 1000.0, 1000.2])
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            r = s.run_turn(
+                "never completes",
+                turn_timeout=600.0,
+                notification_poll_timeout=0.0,
+                absolute_turn_timeout=0.15,
+            )
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "absolute timeout of 0.15s" in r.error
 
 
 

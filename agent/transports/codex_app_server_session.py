@@ -72,6 +72,12 @@ _DATA_IMAGE_EXTENSIONS = {
 }
 _MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024
 
+# A reasoning model can legitimately emit no app-server notifications for
+# several minutes after consuming a large tool result. Treat silence uniformly
+# across the whole turn instead of imposing a shorter post-tool deadline.
+_DEFAULT_TURN_INACTIVITY_TIMEOUT = 10 * 60.0
+_DEFAULT_ABSOLUTE_TURN_TIMEOUT = 2 * 60 * 60.0
+
 
 @dataclass
 class TurnResult:
@@ -93,8 +99,8 @@ class TurnResult:
     model_context_window: Optional[int] = None
     compacted: bool = False
     # Hint to the caller that the underlying codex subprocess is likely
-    # wedged (turn-level timeout fired, post-tool watchdog tripped, or
-    # token-refresh failure killed the child). The caller should retire
+    # wedged (turn-level or absolute timeout fired, or token-refresh failure
+    # killed the child). The caller should retire
     # the session so the next turn respawns codex from scratch instead
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
@@ -697,9 +703,9 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: float = _DEFAULT_TURN_INACTIVITY_TIMEOUT,
         notification_poll_timeout: float = 0.25,
-        post_tool_quiet_timeout: float = 90.0,
+        absolute_turn_timeout: float = _DEFAULT_ABSOLUTE_TURN_TIMEOUT,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -708,13 +714,13 @@ class CodexAppServerSession:
         ``turn_timeout`` is an inactivity limit, not a wall-clock turn budget.
         A long Codex turn may run past it while notifications attributable to
         this turn continue to arrive. Set it to ``0`` to disable the inactivity
-        limit.
+        limit. Tool completions use this same limit because a quiet reasoning
+        phase after a tool result is normal app-server behavior.
 
-        post_tool_quiet_timeout: if codex emits a tool completion and then
-        goes quiet for this many seconds without emitting another item or
-        `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
-        so a wedged codex doesn't burn the full turn deadline.
+        ``absolute_turn_timeout`` is the wall-clock ceiling for one turn even
+        when notifications continue to arrive. Set it to ``0`` to disable the
+        ceiling. Process exit, protocol failure, and explicit interruption are
+        still handled immediately.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -804,15 +810,23 @@ class CodexAppServerSession:
             self._active_turn_id = result.turn_id
         inactivity_timeout = turn_timeout if turn_timeout > 0 else None
         last_activity_at = time.monotonic()
+        turn_started_at = last_activity_at
+        absolute_timeout = (
+            absolute_turn_timeout if absolute_turn_timeout > 0 else None
+        )
         turn_complete = False
-        # Post-tool watchdog state. last_tool_completion_at is set whenever
-        # a tool-shaped item completes; if no further notification arrives
-        # within post_tool_quiet_timeout and the turn hasn't completed, we
-        # fast-fail and retire the session.
-        last_tool_completion_at: Optional[float] = None
 
         while not turn_complete:
             now = time.monotonic()
+            if (
+                absolute_timeout is not None
+                and (now - turn_started_at) >= absolute_timeout
+            ):
+                result.error = self._format_error_with_stderr(
+                    f"turn exceeded absolute timeout of "
+                    f"{absolute_turn_timeout:g}s"
+                )
+                break
             if (
                 inactivity_timeout is not None
                 and (now - last_activity_at) >= inactivity_timeout
@@ -837,24 +851,6 @@ class CodexAppServerSession:
                         "codex app-server subprocess exited unexpectedly",
                         tail_lines=20,
                     )
-                result.should_retire = True
-                break
-
-            # Post-tool watchdog: if a tool completion was the most recent
-            # signal and codex has been silent past the quiet timeout, give
-            # up on this turn instead of waiting for the outer deadline.
-            if (
-                last_tool_completion_at is not None
-                and (time.monotonic() - last_tool_completion_at)
-                    > post_tool_quiet_timeout
-            ):
-                self._issue_interrupt(result.turn_id)
-                result.interrupted = True
-                result.error = (
-                    f"codex went silent for "
-                    f"{post_tool_quiet_timeout:.0f}s after a tool result; "
-                    f"retiring app-server session."
-                )
                 result.should_retire = True
                 break
 
@@ -905,7 +901,6 @@ class CodexAppServerSession:
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
-                        last_tool_completion_at = event_at
                     if proj.final_text is not None:
                         _apply_projected_final_text(result, proj)
                         if _has_turn_aborted_marker(proj.final_text):
@@ -916,10 +911,8 @@ class CodexAppServerSession:
                                 or "codex reported turn_aborted"
                             )
                 self._handle_server_request(sreq)
-                # Activity counts as live signal — reset the post-tool
-                # quiet timer so an approval round-trip doesn't trip it.
+                # The approval round-trip is live turn activity.
                 last_activity_at = time.monotonic()
-                last_tool_completion_at = None
                 continue
 
             note = self._client.take_notification(
@@ -962,15 +955,6 @@ class CodexAppServerSession:
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
-                # Arm/refresh the post-tool quiet watchdog whenever a
-                # tool-shaped item completes.
-                last_tool_completion_at = event_at
-            else:
-                # Any non-tool projected activity (assistant message,
-                # status update, etc.) means codex is still producing
-                # output — clear the quiet timer so we don't fast-fail.
-                if projection.messages or projection.final_text is not None:
-                    last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
                 # (e.g. partial then final). Once an explicit final answer is
@@ -1028,10 +1012,9 @@ class CodexAppServerSession:
             turn_complete = True
 
         if not turn_complete and not result.interrupted:
-            # Hit the inactivity deadline. Issue interrupt to stop wasted compute, and
-            # tell the caller to retire the session — a turn that never
-            # finished is a strong sign codex is wedged in a way the next
-            # turn shouldn't inherit.
+            # Hit the inactivity or absolute deadline. Issue interrupt to stop
+            # wasted compute and retire the unfinished session so the next turn
+            # does not inherit a potentially wedged process.
             self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
@@ -1343,8 +1326,10 @@ class CodexAppServerSession:
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
                 logger.exception("approval_callback raised on exec request")
-                return "decline"
-        return "decline"  # fail-closed when no callback wired
+                return "cancel"
+        # No callback means no human saw the request. Cancel fail-closed; a
+        # decline is reserved for an actual user denial.
+        return "cancel"
 
     def _decide_apply_patch_approval(self, params: dict) -> str:
         """Decide a Codex apply_patch approval request.
@@ -1390,8 +1375,8 @@ class CodexAppServerSession:
                 return _approval_choice_to_codex_decision(choice)
             except Exception:
                 logger.exception("approval_callback raised on apply_patch")
-                return "decline"
-        return "decline"
+                return "cancel"
+        return "cancel"
 
     def _track_pending_file_change(self, note: dict) -> None:
         """Maintain self._pending_file_changes from item/started + item/completed
@@ -1517,9 +1502,12 @@ def _approval_choice_to_codex_decision(choice: str) -> str:
         return "accept"
     if choice in {"session", "always"}:
         return "acceptForSession"
-    # "deny" and "timeout" both map to decline — codex has no wire value for
-    # "prompt expired"; the Hermes-side messaging already distinguishes them.
-    return "decline"
+    if choice == "deny":
+        return "decline"
+    # Timeout, an unavailable approval channel, callback failure, and unknown
+    # outcomes all mean no human denial occurred. ``cancel`` keeps the action
+    # fail-closed without fabricating a rejection by the user.
+    return "cancel"
 
 
 def _has_turn_aborted_marker(text: str) -> bool:

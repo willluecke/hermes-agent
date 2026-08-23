@@ -887,24 +887,29 @@ def run_codex_app_server_turn(
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
-        # Approval callback: defer to Hermes' standard prompt flow if a
-        # CLI thread has installed one. Gateway / cron contexts get the
-        # codex-side fail-closed default.
+        # Approval callback: defer to Hermes' standard prompt flow if a CLI
+        # thread has installed one. Gateway/API turns use their existing
+        # per-run approval queue; cron or detached contexts without an
+        # attached notifier return an explicit ``unavailable`` outcome. That
+        # distinction matters because Codex must cancel an unpresented request,
+        # not report it as rejected by the user.
         try:
             from tools.terminal_tool import _get_approval_callback
             approval_callback = _get_approval_callback()
         except Exception:
             approval_callback = None
+        if approval_callback is None:
+            from tools.approval import request_codex_approval
 
-        # Gateway / cron contexts have no UI to surface codex's approval
-        # requests through, so codex app-server exec / apply_patch requests
-        # fail closed (silently decline) by default. When the user has
+            approval_callback = request_codex_approval
+
+        # When the user has
         # explicitly opted out of Hermes approvals — via `approvals.mode: off`
         # in config, the /yolo session toggle, or --yolo / HERMES_YOLO_MODE —
         # honor that and let codex's own sandbox permission profile
         # (~/.codex/config.toml) be the policy gate instead of double-gating
-        # with a missing Hermes UI. Defaults (manual/smart/unset) preserve the
-        # current fail-closed behavior — this is a no-op for those users.
+        # with Hermes. Defaults (manual/smart/unset) stay fail-closed and use
+        # the callback above for a genuine round trip when a surface exists.
         auto_approve_requests = False
         try:
             from tools.approval import is_approval_bypass_active
@@ -1012,7 +1017,7 @@ def run_codex_app_server_turn(
         agent.clear_interrupt()
 
     # If the turn signalled the underlying client is wedged (deadline
-    # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
+    # blown, a turn deadline fired, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
     # rather than riding the broken process. Mirrors openclaw beta.8's
     # "retire timed-out app-server clients" fix.
