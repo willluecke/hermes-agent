@@ -1,0 +1,10 @@
+[Unit]
+Description=Command Center daily Hermes state backup
+After=local-fs.target hermes-sync.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/will/.local/bin/backup-command-center quick
+Nice=10
+IOSchedulingClass=idle
+UMask=0077

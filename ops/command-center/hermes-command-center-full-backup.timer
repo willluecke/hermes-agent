@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Command Center full Hermes backup weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 03:45:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=hermes-command-center-full-backup.service
+
+[Install]
+WantedBy=timers.target

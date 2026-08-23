@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Command Center Hermes state backup daily
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=10m
+Persistent=true
+Unit=hermes-command-center-backup.service
+
+[Install]
+WantedBy=timers.target
