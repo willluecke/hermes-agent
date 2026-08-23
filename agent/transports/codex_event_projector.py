@@ -63,7 +63,11 @@ class ProjectionResult:
 
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
-    final_text: Optional[str] = None  # Set when an agentMessage completes
+    final_text: Optional[str] = None
+    # True only when Codex explicitly classified this item as the turn's
+    # terminal answer. Phase-less legacy items may still populate final_text,
+    # but they are not safe evidence for deadline recovery.
+    is_final_answer: bool = False
 
 
 class CodexEventProjector:
@@ -118,11 +122,23 @@ class CodexEventProjector:
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""
+        phase = item.get("phase")
         msg: dict[str, Any] = {"role": "assistant", "content": text}
+        if phase in {"commentary", "final_answer"}:
+            msg["phase"] = phase
         if self._pending_reasoning:
             msg["reasoning"] = "\n".join(self._pending_reasoning)
             self._pending_reasoning = []
-        return ProjectionResult(messages=[msg], final_text=text)
+        # Explicit commentary belongs in the transcript but must never become
+        # the run's terminal output. Missing phase preserves compatibility for
+        # older Codex providers once turn/completed arrives; the session layer
+        # will not use an unphased item to recover a timed-out turn.
+        final_text = text if phase != "commentary" else None
+        return ProjectionResult(
+            messages=[msg],
+            final_text=final_text,
+            is_final_answer=phase == "final_answer",
+        )
 
     def _project_user_message(self, item: dict) -> ProjectionResult:
         # codex's userMessage content is a list of UserInput variants. For

@@ -828,7 +828,12 @@ class TestSessionRetirement:
         client = FakeClient()
         client.queue_notification(
             "item/completed",
-            item={"type": "agentMessage", "id": "m1", "text": "done"},
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "phase": "final_answer",
+                "text": "done",
+            },
             threadId="t",
             turnId="tu1",
         )
@@ -847,6 +852,70 @@ class TestSessionRetirement:
             for msg in r.projected_messages
         )
         assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_commentary_without_turn_completed_times_out_instead_of_completing(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m-commentary",
+                "phase": "commentary",
+                "text": "I am still validating the catalog.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "validate",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        assert r.final_text == ""
+        assert r.final_answer_seen is False
+        assert r.interrupted is True
+        assert r.should_retire is True
+        assert r.error and "timed out" in r.error
+        assert any(
+            msg.get("phase") == "commentary"
+            and msg.get("content") == "I am still validating the catalog."
+            for msg in r.projected_messages
+        )
+        assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_phase_less_message_cannot_replace_explicit_final_at_deadline(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m-final",
+                "phase": "final_answer",
+                "text": "authoritative answer",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m-legacy",
+                "text": "late unclassified text",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        s = make_session(client)
+        r = s.run_turn(
+            "validate",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        assert r.final_text == "authoritative answer"
+        assert r.final_answer_seen is True
+        assert r.interrupted is False
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):

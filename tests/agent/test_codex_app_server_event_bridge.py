@@ -158,13 +158,41 @@ class TestStreamDeltaDispatch:
     def test_agent_message_delta_fires_stream_delta(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage",
+            "id": "answer-1",
+            "phase": "final_answer",
+            "text": "",
+        }))
         bridge({"method": "item/agentMessage/delta",
-                "params": {"delta": "hello "}})
+                "params": {"itemId": "answer-1", "delta": "hello "}})
         bridge({"method": "item/agentMessage/delta",
-                "params": {"delta": "world"}})
+                "params": {"itemId": "answer-1", "delta": "world"}})
         assert agent._fire_stream_delta.call_count == 2
         assert agent._fire_stream_delta.call_args_list[0].args == ("hello ",)
         assert agent._fire_stream_delta.call_args_list[1].args == ("world",)
+
+    def test_commentary_delta_never_enters_final_text_stream(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage",
+            "id": "commentary-1",
+            "phase": "commentary",
+            "text": "",
+        }))
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "commentary-1", "delta": "Still working."},
+        })
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "commentary-1",
+            "phase": "commentary",
+            "text": "Still working.",
+        }))
+        agent._fire_stream_delta.assert_not_called()
+        agent._emit_interim_assistant_message.assert_called_once()
 
 
 
@@ -256,6 +284,7 @@ class TestAgentMessageInterimDispatch:
         bridge(_item_completed({
             "type": "agentMessage",
             "id": "am-1",
+            "phase": "commentary",
             "text": "I'll check the config first.",
         }))
         agent._emit_interim_assistant_message.assert_called_once_with(
@@ -273,6 +302,7 @@ class TestAgentMessageInterimDispatch:
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
             "type": "agentMessage", "id": "am-5", "text": "I'll check config.",
+            "phase": "commentary",
         }))
         agent._emit_interim_assistant_message.assert_not_called()
         # Tool progress is unaffected by the commentary toggle.

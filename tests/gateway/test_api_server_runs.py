@@ -410,10 +410,37 @@ class TestRunEvents:
                 body = await events_resp.text()
 
         assert '"event": "message.interim"' in body
+        assert f'"message_id": "{run_id}:commentary:1"' in body
         assert '"text": "I will inspect the files now."' in body
         assert '"already_streamed": true' in body
         assert '"event": "run.completed"' in body
         assert "Inspection complete." in body
+
+    @pytest.mark.asyncio
+    async def test_partial_result_is_failed_not_completed(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "This is only progress.",
+                    "completed": False,
+                    "partial": True,
+                    "error": "turn timed out after 600s",
+                }
+                mock_agent.session_prompt_tokens = 10
+                mock_agent.session_completion_tokens = 5
+                mock_agent.session_total_tokens = 15
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "inspect"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert '"event": "run.failed"' in body
+        assert "turn timed out after 600s" in body
+        assert '"event": "run.completed"' not in body
 
     @pytest.mark.asyncio
     async def test_events_replay_after_first_stream_closes(self, adapter):

@@ -115,6 +115,39 @@ class TestAgentMessageProjection:
         assert r.messages == [{"role": "assistant", "content": "hi there"}]
         assert r.is_tool_iteration is False
 
+    def test_commentary_is_transcript_only_not_terminal_text(self) -> None:
+        p = CodexEventProjector()
+        r = p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage",
+                "id": "commentary-1",
+                "phase": "commentary",
+                "text": "I am checking the repository.",
+            }},
+        })
+        assert r.final_text is None
+        assert r.is_final_answer is False
+        assert r.messages == [{
+            "role": "assistant",
+            "content": "I am checking the repository.",
+            "phase": "commentary",
+        }]
+
+    def test_explicit_final_answer_is_authoritative(self) -> None:
+        p = CodexEventProjector()
+        r = p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage",
+                "id": "final-1",
+                "phase": "final_answer",
+                "text": "The work is complete.",
+            }},
+        })
+        assert r.final_text == "The work is complete."
+        assert r.is_final_answer is True
+
     def test_pending_reasoning_attaches_to_next_assistant_message(self) -> None:
         p = CodexEventProjector()
         # First a reasoning item lands

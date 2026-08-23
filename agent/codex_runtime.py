@@ -500,14 +500,14 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
       * ``item/completed`` for tool-shaped items → ``tool_progress_callback(
         "tool.completed", name, None, None, duration=..., is_error=...,
         result=...)``
-      * ``item/agentMessage/delta`` → ``_fire_stream_delta(text)`` so chat
-        adapters can render the assistant's reply as it streams.
+      * ``item/agentMessage/delta`` for ``phase=final_answer`` →
+        ``_fire_stream_delta(text)`` so chat adapters render only the
+        authoritative answer in the answer slot. Commentary deltas are held
+        out of that channel and surface through the completed-item path.
       * ``item/reasoning/delta`` → ``_fire_reasoning_delta(text)``
-      * ``item/completed`` for ``agentMessage`` →
+      * ``item/completed`` for ``phase=commentary`` ``agentMessage`` →
         ``_emit_interim_assistant_message({"role": "assistant",
-        "content": text})``. The gateway's ``already_streamed`` check
-        dedupes against any text the stream-delta callback already
-        rendered for the same message.
+        "content": text})``.
 
     All callback invocations are guarded — a buggy display callback must
     not tear down the codex turn loop. Errors are logged at DEBUG so the
@@ -517,6 +517,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    agent_message_phases: dict[str, str] = {}
+    buffered_agent_deltas: dict[str, list[str]] = {}
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -606,6 +608,18 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
             return
+        item_id = params.get("itemId") or params.get("item_id") or ""
+        phase = agent_message_phases.get(item_id)
+        if phase == "commentary":
+            return
+        if phase != "final_answer":
+            # Current app-server versions provide phase on item/started, but
+            # delta notifications themselves do not. Buffer an out-of-order or
+            # legacy delta until item/completed tells us whether it is progress
+            # or the final answer. This favors delayed text over misclassified
+            # text that is later erased.
+            buffered_agent_deltas.setdefault(item_id, []).append(text)
+            return
         fn = getattr(agent, "_fire_stream_delta", None)
         if fn is None:
             return
@@ -629,6 +643,8 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
         if not isinstance(text, str) or not text.strip():
+            return
+        if item.get("phase") != "commentary":
             return
         # display.show_commentary=false — mid-turn narration stays off the
         # visible interim path on this runtime too (same contract as the
@@ -662,14 +678,37 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
-        if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
-            _fire_tool_started(item)
-            return
+        if method == "item/started":
+            if item_type in _CODEX_TOOL_ITEM_TYPES:
+                _fire_tool_started(item)
+                return
+            if item_type == "agentMessage":
+                item_id = item.get("id") or ""
+                phase = item.get("phase")
+                if item_id and phase in {"commentary", "final_answer"}:
+                    agent_message_phases[item_id] = phase
+                return
         if method == "item/completed":
             if item_type in _CODEX_TOOL_ITEM_TYPES:
                 _fire_tool_completed(item)
             elif item_type == "agentMessage":
+                item_id = item.get("id") or ""
+                phase = item.get("phase")
+                if item_id and phase in {"commentary", "final_answer"}:
+                    agent_message_phases[item_id] = phase
+                buffered = buffered_agent_deltas.pop(item_id, [])
+                if phase != "commentary":
+                    # phase-less legacy messages remain compatible, but their
+                    # deltas wait until completion instead of leaking a possible
+                    # progress note into the final-answer slot.
+                    agent_message_phases[item_id] = "final_answer"
+                    for delta in buffered:
+                        _fire_text_delta({
+                            "delta": delta,
+                            "itemId": item_id,
+                        })
                 _fire_agent_message_completed(item)
+                agent_message_phases.pop(item_id, None)
 
     return on_event
 

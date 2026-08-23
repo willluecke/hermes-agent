@@ -78,6 +78,10 @@ class TurnResult:
     """Result of one user→assistant→tool turn through the codex app-server."""
 
     final_text: str = ""
+    # Set only by an agentMessage carrying phase=final_answer. This is stricter
+    # than final_text because phase-less legacy messages are accepted only when
+    # Codex also emits turn/completed.
+    final_answer_seen: bool = False
     projected_messages: list[dict] = field(default_factory=list)
     tool_iterations: int = 0
     interrupted: bool = False
@@ -95,6 +99,16 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+
+
+def _apply_projected_final_text(result: TurnResult, projection: Any) -> None:
+    """Keep a phase-qualified final answer canonical once one is observed."""
+    if projection.final_text is None:
+        return
+    if projection.is_final_answer or not result.final_answer_seen:
+        result.final_text = projection.final_text
+    if projection.is_final_answer:
+        result.final_answer_seen = True
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -857,7 +871,7 @@ class CodexAppServerSession:
                         result.tool_iterations += 1
                         last_tool_completion_at = time.monotonic()
                     if proj.final_text is not None:
-                        result.final_text = proj.final_text
+                        _apply_projected_final_text(result, proj)
                         if _has_turn_aborted_marker(proj.final_text):
                             turn_complete = True
                             result.interrupted = True
@@ -920,8 +934,9 @@ class CodexAppServerSession:
                     last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
-                # (e.g. partial then final). Take the last one as canonical.
-                result.final_text = projection.final_text
+                # (e.g. partial then final). Once an explicit final answer is
+                # seen, a later phase-less legacy item cannot replace it.
+                _apply_projected_final_text(result, projection)
                 # Some codex builds tear a turn down by emitting a
                 # `<turn_aborted>` marker in the agent message text and
                 # never sending turn/completed. Treat the marker itself
@@ -963,12 +978,13 @@ class CodexAppServerSession:
             not turn_complete
             and not result.interrupted
             and result.final_text
+            and result.final_answer_seen
             and result.error is None
         ):
             logger.warning(
                 "codex app-server turn reached deadline after a completed "
-                "assistant message but before turn/completed; accepting "
-                "the assistant text as the terminal response"
+                "final-answer message but before turn/completed; accepting "
+                "the phase-qualified text as the terminal response"
             )
             turn_complete = True
 
@@ -1138,7 +1154,7 @@ class CodexAppServerSession:
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
             if projection.final_text is not None:
-                result.final_text = projection.final_text
+                _apply_projected_final_text(result, projection)
                 if _has_turn_aborted_marker(projection.final_text):
                     turn_complete = True
                     result.interrupted = True

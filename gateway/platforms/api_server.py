@@ -7673,15 +7673,20 @@ class APIServerAdapter(BasePlatformAdapter):
         # Codex and Hermes can produce real mid-turn assistant commentary
         # before tool execution. Keep it separate from final-answer deltas so
         # API clients do not have to guess which streamed text is canonical.
+        interim_sequence = 0
+
         def _interim_cb(text: str, *, already_streamed: bool = False) -> None:
+            nonlocal interim_sequence
             if not isinstance(text, str) or not text.strip():
                 return
             if run_id not in self._run_streams:
                 return
+            interim_sequence += 1
             try:
                 loop.call_soon_threadsafe(_put_event_if_active, {
                     "event": "message.interim",
                     "run_id": run_id,
+                    "message_id": f"{run_id}:commentary:{interim_sequence}",
                     "timestamp": time.time(),
                     "text": text,
                     "already_streamed": bool(already_streamed),
@@ -7856,8 +7861,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                elif isinstance(result, dict) and (
+                    result.get("failed")
+                    or result.get("completed") is False
+                    or result.get("partial") is True
+                ):
+                    error_msg = _redact_api_error_text(
+                        result.get("error")
+                        or result.get("interrupt_message")
+                        or "agent run ended before a final answer"
+                    )
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
@@ -7881,6 +7894,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "output": final_response,
+                        "output_kind": "final",
                         "usage": usage,
                     }
                     if pending_steer:
@@ -7890,6 +7904,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "completed",
                         output=final_response,
+                        output_kind="final",
                         usage=usage,
                         last_event="run.completed",
                         **({"pending_steer": pending_steer} if pending_steer else {}),
