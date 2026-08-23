@@ -683,6 +683,11 @@ class CodexAppServerSession:
         forwarding server-initiated approval requests and projecting items
         into Hermes' messages shape.
 
+        ``turn_timeout`` is an inactivity limit, not a wall-clock turn budget.
+        A long Codex turn may run past it while notifications attributable to
+        this turn continue to arrive. Set it to ``0`` to disable the inactivity
+        limit.
+
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
         `turn/completed`, fast-fail and mark the session for retirement.
@@ -775,7 +780,8 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+        inactivity_timeout = turn_timeout if turn_timeout > 0 else None
+        last_activity_at = time.monotonic()
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -783,7 +789,13 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
+        while not turn_complete:
+            now = time.monotonic()
+            if (
+                inactivity_timeout is not None
+                and (now - last_activity_at) >= inactivity_timeout
+            ):
+                break
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -847,6 +859,8 @@ class CodexAppServerSession:
                             pending.get("method"),
                         )
                         continue
+                    event_at = time.monotonic()
+                    last_activity_at = event_at
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -869,7 +883,7 @@ class CodexAppServerSession:
                         result.projected_messages.extend(proj.messages)
                     if proj.is_tool_iteration:
                         result.tool_iterations += 1
-                        last_tool_completion_at = time.monotonic()
+                        last_tool_completion_at = event_at
                     if proj.final_text is not None:
                         _apply_projected_final_text(result, proj)
                         if _has_turn_aborted_marker(proj.final_text):
@@ -882,6 +896,7 @@ class CodexAppServerSession:
                 self._handle_server_request(sreq)
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
+                last_activity_at = time.monotonic()
                 last_tool_completion_at = None
                 continue
 
@@ -902,6 +917,8 @@ class CodexAppServerSession:
                 )
                 continue
 
+            event_at = time.monotonic()
+            last_activity_at = event_at
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -925,7 +942,7 @@ class CodexAppServerSession:
                 result.tool_iterations += 1
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
-                last_tool_completion_at = time.monotonic()
+                last_tool_completion_at = event_at
             else:
                 # Any non-tool projected activity (assistant message,
                 # status update, etc.) means codex is still producing
@@ -989,7 +1006,7 @@ class CodexAppServerSession:
             turn_complete = True
 
         if not turn_complete and not result.interrupted:
-            # Hit the deadline. Issue interrupt to stop wasted compute, and
+            # Hit the inactivity deadline. Issue interrupt to stop wasted compute, and
             # tell the caller to retire the session — a turn that never
             # finished is a strong sign codex is wedged in a way the next
             # turn shouldn't inherit.
@@ -997,7 +1014,7 @@ class CodexAppServerSession:
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s"
+                    f"turn timed out after {turn_timeout}s without activity"
                 )
             result.should_retire = True
 

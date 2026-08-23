@@ -884,6 +884,67 @@ class TestSessionRetirement:
         )
         assert any(method == "turn/interrupt" for method, _ in client.requests)
 
+    def test_active_turn_progress_refreshes_inactivity_deadline(self):
+        """Total turn time may exceed the timeout while current-turn events
+        keep arriving inside the inactivity window.
+        """
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m-commentary-1",
+                "phase": "commentary",
+                "text": "Still working.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m-commentary-2",
+                "phase": "commentary",
+                "text": "Validation is progressing.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m-final",
+                "phase": "final_answer",
+                "text": "Validation completed.",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        original_take_notification = client.take_notification
+
+        def delayed_notification(timeout):
+            time.sleep(0.03)
+            return original_take_notification(timeout)
+
+        client.take_notification = delayed_notification
+        result = make_session(client).run_turn(
+            "validate",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+
+        assert result.final_text == "Validation completed."
+        assert result.final_answer_seen is True
+        assert result.interrupted is False
+        assert result.error is None
+
     def test_phase_less_message_cannot_replace_explicit_final_at_deadline(self):
         client = FakeClient()
         client.queue_notification(

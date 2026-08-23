@@ -1885,6 +1885,15 @@ class AIAgent:
         # is a deliberate user request and still runs.
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
             return
+        # Native Codex app-server authentication belongs to the child process;
+        # Hermes receives only a synthetic base URL and placeholder token. An
+        # automatic review fork runs through the HTTP agent loop, so inheriting
+        # that runtime fails with UnsupportedProtocol (or authentication if the
+        # URL is rewritten). Keep this best-effort maintenance fork out of the
+        # authoritative turn. A separately routed auxiliary review can be added
+        # later without weakening the app-server credential boundary.
+        if focus is None and getattr(self, "api_mode", "") == "codex_app_server":
+            return
         # Explicit off-switch for automatic post-turn forks
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
         # still works — same contract as zeroing the nudge intervals (#87250).

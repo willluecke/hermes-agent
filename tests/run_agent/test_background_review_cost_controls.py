@@ -111,6 +111,26 @@ def test_routing_resolution_failure_falls_back_to_parent():
     assert rt["provider"] == "openai-codex"
 
 
+def test_native_app_server_skips_automatic_background_review():
+    from run_agent import AIAgent
+
+    agent = _FakeAgent()
+    agent.api_mode = "codex_app_server"
+    agent._delegate_depth = 0
+
+    with patch(
+        "agent.background_review.load_background_review_settings"
+    ) as load_settings:
+        AIAgent._spawn_background_review(
+            agent,
+            messages_snapshot=[],
+            review_memory=True,
+            review_skills=False,
+        )
+
+    load_settings.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # _digest_history — routed-path compact replay
 # ---------------------------------------------------------------------------
