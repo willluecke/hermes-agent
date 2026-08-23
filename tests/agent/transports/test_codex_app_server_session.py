@@ -21,6 +21,7 @@ from agent.transports.codex_app_server_session import (
     _approval_choice_to_codex_decision,
     _prepare_turn_input_items,
 )
+from agent.transports.codex_app_server import CodexAppServerError
 
 
 class FakeClient:
@@ -54,6 +55,8 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {})["threadId"]}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -209,6 +212,40 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_existing_native_thread_is_resumed(self):
+        client = FakeClient()
+        s = make_session(client, resume_thread_id="thread-existing-123")
+
+        assert s.ensure_started() == "thread-existing-123"
+        assert s._resumed_existing_thread is True
+        assert [method for method, _ in client.requests].count("thread/resume") == 1
+        assert not any(method == "thread/start" for method, _ in client.requests)
+        _, params = next(r for r in client.requests if r[0] == "thread/resume")
+        assert params == {
+            "cwd": "/tmp",
+            "threadId": "thread-existing-123",
+        }
+
+    def test_failed_resume_starts_fresh_for_durable_history_fallback(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(code=-32602, message="thread missing")
+            if method == "thread/start":
+                return {"thread": {"id": "thread-recovered-456"}}
+            return {}
+
+        client._request_handler = handle
+        s = make_session(client, resume_thread_id="thread-missing-123")
+
+        assert s.ensure_started() == "thread-recovered-456"
+        assert s._resumed_existing_thread is False
+        assert [method for method, _ in client.requests] == [
+            "thread/resume",
+            "thread/start",
+        ]
 
     def test_close_idempotent(self):
         client = FakeClient()

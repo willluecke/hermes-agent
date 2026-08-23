@@ -86,6 +86,118 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_fresh_agent_resumes_thread_bound_to_hermes_session(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured["resume_thread_id"] = kwargs.get("resume_thread_id")
+            self._thread_id = kwargs.get("resume_thread_id") or "thread-new"
+            self._resumed_existing_thread = bool(kwargs.get("resume_thread_id"))
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured["user_input"] = user_input
+            return TurnResult(
+                final_text="continued",
+                projected_messages=[
+                    {"role": "assistant", "content": "continued"}
+                ],
+                turn_id="turn-resumed",
+                thread_id=self._thread_id,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: self._thread_id,
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-resume"
+        db.create_session(session_id, "api_server")
+        db.patch_session_model_config(
+            session_id,
+            {"_codex_app_server_thread_id": "thread-existing-regwatch"},
+        )
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    {"role": "user", "content": "Work on RegWatch"},
+                    {"role": "assistant", "content": "RegWatch is loaded"},
+                ],
+            )
+
+        assert result["final_response"] == "continued"
+        assert captured["resume_thread_id"] == "thread-existing-regwatch"
+        assert captured["user_input"] == "continue"
+
+    def test_fresh_thread_receives_durable_history_handoff(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured["resume_thread_id"] = kwargs.get("resume_thread_id")
+            self._thread_id = "thread-new-regwatch"
+            self._resumed_existing_thread = False
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured["user_input"] = user_input
+            return TurnResult(
+                final_text="continued",
+                projected_messages=[
+                    {"role": "assistant", "content": "continued"}
+                ],
+                turn_id="turn-new",
+                thread_id=self._thread_id,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: self._thread_id,
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-fallback"
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    {"role": "user", "content": "Work on RegWatch"},
+                    {
+                        "role": "assistant",
+                        "content": "Final verdict: NOT PRODUCTION-READY",
+                    },
+                ],
+            )
+
+        assert captured["resume_thread_id"] in {None, ""}
+        assert "<hermes_conversation_history>" in captured["user_input"]
+        assert "Work on RegWatch" in captured["user_input"]
+        assert "Final verdict: NOT PRODUCTION-READY" in captured["user_input"]
+        assert "<current_user_request>\ncontinue" in captured["user_input"]
+        assert (
+            db.get_session_model_config_value(
+                session_id, "_codex_app_server_thread_id"
+            )
+            == "thread-new-regwatch"
+        )
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

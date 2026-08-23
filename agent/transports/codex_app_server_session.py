@@ -406,6 +406,7 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         hermes_session_id: Optional[str] = None,
+        resume_thread_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
         require_exact: bool = False,
@@ -419,6 +420,8 @@ class CodexAppServerSession:
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._hermes_session_id = str(hermes_session_id or "").strip()
+        self._resume_thread_id = str(resume_thread_id or "").strip()
+        self._resumed_existing_thread = False
         self._model = str(model or "").strip()
         self._effort = str(effort or "").strip().lower()
         self._require_exact = bool(require_exact)
@@ -547,7 +550,25 @@ class CodexAppServerSession:
         params: dict[str, Any] = {"cwd": self._cwd}
         if self._model:
             params["model"] = self._model
-        result = self._client.request("thread/start", params, timeout=15)
+        method = "thread/start"
+        if self._resume_thread_id:
+            method = "thread/resume"
+            params["threadId"] = self._resume_thread_id
+            try:
+                result = self._client.request(method, params, timeout=15)
+                self._resumed_existing_thread = True
+            except (CodexAppServerError, TimeoutError) as exc:
+                logger.warning(
+                    "codex thread resume failed for %s; starting a fresh "
+                    "thread with durable Hermes history fallback: %s",
+                    self._resume_thread_id[:8],
+                    exc,
+                )
+                method = "thread/start"
+                params.pop("threadId", None)
+                result = self._client.request(method, params, timeout=15)
+        else:
+            result = self._client.request(method, params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -563,13 +584,14 @@ class CodexAppServerSession:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if self._resumed_existing_thread else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,

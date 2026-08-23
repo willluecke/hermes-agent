@@ -27,6 +27,117 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+_CODEX_APP_SERVER_THREAD_ID_KEY = "_codex_app_server_thread_id"
+_CODEX_HISTORY_HANDOFF_MAX_CHARS = 240_000
+
+
+def _stored_codex_app_server_thread_id(agent: Any) -> str:
+    """Return the native Codex thread bound to this durable Hermes session."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    getter = getattr(session_db, "get_session_model_config_value", None)
+    if not session_id or not callable(getter):
+        return ""
+    try:
+        value = getter(session_id, _CODEX_APP_SERVER_THREAD_ID_KEY, "")
+    except Exception:
+        logger.warning(
+            "could not read persisted Codex thread for Hermes session %s",
+            session_id,
+            exc_info=True,
+        )
+        return ""
+    value = str(value or "").strip()
+    if not value or len(value) > 200:
+        return ""
+    return value
+
+
+def _persist_codex_app_server_thread_id(agent: Any, thread_id: str) -> None:
+    """Atomically bind a native Codex thread to the durable Hermes session."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    patcher = getattr(session_db, "patch_session_model_config", None)
+    if not session_id or not thread_id or not callable(patcher):
+        return
+    try:
+        patcher(session_id, {_CODEX_APP_SERVER_THREAD_ID_KEY: thread_id})
+    except Exception:
+        logger.warning(
+            "could not persist Codex thread %s for Hermes session %s",
+            thread_id[:8],
+            session_id,
+            exc_info=True,
+        )
+
+
+def _history_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(part.get("text") or "").strip()
+        for part in content
+        if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+    ).strip()
+
+
+def _codex_history_handoff(
+    history: List[Dict[str, Any]], user_message: Any
+) -> Any:
+    """Seed a fresh native thread when no persisted Codex thread can resume.
+
+    The app-server runtime accepts only the current turn at ``turn/start``.
+    Preserve complete recent user/assistant messages inside a disclosed
+    transcript rather than silently dropping client-managed history.
+    """
+    rendered: list[str] = []
+    used = 0
+    dropped = 0
+    for message in reversed(history):
+        role = str(message.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = _history_text(message.get("content"))
+        if not content:
+            continue
+        block = f"{role.upper()}:\n{content}"
+        if len(block) > _CODEX_HISTORY_HANDOFF_MAX_CHARS:
+            block = block[-_CODEX_HISTORY_HANDOFF_MAX_CHARS:]
+        if used + len(block) > _CODEX_HISTORY_HANDOFF_MAX_CHARS:
+            dropped += 1
+            continue
+        rendered.append(block)
+        used += len(block)
+    if not rendered:
+        return user_message
+    rendered.reverse()
+    disclosure = (
+        f"\n[{dropped} older non-empty messages omitted from this recovery handoff.]"
+        if dropped
+        else ""
+    )
+    context = (
+        "Hermes is restoring an existing conversation into a fresh native "
+        "Codex thread. Use the following transcript as prior conversation "
+        "context, then execute the current user request. Do not ask the user "
+        "to reselect a project already established here.\n\n"
+        "<hermes_conversation_history>\n"
+        + "\n\n".join(rendered)
+        + disclosure
+        + "\n</hermes_conversation_history>\n\n"
+        "<current_user_request>\n"
+    )
+    if isinstance(user_message, list):
+        return [
+            {"type": "text", "text": context},
+            *user_message,
+            {"type": "text", "text": "\n</current_user_request>"},
+        ]
+    return context + str(user_message) + "\n</current_user_request>"
+
+
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
     """Return the serialized request size and exception class chain.
 
@@ -770,7 +881,9 @@ def run_codex_app_server_turn(
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
+    created_codex_session = False
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
+        created_codex_session = True
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
@@ -824,6 +937,7 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             hermes_session_id=str(getattr(agent, "session_id", "") or ""),
+            resume_thread_id=_stored_codex_app_server_thread_id(agent),
             model=getattr(agent, "model", ""),
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
             require_exact=require_exact,
@@ -840,7 +954,14 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        thread_id = agent._codex_session.ensure_started()
+        _persist_codex_app_server_thread_id(agent, thread_id)
+        turn_input = user_message
+        if created_codex_session and not getattr(
+            agent._codex_session, "_resumed_existing_thread", False
+        ):
+            turn_input = _codex_history_handoff(messages[:-1], user_message)
+        turn = agent._codex_session.run_turn(user_input=turn_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
