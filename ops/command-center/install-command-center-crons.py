@@ -110,6 +110,18 @@ def main() -> None:
         "Give the Opus worker a DIRECTED packet, not 'review everything':",
         monthly["name"],
     )
+    monthly_prompt = replace_once(
+        monthly_prompt,
+        "rejections that turned outcome=refuted => Fable false-positive pattern there",
+        "rejections that turned outcome=refuted => Opus false-positive pattern there",
+        monthly["name"],
+    )
+    monthly_prompt = replace_once(
+        monthly_prompt,
+        "one Fable pass over a repo",
+        "one Opus worker pass over a repo",
+        monthly["name"],
+    )
     edit_agent_job(monthly, monthly_prompt)
 
     auth_script = SOURCE_DIR / "auth-health-check.sh"

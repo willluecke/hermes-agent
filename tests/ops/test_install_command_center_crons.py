@@ -54,6 +54,11 @@ def legacy_jobs() -> list[dict]:
                         "code read directly."
                     ),
                     "Give Fable a DIRECTED packet, not 'review everything':",
+                    (
+                        "rejections that turned outcome=refuted => Fable "
+                        "false-positive pattern there"
+                    ),
+                    "one Fable pass over a repo",
                 ]
             ),
         },
