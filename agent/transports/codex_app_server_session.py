@@ -538,6 +538,7 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             client_env: dict[str, str] = {}
+            client_extra_args: list[str] = []
             if self._hermes_session_id:
                 client_env["HERMES_GATEWAY_SESSION_ID"] = self._hermes_session_id
             policy = self._reversible_deletion_policy
@@ -562,6 +563,7 @@ class CodexAppServerSession:
                         inherited_path=os.environ.get("PATH", ""),
                     )
                     client_env.update(runtime.env)
+                    client_extra_args.extend(runtime.codex_config_args)
                     self._protected_delete_shim_active = True
                 except Exception:
                     logger.exception(
@@ -574,6 +576,8 @@ class CodexAppServerSession:
             }
             if client_env:
                 client_kwargs["env"] = client_env
+            if client_extra_args:
+                client_kwargs["extra_args"] = client_extra_args
             self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",

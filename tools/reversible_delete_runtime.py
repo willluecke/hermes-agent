@@ -22,6 +22,7 @@ class ReversibleDeleteRuntime:
     bin_dir: Path
     runner: Path
     env: dict[str, str]
+    codex_config_args: tuple[str, ...]
 
 
 def _sha256(path: str | os.PathLike[str]) -> str:
@@ -133,6 +134,15 @@ def install_reversible_delete_runtime(
         )
         _atomic_write(bin_dir / executable, script, mode=0o700)
 
+    codex_config_args = (
+        "-c",
+        f"shell_environment_policy.set.PATH={json.dumps(path)}",
+        "-c",
+        (
+            "shell_environment_policy.set.BASH_ENV="
+            f"{json.dumps(str(shell_env))}"
+        ),
+    )
     return ReversibleDeleteRuntime(
         bin_dir=bin_dir,
         runner=runner,
@@ -140,4 +150,5 @@ def install_reversible_delete_runtime(
             "PATH": path,
             "BASH_ENV": str(shell_env),
         },
+        codex_config_args=codex_config_args,
     )

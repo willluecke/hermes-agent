@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -44,6 +45,15 @@ def test_runtime_shim_captures_expanded_glob_before_real_rm(
 
     assert result.returncode == 0, result.stderr
     assert Path(runtime.env["BASH_ENV"]).stat().st_mode & 0o777 == 0o600
+    assert runtime.codex_config_args == (
+        "-c",
+        f"shell_environment_policy.set.PATH={json.dumps(runtime.env['PATH'])}",
+        "-c",
+        (
+            "shell_environment_policy.set.BASH_ENV="
+            f"{json.dumps(runtime.env['BASH_ENV'])}"
+        ),
+    )
     assert not first.exists() and not second.exists()
     assert {item["original_path"] for item in list_trash_items("reg-watch")} == {
         str(first),

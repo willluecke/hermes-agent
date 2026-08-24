@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -34,11 +35,17 @@ class FakeClient:
     drive the notification / server-request streams synchronously."""
 
     def __init__(
-        self, *, codex_bin: str = "codex", codex_home=None, env=None
+        self,
+        *,
+        codex_bin: str = "codex",
+        codex_home=None,
+        env=None,
+        extra_args=None,
     ) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.env = dict(env or {})
+        self.extra_args = list(extra_args or [])
         self.requests: list[tuple[str, dict]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
@@ -1053,6 +1060,18 @@ class TestServerRequestRouting:
             "rmdir",
         }
         assert str(shim_dir) in shell_env.read_text(encoding="utf-8")
+        assert clients[0].extra_args == [
+            "-c",
+            (
+                "shell_environment_policy.set.PATH="
+                f"{json.dumps(clients[0].env['PATH'])}"
+            ),
+            "-c",
+            (
+                "shell_environment_policy.set.BASH_ENV="
+                f"{json.dumps(str(shell_env))}"
+            ),
+        ]
 
     def test_bounded_no_prompt_keeps_dynamic_plain_rm_review_when_shim_missing(
         self, tmp_path, monkeypatch

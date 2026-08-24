@@ -98,7 +98,11 @@ The shim is copied into an owner-only, run-scoped directory before Codex starts;
 its interpreter, policy, workspace, project, real binaries, and source hashes
 are server-bound. The selected runtime directory is prepended to the Codex
 subprocess `PATH`, and an owner-only `BASH_ENV` reapplies that fixed path after
-`bash -lc` reads login profiles. A model cannot redirect it by changing
+`bash -lc` reads login profiles. Hermes also passes both values as run-scoped
+Codex `shell_environment_policy.set` overrides because Codex intentionally
+builds tool environments from its own policy instead of blindly inheriting the
+app-server process environment. This does not modify shared Codex config and
+does not race concurrent project runs. A model cannot redirect it by changing
 `HERMES_HOME`, and a policy-source change during the run fails closed. Non-Bash
 shell wrappers stay on the review path rather than being presumed protected.
 

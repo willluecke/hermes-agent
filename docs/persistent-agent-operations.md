@@ -78,9 +78,10 @@ Chat sends a project key, the gateway resolves it through the server-owned
 `workspaces.projects` map, and Codex receives that canonical directory as its
 workspace root. Routine commands and add/update patches proceed without a
 browser approval round trip. Direct `rm`, `unlink`, and `rmdir` commands are
-also no-prompt: an owner-only server shim and `BASH_ENV` archive their
-shell-expanded targets after login-shell initialization and before the real
-binary can run. Reviewable guarded-YOLO operations such
+also no-prompt: an owner-only server shim plus run-scoped Codex
+`shell_environment_policy` overrides archive their shell-expanded targets after
+login-shell initialization and before the real binary can run. Reviewable
+guarded-YOLO operations such
 as compound or opaque deletion, history changes, and inspectable patch deletes
 or renames pause the run and use the existing browser **Allow once** / **Deny**
 round trip. Commands Codex executes directly inside the workspace are still
