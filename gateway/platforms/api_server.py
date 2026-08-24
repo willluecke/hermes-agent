@@ -2323,6 +2323,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/v1/trash", self._handle_list_trash),
+            ("POST", "/v1/trash/{item_id}/restore", self._handle_restore_trash),
+            ("POST", "/v1/trash/{item_id}/purge", self._handle_purge_trash),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -8033,6 +8036,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if run_cwd:
                         agent.session_cwd = run_cwd
+                    agent.session_project = project or ""
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -8406,6 +8410,136 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+
+    def _resolve_trash_workspace(
+        self, raw_project: Any
+    ) -> tuple[str, str, Any, Optional["web.Response"]]:
+        from gateway.run import _load_gateway_config
+        from tools.reversible_deletion import ReversibleDeletionPolicy
+
+        config = _load_gateway_config()
+        project, workspace, error, status = _resolve_run_workspace(
+            config, raw_project
+        )
+        if error:
+            return (
+                "",
+                "",
+                None,
+                web.json_response(_openai_error(error), status=status),
+            )
+        runtime_cfg = config.get("codex_runtime", {}) if isinstance(config, dict) else {}
+        policy = ReversibleDeletionPolicy.from_config(
+            runtime_cfg.get("reversible_deletion", {})
+            if isinstance(runtime_cfg, dict)
+            else {}
+        )
+        if not policy.enabled:
+            return (
+                "",
+                "",
+                policy,
+                web.json_response(
+                    _openai_error(
+                        "Reversible deletion is not enabled",
+                        code="trash_disabled",
+                    ),
+                    status=404,
+                ),
+            )
+        return project, workspace, policy, None
+
+    async def _handle_list_trash(self, request: "web.Request") -> "web.Response":
+        """GET /v1/trash — list retained items for one configured project."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        project, _workspace, _policy, error = self._resolve_trash_workspace(
+            request.query.get("project")
+        )
+        if error:
+            return error
+        include_terminal = _coerce_request_bool(
+            request.query.get("include_terminal"), default=False
+        )
+        try:
+            from tools.reversible_deletion import list_trash_items
+
+            items = list_trash_items(project, include_terminal=include_terminal)
+        except Exception:
+            logger.exception("[api_server] failed to list trash for %s", project)
+            return web.json_response(
+                _openai_error("Trash storage is unavailable", code="trash_unavailable"),
+                status=500,
+            )
+        return web.json_response({"project": project, "items": items})
+
+    async def _trash_mutation_request(
+        self, request: "web.Request", *, action: str
+    ) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        item_id = str(request.match_info.get("item_id") or "").strip()
+        if not re.fullmatch(r"[a-f0-9]{32}", item_id):
+            return web.json_response(
+                _openai_error("Invalid trash item ID", code="invalid_trash_item"),
+                status=400,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        project, workspace, policy, error = self._resolve_trash_workspace(
+            body.get("project") if isinstance(body, dict) else None
+        )
+        if error:
+            return error
+        try:
+            from tools.reversible_deletion import (
+                RestoreConflict,
+                TrashItemNotFound,
+                purge_trash_item,
+                restore_trash_item,
+            )
+
+            if action == "restore":
+                item = restore_trash_item(
+                    item_id,
+                    project=project,
+                    workspace_root=workspace,
+                    policy=policy,
+                )
+            else:
+                item = purge_trash_item(item_id, project=project)
+        except RestoreConflict as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="trash_restore_conflict"), status=409
+            )
+        except TrashItemNotFound as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="trash_item_not_found"), status=404
+            )
+        except Exception:
+            logger.exception(
+                "[api_server] trash %s failed for project=%s item=%s",
+                action,
+                project,
+                item_id,
+            )
+            return web.json_response(
+                _openai_error("Trash operation failed", code="trash_operation_failed"),
+                status=500,
+            )
+        return web.json_response({"project": project, "item": item})
+
+    async def _handle_restore_trash(self, request: "web.Request") -> "web.Response":
+        """POST /v1/trash/{item_id}/restore — restore without overwriting."""
+        return await self._trash_mutation_request(request, action="restore")
+
+    async def _handle_purge_trash(self, request: "web.Request") -> "web.Response":
+        """POST /v1/trash/{item_id}/purge — permanently remove one payload."""
+        return await self._trash_mutation_request(request, action="purge")
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""

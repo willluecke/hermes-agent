@@ -402,6 +402,7 @@ class _ServerRequestRouting:
 class _PendingFileChange:
     summary: str
     kinds: frozenset[str]
+    destructive_paths: tuple[str, ...] = ()
 
 
 class CodexAppServerSession:
@@ -425,6 +426,8 @@ class CodexAppServerSession:
         effort: Optional[str] = None,
         require_exact: bool = False,
         permission_profile: Optional[str] = None,
+        project_key: Optional[str] = None,
+        reversible_deletion_policy: Any = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -446,6 +449,8 @@ class CodexAppServerSession:
                 "workspace-write",
             )
         )
+        self._project_key = str(project_key or "").strip()
+        self._reversible_deletion_policy = reversible_deletion_policy
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -1331,16 +1336,26 @@ class CodexAppServerSession:
         Keep it that way — do not re-read approval config here.
         """
         command = params.get("command") or ""
+        cwd = params.get("cwd") or self._cwd or "<unknown>"
         review_reason: Optional[str] = None
         if self._routing.auto_approve_exec:
             if not self._routing.guard_no_prompt_exec:
                 return "accept"
 
             from tools.approval import classify_no_prompt_command_guard
+            from tools.reversible_deletion import (
+                command_targets_trash_store,
+                looks_like_file_delete,
+            )
+
+            if command_targets_trash_store(str(command), cwd=str(cwd)):
+                self._last_policy_block_reason = (
+                    "Codex unattended policy blocked mutation of protected "
+                    "Hermes trash storage"
+                )
+                return "cancel"
 
             action, review_reason = classify_no_prompt_command_guard(str(command))
-            if action == "allow":
-                return "accept"
             if action == "deny":
                 self._last_policy_block_reason = (
                     "Codex unattended policy blocked command: "
@@ -1355,13 +1370,22 @@ class CodexAppServerSession:
                 # a client-side policy block.
                 return "cancel"
 
-            # Reviewable commands use the normal Hermes approval bridge. This
-            # keeps routine development autonomous while allowing the browser
-            # to pause and resume the same Codex turn for a bounded risk.
+            is_file_delete = looks_like_file_delete(str(command))
+            if action == "prompt" or is_file_delete:
+                if self._capture_reversible_command_delete(
+                    params, str(command), str(cwd)
+                ):
+                    return "accept"
+                if action == "allow":
+                    review_reason = "file deletion could not be protected automatically"
+            else:
+                return "accept"
+            # Other reviewable commands use the normal Hermes approval bridge.
+            # This keeps routine development autonomous while allowing the
+            # browser to pause and resume the same Codex turn for a bounded risk.
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
         # fall back to the session's cwd when codex doesn't include it so the
         # approval prompt is never empty (quirk #10 fix).
-        cwd = params.get("cwd") or self._cwd or "<unknown>"
         reason = params.get("reason")
         description = f"Codex requests exec in {cwd}"
         if reason:
@@ -1443,7 +1467,9 @@ class CodexAppServerSession:
                         blocked_kinds,
                     )
                     return "cancel"
-                # Inspectable deletes and renames are reviewable. Fall through
+                if self._capture_reversible_file_change(item_id, pending):
+                    return "accept"
+                # Uncaptured deletes and renames are reviewable. Fall through
                 # to the same browser approval bridge used by exec requests.
             else:
                 return "accept"
@@ -1519,10 +1545,12 @@ class CodexAppServerSession:
                 self._pending_file_changes[item_id] = _PendingFileChange(
                     summary="1 change pending",
                     kinds=frozenset(),
+                    destructive_paths=(),
                 )
                 return
             kinds: dict[str, int] = {}
             paths: list[str] = []
+            destructive_paths: list[str] = []
             for ch in changes:
                 if not isinstance(ch, dict):
                     continue
@@ -1537,6 +1565,8 @@ class CodexAppServerSession:
                 p = ch.get("path") or ""
                 if p:
                     paths.append(p)
+                    if kind in {"delete", "rename"}:
+                        destructive_paths.append(str(p))
             counts = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
             preview = ", ".join(paths[:3])
             if len(paths) > 3:
@@ -1544,6 +1574,7 @@ class CodexAppServerSession:
             self._pending_file_changes[item_id] = _PendingFileChange(
                 summary=f"{counts}: {preview}" if preview else counts,
                 kinds=frozenset(kinds),
+                destructive_paths=tuple(destructive_paths),
             )
         elif method == "item/completed":
             self._pending_file_changes.pop(item_id, None)
@@ -1559,6 +1590,95 @@ class CodexAppServerSession:
         if not cached:
             return None
         return cached.summary
+
+    def _current_approval_run_id(self) -> str:
+        try:
+            from tools.approval import get_current_session_key
+
+            return get_current_session_key(default=self._hermes_session_id or "")
+        except Exception:
+            return self._hermes_session_id
+
+    def _capture_reversible_command_delete(
+        self, params: dict, command: str, cwd: str
+    ) -> bool:
+        policy = self._reversible_deletion_policy
+        if not self._project_key or policy is None or not getattr(policy, "enabled", False):
+            return False
+        from tools.reversible_deletion import (
+            capture_delete_command,
+            operation_key_for,
+        )
+
+        run_id = self._current_approval_run_id()
+        request_item = str(
+            params.get("itemId")
+            or params.get("commandExecutionId")
+            or self._active_turn_id
+            or "command"
+        )
+        result = capture_delete_command(
+            command,
+            cwd=cwd,
+            workspace_root=self._cwd,
+            project=self._project_key,
+            run_id=run_id,
+            operation_key=operation_key_for(run_id, request_item, command),
+            policy=policy,
+        )
+        if result.handled:
+            logger.info(
+                "Codex delete protected before acceptance: project=%s items=%d missing=%d",
+                self._project_key,
+                len(result.items),
+                len(result.missing_targets),
+            )
+            return True
+        logger.info(
+            "Codex delete was not auto-trashed; retaining approval gate: %s",
+            result.reason or "uninspectable delete",
+        )
+        return False
+
+    def _capture_reversible_file_change(
+        self, item_id: str, pending: _PendingFileChange
+    ) -> bool:
+        policy = self._reversible_deletion_policy
+        if (
+            not self._project_key
+            or policy is None
+            or not getattr(policy, "enabled", False)
+            or not pending.destructive_paths
+        ):
+            return False
+        from tools.reversible_deletion import (
+            capture_file_change_paths,
+            operation_key_for,
+        )
+
+        run_id = self._current_approval_run_id()
+        result = capture_file_change_paths(
+            pending.destructive_paths,
+            cwd=self._cwd,
+            workspace_root=self._cwd,
+            project=self._project_key,
+            run_id=run_id,
+            operation_key=operation_key_for(run_id, item_id, "file-change"),
+            policy=policy,
+        )
+        if result.handled:
+            logger.info(
+                "Codex file change protected before acceptance: project=%s items=%d missing=%d",
+                self._project_key,
+                len(result.items),
+                len(result.missing_targets),
+            )
+            return True
+        logger.info(
+            "Codex file change was not auto-trashed; retaining approval gate: %s",
+            result.reason or "uninspectable file change",
+        )
+        return False
 
 
 def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:

@@ -921,6 +921,13 @@ def run_codex_app_server_turn(
             and isinstance(no_prompt_cfg, dict)
             and no_prompt_cfg.get("enabled") is True
         )
+        from tools.reversible_deletion import ReversibleDeletionPolicy
+
+        reversible_deletion_policy = ReversibleDeletionPolicy.from_config(
+            codex_runtime_cfg.get("reversible_deletion", {})
+            if isinstance(codex_runtime_cfg, dict)
+            else {}
+        )
 
         # When the user has
         # explicitly opted out of Hermes approvals — via `approvals.mode: off`
@@ -964,6 +971,8 @@ def run_codex_app_server_turn(
             model=getattr(agent, "model", ""),
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
             require_exact=require_exact,
+            project_key=str(getattr(agent, "session_project", "") or ""),
+            reversible_deletion_policy=reversible_deletion_policy,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

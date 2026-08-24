@@ -22,6 +22,10 @@ from agent.transports.codex_app_server_session import (
     _prepare_turn_input_items,
 )
 from agent.transports.codex_app_server import CodexAppServerError
+from tools.reversible_deletion import (
+    ReversibleDeletionPolicy,
+    list_trash_items,
+)
 
 
 class FakeClient:
@@ -945,6 +949,140 @@ class TestServerRequestRouting:
             f"1 {kind}: /workspace/obsolete.txt",
             allow_permanent=False,
         )
+
+    def test_bounded_no_prompt_auto_trashes_static_delete_before_accepting(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        target = workspace / "generated"
+        target.mkdir()
+        (target / "result.txt").write_text("keep", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        decision = session._decide_exec_approval(
+            {
+                "itemId": "exec-delete-1",
+                "command": "rm generated",
+                "cwd": str(workspace),
+            }
+        )
+
+        assert decision == "accept"
+        callback.assert_not_called()
+        assert target.exists(), "the command, not capture, removes the source"
+        items = list_trash_items("reg-watch")
+        assert len(items) == 1
+        assert items[0]["original_path"] == str(target)
+
+    def test_bounded_no_prompt_routes_dynamic_plain_rm_to_browser_review(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        assert session._decide_exec_approval(
+            {"command": 'rm "$TARGET"', "cwd": str(workspace)}
+        ) == "accept"
+        callback.assert_called_once()
+        assert list_trash_items("reg-watch") == []
+
+    def test_bounded_no_prompt_never_allows_trash_store_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        decision = session._decide_exec_approval(
+            {"command": f"rm -rf {hermes_home / 'trash'}"}
+        )
+
+        assert decision == "cancel"
+        callback.assert_not_called()
+        assert "protected Hermes trash" in (session._last_policy_block_reason or "")
+
+    def test_bounded_no_prompt_auto_trashes_structured_file_delete(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        target = workspace / "old.ts"
+        target.write_text("old", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_apply_patch=True,
+                guard_no_prompt_file_changes=True,
+            ),
+        )
+        session._track_pending_file_change(
+            {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "fileChange",
+                        "id": "fc-delete",
+                        "changes": [
+                            {"kind": {"type": "delete"}, "path": str(target)}
+                        ],
+                    }
+                },
+            }
+        )
+
+        assert session._decide_apply_patch_approval(
+            {"itemId": "fc-delete"}
+        ) == "accept"
+        callback.assert_not_called()
+        assert list_trash_items("reg-watch")[0]["original_path"] == str(target)
 
     def test_bounded_no_prompt_declines_uninspectable_file_change(self):
         session = make_session(

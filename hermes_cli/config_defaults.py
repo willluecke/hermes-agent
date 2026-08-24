@@ -12,6 +12,13 @@ DEFAULT_CONFIG = {
     # renders into ~/.codex/config.toml.
     "codex_runtime": {
         "permission_profile": None,
+        "reversible_deletion": {
+            "enabled": False,
+            "max_item_bytes": 5 * 1024**3,
+            "max_total_bytes": 100 * 1024**3,
+            "max_entries": 100_000,
+            "temp_roots": ["/tmp", "/var/tmp"],
+        },
     },
     "providers": {},
     "fallback_providers": [],

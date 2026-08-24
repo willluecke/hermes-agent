@@ -80,6 +80,10 @@ remain non-overridable policy cancellations. An unknown project key is rejected
 before agent creation. Policy cancellations must never be presented as a
 rejection made by the user.
 
+The reversible-deletion contract in [reversible-deletion.md](reversible-deletion.md)
+supersedes the prompt for exact workspace and safe-temp file deletion once that
+subsystem is enabled. It does not weaken approval for non-file destruction.
+
 The generic meaning of `approvals.mode: off` remains full approval bypass and
 must not be used on command-center. The narrower behavior above applies only
 to API-server native Codex runs when `codex_runtime.no_prompt.enabled` is
