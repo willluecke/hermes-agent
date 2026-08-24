@@ -559,7 +559,7 @@ class TestRunConversationCodexPath:
             "hermes_cli.config.load_config_readonly",
             return_value={"approvals": {"mode": "off"}},
         ):
-            agent = _make_codex_agent()
+            agent = _make_codex_agent(platform="api_server")
             with patch.object(
                 agent, "_spawn_background_review", return_value=None
             ):
@@ -575,7 +575,7 @@ class TestRunConversationCodexPath:
     ):
         captured = self._capture_routing_agent(monkeypatch)
         config = {
-            "approvals": {"mode": "off"},
+            "approvals": {"mode": "guarded_yolo"},
             "codex_runtime": {"no_prompt": {"enabled": True}},
         }
         with patch(
@@ -583,7 +583,7 @@ class TestRunConversationCodexPath:
         ), patch(
             "hermes_cli.config.load_config", return_value=config
         ):
-            agent = _make_codex_agent()
+            agent = _make_codex_agent(platform="api_server")
             with patch.object(
                 agent, "_spawn_background_review", return_value=None
             ):
@@ -593,6 +593,30 @@ class TestRunConversationCodexPath:
         assert routing.auto_approve_apply_patch is True
         assert routing.guard_no_prompt_exec is True
         assert routing.guard_no_prompt_file_changes is True
+
+    def test_no_prompt_flag_does_not_change_non_api_codex_sessions(
+        self, monkeypatch
+    ):
+        captured = self._capture_routing_agent(monkeypatch)
+        config = {
+            "approvals": {"mode": "guarded_yolo"},
+            "codex_runtime": {"no_prompt": {"enabled": True}},
+        }
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ), patch(
+            "hermes_cli.config.load_config", return_value=config
+        ):
+            agent = _make_codex_agent(platform="cli")
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+        assert routing.guard_no_prompt_exec is False
+        assert routing.guard_no_prompt_file_changes is False
 
     def test_yaml_boolean_false_approval_mode_also_auto_approves(
         self, monkeypatch

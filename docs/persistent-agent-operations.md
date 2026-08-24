@@ -45,7 +45,7 @@ agent:
   reasoning_effort: xhigh
 fallback_providers: []
 approvals:
-  mode: off
+  mode: guarded_yolo
 codex_runtime:
   permission_profile:
     name: command-center-development
@@ -77,10 +77,11 @@ deletions, unrecognized patch kinds, and permission escalation are cancelled
 without prompting. An unknown project key is rejected before agent creation.
 Policy cancellations must never be presented as a rejection made by the user.
 
-The generic meaning of `approvals.mode: off` remains full approval bypass.
-The narrower behavior above applies only when `codex_runtime.no_prompt.enabled`
-is exactly `true`; do not deploy command-center with `mode: off` unless the
-bounded flag and workspace map are present and tested.
+The generic meaning of `approvals.mode: off` remains full approval bypass and
+must not be used on command-center. The narrower behavior above applies only
+to API-server native Codex runs when `codex_runtime.no_prompt.enabled` is
+exactly `true`. Direct OpenRouter and other non-Codex runtimes continue through
+the normal `guarded_yolo` policy instead of inheriting Codex's auto-approval.
 
 Codex still runs as Linux user `will`, so the workspace sandbox is the write
 boundary, not a confidentiality boundary: same-user files may remain readable

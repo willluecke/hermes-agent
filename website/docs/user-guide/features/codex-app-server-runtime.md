@@ -280,7 +280,7 @@ command-center policy without using a no-sandbox profile:
 
 ```yaml
 approvals:
-  mode: off
+  mode: guarded_yolo
 codex_runtime:
   workspaces:
     default_project: app
@@ -296,13 +296,18 @@ gateway resolves that key from its own configuration, validates the canonical
 directory, and supplies it as Codex's workspace root. Unknown keys fail before
 the agent starts. Legacy clients that omit `project` use `default_project`.
 
-With both `approvals.mode: off` and `no_prompt.enabled: true`, routine Codex
-exec requests and add/update patches are accepted automatically. Commands that
+With `no_prompt.enabled: true`, routine Codex exec requests and add/update
+patches in API-server runs are accepted automatically. Commands that
 guarded YOLO would normally prompt for are cancelled instead, as are hardline
 commands, user deny-rule matches, sudo password injection, file deletions,
 unknown file-change metadata, and permission escalation. No unavailable
 browser prompt is synthesized and no policy decision is described as a human
 rejection.
+
+Keep the global approval mode at `guarded_yolo`. The bounded no-prompt flag is
+scoped to API-server native Codex turns; a direct OpenRouter selection or a
+normal CLI Codex session does not inherit it. Setting global mode `off` remains
+an unrestricted approval bypass and defeats that separation.
 
 This policy bounds writes, not reads. For a confidentiality boundary, run the
 gateway under a dedicated OS account that cannot read the operator's private

@@ -903,6 +903,25 @@ def run_codex_app_server_turn(
 
             approval_callback = request_codex_approval
 
+        from hermes_cli.config import load_config
+
+        runtime_cfg = load_config()
+        codex_runtime_cfg = (
+            runtime_cfg.get("codex_runtime", {})
+            if isinstance(runtime_cfg, dict)
+            else {}
+        )
+        no_prompt_cfg = (
+            codex_runtime_cfg.get("no_prompt", {})
+            if isinstance(codex_runtime_cfg, dict)
+            else {}
+        )
+        bounded_no_prompt = bool(
+            getattr(agent, "platform", "") == "api_server"
+            and isinstance(no_prompt_cfg, dict)
+            and no_prompt_cfg.get("enabled") is True
+        )
+
         # When the user has
         # explicitly opted out of Hermes approvals — via `approvals.mode: off`
         # in config, the /yolo session toggle, or --yolo / HERMES_YOLO_MODE —
@@ -910,11 +929,13 @@ def run_codex_app_server_turn(
         # (~/.codex/config.toml) be the policy gate instead of double-gating
         # with Hermes. Defaults (manual/smart/unset) stay fail-closed and use
         # the callback above for a genuine round trip when a surface exists.
-        auto_approve_requests = False
+        auto_approve_requests = bounded_no_prompt
         try:
             from tools.approval import is_approval_bypass_active
 
-            auto_approve_requests = is_approval_bypass_active()
+            auto_approve_requests = (
+                auto_approve_requests or is_approval_bypass_active()
+            )
         except Exception:
             logger.debug(
                 "codex app-server: approval-bypass lookup failed; "
@@ -930,25 +951,7 @@ def run_codex_app_server_turn(
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
         from agent.reasoning_effort import requested_effort
-        from hermes_cli.config import load_config
-
-        runtime_cfg = load_config()
         model_cfg = runtime_cfg.get("model", {}) if isinstance(runtime_cfg, dict) else {}
-        codex_runtime_cfg = (
-            runtime_cfg.get("codex_runtime", {})
-            if isinstance(runtime_cfg, dict)
-            else {}
-        )
-        no_prompt_cfg = (
-            codex_runtime_cfg.get("no_prompt", {})
-            if isinstance(codex_runtime_cfg, dict)
-            else {}
-        )
-        bounded_no_prompt = bool(
-            auto_approve_requests
-            and isinstance(no_prompt_cfg, dict)
-            and no_prompt_cfg.get("enabled") is True
-        )
         require_exact = bool(
             model_cfg.get("openai_runtime_require_exact", False)
             if isinstance(model_cfg, dict)
