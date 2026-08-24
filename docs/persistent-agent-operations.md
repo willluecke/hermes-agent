@@ -73,8 +73,9 @@ Chat sends a project key, the gateway resolves it through the server-owned
 workspace root. Routine commands and add/update patches proceed without a
 browser approval round trip. Commands in the guarded-YOLO destructive classes,
 hardline commands, `approvals.deny` matches, sudo password injection, patch
-deletions, unrecognized patch kinds, and permission escalation are declined
+deletions, unrecognized patch kinds, and permission escalation are cancelled
 without prompting. An unknown project key is rejected before agent creation.
+Policy cancellations must never be presented as a rejection made by the user.
 
 The generic meaning of `approvals.mode: off` remains full approval bypass.
 The narrower behavior above applies only when `codex_runtime.no_prompt.enabled`

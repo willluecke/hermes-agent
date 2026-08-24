@@ -1271,10 +1271,11 @@ class CodexAppServerSession:
             self._client.respond(rid, {"decision": decision})
         elif method == "item/permissions/requestApproval":
             # Codex sometimes asks to escalate permissions mid-turn. We
-            # always decline — the user already chose their permission
+            # always cancel — the user already chose their permission
             # profile in ~/.codex/config.toml and surprise escalations
-            # shouldn't be silently accepted.
-            self._client.respond(rid, {"decision": "decline"})
+            # shouldn't be silently accepted. ``cancel`` also avoids falsely
+            # presenting this client policy as a user rejection.
+            self._client.respond(rid, {"decision": "cancel"})
         elif method == "mcpServer/elicitation/request":
             # Codex's MCP layer asks the user for structured input on
             # behalf of an MCP server (e.g. tool-call confirmation,
@@ -1327,7 +1328,10 @@ class CodexAppServerSession:
                         "Codex no-prompt policy declined exec: %s",
                         reason or "unclassified guarded command",
                     )
-                    return "decline"
+                    # No human made this decision. ``decline`` is rendered by
+                    # Codex as "rejected by user"; ``cancel`` accurately marks
+                    # a client-side policy block.
+                    return "cancel"
             return "accept"
         command = params.get("command") or ""
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
@@ -1367,14 +1371,14 @@ class CodexAppServerSession:
                         "Codex no-prompt policy declined file change without "
                         "inspectable item metadata"
                     )
-                    return "decline"
+                    return "cancel"
                 if not pending.kinds or not pending.kinds.issubset({"add", "update"}):
                     logger.warning(
                         "Codex no-prompt policy declined guarded file change "
                         "kinds: %s",
                         ", ".join(sorted(pending.kinds)) or "unknown",
                     )
-                    return "decline"
+                    return "cancel"
             return "accept"
         if self._approval_callback is not None:
             # FileChangeRequestApprovalParams gives us reason + grantRoot.

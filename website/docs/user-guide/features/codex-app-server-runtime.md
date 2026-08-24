@@ -298,10 +298,10 @@ the agent starts. Legacy clients that omit `project` use `default_project`.
 
 With both `approvals.mode: off` and `no_prompt.enabled: true`, routine Codex
 exec requests and add/update patches are accepted automatically. Commands that
-guarded YOLO would normally prompt for are declined instead, as are hardline
+guarded YOLO would normally prompt for are cancelled instead, as are hardline
 commands, user deny-rule matches, sudo password injection, file deletions,
 unknown file-change metadata, and permission escalation. No unavailable
-browser prompt is synthesized and no declined request is described as a human
+browser prompt is synthesized and no policy decision is described as a human
 rejection.
 
 This policy bounds writes, not reads. For a confidentiality boundary, run the

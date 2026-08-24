@@ -824,7 +824,7 @@ class TestServerRequestRouting:
             ),
         )
 
-        assert session._decide_exec_approval({"command": command}) == "decline"
+        assert session._decide_exec_approval({"command": command}) == "cancel"
 
     @pytest.mark.parametrize(
         "command",
@@ -851,8 +851,8 @@ class TestServerRequestRouting:
         [
             ("add", "accept"),
             ("update", "accept"),
-            ("delete", "decline"),
-            ("rename", "decline"),
+            ("delete", "cancel"),
+            ("rename", "cancel"),
         ],
     )
     def test_bounded_no_prompt_file_change_policy(self, kind, expected):
@@ -893,7 +893,22 @@ class TestServerRequestRouting:
 
         assert session._decide_apply_patch_approval(
             {"itemId": "missing"}
-        ) == "decline"
+        ) == "cancel"
+
+    def test_permission_escalation_is_cancelled_by_client_policy(self):
+        client = FakeClient()
+        session = make_session(client)
+        session._client = client
+
+        session._handle_server_request(
+            {
+                "id": "permissions-1",
+                "method": "item/permissions/requestApproval",
+                "params": {},
+            }
+        )
+
+        assert ("permissions-1", {"decision": "cancel"}) in client.responses
 
 
 
