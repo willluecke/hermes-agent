@@ -254,3 +254,15 @@ Live command-center evidence on 2026-08-23:
 - The Linux deployment passed 151 focused snapshot, deletion, session, and API
   runtime assertions. One unrelated background-review test retains its existing
   asynchronous failure on both Mac and Linux baselines.
+- Commits `4b3992e16` and `5e85ba2b0` bind the run-scoped shim through Codex's
+  child environment policy and move capture into the gateway-owned loopback
+  broker. Both were deployed from the canonical checkout after idle checks.
+- Live run `run_4be7afbc394a4681a59451cce1d352fd` removed an in-workspace
+  directory through nested `bash -lc` with exit status 0 and no approval event.
+  Trash item `54ed2fe2d51042a7b0800c64ddab12a7` recorded the exact project,
+  source path, run ID, byte count, and entry count before the source disappeared.
+- The broker/runtime/session suite passes 131 focused Linux tests. The broader
+  Codex runtime and runs API selection passes 104 tests; its only failure is the
+  same pre-existing asynchronous review-fork test documented above. Canary
+  payloads were purged by exact item ID after verification, leaving tombstones
+  but no test files or retained payload bytes.
