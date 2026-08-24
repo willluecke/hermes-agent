@@ -8,19 +8,13 @@ every expanded operand, and only then replaces itself with the real OS binary.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
+import socket
 import sys
-import uuid
-from pathlib import Path
 
 
 BLOCK_EXIT = 125
-
-
-def _sha256(path: str | os.PathLike[str]) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def _block(message: str) -> int:
@@ -32,47 +26,36 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--executable", required=True)
     parser.add_argument("--real-executable", required=True)
-    parser.add_argument("--workspace", required=True)
-    parser.add_argument("--project", required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--policy-json", required=True)
-    parser.add_argument("--module-sha256", required=True)
-    parser.add_argument("--constants-sha256", required=True)
+    parser.add_argument("--broker-host", required=True)
+    parser.add_argument("--broker-port", required=True, type=int)
+    parser.add_argument("--broker-token", required=True)
     parser.add_argument("args", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(argv)
     command_args = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
 
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-        import hermes_constants
-        from tools import reversible_deletion
-
-        if _sha256(reversible_deletion.__file__) != parsed.module_sha256:
-            return _block("the server deletion policy changed during this run")
-        if _sha256(hermes_constants.__file__) != parsed.constants_sha256:
-            return _block("the server recovery boundary changed during this run")
-        policy = reversible_deletion.ReversibleDeletionPolicy.from_config(
-            json.loads(parsed.policy_json)
-        )
-        result = reversible_deletion.capture_delete_argv(
-            parsed.executable,
-            command_args,
-            cwd=os.getcwd(),
-            workspace_root=parsed.workspace,
-            project=parsed.project,
-            run_id=parsed.run_id,
-            operation_key=reversible_deletion.operation_key_for(
-                parsed.run_id,
-                parsed.executable,
-                json.dumps(command_args, ensure_ascii=True),
-                uuid.uuid4().hex,
-            ),
-            policy=policy,
-        )
+        request = json.dumps(
+            {
+                "token": parsed.broker_token,
+                "executable": parsed.executable,
+                "args": command_args,
+                "cwd": os.getcwd(),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        with socket.create_connection(
+            (parsed.broker_host, parsed.broker_port), timeout=30
+        ) as connection:
+            connection.sendall(request)
+            response_file = connection.makefile("rb")
+            raw_response = response_file.readline(256 * 1024 + 1)
+        if not raw_response or len(raw_response) > 256 * 1024:
+            return _block("the server capture broker returned no valid response")
+        result = json.loads(raw_response.decode("utf-8"))
     except Exception as exc:
-        return _block(str(exc))
-    if not result.handled:
-        return _block(result.reason or "capture did not complete")
+        return _block(f"the server capture broker failed: {exc}")
+    if not result.get("handled"):
+        return _block(result.get("reason") or "capture did not complete")
 
     os.execv(
         parsed.real_executable,

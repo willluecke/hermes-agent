@@ -61,6 +61,7 @@ def test_static_rm_is_parsed_inside_workspace(trash_env):
         ('rm "$TARGET"', "rm"),
         ("rm -rf *.log", "rm"),
         ("/bin/bash -lc 'unlink \"$TARGET\"'", "unlink"),
+        ("/bin/bash -lc \"/bin/bash -lc 'rm old'\"", "rm"),
         ("/bin/zsh -lc 'rm old'", None),
         ("rmdir empty", "rmdir"),
         ("rm one && rm two", None),

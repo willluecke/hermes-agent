@@ -80,8 +80,10 @@ workspace root. Routine commands and add/update patches proceed without a
 browser approval round trip. Direct `rm`, `unlink`, and `rmdir` commands are
 also no-prompt: an owner-only server shim plus run-scoped Codex
 `shell_environment_policy` overrides archive their shell-expanded targets after
-login-shell initialization and before the real binary can run. Reviewable
-guarded-YOLO operations such
+login-shell initialization through a capability-scoped loopback broker. The
+broker performs capture outside the Codex filesystem sandbox, while Trash and
+the other recovery stores remain absent from Codex's writable roots. Only then
+can the real binary run. Reviewable guarded-YOLO operations such
 as compound or opaque deletion, history changes, and inspectable patch deletes
 or renames pause the run and use the existing browser **Allow once** / **Deny**
 round trip. Commands Codex executes directly inside the workspace are still

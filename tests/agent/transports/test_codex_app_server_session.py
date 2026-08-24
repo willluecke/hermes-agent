@@ -1072,6 +1072,8 @@ class TestServerRequestRouting:
                 f"{json.dumps(str(shell_env))}"
             ),
         ]
+        session.close()
+        assert session._reversible_delete_broker is None
 
     def test_bounded_no_prompt_keeps_dynamic_plain_rm_review_when_shim_missing(
         self, tmp_path, monkeypatch

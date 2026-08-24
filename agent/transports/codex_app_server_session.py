@@ -471,6 +471,7 @@ class CodexAppServerSession:
         self._pending_file_changes: dict[str, _PendingFileChange] = {}
         self._last_policy_block_reason: Optional[str] = None
         self._protected_delete_shim_active = False
+        self._reversible_delete_broker: Any = None
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -548,24 +549,39 @@ class CodexAppServerSession:
                 and getattr(policy, "enabled", False)
             ):
                 try:
+                    from tools.reversible_delete_broker import (
+                        ReversibleDeleteBroker,
+                    )
                     from tools.reversible_delete_runtime import (
                         install_reversible_delete_runtime,
                     )
 
+                    run_scope = (
+                        self._current_approval_run_id()
+                        or self._hermes_session_id
+                        or "unscoped"
+                    )
+                    broker = ReversibleDeleteBroker(
+                        workspace_root=self._cwd,
+                        project=self._project_key,
+                        run_id=run_scope,
+                        policy=policy,
+                    )
                     runtime = install_reversible_delete_runtime(
                         workspace_root=self._cwd,
                         project=self._project_key,
-                        run_id=(
-                            self._current_approval_run_id()
-                            or self._hermes_session_id
-                        ),
+                        run_id=run_scope,
                         policy=policy,
                         inherited_path=os.environ.get("PATH", ""),
+                        broker_endpoint=broker.endpoint,
                     )
+                    self._reversible_delete_broker = broker
                     client_env.update(runtime.env)
                     client_extra_args.extend(runtime.codex_config_args)
                     self._protected_delete_shim_active = True
                 except Exception:
+                    if "broker" in locals():
+                        broker.close()
                     logger.exception(
                         "could not install protected Codex removal shims; "
                         "retaining approval-time deletion capture"
@@ -663,6 +679,9 @@ class CodexAppServerSession:
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._client = None
+        if self._reversible_delete_broker is not None:
+            self._reversible_delete_broker.close()
+            self._reversible_delete_broker = None
         self._thread_id = None
 
     def __enter__(self) -> "CodexAppServerSession":

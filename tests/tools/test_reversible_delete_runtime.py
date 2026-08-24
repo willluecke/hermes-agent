@@ -5,6 +5,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tools.reversible_delete_broker import ReversibleDeleteBroker
 from tools.reversible_delete_runtime import install_reversible_delete_runtime
 from tools.reversible_deletion import ReversibleDeletionPolicy, list_trash_items
 
@@ -23,25 +24,32 @@ def test_runtime_shim_captures_expanded_glob_before_real_rm(
     policy = ReversibleDeletionPolicy(
         enabled=True, temp_roots=(str(tmp_path / "temp"),)
     )
-    runtime = install_reversible_delete_runtime(
+    with ReversibleDeleteBroker(
         workspace_root=str(workspace),
         project="reg-watch",
         run_id="runtime-run",
         policy=policy,
-        inherited_path=os.environ.get("PATH", ""),
-    )
+    ) as broker:
+        runtime = install_reversible_delete_runtime(
+            workspace_root=str(workspace),
+            project="reg-watch",
+            run_id="runtime-run",
+            policy=policy,
+            inherited_path=os.environ.get("PATH", ""),
+            broker_endpoint=broker.endpoint,
+        )
 
-    env = dict(os.environ)
-    env.update(runtime.env)
-    env["TARGET"] = first.name
-    result = subprocess.run(
-        ["/bin/bash", "-lc", 'rm -f "$TARGET" *.log'],
-        cwd=workspace,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+        env = dict(os.environ)
+        env.update(runtime.env)
+        env["TARGET"] = first.name
+        result = subprocess.run(
+            ["/bin/bash", "-lc", 'rm -f "$TARGET" *.log'],
+            cwd=workspace,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
     assert result.returncode == 0, result.stderr
     assert Path(runtime.env["BASH_ENV"]).stat().st_mode & 0o777 == 0o600
@@ -70,24 +78,32 @@ def test_runtime_shim_blocks_outside_workspace_without_deleting(
     outside = tmp_path / "outside.txt"
     outside.write_text("keep", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    runtime = install_reversible_delete_runtime(
+    policy = ReversibleDeletionPolicy(
+        enabled=True,
+        temp_roots=(str(tmp_path / "temp"),),
+    )
+    with ReversibleDeleteBroker(
         workspace_root=str(workspace),
         project="reg-watch",
         run_id="runtime-run",
-        policy=ReversibleDeletionPolicy(
-            enabled=True,
-            temp_roots=(str(tmp_path / "temp"),),
-        ),
-        inherited_path=os.environ.get("PATH", ""),
-    )
+        policy=policy,
+    ) as broker:
+        runtime = install_reversible_delete_runtime(
+            workspace_root=str(workspace),
+            project="reg-watch",
+            run_id="runtime-run",
+            policy=policy,
+            inherited_path=os.environ.get("PATH", ""),
+            broker_endpoint=broker.endpoint,
+        )
 
-    result = subprocess.run(
-        [str(runtime.bin_dir / "rm"), "-f", str(outside)],
-        cwd=workspace,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+        result = subprocess.run(
+            [str(runtime.bin_dir / "rm"), "-f", str(outside)],
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
     assert result.returncode == 125
     assert "outside the selected workspace" in result.stderr
