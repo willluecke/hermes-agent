@@ -157,6 +157,30 @@ class TestStripExistingManagedBlock:
         assert 'name = "gpt-5.5"' in out
         assert "mcp_servers.fs" not in out
 
+    def test_legacy_marker_and_nested_replacement_are_removed_together(self):
+        legacy_marker = (
+            "# managed by hermes-agent — `hermes codex-runtime migrate` "
+            "regenerates this section"
+        )
+        text = (
+            f"{legacy_marker}\n"
+            'default_permissions = "command-center-development"\n'
+            f"{MIGRATION_MARKER}\n"
+            'default_permissions = "command-center-development"\n'
+            "[permissions.command-center-development]\n"
+            'extends = ":workspace"\n'
+            f"{MIGRATION_END_MARKER}\n"
+            "[permissions.command-center-development.network]\n"
+            "enabled = true\n"
+            f"{MIGRATION_END_MARKER}\n"
+            "[features]\n"
+            "shell_tool = true\n"
+        )
+
+        out = _strip_existing_managed_block(text)
+
+        assert out == "[features]\nshell_tool = true\n"
+
 
 # ---- end-to-end migrate(, expose_hermes_tools=False) ----
 

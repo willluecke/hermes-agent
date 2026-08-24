@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 MIGRATION_MARKER = (
     "# managed by hermes-agent — `/codex-runtime codex_app_server` regenerates this section"
 )
+LEGACY_MIGRATION_MARKERS = (
+    "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section",
+)
 MIGRATION_END_MARKER = (
     "# end hermes-agent managed section"
 )
@@ -496,9 +499,10 @@ def _looks_like_table_header(stripped_line: str) -> bool:
 def _strip_existing_managed_block(toml_text: str) -> str:
     """Remove any prior managed section so re-runs idempotently replace it.
 
-    The managed section is everything between MIGRATION_MARKER (start) and
-    MIGRATION_END_MARKER (end), inclusive of both markers. User-edited
-    sections above or below are preserved verbatim.
+    The managed section is everything between a current/legacy start marker
+    and MIGRATION_END_MARKER, inclusive of both markers. User-edited sections
+    above or below are preserved verbatim. Nested markers are consumed as one
+    block so a marker migration cannot strand duplicate generated tables.
 
     Backward compatibility: if the start marker is found but no end marker
     follows, we fall back to the heuristic that swallows lines until we
@@ -510,16 +514,20 @@ def _strip_existing_managed_block(toml_text: str) -> str:
     out: list[str] = []
     in_managed = False
     saw_end_marker = False
+    managed_depth = 0
+    start_markers = {MIGRATION_MARKER, *LEGACY_MIGRATION_MARKERS}
     for line in lines:
         line_stripped_nl = line.rstrip("\n")
-        if line_stripped_nl == MIGRATION_MARKER:
+        if line_stripped_nl in start_markers:
             in_managed = True
             saw_end_marker = False
+            managed_depth += 1
             continue
         if in_managed:
             if line_stripped_nl == MIGRATION_END_MARKER:
-                in_managed = False
-                saw_end_marker = True
+                managed_depth = max(0, managed_depth - 1)
+                in_managed = managed_depth > 0
+                saw_end_marker = not in_managed
                 continue
             stripped = line.lstrip()
             if not saw_end_marker and stripped.startswith("[") and not (
@@ -531,6 +539,7 @@ def _strip_existing_managed_block(toml_text: str) -> str:
                 # Old-format managed block without end marker: bail back
                 # to user content as soon as we see a non-managed section.
                 in_managed = False
+                managed_depth = 0
                 out.append(line)
                 continue
             # Otherwise swallow the line.
