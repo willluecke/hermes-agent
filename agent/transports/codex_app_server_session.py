@@ -470,6 +470,7 @@ class CodexAppServerSession:
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, _PendingFileChange] = {}
         self._last_policy_block_reason: Optional[str] = None
+        self._protected_delete_shim_active = False
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -536,16 +537,42 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            client_env = (
-                {"HERMES_GATEWAY_SESSION_ID": self._hermes_session_id}
-                if self._hermes_session_id
-                else None
-            )
+            client_env: dict[str, str] = {}
+            if self._hermes_session_id:
+                client_env["HERMES_GATEWAY_SESSION_ID"] = self._hermes_session_id
+            policy = self._reversible_deletion_policy
+            if (
+                self._project_key
+                and policy is not None
+                and getattr(policy, "enabled", False)
+            ):
+                try:
+                    from tools.reversible_delete_runtime import (
+                        install_reversible_delete_runtime,
+                    )
+
+                    runtime = install_reversible_delete_runtime(
+                        workspace_root=self._cwd,
+                        project=self._project_key,
+                        run_id=(
+                            self._current_approval_run_id()
+                            or self._hermes_session_id
+                        ),
+                        policy=policy,
+                        inherited_path=os.environ.get("PATH", ""),
+                    )
+                    client_env.update(runtime.env)
+                    self._protected_delete_shim_active = True
+                except Exception:
+                    logger.exception(
+                        "could not install protected Codex removal shims; "
+                        "retaining approval-time deletion capture"
+                    )
             client_kwargs: dict[str, Any] = {
                 "codex_bin": self._codex_bin,
                 "codex_home": self._codex_home,
             }
-            if client_env is not None:
+            if client_env:
                 client_kwargs["env"] = client_env
             self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
@@ -1348,6 +1375,7 @@ class CodexAppServerSession:
             from tools.reversible_deletion import (
                 command_targets_trash_store,
                 looks_like_file_delete,
+                protected_removal_command_name,
             )
 
             if command_targets_trash_store(str(command), cwd=str(cwd)):
@@ -1371,6 +1399,16 @@ class CodexAppServerSession:
                 # Codex as "rejected by user"; ``cancel`` accurately marks
                 # a client-side policy block.
                 return "cancel"
+
+            if (
+                self._protected_delete_shim_active
+                and protected_removal_command_name(str(command)) is not None
+            ):
+                # The PATH shim sees shell-expanded argv, captures every target,
+                # and refuses to call the real binary if any boundary or quota
+                # check fails. Recovery-store and hard-deny checks above remain
+                # non-overridable.
+                return "accept"
 
             is_file_delete = looks_like_file_delete(str(command))
             if action == "prompt" or is_file_delete:

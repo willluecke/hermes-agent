@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -32,9 +33,12 @@ class FakeClient:
     """Stand-in for CodexAppServerClient that records calls and lets the test
     drive the notification / server-request streams synchronously."""
 
-    def __init__(self, *, codex_bin: str = "codex", codex_home=None) -> None:
+    def __init__(
+        self, *, codex_bin: str = "codex", codex_home=None, env=None
+    ) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
+        self.env = dict(env or {})
         self.requests: list[tuple[str, dict]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
@@ -988,7 +992,67 @@ class TestServerRequestRouting:
         assert len(items) == 1
         assert items[0]["original_path"] == str(target)
 
-    def test_bounded_no_prompt_routes_dynamic_plain_rm_to_browser_review(
+    def test_bounded_no_prompt_auto_accepts_dynamic_plain_rm_with_server_shim(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+        session._protected_delete_shim_active = True
+
+        assert session._decide_exec_approval(
+            {"command": 'rm "$TARGET"', "cwd": str(workspace)}
+        ) == "accept"
+        callback.assert_not_called()
+        assert list_trash_items("reg-watch") == []
+
+    def test_session_installs_server_shim_before_starting_codex(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        clients = []
+
+        def factory(**kwargs):
+            client = FakeClient(**kwargs)
+            clients.append(client)
+            return client
+
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=factory,
+            hermes_session_id="session-1",
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+        )
+
+        session.ensure_started()
+
+        assert session._protected_delete_shim_active is True
+        assert clients[0].env["HERMES_GATEWAY_SESSION_ID"] == "session-1"
+        shim_dir = Path(clients[0].env["PATH"].split(os.pathsep, 1)[0])
+        assert {path.name for path in shim_dir.iterdir()} == {
+            "rm",
+            "unlink",
+            "rmdir",
+        }
+
+    def test_bounded_no_prompt_keeps_dynamic_plain_rm_review_when_shim_missing(
         self, tmp_path, monkeypatch
     ):
         hermes_home = tmp_path / "hermes-home"
@@ -1012,7 +1076,6 @@ class TestServerRequestRouting:
             {"command": 'rm "$TARGET"', "cwd": str(workspace)}
         ) == "accept"
         callback.assert_called_once()
-        assert list_trash_items("reg-watch") == []
 
     def test_dynamic_destructive_command_gets_fresh_checkpoint_before_review(
         self, tmp_path, monkeypatch

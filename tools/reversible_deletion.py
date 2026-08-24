@@ -140,6 +140,7 @@ def _protected_store_roots() -> tuple[Path, ...]:
     return (
         _store_root(),
         get_hermes_home() / "workspace-snapshots",
+        get_hermes_home() / "reversible-delete-runtime",
     )
 
 
@@ -165,9 +166,26 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
     try:
-        from hermes_state import apply_wal_with_fallback
-
-        apply_wal_with_fallback(conn, db_label="trash.db")
+        current_row = conn.execute("PRAGMA journal_mode").fetchone()
+        current_mode = str(current_row[0] if current_row else "").lower()
+        sqlite_version = tuple(sqlite3.sqlite_version_info[:3])
+        wal_reset_vulnerable = (
+            (3, 7, 0) <= sqlite_version < (3, 51, 3)
+            and not (3, 50, 7) <= sqlite_version < (3, 51, 0)
+            and not (3, 44, 6) <= sqlite_version < (3, 45, 0)
+        )
+        requested_mode = (
+            "DELETE" if wal_reset_vulnerable and current_mode != "wal" else "WAL"
+        )
+        try:
+            effective_row = conn.execute(
+                f"PRAGMA journal_mode={requested_mode}"
+            ).fetchone()
+            effective_mode = str(effective_row[0] if effective_row else "").lower()
+            if requested_mode == "WAL" and effective_mode != "wal":
+                conn.execute("PRAGMA journal_mode=DELETE")
+        except sqlite3.OperationalError:
+            conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS trash_items (
@@ -245,6 +263,40 @@ def validate_delete_target(
     raise UnsafeDeleteTarget("delete target is outside the selected workspace")
 
 
+def validate_expanded_delete_target(
+    raw_path: str,
+    *,
+    cwd: str,
+    workspace_root: str,
+    policy: ReversibleDeletionPolicy,
+) -> str:
+    """Validate one argv operand after the shell has already expanded it.
+
+    Unlike :func:`validate_delete_target`, metacharacters are ordinary filename
+    bytes here. The protected command shim receives an argv vector directly,
+    so there is no second shell interpretation to defend against.
+    """
+    if not raw_path or raw_path.startswith("~"):
+        raise UnsafeDeleteTarget("delete target is empty or uses home expansion")
+    absolute = os.path.abspath(
+        raw_path if os.path.isabs(raw_path) else os.path.join(cwd, raw_path)
+    )
+    parent = os.path.realpath(os.path.dirname(absolute))
+    target = os.path.join(parent, os.path.basename(absolute))
+    workspace = os.path.realpath(os.path.abspath(workspace_root))
+    for protected_root_path in _protected_store_roots():
+        protected_root = os.path.realpath(protected_root_path)
+        if target == protected_root or _is_descendant(target, protected_root):
+            raise UnsafeDeleteTarget("Hermes recovery storage is protected")
+    if _is_descendant(target, workspace):
+        return target
+    for configured_root in policy.temp_roots:
+        temp_root = os.path.realpath(os.path.abspath(configured_root))
+        if _is_descendant(target, temp_root):
+            return target
+    raise UnsafeDeleteTarget("delete target is outside the selected workspace")
+
+
 def _unwrap_static_command(command: str) -> list[str]:
     try:
         argv = shlex.split(command, posix=True)
@@ -258,6 +310,43 @@ def _unwrap_static_command(command: str) -> list[str]:
             raise UnsafeDeleteTarget("shell wrapper is not a single static command")
         return _unwrap_static_command(argv[2])
     return argv
+
+
+def protected_removal_command_name(command: str) -> Optional[str]:
+    """Return the removal primitive for one shim-covered shell command.
+
+    Variables and globs are permitted because the runtime shim validates their
+    expanded argv. Chained commands, redirects, command substitution, explicit
+    binary paths, and wrappers other than the normal login shell are excluded;
+    those retain the existing approval/checkpoint path.
+    """
+    candidate = str(command or "").strip()
+    if not candidate or "$(" in candidate or "`" in candidate:
+        return None
+    try:
+        argv = shlex.split(candidate, posix=True)
+        if argv and os.path.basename(argv[0]) in {"bash", "sh", "zsh", "dash"}:
+            if len(argv) != 3 or argv[1] not in {"-c", "-lc"}:
+                return None
+            candidate = argv[2]
+        lexer = shlex.shlex(
+            candidate,
+            posix=True,
+            punctuation_chars=";&|<>",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens or any(
+        token and set(token).issubset(set(";&|<>")) for token in tokens
+    ):
+        return None
+    executable = tokens[0]
+    if os.path.dirname(executable):
+        return None
+    return executable if executable in {"rm", "unlink", "rmdir"} else None
 
 
 def _rm_operands(argv: Sequence[str]) -> list[str]:
@@ -276,6 +365,102 @@ def _rm_operands(argv: Sequence[str]) -> list[str]:
             continue
         operands.append(token)
     return operands
+
+
+def _expanded_rm_operands(argv: Sequence[str]) -> list[str]:
+    """Return operands from a shell-expanded GNU/BSD ``rm`` argv."""
+    operands: list[str] = []
+    options_done = False
+    supported_long = {
+        "--dir",
+        "--force",
+        "--interactive",
+        "--no-preserve-root",
+        "--one-file-system",
+        "--preserve-root",
+        "--recursive",
+        "--verbose",
+    }
+    for token in argv[1:]:
+        if not options_done and token == "--":
+            options_done = True
+            continue
+        if not options_done and token.startswith("-") and token != "-":
+            if token in {"--help", "--version"}:
+                continue
+            if token.startswith("--interactive=") or token.startswith(
+                "--preserve-root="
+            ):
+                continue
+            if token.startswith("--"):
+                if token not in supported_long:
+                    raise UnsafeDeleteTarget(
+                        "rm option is not supported by the protected shim"
+                    )
+            elif not set(token[1:]).issubset(set("dfiIRrv")):
+                raise UnsafeDeleteTarget(
+                    "rm option is not supported by the protected shim"
+                )
+            continue
+        operands.append(token)
+    return operands
+
+
+def parse_expanded_delete_argv(
+    executable: str,
+    args: Sequence[str],
+    *,
+    cwd: str,
+    workspace_root: str,
+    policy: ReversibleDeletionPolicy,
+) -> DeletePlan:
+    """Build a delete plan from argv received by the protected command shim."""
+    name = os.path.basename(executable)
+    argv = [name, *[str(arg) for arg in args]]
+    if name == "rm":
+        operands = _expanded_rm_operands(argv)
+    elif name == "unlink":
+        operands = [token for token in argv[1:] if token != "--"]
+        if operands in (["--help"], ["--version"]):
+            operands = []
+        elif len(operands) != 1 or operands[0].startswith("-"):
+            raise UnsafeDeleteTarget(
+                "unlink must name exactly one target through the protected shim"
+            )
+    elif name == "rmdir":
+        operands = []
+        options_done = False
+        for token in argv[1:]:
+            if not options_done and token == "--":
+                options_done = True
+                continue
+            if not options_done and token in {"--help", "--version"}:
+                continue
+            if not options_done and token.startswith("-"):
+                if token not in {
+                    "--ignore-fail-on-non-empty",
+                    "--verbose",
+                    "-v",
+                }:
+                    raise UnsafeDeleteTarget(
+                        "rmdir option is not supported by the protected shim"
+                    )
+                continue
+            operands.append(token)
+    else:
+        raise UnsafeDeleteTarget("command is not a protected removal primitive")
+
+    targets: list[str] = []
+    for operand in operands:
+        target = validate_expanded_delete_target(
+            operand,
+            cwd=cwd,
+            workspace_root=workspace_root,
+            policy=policy,
+        )
+        if target not in targets:
+            targets.append(target)
+    return DeletePlan(command=shlex.join(argv), targets=tuple(targets))
 
 
 def parse_delete_command(
@@ -626,7 +811,9 @@ def capture_delete_command(
 ) -> CaptureResult:
     """Protect every exact target, or report why normal approval is required."""
     if not policy.enabled:
-        return CaptureResult(handled=False, reason="reversible deletion is disabled")
+        return CaptureResult(
+            handled=False, reason="reversible deletion is disabled"
+        )
     try:
         plan = parse_delete_command(
             command,
@@ -660,6 +847,52 @@ def capture_delete_command(
         items=tuple(items),
         missing_targets=tuple(missing),
     )
+
+
+def capture_delete_argv(
+    executable: str,
+    args: Sequence[str],
+    *,
+    cwd: str,
+    workspace_root: str,
+    project: str,
+    run_id: str,
+    operation_key: str,
+    policy: ReversibleDeletionPolicy,
+) -> CaptureResult:
+    """Capture shell-expanded removal operands before invoking the real binary."""
+    if not policy.enabled:
+        return CaptureResult(handled=False, reason="reversible deletion is disabled")
+    try:
+        plan = parse_expanded_delete_argv(
+            executable,
+            args,
+            cwd=cwd,
+            workspace_root=workspace_root,
+            policy=policy,
+        )
+    except ReversibleDeletionError as exc:
+        return CaptureResult(handled=False, reason=str(exc))
+
+    items: list[TrashItem] = []
+    missing: list[str] = []
+    try:
+        for target in plan.targets:
+            if not _lexists(target):
+                missing.append(target)
+                continue
+            items.append(
+                _capture_target(
+                    target,
+                    project=project,
+                    run_id=run_id,
+                    operation_key=operation_key,
+                    policy=policy,
+                )
+            )
+    except ReversibleDeletionError as exc:
+        return CaptureResult(handled=False, reason=str(exc))
+    return CaptureResult(True, tuple(items), tuple(missing))
 
 
 def capture_file_change_paths(

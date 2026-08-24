@@ -77,11 +77,13 @@ This is bounded no-prompt execution, not an unsandboxed Codex profile. Hermes
 Chat sends a project key, the gateway resolves it through the server-owned
 `workspaces.projects` map, and Codex receives that canonical directory as its
 workspace root. Routine commands and add/update patches proceed without a
-browser approval round trip. Reviewable guarded-YOLO operations that emit a
-Codex approval request, including scoped recursive deletion, history changes,
-and inspectable patch deletions or renames, pause the run and use the existing
-browser **Allow once** / **Deny** round trip. Commands Codex executes directly
-inside the workspace are still covered by the mandatory pre-turn snapshot.
+browser approval round trip. Direct `rm`, `unlink`, and `rmdir` commands are
+also no-prompt: an owner-only server shim archives their shell-expanded targets
+before it can invoke the real binary. Reviewable guarded-YOLO operations such
+as compound or opaque deletion, history changes, and inspectable patch deletes
+or renames pause the run and use the existing browser **Allow once** / **Deny**
+round trip. Commands Codex executes directly inside the workspace are still
+covered by the mandatory pre-turn snapshot.
 Hardline commands, `approvals.deny` matches, sudo password
 injection, uninspectable or unrecognized patch kinds, and permission escalation
 remain non-overridable policy cancellations. An unknown project key is rejected
@@ -89,10 +91,11 @@ before agent creation. Policy cancellations must never be presented as a
 rejection made by the user.
 
 The reversible-deletion contract in [reversible-deletion.md](reversible-deletion.md)
-supersedes the prompt for exact workspace and safe-temp file deletion once that
-subsystem is enabled. Its workspace snapshot layer creates a fail-closed
-recovery point before every native Codex turn and before recognized opaque
-destruction. It does not weaken approval for non-file destruction.
+supersedes the prompt for direct workspace and safe-temp `rm`-family deletion
+once that subsystem is enabled. Its workspace snapshot layer creates a
+fail-closed recovery point before every native Codex turn and before recognized
+opaque destruction. Recovery-store mutation, root/system deletion, and
+non-file destruction remain blocked or reviewable under their existing policy.
 
 The generic meaning of `approvals.mode: off` remains full approval bypass and
 must not be used on command-center. The narrower behavior above applies only

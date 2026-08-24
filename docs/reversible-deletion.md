@@ -20,11 +20,13 @@ action.
    occupied destination.
 5. Purge requires an authenticated, explicit browser action. Agent commands
    cannot purge or mutate the trash store.
-6. Root, home, system directories, project roots, user deny rules, sudo password
-   injection, permission escalation, and uninspectable operations remain
+6. Root, home, system directories, project roots, recovery runtime/storage,
+   user deny rules, sudo password injection, and permission escalation remain
    non-overridable policy blocks.
-7. A command that cannot be parsed into exact static delete targets uses the
-   normal **Allow once** / **Deny** approval path. It is never guessed safe.
+7. Direct `rm`, `unlink`, and `rmdir` commands use an owner-only `PATH` shim.
+   The shim validates shell-expanded argv, captures each target, and invokes
+   the real system binary only after every capture commits. A capture or
+   boundary failure returns exit 125 without deleting the source.
 8. Non-file destruction such as force push, Git history replacement, database
    drops, service disruption, and remote deletion continues to require approval.
 9. When workspace snapshots are enabled, a native Codex turn never starts until
@@ -40,6 +42,11 @@ The default store is:
 $HERMES_HOME/trash/
   trash.db
   payloads/<item-id>/payload
+
+$HERMES_HOME/reversible-delete-runtime/<run-key>/
+  bin/{rm,unlink,rmdir}
+  runner.py
+  lib/
 ```
 
 The SQLite ledger records item ID, project key, run/session identity, original
@@ -76,20 +83,35 @@ store quota until they are explicitly purged.
 
 ## Automatic Coverage
 
-The first implementation covers:
+The deletion boundary covers:
 
-- exact `rm`, `unlink`, and `rmdir` operands that contain no variables, globs,
-  substitutions, redirects, or shell pipelines;
+- direct `rm`, `unlink`, and `rmdir` commands, including shell variables and
+  globs, because capture happens after expansion at the argv boundary;
+- exact static removal commands at the Codex approval boundary as a fallback
+  when a protected shim could not be installed;
 - paths whose canonical parent is inside the selected workspace;
 - exact descendants of `/tmp` or `/var/tmp`, excluding the temp root itself;
 - inspectable Codex `fileChange` delete and rename items.
 
-Plain non-recursive `rm` is covered independently of the legacy dangerous
-command regex catalog. Common opaque delete APIs such as Python
+Plain non-recursive `rm` and recursive `rm -rf` use the same protected path.
+The shim is copied into an owner-only, run-scoped directory before Codex starts;
+its interpreter, policy, workspace, project, real binaries, and source hashes
+are server-bound. The selected runtime directory is prepended to the Codex
+subprocess `PATH`. A model cannot redirect it by changing `HERMES_HOME`, and a
+policy-source change during the run fails closed.
+
+Compound shell programs, redirects, command substitutions, and explicit binary
+paths retain approval-time capture/review rather than being classified as one
+shim-covered command. The shim still protects a normal `rm` invocation inside
+an allowed compound command, but Hermes does not auto-approve the entire shell
+program merely because one segment is reversible.
+
+Common opaque delete APIs such as Python
 `shutil.rmtree`/`os.unlink` and Node `fs.rm` are recognized as deletion but are
-not guessed into static targets. They use browser approval when Codex emits an
-exec-approval request; regardless of that protocol detail, the pre-turn
-workspace snapshot protects every file that existed when the turn began.
+not rewritten into synthetic `rm` commands. They use browser approval when
+Codex emits an exec-approval request; regardless of that protocol detail, the
+pre-turn workspace snapshot protects every file that existed when the turn
+began.
 
 The review classifier also recognizes `find -delete`/`-exec`, `xargs rm`,
 `git clean`/`reset`/`restore`/`checkout`, `rsync --delete*`, `shred -u`,
@@ -125,11 +147,12 @@ POST /v1/trash/<item-id>/purge
 Every endpoint resolves project keys and item IDs server-side. Purged ledger
 rows remain as tombstones so permanent deletion remains auditable.
 
-The implementation lives at the Codex app-server approval boundary, not in an
-agent prompt or shell alias. For an exact delete, Hermes validates every target,
-publishes every payload, commits the ledger, and only then returns `accept` to
-Codex. Capture failure leaves the original operation waiting for browser review.
-Restore and purge are not model tools.
+The implementation is server enforcement, not an agent prompt or shell alias.
+Hermes installs the protected command runtime before spawning Codex and keeps
+the approval-boundary parser as a fallback. For a shim-covered delete, Hermes
+auto-accepts the Codex request because the real binary remains unreachable
+through that command until the expanded targets are archived. Restore and purge
+are not model tools.
 
 ## Workspace Snapshots
 
@@ -163,12 +186,13 @@ and promote only the files actually needed.
 ## Known Boundary
 
 Every file present at turn start is recoverable regardless of which executable
-later deletes or overwrites it. Exact Trash capture and the just-in-time
-checkpoint also protect files created earlier in the same turn when Hermes
-recognizes the destructive command. A completely unknown executable can still
-create and delete a brand-new file inside one turn without leaving a version.
-Closing that final gap requires per-command execution in an OverlayFS workspace
-or a filesystem-native snapshot boundary, not more command regexes.
+later deletes or overwrites it. Expanded `rm`-family Trash capture and the
+just-in-time checkpoint also protect files created earlier in the same turn.
+An explicit system-binary path or a completely unknown executable can still
+create and delete a brand-new file inside one turn without leaving a version if
+Codex emits no approval event. Closing that final syscall-level gap requires
+per-command execution in an OverlayFS workspace or a filesystem-native snapshot
+boundary, not more command regexes.
 
 ## Verification
 

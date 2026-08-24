@@ -11,12 +11,15 @@ from tools.reversible_deletion import (
     RestoreConflict,
     TrashQuotaExceeded,
     UnsafeDeleteTarget,
+    capture_delete_argv,
     capture_delete_command,
     capture_file_change_paths,
     list_trash_items,
     looks_like_file_delete,
     operation_key_for,
+    parse_expanded_delete_argv,
     parse_delete_command,
+    protected_removal_command_name,
     purge_trash_item,
     restore_trash_item,
 )
@@ -50,6 +53,78 @@ def test_static_rm_is_parsed_inside_workspace(trash_env):
         policy=policy,
     )
     assert plan.targets == (str(target),)
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ('rm "$TARGET"', "rm"),
+        ("rm -rf *.log", "rm"),
+        ("/bin/bash -lc 'unlink \"$TARGET\"'", "unlink"),
+        ("rmdir empty", "rmdir"),
+        ("rm one && rm two", None),
+        ("rm $(find . -name old)", None),
+        ("/usr/bin/rm old", None),
+        ("PATH=/usr/bin rm old", None),
+    ],
+)
+def test_protected_removal_command_detection(command: str, expected: str | None):
+    assert protected_removal_command_name(command) == expected
+
+
+def test_expanded_argv_treats_metacharacters_as_filename_bytes(trash_env):
+    _home, workspace, _temp_root, policy = trash_env
+    target = workspace / "build[final]$1"
+    plan = parse_expanded_delete_argv(
+        "rm",
+        ["-rf", str(target)],
+        cwd=str(workspace),
+        workspace_root=str(workspace),
+        policy=policy,
+    )
+    assert plan.targets == (str(target),)
+
+
+def test_expanded_argv_capture_covers_shell_resolved_targets(trash_env):
+    _home, workspace, _temp_root, policy = trash_env
+    first = workspace / "one.log"
+    second = workspace / "two.log"
+    first.write_text("one", encoding="utf-8")
+    second.write_text("two", encoding="utf-8")
+
+    result = capture_delete_argv(
+        "rm",
+        ["-f", str(first), str(second)],
+        cwd=str(workspace),
+        workspace_root=str(workspace),
+        project="reg-watch",
+        run_id="expanded-run",
+        operation_key="expanded-op",
+        policy=policy,
+    )
+
+    assert result.handled is True
+    assert {item.original_path for item in result.items} == {str(first), str(second)}
+    assert first.exists() and second.exists()
+
+
+@pytest.mark.parametrize(
+    "store_name", ["trash", "workspace-snapshots", "reversible-delete-runtime"]
+)
+def test_expanded_argv_never_accepts_recovery_storage(trash_env, store_name: str):
+    home, workspace, _temp_root, policy = trash_env
+    result = capture_delete_argv(
+        "rm",
+        ["-rf", str(home / store_name / "payload")],
+        cwd=str(workspace),
+        workspace_root=str(workspace),
+        project="reg-watch",
+        run_id="protected-run",
+        operation_key="protected-op",
+        policy=policy,
+    )
+    assert result.handled is False
+    assert "recovery storage" in (result.reason or "")
 
 
 @pytest.mark.parametrize(
@@ -297,7 +372,9 @@ def test_store_metadata_is_owner_only(trash_env):
     assert (home / "trash" / "trash.db").stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("store_name", ["trash", "workspace-snapshots"])
+@pytest.mark.parametrize(
+    "store_name", ["trash", "workspace-snapshots", "reversible-delete-runtime"]
+)
 def test_recovery_stores_are_never_delete_targets(trash_env, store_name: str):
     home, workspace, _temp_root, policy = trash_env
     protected = home / store_name / "payload"
