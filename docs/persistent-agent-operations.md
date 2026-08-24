@@ -146,7 +146,7 @@ The reusable state-gated cron design is documented in
 [Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md).
 This section contains only command-center deployment commands.
 
-Install or update the tracked gate idempotently from the deployed migration
+Install or update the tracked gate idempotently from the deployed canonical
 checkout:
 
 ```bash
@@ -424,7 +424,7 @@ Daily gate budget exhausted:
 
 1. Confirm no active Hermes or subscription-worker jobs.
 2. Run and verify a command-center quick backup.
-3. Update source in the migration branch and run targeted tests.
+3. Update the `command-center` branch and run targeted tests.
 4. Update one native CLI at a time.
 5. Reapply the Hermes tools MCP migration to Codex configuration if needed.
 6. Run exact-model probes before restarting the gateway.

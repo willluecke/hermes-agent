@@ -135,3 +135,30 @@ def test_replace_once_is_idempotent_and_rejects_ambiguous_legacy_text() -> None:
     assert installer.replace_once("new", "old", "new", "job") == "new"
     with pytest.raises(RuntimeError, match="found 2"):
         installer.replace_once("old old", "old", "new", "job")
+
+
+def test_replace_one_of_converges_from_partial_path_migration() -> None:
+    installer = load_installer()
+    intermediate = (
+        "Pick hermes-agent-migration or audit hermes-agent-migration."
+    )
+    canonical = "Pick hermes-agent or audit hermes-agent."
+
+    assert (
+        installer.replace_one_of(
+            intermediate,
+            ("unrelated legacy", intermediate),
+            canonical,
+            "monthly",
+        )
+        == canonical
+    )
+    assert (
+        installer.replace_one_of(
+            canonical,
+            ("unrelated legacy", intermediate),
+            canonical,
+            "monthly",
+        )
+        == canonical
+    )

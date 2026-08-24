@@ -47,6 +47,24 @@ def replace_once(prompt: str, old: str, new: str, job_name: str) -> str:
     return prompt.replace(old, new, 1)
 
 
+def replace_one_of(
+    prompt: str,
+    old_values: tuple[str, ...],
+    new: str,
+    job_name: str,
+) -> str:
+    if new in prompt:
+        return prompt
+    matches = [old for old in old_values if prompt.count(old) == 1]
+    ambiguous = [old for old in old_values if prompt.count(old) > 1]
+    if len(matches) != 1 or ambiguous:
+        raise RuntimeError(
+            f"Expected one recognized legacy passage in {job_name!r}, "
+            f"found {len(matches)}"
+        )
+    return prompt.replace(matches[0], new, 1)
+
+
 def edit_agent_job(job: dict, prompt: str) -> None:
     subprocess.run(
         [
@@ -98,9 +116,12 @@ def main() -> None:
         "You are the command-center Codex decision authority; delegate one bounded independent review to the Claude Opus 5 subscription worker through opus_code_worker.",
         monthly["name"],
     )
-    monthly_prompt = replace_once(
+    monthly_prompt = replace_one_of(
         monthly_prompt,
-        "Pick ONE repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes (or null), audit 3DCarParts this month; otherwise audit hermes. For local repos not on the Pi, use the consult-claude channel (~/.hermes/bin/consult-claude) to have Claude Code on Will's Mac do read-only reads; for Pi-resident code read directly.",
+        (
+            "Pick ONE repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes (or null), audit 3DCarParts this month; otherwise audit hermes. For local repos not on the Pi, use the consult-claude channel (~/.hermes/bin/consult-claude) to have Claude Code on Will's Mac do read-only reads; for Pi-resident code read directly.",
+            "Pick ONE registered command-center repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes-agent-migration (or null), audit 3dcarparts this month; otherwise audit hermes-agent-migration. Load that project's RecCli context before review. Both canonical checkouts are local on command-center; do not depend on the Pi or Mac.",
+        ),
         "Pick ONE registered command-center repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes-agent (or null), audit 3dcarparts this month; otherwise audit hermes-agent. Load that project's RecCli context before review. Both canonical checkouts are local on command-center; do not depend on the Pi or Mac.",
         monthly["name"],
     )
