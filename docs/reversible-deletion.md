@@ -1,7 +1,6 @@
 # Reversible Deletion
 
-Status: implemented and locally validated, awaiting command-center deployment,
-2026-08-23
+Status: deployed and live-verified on command-center, 2026-08-23
 
 Hermes command-center treats ordinary file deletion as a reversible operation.
 The selected project remains the write boundary, but a statically inspectable
@@ -123,7 +122,7 @@ filesystems or filesystem-native snapshots under a dedicated worker account.
 
 ## Verification
 
-Pre-deployment evidence on 2026-08-23:
+Automated evidence on 2026-08-23:
 
 - 97 focused Python tests cover parsing, boundary checks, symlinks, quotas,
   idempotency, command and file-change routing, authentication, restore
@@ -135,5 +134,20 @@ Pre-deployment evidence on 2026-08-23:
 - 10 Playwright browser tests pass, including the Trash lifecycle at 1280x800
   and 390x844 with long-path overflow checks and two-step permanent deletion.
 
-Live command-center delete/restore/purge evidence is recorded here after
-deployment.
+Live command-center evidence on 2026-08-23:
+
+- Gateway commit `d60159f5d` was deployed, the policy was enabled through the
+  Hermes configuration interface, and `hermes-gateway.service` was restarted
+  only after confirming no run was active.
+- Run `run_1a03bf3504c243cb9fc6793057a090c7` executed the exact command
+  `rm -rf /tmp/hermes-trash-e2e-20260823` and completed normally. The source was
+  absent only after the protected capture and ledger commit succeeded.
+- Ledger item `b7c145c4804741dc8a875bf946cb3544` retained the directory under
+  the `reg-watch` project with its original path, run ID, type, byte count, and
+  entry count.
+- Restore recreated the file with byte-identical content. Purge then removed
+  only the protected payload, left the restored source intact, and retained the
+  ledger tombstone with status `purged`.
+- Hermes Chat commit `0c8808a` was pushed to `main`. The production Vercel
+  Trash route responds with HTTP 401 without credentials, proving both that the
+  new route is deployed and that its authentication gate is active.
