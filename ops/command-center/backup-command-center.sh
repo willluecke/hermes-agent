@@ -22,7 +22,7 @@ backup_root=${COMMAND_CENTER_BACKUP_ROOT:-$home_dir/.local/state/command-center-
 hermes_bin=${HERMES_BIN:-$home_dir/.local/bin/hermes}
 # Keep backup and integrity semantics aligned with the SQLite build Hermes uses.
 # Debian's system sqlite3 can misclassify newer trigram FTS indexes as malformed.
-sqlite_python=${COMMAND_CENTER_SQLITE_PYTHON:-$home_dir/src/hermes-agent-migration/venv/bin/python}
+sqlite_python=${COMMAND_CENTER_SQLITE_PYTHON:-$hermes_home/venvs/hermes-command-center/bin/python}
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 final_dir=$backup_root/$mode-$timestamp
 staging_dir=$backup_root/.$mode-$timestamp-$$.partial
@@ -181,7 +181,7 @@ if [[ -d $home_dir/.cloudflared ]]; then
   done < <(find "$home_dir/.cloudflared" -maxdepth 1 -type f -print0)
 fi
 
-agent_repo=$home_dir/src/hermes-agent-migration
+agent_repo=$home_dir/src/hermes-agent
 chat_repo=$home_dir/coding-projects/hermes-chat
 {
   printf 'schema=command-center-backup-v1\n'

@@ -59,7 +59,7 @@ codex_runtime:
       reg-watch: /home/will/coding-projects/reg-watch
       closure-engine: /home/will/coding-projects/closure-engine
       llm-view: /home/will/coding-projects/llm-view
-      hermes-agent-migration: /home/will/src/hermes-agent-migration
+      hermes-agent: /home/will/src/hermes-agent
   no_prompt:
     enabled: true
 ```
@@ -150,7 +150,7 @@ Install or update the tracked gate idempotently from the deployed migration
 checkout:
 
 ```bash
-cd /home/will/src/hermes-agent-migration
+cd /home/will/src/hermes-agent
 ops/command-center/install-agentic-loop.sh
 ```
 
@@ -318,7 +318,7 @@ to complete or explicitly cancel it first.
 
 ## Backups
 
-Install the tracked backup services from the deployed migration checkout:
+Install the tracked backup services from the deployed canonical checkout:
 
 ```bash
 bash ops/command-center/install-command-center-backups.sh
@@ -332,7 +332,7 @@ Backups are private, atomic directories under
 - `full-*`: weekly full Hermes export plus chat-sync SQLite and recovery
   configuration; 4 retained.
 
-The script must use the migration virtual environment's Python/SQLite runtime.
+The script uses the command-center virtual environment's Python/SQLite runtime.
 The Debian `sqlite3` CLI is older and can falsely report Hermes' newer trigram
 FTS index as malformed. Override `COMMAND_CENTER_SQLITE_PYTHON` only with a
 runtime whose SQLite compatibility has been verified against the live DB.

@@ -13,7 +13,7 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", HOME / ".hermes"))
 SOURCE_DIR = Path(
     os.environ.get(
         "SOURCE_DIR",
-        HOME / "src" / "hermes-agent-migration" / "ops" / "command-center",
+        HOME / "src" / "hermes-agent" / "ops" / "command-center",
     )
 )
 HERMES_BIN = os.environ.get("HERMES_BIN", str(HOME / ".local" / "bin" / "hermes"))
@@ -101,7 +101,7 @@ def main() -> None:
     monthly_prompt = replace_once(
         monthly_prompt,
         "Pick ONE repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes (or null), audit 3DCarParts this month; otherwise audit hermes. For local repos not on the Pi, use the consult-claude channel (~/.hermes/bin/consult-claude) to have Claude Code on Will's Mac do read-only reads; for Pi-resident code read directly.",
-        "Pick ONE registered command-center repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes-agent-migration (or null), audit 3dcarparts this month; otherwise audit hermes-agent-migration. Load that project's RecCli context before review. Both canonical checkouts are local on command-center; do not depend on the Pi or Mac.",
+        "Pick ONE registered command-center repo this month, alternating: check /home/will/.hermes/pipeline-audit.json 'last_monthly_repo_audit' — if it was hermes-agent (or null), audit 3dcarparts this month; otherwise audit hermes-agent. Load that project's RecCli context before review. Both canonical checkouts are local on command-center; do not depend on the Pi or Mac.",
         monthly["name"],
     )
     monthly_prompt = replace_once(

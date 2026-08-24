@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source_dir=${SOURCE_DIR:-$HOME/src/hermes-agent-migration/ops/command-center}
+source_dir=${SOURCE_DIR:-$HOME/src/hermes-agent/ops/command-center}
 unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 
 install -D -m 0700 \

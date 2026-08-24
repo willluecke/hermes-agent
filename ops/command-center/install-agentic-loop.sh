@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE_DIR=${SOURCE_DIR:-/home/will/src/hermes-agent-migration/ops/command-center}
+SOURCE_DIR=${SOURCE_DIR:-/home/will/src/hermes-agent/ops/command-center}
 HERMES_HOME=${HERMES_HOME:-/home/will/.hermes}
 HERMES_BIN=${HERMES_BIN:-/home/will/.local/bin/hermes}
 JOB_NAME="Governed Agentic Loop Gate"

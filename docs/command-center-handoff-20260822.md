@@ -13,8 +13,8 @@ against the live host.
 - SSH: `will@192.168.1.243`
 - OS: Debian 13, headless
 - Hardware: Ryzen 7 8845HS, 32 GB RAM, 1 TB NVMe
-- Primary checkout: `/home/will/src/hermes-agent-migration`
-- Branch: `migration/command-center-20260822`
+- Primary checkout: `/home/will/src/hermes-agent`
+- Branch: `command-center`
 - Verified operational baseline commit: `4ba7eb630`
 - Hermes Chat production-smoke commit: `0e90d5b`
 - The Raspberry Pi is not the active Hermes host. Do not change it without an
@@ -162,7 +162,7 @@ Automated private backups live under:
 Install or refresh the timers with:
 
 ```bash
-bash /home/will/src/hermes-agent-migration/ops/command-center/install-command-center-backups.sh
+bash /home/will/src/hermes-agent/ops/command-center/install-command-center-backups.sh
 ```
 
 Both modes passed manual restore-artifact checks on 2026-08-23: every manifest
