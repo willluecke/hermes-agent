@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from typing import Any, Optional
 
 import pytest
@@ -805,19 +805,46 @@ class TestServerRequestRouting:
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "rm -rf ./build",
-            "git reset --hard",
-            "git push --force origin main",
-            "sudo -S id",
-            "",
-        ],
-    )
-    def test_bounded_no_prompt_declines_guarded_exec(self, command):
+    @pytest.mark.parametrize("choice,expected", [
+        ("once", "accept"),
+        ("deny", "decline"),
+        ("timeout", "cancel"),
+    ])
+    def test_bounded_no_prompt_routes_reviewable_exec_to_user(
+        self, choice, expected
+    ):
+        calls = []
+
+        def callback(command, description, *, allow_permanent=True):
+            calls.append((command, description, allow_permanent))
+            return choice
+
         session = make_session(
             FakeClient(),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        assert session._decide_exec_approval({
+            "command": "rm -rf /tmp/regwatch-closure.4jhNlp",
+            "cwd": "/workspace",
+        }) == expected
+        assert calls == [(
+            "rm -rf /tmp/regwatch-closure.4jhNlp",
+            "Codex requests exec in /workspace — Hermes review: "
+            "recursive deletion using an absolute path",
+            False,
+        )]
+
+    @pytest.mark.parametrize("command", ["rm -rf /", "sudo -S id", ""])
+    def test_bounded_no_prompt_hard_denies_non_overridable_exec(self, command):
+        callback = MagicMock(return_value="once")
+        session = make_session(
+            FakeClient(),
+            approval_callback=callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=True,
                 guard_no_prompt_exec=True,
@@ -825,6 +852,7 @@ class TestServerRequestRouting:
         )
 
         assert session._decide_exec_approval({"command": command}) == "cancel"
+        callback.assert_not_called()
 
     @pytest.mark.parametrize(
         "command",
@@ -846,16 +874,13 @@ class TestServerRequestRouting:
 
         assert session._decide_exec_approval({"command": command}) == "accept"
 
-    @pytest.mark.parametrize(
-        ("kind", "expected"),
-        [
-            ("add", "accept"),
-            ("update", "accept"),
-            ("delete", "cancel"),
-            ("rename", "cancel"),
-        ],
-    )
-    def test_bounded_no_prompt_file_change_policy(self, kind, expected):
+    @pytest.mark.parametrize(("kind", "expected"), [
+        ("add", "accept"),
+        ("update", "accept"),
+    ])
+    def test_bounded_no_prompt_auto_accepts_additive_file_changes(
+        self, kind, expected
+    ):
         session = make_session(
             FakeClient(),
             request_routing=_ServerRequestRouting(
@@ -881,6 +906,45 @@ class TestServerRequestRouting:
         assert session._decide_apply_patch_approval(
             {"itemId": "fc-guarded"}
         ) == expected
+
+    @pytest.mark.parametrize(("kind", "choice", "expected"), [
+        ("delete", "once", "accept"),
+        ("rename", "deny", "decline"),
+    ])
+    def test_bounded_no_prompt_routes_destructive_file_changes_to_user(
+        self, kind, choice, expected
+    ):
+        callback = MagicMock(return_value=choice)
+        session = make_session(
+            FakeClient(),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_apply_patch=True,
+                guard_no_prompt_file_changes=True,
+            ),
+        )
+        session._track_pending_file_change({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "fileChange",
+                    "id": "fc-reviewable",
+                    "changes": [{
+                        "kind": {"type": kind},
+                        "path": "/workspace/obsolete.txt",
+                    }],
+                }
+            },
+        })
+
+        assert session._decide_apply_patch_approval(
+            {"itemId": "fc-reviewable"}
+        ) == expected
+        callback.assert_called_once_with(
+            f"apply_patch: 1 {kind}: /workspace/obsolete.txt",
+            f"1 {kind}: /workspace/obsolete.txt",
+            allow_permanent=False,
+        )
 
     def test_bounded_no_prompt_declines_uninspectable_file_change(self):
         session = make_session(
@@ -915,7 +979,7 @@ class TestServerRequestRouting:
         client.queue_server_request(
             "item/commandExecution/requestApproval",
             request_id="policy-1",
-            command="rm -rf ./build",
+            command="rm -rf /",
             cwd="/tmp",
         )
         client.queue_notification(

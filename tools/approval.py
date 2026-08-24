@@ -2363,38 +2363,45 @@ def detect_guarded_yolo_prompt_command(command: str) -> tuple:
     return (True, description)
 
 
-def check_no_prompt_command_guard(command: str) -> tuple[bool, str | None]:
+def classify_no_prompt_command_guard(command: str) -> tuple[str, str | None]:
     """Classify a command for bounded, unattended Codex execution.
 
     This is deliberately stricter than ``approvals.mode: off``. A no-prompt
     browser run may execute routine development commands without waiting for a
-    human, but anything that the guarded-YOLO policy would normally present to
-    a user is denied instead. The unconditional hardline, sudo-stdin, and
-    user-configured deny floors remain in force as well.
+    human. Commands that guarded YOLO would normally present to a user retain
+    that interactive review path; the unconditional hardline, sudo-stdin, and
+    user-configured deny floors remain non-overridable.
 
-    Returns ``(allowed, reason)``. Callers must fail closed when ``allowed`` is
-    false; this helper never opens an interactive approval channel.
+    Returns ``("allow"|"prompt"|"deny", reason)``. The caller owns the
+    interactive approval round trip for ``prompt`` and must fail closed when no
+    approval channel is attached.
     """
     if not isinstance(command, str) or not command.strip():
-        return (False, "command payload is empty or uninspectable")
+        return ("deny", "command payload is empty or uninspectable")
 
     is_hardline, description = detect_hardline_command(command)
     if is_hardline:
-        return (False, description)
+        return ("deny", description)
 
     is_sudo_guess, description = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
-        return (False, description)
+        return ("deny", description)
 
     deny_pattern = _match_user_deny_rule(command)
     if deny_pattern is not None:
-        return (False, f"matches approvals.deny rule {deny_pattern!r}")
+        return ("deny", f"matches approvals.deny rule {deny_pattern!r}")
 
     must_prompt, description = detect_guarded_yolo_prompt_command(command)
     if must_prompt:
-        return (False, description)
+        return ("prompt", description)
 
-    return (True, None)
+    return ("allow", None)
+
+
+def check_no_prompt_command_guard(command: str) -> tuple[bool, str | None]:
+    """Backward-compatible boolean view of the bounded command policy."""
+    action, reason = classify_no_prompt_command_guard(command)
+    return (action == "allow", reason)
 
 
 # =========================================================================

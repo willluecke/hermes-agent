@@ -71,11 +71,14 @@ This is bounded no-prompt execution, not an unsandboxed Codex profile. Hermes
 Chat sends a project key, the gateway resolves it through the server-owned
 `workspaces.projects` map, and Codex receives that canonical directory as its
 workspace root. Routine commands and add/update patches proceed without a
-browser approval round trip. Commands in the guarded-YOLO destructive classes,
-hardline commands, `approvals.deny` matches, sudo password injection, patch
-deletions, unrecognized patch kinds, and permission escalation are cancelled
-without prompting. An unknown project key is rejected before agent creation.
-Policy cancellations must never be presented as a rejection made by the user.
+browser approval round trip. Reviewable guarded-YOLO operations, including
+scoped recursive deletion, history changes, and inspectable patch deletions or
+renames, pause the run and use the existing browser **Allow once** / **Deny**
+round trip. Hardline commands, `approvals.deny` matches, sudo password
+injection, uninspectable or unrecognized patch kinds, and permission escalation
+remain non-overridable policy cancellations. An unknown project key is rejected
+before agent creation. Policy cancellations must never be presented as a
+rejection made by the user.
 
 The generic meaning of `approvals.mode: off` remains full approval bypass and
 must not be used on command-center. The narrower behavior above applies only

@@ -1330,28 +1330,34 @@ class CodexAppServerSession:
         gate (mode + ``approvals.timeout``) in ``tools/approval.py``.
         Keep it that way — do not re-read approval config here.
         """
-        if self._routing.auto_approve_exec:
-            if self._routing.guard_no_prompt_exec:
-                from tools.approval import check_no_prompt_command_guard
-
-                allowed, reason = check_no_prompt_command_guard(
-                    str(params.get("command") or "")
-                )
-                if not allowed:
-                    self._last_policy_block_reason = (
-                        "Codex unattended policy blocked command: "
-                        f"{reason or 'guarded command'}"
-                    )
-                    logger.warning(
-                        "Codex no-prompt policy declined exec: %s",
-                        reason or "unclassified guarded command",
-                    )
-                    # No human made this decision. ``decline`` is rendered by
-                    # Codex as "rejected by user"; ``cancel`` accurately marks
-                    # a client-side policy block.
-                    return "cancel"
-            return "accept"
         command = params.get("command") or ""
+        review_reason: Optional[str] = None
+        if self._routing.auto_approve_exec:
+            if not self._routing.guard_no_prompt_exec:
+                return "accept"
+
+            from tools.approval import classify_no_prompt_command_guard
+
+            action, review_reason = classify_no_prompt_command_guard(str(command))
+            if action == "allow":
+                return "accept"
+            if action == "deny":
+                self._last_policy_block_reason = (
+                    "Codex unattended policy blocked command: "
+                    f"{review_reason or 'guarded command'}"
+                )
+                logger.warning(
+                    "Codex no-prompt policy declined exec: %s",
+                    review_reason or "unclassified guarded command",
+                )
+                # No human made this decision. ``decline`` is rendered by
+                # Codex as "rejected by user"; ``cancel`` accurately marks
+                # a client-side policy block.
+                return "cancel"
+
+            # Reviewable commands use the normal Hermes approval bridge. This
+            # keeps routine development autonomous while allowing the browser
+            # to pause and resume the same Codex turn for a bounded risk.
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
         # fall back to the session's cwd when codex doesn't include it so the
         # approval prompt is never empty (quirk #10 fix).
@@ -1360,17 +1366,40 @@ class CodexAppServerSession:
         description = f"Codex requests exec in {cwd}"
         if reason:
             description += f" — {reason}"
+        if review_reason:
+            visible_reason = (
+                "recursive deletion using an absolute path"
+                if review_reason == "delete in root path"
+                else review_reason
+            )
+            description += f" — Hermes review: {visible_reason}"
         if self._approval_callback is not None:
             try:
                 choice = self._approval_callback(
                     command, description, allow_permanent=False
                 )
-                return _approval_choice_to_codex_decision(choice)
+                decision = _approval_choice_to_codex_decision(choice)
+                if choice == "timeout":
+                    self._last_policy_block_reason = (
+                        "Codex command approval timed out without a user response"
+                    )
+                elif choice == "unavailable":
+                    self._last_policy_block_reason = (
+                        "Codex command required approval, but no approval channel "
+                        "was available"
+                    )
+                return decision
             except Exception:
                 logger.exception("approval_callback raised on exec request")
+                self._last_policy_block_reason = (
+                    "Codex command approval failed before a user decision"
+                )
                 return "cancel"
         # No callback means no human saw the request. Cancel fail-closed; a
         # decline is reserved for an actual user denial.
+        self._last_policy_block_reason = (
+            "Codex command required approval, but no approval channel was available"
+        )
         return "cancel"
 
     def _decide_apply_patch_approval(self, params: dict) -> str:
@@ -1394,7 +1423,15 @@ class CodexAppServerSession:
                         "inspectable item metadata"
                     )
                     return "cancel"
-                if not pending.kinds or not pending.kinds.issubset({"add", "update"}):
+                if not pending.kinds:
+                    self._last_policy_block_reason = (
+                        "Codex unattended policy blocked an uninspectable "
+                        "file change"
+                    )
+                    return "cancel"
+                if pending.kinds.issubset({"add", "update"}):
+                    return "accept"
+                if not pending.kinds.issubset({"delete", "rename"}):
                     blocked_kinds = ", ".join(sorted(pending.kinds)) or "unknown"
                     self._last_policy_block_reason = (
                         "Codex unattended policy blocked file change kinds: "
@@ -1406,7 +1443,10 @@ class CodexAppServerSession:
                         blocked_kinds,
                     )
                     return "cancel"
-            return "accept"
+                # Inspectable deletes and renames are reviewable. Fall through
+                # to the same browser approval bridge used by exec requests.
+            else:
+                return "accept"
         if self._approval_callback is not None:
             # FileChangeRequestApprovalParams gives us reason + grantRoot.
             # The actual changeset lives on the corresponding fileChange
@@ -1439,10 +1479,26 @@ class CodexAppServerSession:
                     description,
                     allow_permanent=False,
                 )
-                return _approval_choice_to_codex_decision(choice)
+                decision = _approval_choice_to_codex_decision(choice)
+                if choice == "timeout":
+                    self._last_policy_block_reason = (
+                        "Codex file-change approval timed out without a user response"
+                    )
+                elif choice == "unavailable":
+                    self._last_policy_block_reason = (
+                        "Codex file change required approval, but no approval "
+                        "channel was available"
+                    )
+                return decision
             except Exception:
                 logger.exception("approval_callback raised on apply_patch")
+                self._last_policy_block_reason = (
+                    "Codex file-change approval failed before a user decision"
+                )
                 return "cancel"
+        self._last_policy_block_reason = (
+            "Codex file change required approval, but no approval channel was available"
+        )
         return "cancel"
 
     def _track_pending_file_change(self, note: dict) -> None:

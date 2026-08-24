@@ -297,12 +297,15 @@ directory, and supplies it as Codex's workspace root. Unknown keys fail before
 the agent starts. Legacy clients that omit `project` use `default_project`.
 
 With `no_prompt.enabled: true`, routine Codex exec requests and add/update
-patches in API-server runs are accepted automatically. Commands that
-guarded YOLO would normally prompt for are cancelled instead, as are hardline
-commands, user deny-rule matches, sudo password injection, file deletions,
-unknown file-change metadata, and permission escalation. No unavailable
-browser prompt is synthesized and no policy decision is described as a human
-rejection.
+patches in API-server runs are accepted automatically. Reviewable commands that
+guarded YOLO would normally prompt for pause the run and emit the standard
+`approval.request` event; an attached browser presents **Allow once** / **Deny**
+and resumes the same Codex turn after the decision. Inspectable patch deletions
+and renames use the same path. Hardline commands, user deny-rule matches, sudo
+password injection, uninspectable or unknown file-change metadata, and
+permission escalation remain non-overridable cancellations. If no approval
+channel is attached, a reviewable request fails closed and is never described
+as a human rejection.
 
 Keep the global approval mode at `guarded_yolo`. The bounded no-prompt flag is
 scoped to API-server native Codex turns; a direct OpenRouter selection or a
