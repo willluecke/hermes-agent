@@ -1046,11 +1046,13 @@ class TestServerRequestRouting:
         assert session._protected_delete_shim_active is True
         assert clients[0].env["HERMES_GATEWAY_SESSION_ID"] == "session-1"
         shim_dir = Path(clients[0].env["PATH"].split(os.pathsep, 1)[0])
+        shell_env = Path(clients[0].env["BASH_ENV"])
         assert {path.name for path in shim_dir.iterdir()} == {
             "rm",
             "unlink",
             "rmdir",
         }
+        assert str(shim_dir) in shell_env.read_text(encoding="utf-8")
 
     def test_bounded_no_prompt_keeps_dynamic_plain_rm_review_when_shim_missing(
         self, tmp_path, monkeypatch

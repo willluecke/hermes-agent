@@ -97,8 +97,10 @@ Plain non-recursive `rm` and recursive `rm -rf` use the same protected path.
 The shim is copied into an owner-only, run-scoped directory before Codex starts;
 its interpreter, policy, workspace, project, real binaries, and source hashes
 are server-bound. The selected runtime directory is prepended to the Codex
-subprocess `PATH`. A model cannot redirect it by changing `HERMES_HOME`, and a
-policy-source change during the run fails closed.
+subprocess `PATH`, and an owner-only `BASH_ENV` reapplies that fixed path after
+`bash -lc` reads login profiles. A model cannot redirect it by changing
+`HERMES_HOME`, and a policy-source change during the run fails closed. Non-Bash
+shell wrappers stay on the review path rather than being presumed protected.
 
 Compound shell programs, redirects, command substitutions, and explicit binary
 paths retain approval-time capture/review rather than being classified as one

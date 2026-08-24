@@ -85,6 +85,17 @@ def install_reversible_delete_runtime(
     )
 
     policy_json = json.dumps(asdict(policy), separators=(",", ":"), sort_keys=True)
+    path = (
+        f"{bin_dir}{os.pathsep}{inherited_path}"
+        if inherited_path
+        else str(bin_dir)
+    )
+    shell_env = runtime_root / "shell-env.sh"
+    _atomic_write(
+        shell_env,
+        f"export PATH={shlex.quote(path)}\n",
+        mode=0o600,
+    )
     common = [
         shlex.quote(sys.executable),
         "-I",
@@ -122,9 +133,11 @@ def install_reversible_delete_runtime(
         )
         _atomic_write(bin_dir / executable, script, mode=0o700)
 
-    path = f"{bin_dir}{os.pathsep}{inherited_path}" if inherited_path else str(bin_dir)
     return ReversibleDeleteRuntime(
         bin_dir=bin_dir,
         runner=runner,
-        env={"PATH": path},
+        env={
+            "PATH": path,
+            "BASH_ENV": str(shell_env),
+        },
     )

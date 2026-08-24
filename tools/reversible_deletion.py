@@ -325,7 +325,7 @@ def protected_removal_command_name(command: str) -> Optional[str]:
         return None
     try:
         argv = shlex.split(candidate, posix=True)
-        if argv and os.path.basename(argv[0]) in {"bash", "sh", "zsh", "dash"}:
+        if argv and os.path.basename(argv[0]) == "bash":
             if len(argv) != 3 or argv[1] not in {"-c", "-lc"}:
                 return None
             candidate = argv[2]

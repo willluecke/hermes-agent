@@ -34,7 +34,7 @@ def test_runtime_shim_captures_expanded_glob_before_real_rm(
     env.update(runtime.env)
     env["TARGET"] = first.name
     result = subprocess.run(
-        ["/bin/sh", "-c", 'rm -f "$TARGET" *.log'],
+        ["/bin/bash", "-lc", 'rm -f "$TARGET" *.log'],
         cwd=workspace,
         env=env,
         text=True,
@@ -43,6 +43,7 @@ def test_runtime_shim_captures_expanded_glob_before_real_rm(
     )
 
     assert result.returncode == 0, result.stderr
+    assert Path(runtime.env["BASH_ENV"]).stat().st_mode & 0o777 == 0o600
     assert not first.exists() and not second.exists()
     assert {item["original_path"] for item in list_trash_items("reg-watch")} == {
         str(first),
