@@ -15,8 +15,8 @@ module:
      OpenClaw calls "migrate native codex plugins" — the YouTube-video-
      worthy bit Pash highlighted: Canva, GitHub, Calendar, Gmail
      pre-configured.)
-  3. Writes a [permissions] default profile so users on this runtime
-     don't get an approval prompt on every write attempt.
+  3. Writes a top-level default permission selection and, when configured,
+     a least-privilege custom [permissions.<name>] profile.
 
 What translates (MCP servers):
   Hermes mcp_servers.<n>.command/args/env  → codex stdio transport
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # Marker comments wrapping the managed section so re-runs can detect
 # what's ours and what's user-edited. Both must appear or strip is a no-op.
 MIGRATION_MARKER = (
-    "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section"
+    "# managed by hermes-agent — `/codex-runtime codex_app_server` regenerates this section"
 )
 MIGRATION_END_MARKER = (
     "# end hermes-agent managed section"
@@ -296,9 +296,8 @@ def render_codex_toml_section(
     if default_permission_profile:
         # Codex's config schema: `default_permissions` is a top-level
         # string referencing a profile name. Built-in profile names start
-        # with ":" (":workspace-write", ":read-only", ":full-access"). The
-        # [permissions] table is for *user-defined* named profiles with
-        # structured fields — not what we want.
+        # with ":" (for example, ":workspace" and ":read-only"). The
+        # [permissions] table is for user-defined named profiles.
         normalized = default_permission_profile
         if (
             not normalized.startswith(":")
@@ -731,8 +730,8 @@ def migrate(
         default_permission_profile: when set (default ":workspace"), write
             top-level `default_permissions = "<name>"` so users on this
             runtime don't get an approval prompt on every write attempt.
-            Built-in codex profile names are ":workspace", ":read-only",
-            ":danger-no-sandbox" (note the leading ":"). Also accepts a
+            Built-in codex profile names include ":workspace", ":read-only",
+            and ":danger-full-access" (note the leading ":"). Also accepts a
             user-defined profile name (no leading ":") that the user has
             configured in their own [permissions.<name>] table. Set None
             to leave permissions unset and let codex use its compiled-in

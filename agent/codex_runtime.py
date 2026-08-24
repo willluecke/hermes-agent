@@ -1103,9 +1103,28 @@ def run_codex_app_server_turn(
         should_review_skills = True
         agent._iters_since_skill = 0
 
+    # A clean turn/completed notification without assistant text is not a
+    # successful chat turn. This occurs when Codex cancels an unanswered
+    # approval request: the protocol closes normally, but there is no answer
+    # to persist or return. Keep that distinct from an authoritative final.
+    missing_final = (
+        not turn.interrupted
+        and turn.error is None
+        and (
+            not isinstance(turn.final_text, str)
+            or not turn.final_text.strip()
+        )
+    )
+    effective_error = turn.error
+    if missing_final:
+        effective_error = (
+            "codex app-server turn completed without final assistant text; "
+            "a requested approval may have expired or been unavailable"
+        )
+
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if not turn.interrupted and effective_error is None:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
@@ -1137,15 +1156,15 @@ def run_codex_app_server_turn(
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": not turn.interrupted and effective_error is None,
+        "partial": turn.interrupted or effective_error is not None,
         "interrupted": _user_interrupted,
         **(
             {"interrupt_message": _interrupt_message}
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": effective_error,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

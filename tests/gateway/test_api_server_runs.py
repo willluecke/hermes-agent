@@ -149,6 +149,37 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_empty_final_response_is_failed_not_completed(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "",
+                    "completed": True,
+                    "partial": False,
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                for _ in range(80):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] in {"completed", "failed"}:
+                        break
+                    await asyncio.sleep(0.025)
+
+                assert status["status"] == "failed"
+                assert "without final assistant text" in status["error"]
+
+                events = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+                assert '"event": "run.failed"' in events
+                assert '"event": "run.completed"' not in events
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("raises", [False, True])
     async def test_run_releases_codex_writer_before_terminal_status(
         self, adapter, raises
@@ -695,6 +726,52 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_approval_response_targets_exact_request_id(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        run_id = "run_targetedapproval"
+        auth_adapter._set_run_status(run_id, "waiting_for_approval")
+        auth_adapter._run_approval_sessions[run_id] = run_id
+        auth_adapter._run_streams[run_id] = _ReplayableRunEventStream(1000)
+
+        first = approval_mod._ApprovalEntry({
+            "request_id": "approval-first",
+            "command": "first",
+        })
+        second = approval_mod._ApprovalEntry({
+            "request_id": "approval-second",
+            "command": "second",
+        })
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [first, second]
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once", "request_id": "approval-second"},
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+
+            assert response.status == 200
+            assert payload["request_id"] == "approval-second"
+            assert second.result == "once"
+            assert second.event.is_set()
+            assert first.result is None
+            assert not first.event.is_set()
+            with approval_mod._lock:
+                assert approval_mod._gateway_queues[run_id] == [first]
+
+            events, _, _ = auth_adapter._run_streams[run_id].read_from(0)
+            assert events[-1]["event"] == "approval.responded"
+            assert events[-1]["request_id"] == "approval-second"
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            auth_adapter._run_approval_sessions.pop(run_id, None)
+            auth_adapter._run_streams.pop(run_id, None)
 
 
 # ---------------------------------------------------------------------------

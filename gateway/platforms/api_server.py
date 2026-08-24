@@ -8138,6 +8138,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    if not isinstance(final_response, str) or not final_response.strip():
+                        error_msg = "agent run completed without final assistant text"
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "failed",
+                            error=error_msg,
+                            last_event="run.failed",
+                        )
+                        return
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
@@ -8377,6 +8392,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        request_id = str(body.get("request_id") or "").strip() or None
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -8384,6 +8400,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                request_id=request_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -8408,6 +8425,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
+                    **({"request_id": request_id} if request_id else {}),
                 })
             except Exception:
                 pass
@@ -8417,6 +8435,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+            **({"request_id": request_id} if request_id else {}),
         })
 
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":

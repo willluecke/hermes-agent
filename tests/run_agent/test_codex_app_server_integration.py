@@ -86,6 +86,38 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_turn_completed_without_final_text_is_partial_failure(
+        self, monkeypatch
+    ):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="",
+                projected_messages=[
+                    {"role": "tool", "tool_call_id": "exec_1", "content": "ok"}
+                ],
+                tool_iterations=1,
+                interrupted=False,
+                error=None,
+                turn_id="turn-empty-final",
+                thread_id="thread-empty-final",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-empty-final",
+        )
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("continue")
+
+        assert result["final_response"] == ""
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "without final assistant text" in result["error"]
+
     def test_fresh_agent_resumes_thread_bound_to_hermes_session(
         self, monkeypatch, tmp_path
     ):
