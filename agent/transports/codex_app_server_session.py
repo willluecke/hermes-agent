@@ -462,6 +462,7 @@ class CodexAppServerSession:
         # approval params don't carry the changeset, so we cache here
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, _PendingFileChange] = {}
+        self._last_policy_block_reason: Optional[str] = None
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -736,6 +737,7 @@ class CodexAppServerSession:
         # the caller can render — instead of bubbling raw codex exceptions
         # up to AIAgent.run_conversation.
         result = TurnResult()
+        self._last_policy_block_reason = None
         try:
             self.ensure_started()
         except (CodexAppServerError, TimeoutError) as exc:
@@ -1031,6 +1033,15 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
+        if (
+            self._last_policy_block_reason
+            and not result.final_text.strip()
+        ):
+            # The policy cancellation is the causal user-facing error even if
+            # this Codex build omits its terminal notification and the adapter
+            # subsequently hits the inactivity fallback.
+            result.error = self._last_policy_block_reason
+
         with self._active_turn_lock:
             self._active_turn_id = None
         self._interrupt_event.clear()
@@ -1275,6 +1286,9 @@ class CodexAppServerSession:
             # profile in ~/.codex/config.toml and surprise escalations
             # shouldn't be silently accepted. ``cancel`` also avoids falsely
             # presenting this client policy as a user rejection.
+            self._last_policy_block_reason = (
+                "Codex unattended policy blocked a permission escalation"
+            )
             self._client.respond(rid, {"decision": "cancel"})
         elif method == "mcpServer/elicitation/request":
             # Codex's MCP layer asks the user for structured input on
@@ -1324,6 +1338,10 @@ class CodexAppServerSession:
                     str(params.get("command") or "")
                 )
                 if not allowed:
+                    self._last_policy_block_reason = (
+                        "Codex unattended policy blocked command: "
+                        f"{reason or 'guarded command'}"
+                    )
                     logger.warning(
                         "Codex no-prompt policy declined exec: %s",
                         reason or "unclassified guarded command",
@@ -1367,16 +1385,25 @@ class CodexAppServerSession:
                 item_id = str(params.get("itemId") or "")
                 pending = self._pending_file_changes.get(item_id)
                 if pending is None:
+                    self._last_policy_block_reason = (
+                        "Codex unattended policy blocked an uninspectable "
+                        "file change"
+                    )
                     logger.warning(
                         "Codex no-prompt policy declined file change without "
                         "inspectable item metadata"
                     )
                     return "cancel"
                 if not pending.kinds or not pending.kinds.issubset({"add", "update"}):
+                    blocked_kinds = ", ".join(sorted(pending.kinds)) or "unknown"
+                    self._last_policy_block_reason = (
+                        "Codex unattended policy blocked file change kinds: "
+                        f"{blocked_kinds}"
+                    )
                     logger.warning(
                         "Codex no-prompt policy declined guarded file change "
                         "kinds: %s",
-                        ", ".join(sorted(pending.kinds)) or "unknown",
+                        blocked_kinds,
                     )
                     return "cancel"
             return "accept"

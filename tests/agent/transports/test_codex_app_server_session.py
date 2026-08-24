@@ -910,6 +910,35 @@ class TestServerRequestRouting:
 
         assert ("permissions-1", {"decision": "cancel"}) in client.responses
 
+    def test_policy_cancellation_becomes_an_accurate_turn_error(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="policy-1",
+            command="rm -rf ./build",
+            cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(
+            client,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        result = session.run_turn("delete build", turn_timeout=1.0)
+
+        assert ("policy-1", {"decision": "cancel"}) in client.responses
+        assert result.final_text == ""
+        assert result.error is not None
+        assert "unattended policy blocked command" in result.error
+        assert "user" not in result.error.lower()
+
 
 
 # ---- enriched approval prompts ----
