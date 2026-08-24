@@ -1,7 +1,7 @@
 # Reversible Deletion
 
-Status: per-target Trash deployed; workspace snapshot extension implemented and
-awaiting command-center verification, 2026-08-23
+Status: per-target Trash and workspace snapshots deployed and verified on
+command-center, 2026-08-23
 
 Hermes command-center treats ordinary file deletion as a reversible operation.
 The selected project remains the write boundary, but a statically inspectable
@@ -29,8 +29,8 @@ action.
    drops, service disruption, and remote deletion continues to require approval.
 9. When workspace snapshots are enabled, a native Codex turn never starts until
    its pre-turn recovery point has completed. A recognized destructive command
-   that could not be captured as an exact Trash item gets another checkpoint
-   immediately before browser review.
+   that emits a Codex exec-approval request gets another checkpoint immediately
+   before browser review when it could not be captured as an exact Trash item.
 
 ## Storage
 
@@ -87,7 +87,9 @@ The first implementation covers:
 Plain non-recursive `rm` is covered independently of the legacy dangerous
 command regex catalog. Common opaque delete APIs such as Python
 `shutil.rmtree`/`os.unlink` and Node `fs.rm` are recognized as deletion but are
-not guessed into static targets; they use browser approval.
+not guessed into static targets. They use browser approval when Codex emits an
+exec-approval request; regardless of that protocol detail, the pre-turn
+workspace snapshot protects every file that existed when the turn began.
 
 The review classifier also recognizes `find -delete`/`-exec`, `xargs rm`,
 `git clean`/`reset`/`restore`/`checkout`, `rsync --delete*`, `shred -u`,
@@ -199,3 +201,17 @@ Live command-center evidence on 2026-08-23:
 - Hermes Chat commit `0c8808a` was pushed to `main`. The production Vercel
   Trash route responds with HTTP 401 without credentials, proving both that the
   new route is deployed and that its authentication gate is active.
+- Canonical Hermes commit `5bdda3467` is deployed from
+  `/home/will/src/hermes-agent` through the external
+  `~/.hermes/venvs/hermes-command-center` environment. Gateway and sync remained
+  active after one idle-checked restart.
+- Run `run_3791fc9a3864431c86ae4c16dc1f6473` executed Python
+  `os.remove(...)` against an untracked marker in `hermes-chat`. Codex emitted no
+  approval request, which exercised the broad recovery boundary rather than an
+  exact command parser.
+- Snapshot `20260824T032940.241537Z-badbfb906a` contained the marker before the
+  turn. Materializing it into a new `/tmp` destination restored byte-identical
+  content after the live source had been deleted.
+- The Linux deployment passed 151 focused snapshot, deletion, session, and API
+  runtime assertions. One unrelated background-review test retains its existing
+  asynchronous failure on both Mac and Linux baselines.

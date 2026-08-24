@@ -62,6 +62,12 @@ codex_runtime:
       hermes-agent: /home/will/src/hermes-agent
   no_prompt:
     enabled: true
+  reversible_deletion:
+    enabled: true
+  workspace_snapshots:
+    enabled: true
+    keep_snapshots: 32
+    timeout_seconds: 600
 ```
 
 Do not add an API provider fallback to this path. Auxiliary API-backed tools
@@ -71,10 +77,12 @@ This is bounded no-prompt execution, not an unsandboxed Codex profile. Hermes
 Chat sends a project key, the gateway resolves it through the server-owned
 `workspaces.projects` map, and Codex receives that canonical directory as its
 workspace root. Routine commands and add/update patches proceed without a
-browser approval round trip. Reviewable guarded-YOLO operations, including
-scoped recursive deletion, history changes, and inspectable patch deletions or
-renames, pause the run and use the existing browser **Allow once** / **Deny**
-round trip. Hardline commands, `approvals.deny` matches, sudo password
+browser approval round trip. Reviewable guarded-YOLO operations that emit a
+Codex approval request, including scoped recursive deletion, history changes,
+and inspectable patch deletions or renames, pause the run and use the existing
+browser **Allow once** / **Deny** round trip. Commands Codex executes directly
+inside the workspace are still covered by the mandatory pre-turn snapshot.
+Hardline commands, `approvals.deny` matches, sudo password
 injection, uninspectable or unrecognized patch kinds, and permission escalation
 remain non-overridable policy cancellations. An unknown project key is rejected
 before agent creation. Policy cancellations must never be presented as a
