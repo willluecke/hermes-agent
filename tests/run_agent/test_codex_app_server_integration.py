@@ -86,6 +86,86 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_enabled_workspace_snapshot_precedes_native_turn(
+        self, fake_session, monkeypatch, tmp_path
+    ):
+        workspace = tmp_path / "reg-watch"
+        workspace.mkdir()
+        order: list[str] = []
+        original_run_turn = CodexAppServerSession.run_turn
+
+        def tracked_run_turn(self, user_input: str, **kwargs):
+            order.append("turn")
+            return original_run_turn(self, user_input, **kwargs)
+
+        snapshot = SimpleNamespace(as_dict=lambda: {"snapshot_id": "snap-1"})
+
+        def fake_snapshot(**kwargs):
+            order.append("snapshot")
+            assert kwargs["workspace_root"] == str(workspace)
+            assert kwargs["project"] == "reg-watch"
+            assert kwargs["policy"].enabled is True
+            return snapshot
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", tracked_run_turn)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "codex_runtime": {
+                    "workspace_snapshots": {
+                        "enabled": True,
+                        "keep_snapshots": 8,
+                        "timeout_seconds": 30,
+                    }
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "tools.workspace_snapshots.capture_workspace_snapshot", fake_snapshot
+        )
+
+        agent = _make_codex_agent()
+        agent.session_cwd = str(workspace)
+        agent.session_project = "reg-watch"
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("continue")
+
+        assert result["completed"] is True
+        assert order == ["snapshot", "turn"]
+        assert agent._last_workspace_snapshot == {"snapshot_id": "snap-1"}
+
+    def test_workspace_snapshot_failure_prevents_native_turn(
+        self, fake_session, monkeypatch, tmp_path
+    ):
+        from tools.workspace_snapshots import WorkspaceSnapshotError
+
+        workspace = tmp_path / "reg-watch"
+        workspace.mkdir()
+        run_turn = MagicMock()
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", run_turn)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "codex_runtime": {
+                    "workspace_snapshots": {"enabled": True}
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "tools.workspace_snapshots.capture_workspace_snapshot",
+            MagicMock(side_effect=WorkspaceSnapshotError("snapshot unavailable")),
+        )
+
+        agent = _make_codex_agent()
+        agent.session_cwd = str(workspace)
+        agent.session_project = "reg-watch"
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("continue")
+
+        run_turn.assert_not_called()
+        assert result["completed"] is False
+        assert "snapshot unavailable" in (result["error"] or "")
+
     def test_turn_completed_without_final_text_is_partial_failure(
         self, monkeypatch
     ):

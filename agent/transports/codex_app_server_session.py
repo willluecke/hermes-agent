@@ -428,6 +428,7 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         project_key: Optional[str] = None,
         reversible_deletion_policy: Any = None,
+        workspace_snapshot_policy: Any = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -451,6 +452,7 @@ class CodexAppServerSession:
         )
         self._project_key = str(project_key or "").strip()
         self._reversible_deletion_policy = reversible_deletion_policy
+        self._workspace_snapshot_policy = workspace_snapshot_policy
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
@@ -1351,7 +1353,7 @@ class CodexAppServerSession:
             if command_targets_trash_store(str(command), cwd=str(cwd)):
                 self._last_policy_block_reason = (
                     "Codex unattended policy blocked mutation of protected "
-                    "Hermes trash storage"
+                    "Hermes recovery storage"
                 )
                 return "cancel"
 
@@ -1376,6 +1378,26 @@ class CodexAppServerSession:
                     params, str(command), str(cwd)
                 ):
                     return "accept"
+                if is_file_delete:
+                    request_item = str(
+                        params.get("itemId")
+                        or params.get("commandExecutionId")
+                        or self._active_turn_id
+                        or "destructive-command"
+                    )
+                    try:
+                        self.capture_workspace_snapshot(
+                            f"before-command:{request_item}"
+                        )
+                    except Exception as exc:
+                        self._last_policy_block_reason = (
+                            "Codex destructive command was blocked because its "
+                            f"workspace checkpoint failed: {exc}"
+                        )
+                        logger.exception(
+                            "workspace checkpoint failed before destructive command"
+                        )
+                        return "cancel"
                 if action == "allow":
                     review_reason = "file deletion could not be protected automatically"
             else:
@@ -1598,6 +1620,24 @@ class CodexAppServerSession:
             return get_current_session_key(default=self._hermes_session_id or "")
         except Exception:
             return self._hermes_session_id
+
+    def capture_workspace_snapshot(self, task_id: str) -> Any:
+        """Create a fail-closed recovery point for the current workspace."""
+        policy = getattr(self, "_workspace_snapshot_policy", None)
+        if policy is None or not getattr(policy, "enabled", False):
+            return None
+        from tools.workspace_snapshots import capture_workspace_snapshot
+
+        project = self._project_key or os.path.basename(
+            os.path.realpath(self._cwd)
+        ) or "workspace"
+        return capture_workspace_snapshot(
+            workspace_root=self._cwd,
+            project=project,
+            session_id=self._hermes_session_id,
+            task_id=str(task_id or ""),
+            policy=policy,
+        )
 
     def _capture_reversible_command_delete(
         self, params: dict, command: str, cwd: str

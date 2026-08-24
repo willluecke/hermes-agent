@@ -82,7 +82,9 @@ rejection made by the user.
 
 The reversible-deletion contract in [reversible-deletion.md](reversible-deletion.md)
 supersedes the prompt for exact workspace and safe-temp file deletion once that
-subsystem is enabled. It does not weaken approval for non-file destruction.
+subsystem is enabled. Its workspace snapshot layer creates a fail-closed
+recovery point before every native Codex turn and before recognized opaque
+destruction. It does not weaken approval for non-file destruction.
 
 The generic meaning of `approvals.mode: off` remains full approval bypass and
 must not be used on command-center. The narrower behavior above applies only
@@ -94,9 +96,9 @@ Codex still runs as Linux user `will`, so the workspace sandbox is the write
 boundary, not a confidentiality boundary: same-user files may remain readable
 to subprocesses. A dedicated worker account is the next isolation step if
 command-center later stores unrelated private material. Git history and the
-tracked command-center backups remain the recovery layer for permitted edits;
-an update patch can replace file contents even though a protocol-level
-`delete` change is denied.
+tracked command-center backups remain the host-loss recovery layer. Incremental
+per-turn workspace snapshots are the local recovery layer for permitted edits,
+including replacement and deletion hidden inside an opaque executable.
 
 Claude implementation jobs are pinned by the subscription worker to:
 

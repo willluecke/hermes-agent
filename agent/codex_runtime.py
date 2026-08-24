@@ -928,6 +928,13 @@ def run_codex_app_server_turn(
             if isinstance(codex_runtime_cfg, dict)
             else {}
         )
+        from tools.workspace_snapshots import WorkspaceSnapshotPolicy
+
+        workspace_snapshot_policy = WorkspaceSnapshotPolicy.from_config(
+            codex_runtime_cfg.get("workspace_snapshots", {})
+            if isinstance(codex_runtime_cfg, dict)
+            else {}
+        )
 
         # When the user has
         # explicitly opted out of Hermes approvals — via `approvals.mode: off`
@@ -973,6 +980,7 @@ def run_codex_app_server_turn(
             require_exact=require_exact,
             project_key=str(getattr(agent, "session_project", "") or ""),
             reversible_deletion_policy=reversible_deletion_policy,
+            workspace_snapshot_policy=workspace_snapshot_policy,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -988,6 +996,17 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
+        # Command parsing cannot see an unlink hidden inside an arbitrary
+        # executable. A configured workspace snapshot is therefore the broad
+        # recovery boundary: it must complete before this turn reaches Codex.
+        # This runs for every turn, including turns that reuse a warm app-server
+        # session, so files created by an earlier turn are protected too.
+        snapshot = agent._codex_session.capture_workspace_snapshot(
+            str(effective_task_id or "")
+        )
+        if snapshot is not None:
+            agent._last_workspace_snapshot = snapshot.as_dict()
+
         thread_id = agent._codex_session.ensure_started()
         _persist_codex_app_server_thread_id(agent, thread_id)
         turn_input = user_message

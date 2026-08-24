@@ -19,6 +19,14 @@ DEFAULT_CONFIG = {
             "max_entries": 100_000,
             "temp_roots": ["/tmp", "/var/tmp"],
         },
+        # Incremental full-workspace recovery point before every native Codex
+        # turn. Disabled by default because it creates a local retention policy
+        # and requires rsync; command-center enables it explicitly.
+        "workspace_snapshots": {
+            "enabled": False,
+            "keep_snapshots": 32,
+            "timeout_seconds": 600,
+        },
     },
     "providers": {},
     "fallback_providers": [],

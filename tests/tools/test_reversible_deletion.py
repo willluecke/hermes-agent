@@ -59,6 +59,20 @@ def test_static_rm_is_parsed_inside_workspace(trash_env):
         "unlink old.txt",
         "python -c 'import shutil; shutil.rmtree(\"old\")'",
         "node -e 'fs.rm(\"old\", {recursive: true})'",
+        "find . -type f -delete",
+        "find build -exec rm -rf {} +",
+        "find . -print0 | xargs -0 rm",
+        "git clean -fdx",
+        "git reset --hard HEAD",
+        "rsync -a --delete source/ destination/",
+        "shred -u secret.txt",
+        "truncate -s 0 evidence.json",
+        "dd if=/dev/zero of=evidence.bin bs=1 count=1",
+        "make clean",
+        "npm run clean",
+        "ruby -e 'FileUtils.rm_rf(\"build\")'",
+        "perl -e 'unlink \"old.txt\"'",
+        "pwsh -c 'Remove-Item -Recurse build'",
     ],
 )
 def test_file_delete_detection_covers_plain_and_opaque_forms(command: str):
@@ -281,3 +295,16 @@ def test_store_metadata_is_owner_only(trash_env):
     )
     assert (home / "trash").stat().st_mode & 0o777 == 0o700
     assert (home / "trash" / "trash.db").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("store_name", ["trash", "workspace-snapshots"])
+def test_recovery_stores_are_never_delete_targets(trash_env, store_name: str):
+    home, workspace, _temp_root, policy = trash_env
+    protected = home / store_name / "payload"
+    with pytest.raises(UnsafeDeleteTarget, match="recovery storage"):
+        parse_delete_command(
+            f"rm -rf {protected}",
+            cwd=str(workspace),
+            workspace_root=str(workspace),
+            policy=policy,
+        )

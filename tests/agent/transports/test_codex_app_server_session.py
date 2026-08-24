@@ -1014,6 +1014,62 @@ class TestServerRequestRouting:
         callback.assert_called_once()
         assert list_trash_items("reg-watch") == []
 
+    def test_dynamic_destructive_command_gets_fresh_checkpoint_before_review(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+        session.capture_workspace_snapshot = MagicMock(return_value=object())
+
+        assert session._decide_exec_approval(
+            {"itemId": "exec-find", "command": "find . -type f -delete"}
+        ) == "accept"
+        session.capture_workspace_snapshot.assert_called_once_with(
+            "before-command:exec-find"
+        )
+        callback.assert_called_once()
+
+    def test_destructive_command_is_cancelled_when_checkpoint_fails(
+        self, tmp_path
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        callback = MagicMock(return_value="once")
+        session = CodexAppServerSession(
+            cwd=str(workspace),
+            client_factory=lambda **kw: FakeClient(),
+            project_key="reg-watch",
+            reversible_deletion_policy=ReversibleDeletionPolicy(enabled=True),
+            approval_callback=callback,
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+        session.capture_workspace_snapshot = MagicMock(
+            side_effect=RuntimeError("disk unavailable")
+        )
+
+        assert session._decide_exec_approval(
+            {"itemId": "exec-clean", "command": "git clean -fdx"}
+        ) == "cancel"
+        callback.assert_not_called()
+        assert "checkpoint failed" in (session._last_policy_block_reason or "")
+
     def test_bounded_no_prompt_never_allows_trash_store_mutation(
         self, tmp_path, monkeypatch
     ):
@@ -1040,7 +1096,9 @@ class TestServerRequestRouting:
 
         assert decision == "cancel"
         callback.assert_not_called()
-        assert "protected Hermes trash" in (session._last_policy_block_reason or "")
+        assert "protected Hermes recovery" in (
+            session._last_policy_block_reason or ""
+        )
 
     def test_bounded_no_prompt_auto_trashes_structured_file_delete(
         self, tmp_path, monkeypatch

@@ -1,6 +1,7 @@
 # Reversible Deletion
 
-Status: deployed and live-verified on command-center, 2026-08-23
+Status: per-target Trash deployed; workspace snapshot extension implemented and
+awaiting command-center verification, 2026-08-23
 
 Hermes command-center treats ordinary file deletion as a reversible operation.
 The selected project remains the write boundary, but a statically inspectable
@@ -26,6 +27,10 @@ action.
    normal **Allow once** / **Deny** approval path. It is never guessed safe.
 8. Non-file destruction such as force push, Git history replacement, database
    drops, service disruption, and remote deletion continues to require approval.
+9. When workspace snapshots are enabled, a native Codex turn never starts until
+   its pre-turn recovery point has completed. A recognized destructive command
+   that could not be captured as an exact Trash item gets another checkpoint
+   immediately before browser review.
 
 ## Storage
 
@@ -59,6 +64,10 @@ codex_runtime:
     temp_roots:
       - /tmp
       - /var/tmp
+  workspace_snapshots:
+    enabled: true
+    keep_snapshots: 32
+    timeout_seconds: 600
 ```
 
 Defaults ship disabled so an upstream install does not acquire a new retention
@@ -79,6 +88,14 @@ Plain non-recursive `rm` is covered independently of the legacy dangerous
 command regex catalog. Common opaque delete APIs such as Python
 `shutil.rmtree`/`os.unlink` and Node `fs.rm` are recognized as deletion but are
 not guessed into static targets; they use browser approval.
+
+The review classifier also recognizes `find -delete`/`-exec`, `xargs rm`,
+`git clean`/`reset`/`restore`/`checkout`, `rsync --delete*`, `shred -u`,
+`truncate`, `dd of=`, non-append `tee`, clean targets in common build/package
+commands, BusyBox removal, and common Python, Node, Deno, Ruby, Perl, Java, Go,
+Rust, and PowerShell deletion APIs. These dynamic forms rely on the workspace
+snapshot rather than pretending their targets can be recovered from command
+text safely.
 
 Missing targets under force-style cleanup are safe no-ops. Symlinks are captured
 as symlinks and never followed. Paths crossing a filesystem boundary are copied,
@@ -112,13 +129,44 @@ publishes every payload, commits the ledger, and only then returns `accept` to
 Codex. Capture failure leaves the original operation waiting for browser review.
 Restore and purge are not model tools.
 
+## Workspace Snapshots
+
+Workspace snapshots live outside project workspaces under:
+
+```text
+$HERMES_HOME/workspace-snapshots/<project-and-hash>/<snapshot-id>/
+  manifest.json
+  payload/
+```
+
+Hermes uses `rsync --link-dest` so unchanged files share read-only recovery
+inodes between snapshots while changed files consume new space. Publication is
+atomic, snapshots are serialized per project, and the oldest complete recovery
+points are pruned after the configured count. The snapshot store and Trash
+store are both non-overridable protected namespaces.
+
+List snapshots and materialize one into a new, unoccupied directory:
+
+```bash
+python -m tools.workspace_snapshots list --project reg-watch
+python -m tools.workspace_snapshots materialize \
+  --project reg-watch \
+  --snapshot <snapshot-id> \
+  --destination /home/will/recovery/reg-watch-<snapshot-id>
+```
+
+Materialization never writes over the live workspace. Compare the recovery copy
+and promote only the files actually needed.
+
 ## Known Boundary
 
-No command-string policy can intercept arbitrary deletion hidden inside an
-opaque program. Hermes therefore detects common opaque deletion forms and sends
-them to interactive approval, but this subsystem is not a filesystem snapshot
-or kernel-level write monitor. Stronger guarantees require per-run overlay
-filesystems or filesystem-native snapshots under a dedicated worker account.
+Every file present at turn start is recoverable regardless of which executable
+later deletes or overwrites it. Exact Trash capture and the just-in-time
+checkpoint also protect files created earlier in the same turn when Hermes
+recognizes the destructive command. A completely unknown executable can still
+create and delete a brand-new file inside one turn without leaving a version.
+Closing that final gap requires per-command execution in an OverlayFS workspace
+or a filesystem-native snapshot boundary, not more command regexes.
 
 ## Verification
 

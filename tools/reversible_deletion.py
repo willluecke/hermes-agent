@@ -136,6 +136,13 @@ def _store_root() -> Path:
     return get_hermes_home() / "trash"
 
 
+def _protected_store_roots() -> tuple[Path, ...]:
+    return (
+        _store_root(),
+        get_hermes_home() / "workspace-snapshots",
+    )
+
+
 def _db_path() -> Path:
     return _store_root() / "trash.db"
 
@@ -225,9 +232,10 @@ def validate_delete_target(
     """Resolve one target without following the target symlink itself."""
     target = _canonical_delete_target(raw_path, cwd)
     workspace = os.path.realpath(os.path.abspath(workspace_root))
-    trash_root = os.path.realpath(_store_root())
-    if target == trash_root or _is_descendant(target, trash_root):
-        raise UnsafeDeleteTarget("Hermes trash storage is protected")
+    for protected_root_path in _protected_store_roots():
+        protected_root = os.path.realpath(protected_root_path)
+        if target == protected_root or _is_descendant(target, protected_root):
+            raise UnsafeDeleteTarget("Hermes recovery storage is protected")
     if _is_descendant(target, workspace):
         return target
     for configured_root in policy.temp_roots:
@@ -313,14 +321,22 @@ def parse_delete_command(
 
 
 def command_targets_trash_store(command: str, *, cwd: str) -> bool:
-    """Detect direct attempts to mutate the protected trash namespace."""
-    trash_root = os.path.realpath(_store_root())
+    """Detect direct attempts to mutate a protected recovery namespace.
+
+    The historical function name is retained for callers; it now protects both
+    per-target Trash payloads and whole-workspace snapshots.
+    """
+    protected_roots = tuple(
+        os.path.realpath(path) for path in _protected_store_roots()
+    )
     lowered = command.lower()
-    textual_markers = (
-        str(_store_root()).lower(),
+    textual_markers = tuple(str(path).lower() for path in _protected_store_roots()) + (
         "$hermes_home/trash",
         "${hermes_home}/trash",
         "~/.hermes/trash",
+        "$hermes_home/workspace-snapshots",
+        "${hermes_home}/workspace-snapshots",
+        "~/.hermes/workspace-snapshots",
     )
     if any(marker in lowered for marker in textual_markers):
         return True
@@ -339,28 +355,90 @@ def command_targets_trash_store(command: str, *, cwd: str) -> bool:
         )
         for operand in operands:
             target = _canonical_delete_target(operand, cwd)
-            if target == trash_root or _is_descendant(target, trash_root):
-                return True
+            for protected_root in protected_roots:
+                if target == protected_root or _is_descendant(target, protected_root):
+                    return True
     except ReversibleDeletionError:
         return False
     return False
 
 
 def looks_like_file_delete(command: str) -> bool:
-    """Return whether a command must be captured or explicitly reviewed."""
+    """Return whether a command can remove or irreversibly replace file data.
+
+    Exact rm/unlink/rmdir targets are captured by the Trash layer. Other forms
+    are deliberately classified as reviewable; the pre-turn workspace snapshot
+    remains the recovery layer when their targets are dynamic or opaque.
+    """
     try:
         argv = _unwrap_static_command(command)
     except ReversibleDeletionError:
         argv = []
-    if argv and os.path.basename(argv[0]) in {"rm", "unlink", "rmdir"}:
-        return True
+    if argv:
+        executable = os.path.basename(argv[0]).lower()
+        lowered_argv = [token.lower() for token in argv[1:]]
+        if executable in {"rm", "unlink", "rmdir", "srm", "wipe", "truncate"}:
+            return True
+        if executable == "shred" and any(
+            token == "-u" or "u" in token[1:] or token.startswith("--remove")
+            for token in lowered_argv
+            if token.startswith("-")
+        ):
+            return True
+        if executable == "busybox" and lowered_argv[:1] in (
+            ["rm"],
+            ["unlink"],
+            ["rmdir"],
+        ):
+            return True
+        if executable == "find" and (
+            "-delete" in lowered_argv
+            or any(
+                token in {"rm", "unlink", "rmdir", "shred"}
+                for token in lowered_argv
+            )
+        ):
+            return True
+        if executable == "xargs" and any(
+            os.path.basename(token) in {"rm", "unlink", "rmdir", "shred"}
+            for token in lowered_argv
+        ):
+            return True
+        if executable == "git" and any(
+            token in {"clean", "reset", "restore", "checkout"}
+            for token in lowered_argv[:2]
+        ):
+            return True
+        if executable == "rsync" and any(
+            token == "--delete" or token.startswith("--delete-")
+            for token in lowered_argv
+        ):
+            return True
+        if executable == "dd" and any(token.startswith("of=") for token in argv[1:]):
+            return True
+        if executable == "tee" and "-a" not in lowered_argv and "--append" not in lowered_argv:
+            return True
+        if executable in {"make", "gmake"} and "clean" in lowered_argv:
+            return True
+        if executable in {"npm", "pnpm", "yarn", "bun"} and any(
+            token in {"clean", "run"} for token in lowered_argv[:2]
+        ) and "clean" in lowered_argv:
+            return True
     lowered = command.lower()
     opaque_patterns = (
         r"\bshutil\.rmtree\s*\(",
         r"\bos\.(?:remove|unlink|rmdir|removedirs)\s*\(",
+        r"\bpathlib\b.*\.(?:unlink|rmdir)\s*\(",
         r"\.unlink\s*\(",
-        r"\bfs\.(?:rm|rmdir|unlink|removedir)\s*\(",
+        r"\bfs(?:\.promises)?\.(?:rm|rmdir|unlink|removedir)\s*\(",
         r"\bdeno\.remove\s*\(",
+        r"\bfileutils\.(?:rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry)\s*\(",
+        r"\bfile\.(?:delete|unlink)\s*\(",
+        r"\bfiles\.delete(?:ifexists)?\s*\(",
+        r"\bos\.(?:remove|removeall)\s*\(",
+        r"\bstd::fs::(?:remove_file|remove_dir|remove_dir_all)\s*\(",
+        r"\bremove-item\b",
+        r"\bunlink\b",
     )
     return any(re.search(pattern, lowered) for pattern in opaque_patterns)
 
