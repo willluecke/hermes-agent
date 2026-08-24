@@ -934,6 +934,21 @@ def run_codex_app_server_turn(
 
         runtime_cfg = load_config()
         model_cfg = runtime_cfg.get("model", {}) if isinstance(runtime_cfg, dict) else {}
+        codex_runtime_cfg = (
+            runtime_cfg.get("codex_runtime", {})
+            if isinstance(runtime_cfg, dict)
+            else {}
+        )
+        no_prompt_cfg = (
+            codex_runtime_cfg.get("no_prompt", {})
+            if isinstance(codex_runtime_cfg, dict)
+            else {}
+        )
+        bounded_no_prompt = bool(
+            auto_approve_requests
+            and isinstance(no_prompt_cfg, dict)
+            and no_prompt_cfg.get("enabled") is True
+        )
         require_exact = bool(
             model_cfg.get("openai_runtime_require_exact", False)
             if isinstance(model_cfg, dict)
@@ -950,6 +965,8 @@ def run_codex_app_server_turn(
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
+                guard_no_prompt_exec=bounded_no_prompt,
+                guard_no_prompt_file_changes=bounded_no_prompt,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
         )

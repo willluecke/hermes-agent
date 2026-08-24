@@ -23,6 +23,10 @@
     {
       "path": "/home/will/coding-projects/llm-view",
       "name": "llm-view"
+    },
+    {
+      "path": "/home/will/src/hermes-agent-migration",
+      "name": "hermes-agent-migration"
     }
   ]
 }

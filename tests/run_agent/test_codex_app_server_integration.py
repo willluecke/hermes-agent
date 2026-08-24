@@ -567,6 +567,32 @@ class TestRunConversationCodexPath:
         routing = captured["request_routing"]
         assert routing.auto_approve_exec is True
         assert routing.auto_approve_apply_patch is True
+        assert routing.guard_no_prompt_exec is False
+        assert routing.guard_no_prompt_file_changes is False
+
+    def test_command_center_no_prompt_enables_bounded_routing(
+        self, monkeypatch
+    ):
+        captured = self._capture_routing_agent(monkeypatch)
+        config = {
+            "approvals": {"mode": "off"},
+            "codex_runtime": {"no_prompt": {"enabled": True}},
+        }
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ), patch(
+            "hermes_cli.config.load_config", return_value=config
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is True
+        assert routing.auto_approve_apply_patch is True
+        assert routing.guard_no_prompt_exec is True
+        assert routing.guard_no_prompt_file_changes is True
 
     def test_yaml_boolean_false_approval_mode_also_auto_approves(
         self, monkeypatch

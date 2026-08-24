@@ -273,6 +273,42 @@ The configuration surface cannot select a danger profile or sudo mode. When
 the section is absent or `permission_profile` is `null`, Hermes keeps the
 built-in `:workspace` default with outbound command networking disabled.
 
+### Bounded no-prompt runs
+
+An API client that cannot present approval prompts can opt into a narrower
+command-center policy without using a no-sandbox profile:
+
+```yaml
+approvals:
+  mode: off
+codex_runtime:
+  workspaces:
+    default_project: app
+    projects:
+      app: /srv/projects/app
+      worker: /srv/projects/worker
+  no_prompt:
+    enabled: true
+```
+
+The API request sends `project: app`; it never sends a filesystem path. The
+gateway resolves that key from its own configuration, validates the canonical
+directory, and supplies it as Codex's workspace root. Unknown keys fail before
+the agent starts. Legacy clients that omit `project` use `default_project`.
+
+With both `approvals.mode: off` and `no_prompt.enabled: true`, routine Codex
+exec requests and add/update patches are accepted automatically. Commands that
+guarded YOLO would normally prompt for are declined instead, as are hardline
+commands, user deny-rule matches, sudo password injection, file deletions,
+unknown file-change metadata, and permission escalation. No unavailable
+browser prompt is synthesized and no declined request is described as a human
+rejection.
+
+This policy bounds writes, not reads. For a confidentiality boundary, run the
+gateway under a dedicated OS account that cannot read the operator's private
+home directory. Keep Git or snapshot backups as the recovery boundary for
+allowed file updates.
+
 You can override the default in `~/.codex/config.toml` outside Hermes' managed block:
 
 ```toml

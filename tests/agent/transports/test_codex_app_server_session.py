@@ -805,6 +805,96 @@ class TestServerRequestRouting:
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -rf ./build",
+            "git reset --hard",
+            "git push --force origin main",
+            "sudo -S id",
+            "",
+        ],
+    )
+    def test_bounded_no_prompt_declines_guarded_exec(self, command):
+        session = make_session(
+            FakeClient(),
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        assert session._decide_exec_approval({"command": command}) == "decline"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git status --short",
+            "git push origin main",
+            "npm test",
+            "python3 -m pytest -q",
+        ],
+    )
+    def test_bounded_no_prompt_accepts_routine_exec(self, command):
+        session = make_session(
+            FakeClient(),
+            request_routing=_ServerRequestRouting(
+                auto_approve_exec=True,
+                guard_no_prompt_exec=True,
+            ),
+        )
+
+        assert session._decide_exec_approval({"command": command}) == "accept"
+
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [
+            ("add", "accept"),
+            ("update", "accept"),
+            ("delete", "decline"),
+            ("rename", "decline"),
+        ],
+    )
+    def test_bounded_no_prompt_file_change_policy(self, kind, expected):
+        session = make_session(
+            FakeClient(),
+            request_routing=_ServerRequestRouting(
+                auto_approve_apply_patch=True,
+                guard_no_prompt_file_changes=True,
+            ),
+        )
+        session._track_pending_file_change(
+            {
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "fileChange",
+                        "id": "fc-guarded",
+                        "changes": [
+                            {"kind": {"type": kind}, "path": "/tmp/file.txt"}
+                        ],
+                    }
+                },
+            }
+        )
+
+        assert session._decide_apply_patch_approval(
+            {"itemId": "fc-guarded"}
+        ) == expected
+
+    def test_bounded_no_prompt_declines_uninspectable_file_change(self):
+        session = make_session(
+            FakeClient(),
+            request_routing=_ServerRequestRouting(
+                auto_approve_apply_patch=True,
+                guard_no_prompt_file_changes=True,
+            ),
+        )
+
+        assert session._decide_apply_patch_approval(
+            {"itemId": "missing"}
+        ) == "decline"
+
 
 
 # ---- enriched approval prompts ----

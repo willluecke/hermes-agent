@@ -44,10 +44,50 @@ model:
 agent:
   reasoning_effort: xhigh
 fallback_providers: []
+approvals:
+  mode: off
+codex_runtime:
+  permission_profile:
+    name: command-center-development
+    network_access: true
+  workspaces:
+    default_project: hermes-chat
+    projects:
+      hermes-chat: /home/will/coding-projects/hermes-chat
+      reccli: /home/will/coding-projects/RecCli
+      3dcarparts: /home/will/coding-projects/3dcarparts
+      reg-watch: /home/will/coding-projects/reg-watch
+      closure-engine: /home/will/coding-projects/closure-engine
+      llm-view: /home/will/coding-projects/llm-view
+      hermes-agent-migration: /home/will/src/hermes-agent-migration
+  no_prompt:
+    enabled: true
 ```
 
 Do not add an API provider fallback to this path. Auxiliary API-backed tools
 must not be treated as decision authority.
+
+This is bounded no-prompt execution, not an unsandboxed Codex profile. Hermes
+Chat sends a project key, the gateway resolves it through the server-owned
+`workspaces.projects` map, and Codex receives that canonical directory as its
+workspace root. Routine commands and add/update patches proceed without a
+browser approval round trip. Commands in the guarded-YOLO destructive classes,
+hardline commands, `approvals.deny` matches, sudo password injection, patch
+deletions, unrecognized patch kinds, and permission escalation are declined
+without prompting. An unknown project key is rejected before agent creation.
+
+The generic meaning of `approvals.mode: off` remains full approval bypass.
+The narrower behavior above applies only when `codex_runtime.no_prompt.enabled`
+is exactly `true`; do not deploy command-center with `mode: off` unless the
+bounded flag and workspace map are present and tested.
+
+Codex still runs as Linux user `will`, so the workspace sandbox is the write
+boundary, not a confidentiality boundary: same-user files may remain readable
+to subprocesses. A dedicated worker account is the next isolation step if
+command-center later stores unrelated private material. Git history and the
+tracked command-center backups remain the recovery layer for permitted edits;
+an update patch can replace file contents even though a protocol-level
+`delete` change is denied.
 
 Claude implementation jobs are pinned by the subscription worker to:
 
@@ -173,6 +213,8 @@ git config --global --get user.name
 git config --global --get user.email
 codex mcp get hermes-tools --json
 codex mcp get reccli --json
+rg -n '^default_permissions|^\[permissions\.command-center-development\]' \
+  /home/will/.codex/config.toml
 test -r /home/will/AGENTS.md
 jq -e '.projects | length > 0' /home/will/.reccli/projects.json
 test -x /home/will/.hermes/scripts/agentic-loop-gate.py
@@ -201,6 +243,11 @@ surface: context loading, read/search/inspection tools, and
 `save_session_notes`. Do not expose RecCli organization launch, approval,
 promotion, deletion, recovery, or configuration tools through this automatic
 approval path.
+
+The generated Codex config must select `command-center-development`, extend
+`:workspace`, and enable network access. It must never select
+`:danger-full-access`. A fresh Hermes run should report the selected project in
+`GET /v1/runs/<run_id>` and start Codex with that project's canonical path.
 
 The `ss` output must show only `127.0.0.1:8642` and `127.0.0.1:8643`, never
 `0.0.0.0` or `[::]` for either listener.

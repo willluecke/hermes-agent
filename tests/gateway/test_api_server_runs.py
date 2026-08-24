@@ -23,6 +23,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _ReplayableRunEventStream,
     _approval_event_choices,
+    _resolve_run_workspace,
     cors_middleware,
     security_headers_middleware,
 )
@@ -123,6 +124,104 @@ def auth_adapter():
 
 
 class TestStartRun:
+    def test_workspace_resolver_accepts_only_server_configured_keys(self, tmp_path):
+        project_root = tmp_path / "reg-watch"
+        project_root.mkdir()
+        config = {
+            "codex_runtime": {
+                "workspaces": {
+                    "default_project": "reg-watch",
+                    "projects": {"reg-watch": str(project_root)},
+                }
+            }
+        }
+
+        assert _resolve_run_workspace(config, None) == (
+            "reg-watch",
+            str(project_root.resolve()),
+            None,
+            0,
+        )
+        project, cwd, error, status = _resolve_run_workspace(config, "/etc")
+        assert (project, cwd, status) == ("", "", 400)
+        assert "configured project key" in error
+
+    @pytest.mark.asyncio
+    async def test_start_binds_server_resolved_project_cwd(self, adapter, tmp_path):
+        project_root = tmp_path / "reg-watch"
+        project_root.mkdir()
+        config = {
+            "codex_runtime": {
+                "workspaces": {
+                    "default_project": "reg-watch",
+                    "projects": {"reg-watch": str(project_root)},
+                }
+            }
+        }
+        captured = {}
+        mock_agent = MagicMock()
+
+        def _capture_run(user_message=None, conversation_history=None, task_id=None):
+            from agent.runtime_cwd import resolve_agent_cwd
+
+            captured["cwd"] = str(resolve_agent_cwd())
+            captured["agent_cwd"] = mock_agent.session_cwd
+            return {"final_response": "done"}
+
+        mock_agent.run_conversation.side_effect = _capture_run
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=config
+            ), patch.object(
+                adapter, "_create_agent", return_value=mock_agent
+            ):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "project": "reg-watch"},
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(80):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+
+        assert captured == {
+            "cwd": str(project_root.resolve()),
+            "agent_cwd": str(project_root.resolve()),
+        }
+        assert status["project"] == "reg-watch"
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_unknown_project_before_agent_creation(
+        self, adapter, tmp_path
+    ):
+        config = {
+            "codex_runtime": {
+                "workspaces": {
+                    "default_project": "reg-watch",
+                    "projects": {"reg-watch": str(tmp_path)},
+                }
+            }
+        }
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                "gateway.run._load_gateway_config", return_value=config
+            ), patch.object(adapter, "_create_agent") as create_agent:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "project": "../../etc"},
+                )
+
+        assert response.status == 400
+        create_agent.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)

@@ -106,6 +106,51 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
 
 
+def _resolve_run_workspace(
+    config: Dict[str, Any], raw_project: Any
+) -> tuple[str, str, Optional[str], int]:
+    """Resolve a browser project key through the server-owned workspace map.
+
+    The request may select a key, never a path. If no workspace map is
+    configured this is a compatibility no-op. Once configured, unknown keys
+    fail closed and every accepted path is canonicalized and checked before a
+    run is admitted.
+    """
+    runtime_cfg = config.get("codex_runtime", {}) if isinstance(config, dict) else {}
+    workspace_cfg = (
+        runtime_cfg.get("workspaces", {})
+        if isinstance(runtime_cfg, dict)
+        else {}
+    )
+    projects = (
+        workspace_cfg.get("projects", {})
+        if isinstance(workspace_cfg, dict)
+        else {}
+    )
+    if not isinstance(projects, dict) or not projects:
+        return ("", "", None, 0)
+
+    if raw_project is not None and not isinstance(raw_project, str):
+        return ("", "", "'project' must be a configured project key", 400)
+    project = str(raw_project or workspace_cfg.get("default_project") or "").strip()
+    if not project or len(project) > 80 or not re.fullmatch(r"[A-Za-z0-9._-]+", project):
+        return ("", "", "'project' must be a configured project key", 400)
+    raw_path = projects.get(project)
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return ("", "", f"Unknown project {project!r}", 400)
+
+    configured_path = Path(raw_path).expanduser()
+    if not configured_path.is_absolute():
+        return ("", "", f"Configured workspace for {project!r} is not absolute", 503)
+    try:
+        resolved = configured_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return ("", "", f"Configured workspace for {project!r} is unavailable", 503)
+    if not resolved.is_dir():
+        return ("", "", f"Configured workspace for {project!r} is not a directory", 503)
+    return (project, str(resolved), None, 0)
+
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -7178,6 +7223,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
+        cwd: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -7203,6 +7249,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
+            cwd=cwd,
             async_delivery=False,
             cron_session="",
         )
@@ -7780,6 +7827,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if not user_message:
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
+        from gateway.run import _load_gateway_config
+
+        project, run_cwd, workspace_error, workspace_status = _resolve_run_workspace(
+            _load_gateway_config(), body.get("project")
+        )
+        if workspace_error:
+            return web.json_response(
+                _openai_error(workspace_error), status=workspace_status
+            )
+
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
 
@@ -7932,6 +7989,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             model=body.get("model", self._model_name),
             execution_mode=execution_mode,
+            project=project or None,
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -7973,6 +8031,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         single_model=single_model,
                     )
+                    if run_cwd:
+                        agent.session_cwd = run_cwd
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -8040,6 +8100,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 browser_control_transport_family=(
                                     request_browser_control_transport_family
                                 ),
+                                cwd=run_cwd,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no

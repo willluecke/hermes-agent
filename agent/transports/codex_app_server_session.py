@@ -394,6 +394,14 @@ class _ServerRequestRouting:
 
     auto_approve_exec: bool = False
     auto_approve_apply_patch: bool = False
+    guard_no_prompt_exec: bool = False
+    guard_no_prompt_file_changes: bool = False
+
+
+@dataclass(frozen=True)
+class _PendingFileChange:
+    summary: str
+    kinds: frozenset[str]
 
 
 class CodexAppServerSession:
@@ -453,7 +461,7 @@ class CodexAppServerSession:
         # bridge when codex sends item/fileChange/requestApproval. The
         # approval params don't carry the changeset, so we cache here
         # to surface a real summary in the approval prompt (quirk #4).
-        self._pending_file_changes: dict[str, str] = {}
+        self._pending_file_changes: dict[str, _PendingFileChange] = {}
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -1308,6 +1316,18 @@ class CodexAppServerSession:
         Keep it that way — do not re-read approval config here.
         """
         if self._routing.auto_approve_exec:
+            if self._routing.guard_no_prompt_exec:
+                from tools.approval import check_no_prompt_command_guard
+
+                allowed, reason = check_no_prompt_command_guard(
+                    str(params.get("command") or "")
+                )
+                if not allowed:
+                    logger.warning(
+                        "Codex no-prompt policy declined exec: %s",
+                        reason or "unclassified guarded command",
+                    )
+                    return "decline"
             return "accept"
         command = params.get("command") or ""
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
@@ -1339,6 +1359,22 @@ class CodexAppServerSession:
         the docstring on ``_decide_exec_approval``.
         """
         if self._routing.auto_approve_apply_patch:
+            if self._routing.guard_no_prompt_file_changes:
+                item_id = str(params.get("itemId") or "")
+                pending = self._pending_file_changes.get(item_id)
+                if pending is None:
+                    logger.warning(
+                        "Codex no-prompt policy declined file change without "
+                        "inspectable item metadata"
+                    )
+                    return "decline"
+                if not pending.kinds or not pending.kinds.issubset({"add", "update"}):
+                    logger.warning(
+                        "Codex no-prompt policy declined guarded file change "
+                        "kinds: %s",
+                        ", ".join(sorted(pending.kinds)) or "unknown",
+                    )
+                    return "decline"
             return "accept"
         if self._approval_callback is not None:
             # FileChangeRequestApprovalParams gives us reason + grantRoot.
@@ -1393,14 +1429,23 @@ class CodexAppServerSession:
         if method == "item/started":
             changes = item.get("changes") or []
             if not changes:
-                self._pending_file_changes[item_id] = "1 change pending"
+                self._pending_file_changes[item_id] = _PendingFileChange(
+                    summary="1 change pending",
+                    kinds=frozenset(),
+                )
                 return
             kinds: dict[str, int] = {}
             paths: list[str] = []
             for ch in changes:
                 if not isinstance(ch, dict):
                     continue
-                kind = (ch.get("kind") or {}).get("type") or "update"
+                raw_kind = ch.get("kind") or {}
+                kind = (
+                    raw_kind.get("type")
+                    if isinstance(raw_kind, dict)
+                    else str(raw_kind)
+                ) or "update"
+                kind = str(kind).lower()
                 kinds[kind] = kinds.get(kind, 0) + 1
                 p = ch.get("path") or ""
                 if p:
@@ -1409,8 +1454,9 @@ class CodexAppServerSession:
             preview = ", ".join(paths[:3])
             if len(paths) > 3:
                 preview += f", +{len(paths) - 3} more"
-            self._pending_file_changes[item_id] = (
-                f"{counts}: {preview}" if preview else counts
+            self._pending_file_changes[item_id] = _PendingFileChange(
+                summary=f"{counts}: {preview}" if preview else counts,
+                kinds=frozenset(kinds),
             )
         elif method == "item/completed":
             self._pending_file_changes.pop(item_id, None)
@@ -1425,7 +1471,7 @@ class CodexAppServerSession:
         cached = self._pending_file_changes.get(item_id)
         if not cached:
             return None
-        return cached
+        return cached.summary
 
 
 def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:
