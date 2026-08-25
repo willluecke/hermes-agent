@@ -47,3 +47,11 @@ historical evidence; Hermes/Sol remains the decision authority.
 
 Never infer permission to push, merge, deploy, release, spend money, contact an
 external party, or perform a destructive action from RecCli history.
+
+## Safe Gateway Restarts
+
+Do not use a direct `systemctl restart` for command-center deployments. Run
+`ops/command-center/restart-gateway-when-idle.sh`. It requests an external
+drain, waits for the persisted total active-work count to remain at zero for
+two samples, and then restarts. A timeout cancels the drain and does not
+restart the service.

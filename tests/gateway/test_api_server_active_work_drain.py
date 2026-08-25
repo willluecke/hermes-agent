@@ -126,6 +126,11 @@ class TestDrainWaitsForApiWork:
         runner, _adapter = make_restart_runner()
         api = APIServerAdapter(PlatformConfig(enabled=True))
         runner.adapters = {Platform.API_SERVER: api}
+        api.gateway_runner = runner
+        persisted_counts = []
+        runner._persist_active_agents = lambda: persisted_counts.append(
+            runner._active_work_count()
+        )
         app = _make_admission_app(api)
         original_create_task = asyncio.create_task
         task_started = asyncio.Event()
@@ -164,6 +169,12 @@ class TestDrainWaitsForApiWork:
                 _snapshot, timed_out = await drain_task
 
         assert timed_out is False
+        assert persisted_counts
+        assert persisted_counts[-1] == 0
+        first_busy = persisted_counts.index(1)
+        # Admission -> task registration is a single state transition. The
+        # operator-facing runtime status must never flash idle between them.
+        assert 0 not in persisted_counts[first_busy:-1]
 
     @pytest.mark.asyncio
     async def test_drain_times_out_if_api_run_outlives_the_window(self):
@@ -604,5 +615,4 @@ class TestShutdownSettleWindow:
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
         ]
-
 

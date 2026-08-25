@@ -1361,12 +1361,14 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        self._persist_gateway_active_work()
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                self._persist_gateway_active_work()
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -1377,6 +1379,7 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        adapter._persist_gateway_active_work()
 
 
 @contextmanager
@@ -1388,6 +1391,7 @@ def _reserve_pending_api_work(adapter):
     """
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
+    adapter._persist_gateway_active_work()
     try:
         yield reservation
     finally:
@@ -1788,6 +1792,22 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return 0
 
+    def _persist_gateway_active_work(self) -> None:
+        """Refresh the shared runtime count after API work changes.
+
+        API turns are owned by this adapter rather than
+        ``GatewayRunner._running_agents``.  Without this callback, the live
+        drain sees them but the persisted status used by operators can remain
+        at zero for the entire run.
+        """
+        try:
+            persist = getattr(self.gateway_runner, "_persist_active_agents", None)
+            if callable(persist):
+                persist()
+        except Exception:
+            # Status reporting is best-effort and must not break a request.
+            pass
+
     def interrupt_active_runs(self, reason: str) -> int:
         """Cooperatively interrupt every adapter-owned agent during shutdown.
 
@@ -1864,12 +1884,14 @@ class APIServerAdapter(BasePlatformAdapter):
             headers={"Retry-After": "1"},
         )
 
-    def _activate_admitted_request(self) -> None:
+    def _activate_admitted_request(self, *, persist: bool = True) -> None:
         """Transfer this request's drain reservation to agent bookkeeping."""
         reservation = _api_agent_request_reservation.get()
         if reservation and reservation["active"]:
             reservation["active"] = False
             self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            if persist:
+                self._persist_gateway_active_work()
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
@@ -7592,12 +7614,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                     clear_session_vars(tokens)
 
-        self._activate_admitted_request()
+        # Transfer pending -> in-flight as one externally visible state change;
+        # persisting between the two assignments would create a false-idle
+        # window even though there is no await here.
+        self._activate_admitted_request(persist=False)
         self._inflight_agent_runs += 1
+        self._persist_gateway_active_work()
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            self._persist_gateway_active_work()
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -8532,10 +8559,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._persist_gateway_active_work()
 
-        self._activate_admitted_request()
+        # Transfer pending -> task as one externally visible state change.
+        self._activate_admitted_request(persist=False)
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        self._persist_gateway_active_work()
         try:
             self._background_tasks.add(task)
         except TypeError:
