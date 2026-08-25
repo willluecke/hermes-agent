@@ -122,12 +122,32 @@ def _resolve_run_workspace(
         if isinstance(runtime_cfg, dict)
         else {}
     )
-    projects = (
+    configured_projects = (
         workspace_cfg.get("projects", {})
         if isinstance(workspace_cfg, dict)
         else {}
     )
-    if not isinstance(projects, dict) or not projects:
+    projects = dict(configured_projects) if isinstance(configured_projects, dict) else {}
+    projects_file = (
+        workspace_cfg.get("projects_file")
+        if isinstance(workspace_cfg, dict)
+        else None
+    )
+    if projects_file is not None:
+        if not isinstance(projects_file, str) or not projects_file.strip():
+            return ("", "", "Configured projects_file must be an absolute path", 503)
+        registry_path = Path(projects_file).expanduser()
+        if not registry_path.is_absolute():
+            return ("", "", "Configured projects_file must be an absolute path", 503)
+        try:
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return ("", "", "Configured project registry is unavailable", 503)
+        if not isinstance(registry, dict):
+            return ("", "", "Configured project registry must be a JSON object", 503)
+        projects.update(registry)
+
+    if not projects and projects_file is None:
         return ("", "", None, 0)
 
     if raw_project is not None and not isinstance(raw_project, str):

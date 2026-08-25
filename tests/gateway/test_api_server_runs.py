@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -145,6 +146,46 @@ class TestStartRun:
         project, cwd, error, status = _resolve_run_workspace(config, "/etc")
         assert (project, cwd, status) == ("", "", 400)
         assert "configured project key" in error
+
+    def test_workspace_resolver_reloads_server_owned_project_registry(self, tmp_path):
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        registry = tmp_path / "projects.json"
+        registry.write_text(json.dumps({"first": str(first)}), encoding="utf-8")
+        config = {
+            "codex_runtime": {
+                "workspaces": {
+                    "default_project": "first",
+                    "projects_file": str(registry),
+                }
+            }
+        }
+
+        assert _resolve_run_workspace(config, "first")[:2] == (
+            "first",
+            str(first.resolve()),
+        )
+        registry.write_text(json.dumps({"second": str(second)}), encoding="utf-8")
+        assert _resolve_run_workspace(config, "second")[:2] == (
+            "second",
+            str(second.resolve()),
+        )
+        assert _resolve_run_workspace(config, "first")[3] == 400
+
+    def test_workspace_resolver_fails_closed_on_broken_project_registry(self, tmp_path):
+        registry = tmp_path / "projects.json"
+        registry.write_text("not json", encoding="utf-8")
+        config = {
+            "codex_runtime": {
+                "workspaces": {"projects_file": str(registry)}
+            }
+        }
+
+        project, cwd, error, status = _resolve_run_workspace(config, "anything")
+        assert (project, cwd, status) == ("", "", 503)
+        assert "registry" in error
 
     @pytest.mark.asyncio
     async def test_start_binds_server_resolved_project_cwd(self, adapter, tmp_path):
