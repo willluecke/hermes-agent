@@ -23,6 +23,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _ReplayableRunEventStream,
+    _api_goal_command_args,
     _approval_event_choices,
     _resolve_run_workspace,
     cors_middleware,
@@ -125,6 +126,20 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("/goal ship it", "ship it"),
+            ("  /goal status  ", "status"),
+            ("/goal", ""),
+            ("/goals ship it", None),
+            ("explain /goal ship it", None),
+            ([{"type": "text", "text": "/goal ship it"}], None),
+        ],
+    )
+    def test_goal_command_recognition_is_exact(self, value, expected):
+        assert _api_goal_command_args(value) == expected
+
     def test_workspace_resolver_accepts_only_server_configured_keys(self, tmp_path):
         project_root = tmp_path / "reg-watch"
         project_root.mkdir()
@@ -582,6 +597,139 @@ class TestStartRun:
 
         assert resp.status == 400
         mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("runtime", "expected_provider", "expected_model", "single_model"),
+        [
+            ({}, None, None, False),
+            (
+                {
+                    "execution_mode": "single_model",
+                    "provider": "anthropic",
+                    "model": "claude-opus-test",
+                },
+                "anthropic",
+                "claude-opus-test",
+                True,
+            ),
+            (
+                {
+                    "execution_mode": "single_model",
+                    "provider": "openai-codex",
+                    "model": "gpt-codex-test",
+                },
+                "openai-codex",
+                "gpt-codex-test",
+                True,
+            ),
+        ],
+    )
+    async def test_goal_loop_runs_for_orchestrated_and_single_model_runtimes(
+        self,
+        adapter,
+        runtime,
+        expected_provider,
+        expected_model,
+        single_model,
+    ):
+        app = _create_runs_app(adapter)
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.side_effect = [
+            {"final_response": "first pass"},
+            {"final_response": "authoritative finish"},
+        ]
+        mock_agent.session_prompt_tokens = 20
+        mock_agent.session_completion_tokens = 10
+        mock_agent.session_total_tokens = 30
+        decisions = [
+            {
+                "should_continue": True,
+                "continuation_prompt": "continue toward the goal",
+                "message": "Continuing toward goal",
+            },
+            {
+                "should_continue": False,
+                "continuation_prompt": None,
+                "message": "Goal achieved",
+            },
+        ]
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent", return_value=mock_agent
+            ) as create_agent, patch(
+                "gateway.platforms.api_server._prepare_api_goal_command",
+                return_value={
+                    "notice": "Goal set",
+                    "run_prompt": "ship it",
+                    "continuation": False,
+                },
+            ), patch(
+                "gateway.platforms.api_server._evaluate_api_goal_turn",
+                side_effect=decisions,
+            ) as evaluate:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "/goal ship it",
+                        "session_id": "goal-runtime-session",
+                        **runtime,
+                    },
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                events = await events_response.text()
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+
+        assert status["status"] == "completed"
+        assert status["output"] == "authoritative finish"
+        assert '"text": "first pass"' in events
+        assert '"text": "Continuing toward goal"' in events
+        assert '"output": "authoritative finish"' in events
+        assert mock_agent.run_conversation.call_count == 2
+        first, second = mock_agent.run_conversation.call_args_list
+        assert first.kwargs["user_message"] == "ship it"
+        assert first.kwargs["persist_user_message"] == "/goal ship it"
+        assert second.kwargs["user_message"] == "continue toward the goal"
+        assert second.kwargs["persist_user_display_kind"] == "auto_continue"
+        assert second.kwargs["conversation_history"] is None
+        assert evaluate.call_count == 2
+        created = create_agent.call_args.kwargs
+        assert created["requested_provider"] == expected_provider
+        assert created["requested_model"] == expected_model
+        assert created["single_model"] is single_model
+
+    @pytest.mark.asyncio
+    async def test_goal_status_completes_without_running_a_model_turn(self, adapter):
+        app = _create_runs_app(adapter)
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent", return_value=mock_agent
+            ) as create_agent, patch(
+                "gateway.platforms.api_server._prepare_api_goal_command",
+                return_value={"response": "Goal active: ship it"},
+            ):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "/goal status",
+                        "session_id": "goal-control-session",
+                    },
+                )
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                events = await events_response.text()
+
+        mock_agent.run_conversation.assert_not_called()
+        create_agent.assert_not_called()
+        assert '"output": "Goal active: ship it"' in events
 
 
 # ---------------------------------------------------------------------------

@@ -171,6 +171,72 @@ def _resolve_run_workspace(
     return (project, str(resolved), None, 0)
 
 
+_API_GOAL_COMMAND_RE = re.compile(r"^\s*/goal(?:\s+(.*))?\s*$", re.DOTALL)
+
+
+def _api_goal_command_args(value: Any) -> Optional[str]:
+    """Return ``/goal`` arguments for the native runs surface.
+
+    ``/v1/runs`` does not pass through :class:`GatewayRunner` slash-command
+    dispatch.  Recognizing the command here keeps browser sessions on the same
+    durable GoalManager used by the CLI, TUI, and messaging gateways.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _API_GOAL_COMMAND_RE.fullmatch(value)
+    if match is None:
+        return None
+    return (match.group(1) or "").strip()
+
+
+def _api_goal_max_turns() -> int:
+    try:
+        from hermes_cli.config import load_config
+
+        goals_cfg = (load_config() or {}).get("goals") or {}
+        return int(goals_cfg.get("max_turns", 20) or 20)
+    except Exception:
+        return 20
+
+
+def _api_goal_manager(session_id: str):
+    from hermes_cli.goals import GoalManager
+
+    return GoalManager(
+        session_id=session_id,
+        default_max_turns=_api_goal_max_turns(),
+    )
+
+
+def _prepare_api_goal_command(session_id: str, args: str) -> Dict[str, Any]:
+    """Apply one browser command through Hermes' native goal service."""
+    from hermes_cli.goals import prepare_goal_command
+
+    return prepare_goal_command(_api_goal_manager(session_id), args)
+
+
+def _evaluate_api_goal_turn(
+    session_id: str,
+    final_response: str,
+    *,
+    user_initiated: bool,
+) -> Optional[Dict[str, Any]]:
+    mgr = _api_goal_manager(session_id)
+    if not mgr.is_active():
+        return None
+    try:
+        from hermes_cli.goals import gather_background_processes
+
+        background_processes = gather_background_processes()
+    except Exception:
+        background_processes = None
+    return mgr.evaluate_after_turn(
+        final_response,
+        user_initiated=user_initiated,
+        background_processes=background_processes,
+    )
+
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -7908,6 +7974,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        goal_command_args = _api_goal_command_args(user_message)
         execution_mode = _clean_request_string(body.get("execution_mode")) or "orchestrated"
         if execution_mode not in {"orchestrated", "single_model"}:
             return web.json_response(
@@ -8040,6 +8107,50 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.cancelled",
                     )
                     return
+                goal_directive = None
+                if goal_command_args is not None:
+                    def _prepare_goal_sync():
+                        with self._profile_scope(request_profile):
+                            return _prepare_api_goal_command(
+                                session_id, goal_command_args
+                            )
+
+                    goal_directive = await asyncio.get_running_loop().run_in_executor(
+                        None, _prepare_goal_sync
+                    )
+                    notice = str(goal_directive.get("notice") or "").strip()
+                    if notice:
+                        _interim_cb(notice, already_streamed=False)
+                    if not goal_directive.get("run_prompt"):
+                        final_response = str(
+                            goal_directive.get("response") or ""
+                        ).strip()
+                        if not final_response:
+                            raise RuntimeError(
+                                "goal command completed without a response"
+                            )
+                        usage = {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                        }
+                        _put_event_if_active({
+                            "event": "run.completed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "output": final_response,
+                            "output_kind": "final",
+                            "usage": usage,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "completed",
+                            output=final_response,
+                            output_kind="final",
+                            usage=usage,
+                            last_event="run.completed",
+                        )
+                        return
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -8132,11 +8243,92 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            run_message = user_message
+                            run_history = conversation_history
+                            goal_user_initiated = True
+                            goal_turn = 0
+                            if goal_directive is not None:
+                                if goal_directive.get("run_prompt"):
+                                    run_message = goal_directive["run_prompt"]
+                                    goal_user_initiated = not bool(
+                                        goal_directive.get("continuation")
+                                    )
+
+                            while True:
+                                run_kwargs: Dict[str, Any] = {
+                                    "user_message": run_message,
+                                    "conversation_history": run_history,
+                                    "task_id": (
+                                        effective_task_id
+                                        if goal_turn == 0
+                                        else f"{effective_task_id}:goal:{goal_turn}"
+                                    ),
+                                }
+                                if goal_turn > 0:
+                                    run_kwargs.update(
+                                        {
+                                            "persist_user_display_kind": "auto_continue",
+                                            "persist_user_display_metadata": {
+                                                "source": "goal",
+                                                "turn": goal_turn + 1,
+                                            },
+                                        }
+                                    )
+                                elif goal_command_args is not None:
+                                    # The model receives the objective, while
+                                    # durable history keeps the command the
+                                    # user actually entered.
+                                    run_kwargs["persist_user_message"] = user_message
+
+                                r = agent.run_conversation(**run_kwargs)
+                                if not isinstance(r, dict) or (
+                                    r.get("failed")
+                                    or r.get("completed") is False
+                                    or r.get("partial") is True
+                                ):
+                                    break
+                                final_text = str(r.get("final_response") or "").strip()
+                                if not final_text:
+                                    break
+
+                                decision = _evaluate_api_goal_turn(
+                                    session_id,
+                                    final_text,
+                                    user_initiated=goal_user_initiated,
+                                )
+                                if not decision:
+                                    break
+                                decision_message = str(
+                                    decision.get("message") or ""
+                                ).strip()
+                                if not decision.get("should_continue"):
+                                    if decision_message:
+                                        _interim_cb(
+                                            decision_message,
+                                            already_streamed=False,
+                                        )
+                                    break
+
+                                # This turn's streamed answer is not the final
+                                # answer for the overall run. Archive it as an
+                                # ordered commentary event before the next
+                                # turn so completion cannot erase it.
+                                _interim_cb(final_text, already_streamed=True)
+                                if decision_message:
+                                    _interim_cb(
+                                        decision_message,
+                                        already_streamed=False,
+                                    )
+                                run_message = str(
+                                    decision.get("continuation_prompt") or ""
+                                ).strip()
+                                if not run_message:
+                                    break
+                                run_history = None
+                                goal_user_initiated = False
+                                goal_turn += 1
+                                if run_id in self._stopping_run_ids:
+                                    break
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later

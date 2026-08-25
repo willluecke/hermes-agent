@@ -138,6 +138,47 @@ class TestGoalManager:
         assert prompt.strip()  # non-empty
 
 
+class TestPrepareGoalCommand:
+    def test_set_status_resume_and_clear_share_one_command_contract(self, hermes_home):
+        from hermes_cli.goals import GoalManager, prepare_goal_command
+
+        manager = GoalManager(session_id="shared-command", default_max_turns=7)
+        started = prepare_goal_command(manager, "finish the release")
+        assert started["run_prompt"] == "finish the release"
+        assert started["continuation"] is False
+        assert "7-turn budget" in started["response"]
+
+        status = prepare_goal_command(manager, "status")
+        assert "finish the release" in status["response"]
+
+        paused = prepare_goal_command(manager, "pause")
+        assert paused["clear_pending"] is True
+        assert manager.state.status == "paused"
+
+        resumed = prepare_goal_command(manager, "resume")
+        assert resumed["continuation"] is True
+        assert "finish the release" in resumed["run_prompt"]
+
+        cleared = prepare_goal_command(manager, "clear")
+        assert cleared == {
+            "response": "Goal cleared.",
+            "clear_pending": True,
+        }
+        assert manager.has_goal() is False
+
+    def test_control_commands_do_not_invent_a_goal(self, hermes_home):
+        from hermes_cli.goals import GoalManager, prepare_goal_command
+
+        manager = GoalManager(session_id="shared-control")
+        assert prepare_goal_command(manager, "status")["response"].startswith(
+            "No active goal"
+        )
+        assert prepare_goal_command(manager, "resume") == {
+            "response": "No goal to resume."
+        }
+        assert manager.state is None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
 # ──────────────────────────────────────────────────────────────────────
@@ -797,4 +838,3 @@ class TestContractAndBackgroundCompose:
         # The judge can return a wait verdict on a contract goal.
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
-

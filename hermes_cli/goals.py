@@ -2133,6 +2133,153 @@ class GoalManager:
         return self._state.contract.render_block()
 
 
+def prepare_goal_command(manager: GoalManager, args: str) -> Dict[str, Any]:
+    """Apply one ``/goal`` command using the shared durable goal engine.
+
+    Transport adapters own delivery and scheduling.  This function owns the
+    command vocabulary and state mutation so CLI, gateway, browser, and native
+    provider surfaces cannot silently develop different goal semantics.
+
+    ``run_prompt`` asks the caller to start or resume work immediately.
+    ``clear_pending`` asks queue-backed transports to discard stale synthetic
+    continuations after pause/clear.
+    """
+    args = (args or "").strip()
+    lower = args.lower()
+
+    if not args or lower == "status":
+        return {"response": manager.status_line()}
+    if lower == "show":
+        return {"response": f"{manager.status_line()}\n{manager.render_contract()}"}
+    if lower == "pause":
+        state = manager.pause(reason="user-paused")
+        return {
+            "response": (
+                "No active goal. Set one with /goal <text>."
+                if state is None
+                else f"Goal paused: {state.goal}"
+            ),
+            "clear_pending": True,
+        }
+    if lower == "resume":
+        state = manager.resume()
+        if state is None:
+            return {"response": "No goal to resume."}
+        return {
+            "response": f"Goal resumed: {state.goal}",
+            "notice": f"Goal resumed: {state.goal}",
+            "run_prompt": manager.next_continuation_prompt(),
+            "continuation": True,
+        }
+    if lower in {"clear", "stop", "done"}:
+        had_goal = manager.has_goal()
+        manager.clear()
+        return {
+            "response": "Goal cleared." if had_goal else "No active goal.",
+            "clear_pending": True,
+        }
+
+    if lower == "wait" or lower.startswith("wait "):
+        wait_arg = args[len("wait") :].strip()
+        if not wait_arg:
+            return {"response": "Usage: /goal wait <pid> [reason]"}
+        tokens = wait_arg.split(None, 1)
+        try:
+            pid = int(tokens[0])
+        except ValueError:
+            return {"response": "/goal wait: <pid> must be an integer process id."}
+        reason = tokens[1].strip() if len(tokens) > 1 else ""
+        try:
+            manager.wait_on(pid, reason=reason)
+        except (RuntimeError, ValueError) as exc:
+            return {"response": f"/goal wait: {exc}"}
+        reason_text = f" ({reason})" if reason else ""
+        return {
+            "response": (
+                f"Goal parked on pid {pid}{reason_text}. "
+                "Loop pauses until it exits."
+            )
+        }
+    if lower == "unwait":
+        return {
+            "response": (
+                "Wait barrier cleared; the goal can resume."
+                if manager.stop_waiting()
+                else "No wait barrier set."
+            )
+        }
+
+    if lower == "gate" or lower.startswith("gate "):
+        gate_arg = args[len("gate") :].strip()
+        gate_lower = gate_arg.lower()
+        if not gate_arg or gate_lower == "list":
+            return {"response": manager.render_gates()}
+        if gate_lower.startswith("add "):
+            command = gate_arg[len("add ") :].strip()
+            try:
+                gate = manager.add_gate(command)
+            except (RuntimeError, ValueError) as exc:
+                return {"response": f"/goal gate add: {exc}"}
+            return {
+                "response": (
+                    f"Gate added: $ {gate.command} "
+                    f"({gate.max_retries} retries, {gate.timeout_seconds}s timeout). "
+                    "It must pass before the goal can complete."
+                )
+            }
+        if gate_lower.startswith("remove ") or gate_lower.startswith("rm "):
+            try:
+                index_text = gate_arg.split(None, 1)[1].strip()
+                removed = manager.remove_gate(int(index_text))
+            except (RuntimeError, ValueError, IndexError) as exc:
+                return {"response": f"/goal gate remove: {exc}"}
+            return {"response": f"Gate removed: $ {removed}"}
+        if gate_lower == "clear":
+            try:
+                count = manager.clear_gates()
+            except RuntimeError as exc:
+                return {"response": f"/goal gate clear: {exc}"}
+            return {
+                "response": f"Cleared {count} goal gate{'s' if count != 1 else ''}."
+            }
+        return {
+            "response": "Usage: /goal gate [list | add <command> | remove <N> | clear]"
+        }
+
+    requested_draft = lower == "draft" or lower.startswith("draft ")
+    contract = None
+    objective = args
+    if requested_draft:
+        objective = args[len("draft") :].strip()
+        if not objective:
+            return {"response": "Usage: /goal draft <objective in plain language>"}
+        try:
+            contract = draft_contract(objective)
+        except Exception as exc:
+            logger.debug("goal contract draft failed: %s", exc)
+    else:
+        headline, parsed = parse_contract(args)
+        objective = headline or args
+        contract = parsed if not parsed.is_empty() else None
+
+    try:
+        state = manager.set(objective, contract=contract)
+    except ValueError as exc:
+        return {"response": f"Invalid goal: {exc}"}
+
+    notice = f"Goal set ({state.max_turns}-turn budget): {state.goal}"
+    if state.has_contract():
+        notice = f"{notice}\nCompletion contract:\n{state.contract.render_block()}"
+    elif requested_draft:
+        notice = f"{notice}\nCould not draft a contract; using a free-form goal."
+    return {
+        "response": notice,
+        "notice": notice,
+        "run_prompt": state.goal,
+        "continuation": False,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Kanban worker goal loop
 # ──────────────────────────────────────────────────────────────────────
@@ -2303,6 +2450,7 @@ __all__ = [
     "GoalContract",
     "GoalGate",
     "GoalManager",
+    "prepare_goal_command",
     "parse_contract",
     "draft_contract",
     "run_gate",
