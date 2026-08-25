@@ -8457,6 +8457,11 @@ class APIServerAdapter(BasePlatformAdapter):
                             last_event="run.failed",
                         )
                         return
+                    # Remote run clients cannot resolve command-center paths.
+                    # Apply the same validated raster-image delivery used by
+                    # the other API response paths before this output enters
+                    # SSE replay, run status, and the durable chat archive.
+                    final_response = _resolve_media_to_data_urls(final_response)
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.

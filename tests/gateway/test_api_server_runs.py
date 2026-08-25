@@ -805,6 +805,38 @@ class TestRunEvents:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_completed_run_inlines_safe_media_image(self, adapter, tmp_path):
+        image = tmp_path / "preview.png"
+        image.write_bytes(
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR"
+            b"\x00\x00\x00\x01\x00\x00\x00\x01"
+        )
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": f"Rendered preview:\n\nMEDIA:{image}"
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post("/v1/runs", json={"input": "render"})
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_response.text()
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_response.json()
+
+        assert "data:image/png;base64," in body
+        assert "MEDIA:" not in body
+        assert "data:image/png;base64," in status["output"]
+        assert "MEDIA:" not in status["output"]
+
+    @pytest.mark.asyncio
     async def test_interim_assistant_text_has_its_own_run_event(self, adapter):
         """Tool-call commentary must not masquerade as final answer text."""
         app = _create_runs_app(adapter)
