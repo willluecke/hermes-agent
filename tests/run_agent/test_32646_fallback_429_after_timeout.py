@@ -142,8 +142,6 @@ class TestFallbackChainResetOnTransportRecovery:
         mock_fb_client._custom_headers = None
         mock_fb_client.default_headers = None
 
-        from agent import conversation_loop as _conversation_loop
-
         with (
             patch(
                 "agent.auxiliary_client.resolve_provider_client",
@@ -242,6 +240,7 @@ class TestFallbackChainResetOnTransportRecovery:
         ]
         agent = _make_agent_with_fallback(fb_chain)
         agent._api_max_retries = 2
+        from agent import conversation_loop as _conversation_loop
 
         calls = []
 
