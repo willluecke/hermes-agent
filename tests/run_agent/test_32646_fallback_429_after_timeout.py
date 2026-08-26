@@ -8,7 +8,7 @@ Scenario:
   1. ``_try_recover_primary_transport()`` succeeds after 3 timeouts and
      resets ``retry_count = 0`` so the rebuilt primary client gets one
      more attempt.
-  2. The next attempt hits HTTP 429.
+  2. The next attempt enters a sustained HTTP 429 window.
   3. Before this fix, an eager-fallback attempt that lost its race with
      a concurrent session mutating the on-disk credential pool could
      leave ``_fallback_index`` advanced past the chain length without
@@ -17,8 +17,9 @@ Scenario:
      len(_fallback_chain)``), so the retry budget burned on the primary
      model with no fallback ever attempted.
   4. The fix resets ``_fallback_index`` / ``_fallback_activated`` /
-     ``TurnRetryState.has_retried_429`` after transport recovery so the post-recovery
-     429 always gets a fresh fallback-chain attempt.
+     ``TurnRetryState.has_retried_429`` after transport recovery so the
+     post-recovery 429 window gets a fresh fallback-chain attempt after its
+     bounded retries are exhausted.
 """
 
 from __future__ import annotations
@@ -225,9 +226,10 @@ class TestFallbackChainResetOnTransportRecovery:
         Start the turn with the fallback chain already burned, matching
         the stale state reported in the issue. Two transient timeouts
         exhaust the retry loop and trigger primary transport recovery.
-        The next primary attempt returns 429. The conversation loop must
+        The next primary attempts return 429. The conversation loop must
         reset the stale fallback-chain state during recovery so that the
-        post-recovery 429 activates the configured fallback provider.
+        post-recovery retry window eventually activates the configured
+        fallback provider.
         """
         fb_chain = [
             {
@@ -249,7 +251,9 @@ class TestFallbackChainResetOnTransportRecovery:
                 agent._fallback_activated = False
             if attempt <= 2:
                 raise ReadTimeout("read timed out")
-            if attempt == 3:
+            # Initial busy response plus seven retries. The fallback should
+            # activate only after the eighth consecutive 429.
+            if 3 <= attempt <= 10:
                 raise RateLimitError()
             return _mock_response("Recovered via fallback")
 
@@ -281,9 +285,7 @@ class TestFallbackChainResetOnTransportRecovery:
         assert result["completed"] is True
         assert result["final_response"] == "Recovered via fallback"
         assert calls == [
-            ("zai", "glm-5.1"),
-            ("zai", "glm-5.1"),
-            ("zai", "glm-5.1"),
+            *(("zai", "glm-5.1") for _ in range(10)),
             ("zai", "glm-4.7"),
         ]
         mock_resolve.assert_called_once()
