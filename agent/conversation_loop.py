@@ -82,9 +82,13 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.retry_utils import (
+    PROVIDER_BUSY_RETRY_OFFSETS,
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
+    parse_retry_after_seconds,
+    provider_busy_retry_ceiling,
+    provider_busy_retry_delay,
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
@@ -5070,13 +5074,41 @@ def run_conversation(
                     )
 
                 retry_count += 1
+                error_type = type(api_error).__name__
+                error_msg = str(api_error).lower()
+                _provider = getattr(agent, "provider", "unknown")
+                _provider_busy_429 = (
+                    status_code == 429
+                    and classified.reason in {
+                        FailoverReason.rate_limit,
+                        FailoverReason.upstream_rate_limit,
+                        FailoverReason.overloaded,
+                    }
+                    # Nous has a cross-session account-level breaker that must
+                    # decide whether a 429 is genuine before another request is
+                    # spent. Preserve that narrower provider policy.
+                    and str(_provider).strip().lower() != "nous"
+                    # Some relays wrap deterministic max-output request errors
+                    # in a 429. Their dedicated clamp below owns that recovery.
+                    and parse_available_output_tokens_from_error(error_msg) is None
+                )
+                if _provider_busy_429:
+                    _retry.provider_busy_failures += 1
+                    if _retry.provider_busy_failures == 1:
+                        # ``max_retries`` is actually the total request-attempt
+                        # ceiling. Extend it relative to any earlier, unrelated
+                        # transient failures so this first busy response still
+                        # receives all seven scheduled retries.
+                        max_retries = max(
+                            max_retries,
+                            retry_count - 1 + provider_busy_retry_ceiling(),
+                        )
+
                 elapsed_time = time.time() - api_start_time
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )
-                
-                error_type = type(api_error).__name__
-                error_msg = str(api_error).lower()
+
                 _error_summary = agent._summarize_api_error(api_error)
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
@@ -5087,7 +5119,6 @@ def run_conversation(
                     _error_summary,
                 )
 
-                _provider = getattr(agent, "provider", "unknown")
                 _base = getattr(agent, "base_url", "unknown")
                 _model = getattr(agent, "model", "unknown")
                 _status_code_str = f" [HTTP {status_code}]" if status_code else ""
@@ -5299,12 +5330,12 @@ def run_conversation(
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
 
-                # Eager fallback for rate-limit errors (429 or quota exhaustion)
-                # and transport errors (connection failure / timeout / provider
-                # overloaded).  Rate limits and billing: switch immediately —
-                # the primary provider won't recover within the retry window.
-                # Transport errors: allow 1 retry first (transient hiccups
-                # recover), then fall back if the provider is truly unreachable.
+                # Billing/quota walls still fall back immediately. Transient
+                # provider 429s first get the bounded two-minute retry window;
+                # only an exhausted window may switch an orchestrated run to
+                # its configured fallback. Direct single-model runs carry no
+                # fallback chain and therefore fail on the selected model.
+                # Other transport errors allow one retry before fallback.
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
@@ -5339,11 +5370,29 @@ def run_conversation(
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
-                if _is_zai_coding_overload:
+                if _is_zai_coding_overload and not _provider_busy_429:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                _provider_busy_exhausted = (
+                    _provider_busy_429
+                    and _retry.provider_busy_failures > len(PROVIDER_BUSY_RETRY_OFFSETS)
+                )
                 _should_fallback = (
-                    (is_rate_limited and _wrapped_output_cap_budget is None)
-                    or (_is_transport_failure and retry_count >= 2)
+                    (
+                        is_rate_limited
+                        and _wrapped_output_cap_budget is None
+                        and (
+                            not _provider_busy_429
+                            or _provider_busy_exhausted
+                        )
+                    )
+                    or (
+                        _is_transport_failure
+                        and (
+                            _provider_busy_exhausted
+                            if _provider_busy_429
+                            else retry_count >= 2
+                        )
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -6228,7 +6277,7 @@ def run_conversation(
                         "error": _nonretryable_summary,
                     }
 
-                if retry_count >= max_retries:
+                if retry_count >= max_retries or _provider_busy_exhausted:
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
@@ -6285,8 +6334,14 @@ def run_conversation(
                             model=_model,
                             unverified=classified.billing_unverified,
                         )
+                    elif _provider_busy_exhausted:
+                        agent._emit_status(
+                            "❌ Provider remained busy after "
+                            f"{len(PROVIDER_BUSY_RETRY_OFFSETS)} retries over "
+                            f"{PROVIDER_BUSY_RETRY_OFFSETS[-1]:.0f}s — {_final_summary}"
+                        )
                     elif is_rate_limited:
-                        agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                        agent._emit_status(f"❌ Rate limited after {max_retries} attempts — {_final_summary}")
                     else:
                         agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
                     agent._vprint(f"{agent.log_prefix}   💀 Final error: {_final_summary}", force=True)
@@ -6454,25 +6509,42 @@ def run_conversation(
                         "billing_block": _billing_block,
                     }
 
-                # For rate limits, respect the Retry-After header if present
+                # For rate limits, respect the Retry-After header if present.
                 _retry_after = None
-                if is_rate_limited:
+                if is_rate_limited or _provider_busy_429:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                    if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                        if _ra_raw:
-                            try:
-                                # Cap at 10 minutes. Anthropic Tier 1 input-token
-                                # buckets reset in ~171s, so a 120s cap caused us to
-                                # retry before the actual reset window and re-trip the
-                                # limit. 600s covers all realistic provider reset
-                                # windows while still rejecting pathological values. (#26293)
-                                _retry_after = min(float(_ra_raw), 600)
-                            except (TypeError, ValueError):
-                                pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
-                _backoff_policy = None
-                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
+                    _parsed_retry_after = parse_retry_after_seconds(_resp_headers)
+                    if _parsed_retry_after is not None:
+                        # Cap at 10 minutes. Anthropic Tier 1 input-token
+                        # buckets can reset after the normal interactive retry
+                        # window; honor that provider instruction without
+                        # accepting a pathological unbounded delay. (#26293)
+                        _retry_after = min(_parsed_retry_after, 600.0)
+                if _provider_busy_429:
+                    wait_time = (
+                        _retry_after
+                        if _retry_after is not None
+                        else provider_busy_retry_delay(
+                            _retry.provider_busy_failures
+                        )
+                    )
+                    _backoff_policy = "provider_busy_2m"
+                else:
+                    wait_time = (
+                        _retry_after
+                        if _retry_after is not None
+                        else jittered_backoff(
+                            retry_count,
+                            base_delay=2.0,
+                            max_delay=60.0,
+                        )
+                    )
+                    _backoff_policy = None
+                if (
+                    not _provider_busy_429
+                    and (is_rate_limited or _is_zai_coding_overload)
+                    and _retry_after is None
+                ):
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
@@ -6480,7 +6552,18 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                if _provider_busy_429:
+                    _rate_limit_status = (
+                        "Provider busy (HTTP 429). "
+                        f"Retry {_retry.provider_busy_failures}/"
+                        f"{len(PROVIDER_BUSY_RETRY_OFFSETS)} in {wait_time:.1f}s; "
+                        "the same run and model are preserved."
+                    )
+                    # These waits are long enough that silence looks like a
+                    # stalled run. Emit each bounded retry immediately; API
+                    # gateway status callbacks persist it in run chronology.
+                    agent._emit_status(_rate_limit_status)
+                elif is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"

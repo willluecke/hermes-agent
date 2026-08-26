@@ -34,6 +34,41 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 # the two from silently desyncing if the short-retry count is ever tuned.
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
+# Cumulative retry targets for transient provider HTTP 429 responses.  The
+# seventh retry begins 110 seconds after the first failed request, leaving a
+# small margin inside the user-facing two-minute recovery window.  Keeping
+# these as cumulative targets makes the intended wall-clock budget explicit;
+# ``provider_busy_retry_delay`` converts them to per-retry sleeps.
+PROVIDER_BUSY_RETRY_OFFSETS = (5.0, 10.0, 20.0, 35.0, 55.0, 80.0, 110.0)
+
+
+def provider_busy_retry_delay(retry_number: int) -> float:
+    """Return the delay before a 1-based transient-429 retry.
+
+    The schedule's cumulative retry times are 5, 10, 20, 35, 55, 80, and
+    110 seconds.  Calls past the supported retry budget raise ``ValueError``
+    so callers cannot silently turn this bounded policy into an infinite
+    retry loop.
+    """
+    if retry_number < 1 or retry_number > len(PROVIDER_BUSY_RETRY_OFFSETS):
+        raise ValueError(
+            f"retry_number must be between 1 and {len(PROVIDER_BUSY_RETRY_OFFSETS)}"
+        )
+    previous = (
+        PROVIDER_BUSY_RETRY_OFFSETS[retry_number - 2]
+        if retry_number > 1
+        else 0.0
+    )
+    return PROVIDER_BUSY_RETRY_OFFSETS[retry_number - 1] - previous
+
+
+def provider_busy_retry_ceiling() -> int:
+    """Maximum API attempts for the transient-429 policy.
+
+    One initial request plus seven retries means eight total provider calls.
+    """
+    return len(PROVIDER_BUSY_RETRY_OFFSETS) + 1
+
 
 def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     """Parse a ``Retry-After`` value into non-negative seconds.

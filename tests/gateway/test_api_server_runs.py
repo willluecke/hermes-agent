@@ -872,6 +872,41 @@ class TestRunEvents:
         assert "Inspection complete." in body
 
     @pytest.mark.asyncio
+    async def test_lifecycle_status_is_persisted_in_run_chronology(self, adapter):
+        """Provider retry countdowns must survive detach and replay."""
+        app = _create_runs_app(adapter)
+
+        def create_agent(**kwargs):
+            mock_agent = MagicMock()
+
+            def run_conversation(**_run_kwargs):
+                kwargs["status_callback"](
+                    "lifecycle",
+                    "Provider busy (HTTP 429). Retry 1/7 in 5.0s; "
+                    "the same run and model are preserved.",
+                )
+                return {"final_response": "Recovered."}
+
+            mock_agent.run_conversation.side_effect = run_conversation
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "continue"})
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert '"event": "message.interim"' in body
+        assert f'"message_id": "{run_id}:commentary:1"' in body
+        assert "Provider busy (HTTP 429). Retry 1/7" in body
+        assert '"already_streamed": false' in body
+        assert '"event": "run.completed"' in body
+
+    @pytest.mark.asyncio
     async def test_partial_result_is_failed_not_completed(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

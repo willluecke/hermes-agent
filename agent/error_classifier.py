@@ -1317,6 +1317,20 @@ def _classify_by_status(
         # endpoint is still busy, and does nothing for a single-key user).
         # Disambiguate on the error body so an overload 429 takes the
         # transient-overload path instead of burning the pool. (#14038)
+        # A few providers return explicit credit/quota exhaustion as 429
+        # instead of 402. This is not congestion and cannot recover on a
+        # timer, so classify it before the generic 429 branch.
+        if (
+            error_code.lower() in _BILLING_ERROR_CODES
+            or any(p in error_msg for p in _BILLING_PATTERNS)
+        ):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+                error_context=_billing_ambiguity_context(error_msg),
+            )
         if any(p in error_msg for p in _OVERLOADED_PATTERNS):
             return result_fn(
                 FailoverReason.overloaded,

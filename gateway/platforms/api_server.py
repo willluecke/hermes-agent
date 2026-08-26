@@ -2987,6 +2987,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         interim_assistant_callback=None,
+        status_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -3331,6 +3332,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
             "interim_assistant_callback": interim_assistant_callback,
+            "status_callback": status_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
@@ -8099,6 +8101,12 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        def _status_cb(_event_type: str, message: str) -> None:
+            # Lifecycle notices such as bounded provider-retry countdowns are
+            # part of the durable run chronology. Reuse the interim event path
+            # so reattach/archive consumers receive the same ordered notice.
+            _interim_cb(message, already_streamed=False)
+
         self._set_run_status(
             run_id,
             "queued",
@@ -8184,6 +8192,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
                         interim_assistant_callback=_interim_cb,
+                        status_callback=_status_cb,
                         tool_progress_callback=event_cb,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),

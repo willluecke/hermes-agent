@@ -5,7 +5,34 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    PROVIDER_BUSY_RETRY_OFFSETS,
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+    provider_busy_retry_ceiling,
+    provider_busy_retry_delay,
+)
+
+
+def test_provider_busy_schedule_fits_two_minute_window():
+    delays = [
+        provider_busy_retry_delay(attempt)
+        for attempt in range(1, len(PROVIDER_BUSY_RETRY_OFFSETS) + 1)
+    ]
+
+    assert delays == [5.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+    assert sum(delays) == PROVIDER_BUSY_RETRY_OFFSETS[-1] == 110.0
+    assert provider_busy_retry_ceiling() == 8
+
+
+def test_provider_busy_schedule_rejects_unbounded_attempts():
+    import pytest
+
+    with pytest.raises(ValueError):
+        provider_busy_retry_delay(0)
+    with pytest.raises(ValueError):
+        provider_busy_retry_delay(8)
 
 
 def test_backoff_is_exponential():
