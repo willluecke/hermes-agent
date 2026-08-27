@@ -409,6 +409,9 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Signed-in Claude Code subscription runtime. Like codex_app_server, this
+    # delegates the complete turn to a local CLI while Hermes owns the run.
+    "claude_code",
 }
 
 
@@ -1823,6 +1826,19 @@ def resolve_runtime_provider(
             "base_url": "codex-app-server://local",
             "api_key": "codex-cli-subscription-auth",
             "source": "codex-cli-subscription",
+            "requested_provider": requested_provider,
+        }
+
+    # Hermes Chat can select Claude Max without converting that selection into
+    # a standalone dashboard worker job. The child CLI owns OAuth refresh and
+    # subscription authentication; no Anthropic API key enters Hermes.
+    if requested_provider == "claude-code":
+        return {
+            "provider": requested_provider,
+            "api_mode": "claude_code",
+            "base_url": "claude-code://local",
+            "api_key": "claude-cli-subscription-auth",
+            "source": "claude-cli-subscription",
             "requested_provider": requested_provider,
         }
 

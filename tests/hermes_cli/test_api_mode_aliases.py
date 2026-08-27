@@ -3,7 +3,8 @@
 Regression coverage for the silent api_mode vocabulary break: earlier
 releases accepted ``api_mode: openai`` on custom provider entries. The
 canonical set consumed by ``agent_init`` is now {chat_completions,
-codex_responses, anthropic_messages, bedrock_converse, codex_app_server},
+codex_responses, anthropic_messages, bedrock_converse, codex_app_server,
+claude_code},
 and an unrecognized value was silently ignored at BOTH consumption sites:
 
 * ``hermes_cli.config._normalize_custom_provider_entry`` passed the raw

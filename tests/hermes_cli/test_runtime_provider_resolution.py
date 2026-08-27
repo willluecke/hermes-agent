@@ -42,6 +42,30 @@ def test_codex_app_server_uses_cli_subscription_without_resolving_credentials(
     }
 
 
+def test_claude_code_uses_subscription_without_resolving_api_credentials(monkeypatch):
+    monkeypatch.setattr(rp, "load_config", lambda: {"model": {}})
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Anthropic API credential resolution must be bypassed")
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="claude-code", target_model="claude-fable-5"
+    )
+
+    assert resolved == {
+        "provider": "claude-code",
+        "api_mode": "claude_code",
+        "base_url": "claude-code://local",
+        "api_key": "claude-cli-subscription-auth",
+        "source": "claude-cli-subscription",
+        "requested_provider": "claude-code",
+    }
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(
