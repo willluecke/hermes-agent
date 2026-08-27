@@ -304,6 +304,165 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_existing_session_uses_canonical_history_over_client_projection(
+        self, adapter
+    ):
+        """A reduced browser transcript must not erase resumable tool context."""
+        app = _create_runs_app(adapter)
+        captured = {}
+        canonical_history = [
+            {"role": "user", "content": "build the loop"},
+            {
+                "role": "assistant",
+                "content": "Building the scratch subject now.",
+                "finish_reason": "tool_calls",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "todo", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "todo",
+                "content": '{"status":"in_progress"}',
+            },
+            {
+                "role": "assistant",
+                "content": "Iteration-limit handoff: resume the loop implementation.",
+            },
+        ]
+        lossy_client_history = [
+            {"role": "user", "content": "build the loop"},
+            {
+                "role": "assistant",
+                "content": "Run ended before an authoritative final answer.",
+            },
+        ]
+        mock_agent = MagicMock()
+
+        def _capture_run(user_message=None, conversation_history=None, task_id=None):
+            captured["history"] = conversation_history
+            return {"final_response": "resumed"}
+
+        mock_agent.run_conversation.side_effect = _capture_run
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_conversation_history_for_session",
+                return_value=canonical_history,
+            ) as load_history, patch.object(
+                adapter, "_create_agent", return_value=mock_agent
+            ):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "continue",
+                        "session_id": "iteration-limited-session",
+                        "conversation_history": lossy_client_history,
+                    },
+                )
+                assert response.status == 202
+                run_id = (await response.json())["run_id"]
+                for _ in range(80):
+                    status = await (
+                        await cli.get(f"/v1/runs/{run_id}")
+                    ).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+
+        load_history.assert_awaited_once_with("iteration-limited-session")
+        assert captured["history"] == canonical_history
+
+    @pytest.mark.asyncio
+    async def test_new_session_keeps_client_bootstrap_history(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+        bootstrap_history = [
+            {"role": "user", "content": "imported prompt"},
+            {"role": "assistant", "content": "imported answer"},
+        ]
+        mock_agent = MagicMock()
+
+        def _capture_run(user_message=None, conversation_history=None, task_id=None):
+            captured["history"] = conversation_history
+            return {"final_response": "continued"}
+
+        mock_agent.run_conversation.side_effect = _capture_run
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_conversation_history_for_session",
+                return_value=[],
+            ), patch.object(adapter, "_create_agent", return_value=mock_agent):
+                response = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "continue",
+                        "session_id": "not-yet-persisted",
+                        "conversation_history": bootstrap_history,
+                    },
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(80):
+                    status = await (
+                        await cli.get(f"/v1/runs/{run_id}")
+                    ).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+
+        assert captured["history"] == bootstrap_history
+
+    @pytest.mark.asyncio
+    async def test_iteration_limit_failure_preserves_generated_summary(self, adapter):
+        app = _create_runs_app(adapter)
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {
+            "final_response": "Resume from task two; task one is complete.",
+            "completed": False,
+            "failed": False,
+            "partial": False,
+            "turn_exit_reason": "max_iterations_reached(50/50)",
+        }
+        mock_agent.session_prompt_tokens = 10
+        mock_agent.session_completion_tokens = 5
+        mock_agent.session_total_tokens = 15
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
+                response = await cli.post("/v1/runs", json={"input": "build it"})
+                run_id = (await response.json())["run_id"]
+                for _ in range(80):
+                    status = await (
+                        await cli.get(f"/v1/runs/{run_id}")
+                    ).json()
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.025)
+                events = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+
+        assert status["output"] == "Resume from task two; task one is complete."
+        assert status["output_kind"] == "summary"
+        assert '"event": "run.failed"' in events
+        assert '"output_kind": "summary"' in events
+        assert '"output": "Resume from task two; task one is complete."' in events
+
+    @pytest.mark.asyncio
     async def test_empty_final_response_is_failed_not_completed(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:

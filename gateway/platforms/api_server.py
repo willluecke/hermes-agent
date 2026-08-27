@@ -8003,6 +8003,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+
+        # Existing Hermes sessions are server-authoritative. Browser clients
+        # intentionally project the durable transcript down to user/final-text
+        # bubbles and cannot faithfully round-trip assistant tool-call turns,
+        # tool results, or mid-turn commentary. Trusting that reduced
+        # ``conversation_history`` on resume made an iteration-limited run look
+        # amnesiac even though state.db still held the complete turn. Load the
+        # canonical active transcript whenever this request names an existing
+        # session; client history remains the bootstrap path for a session that
+        # has not reached state.db yet.
+        if session_id:
+            persisted_history = await self._conversation_history_for_session(
+                session_id
+            )
+            if persisted_history:
+                if conversation_history and conversation_history != persisted_history:
+                    logger.info(
+                        "Using canonical session history for /v1/runs resume "
+                        "(session=%s client_messages=%d persisted_messages=%d)",
+                        session_id,
+                        len(conversation_history),
+                        len(persisted_history),
+                    )
+                conversation_history = persisted_history
+
         goal_command_args = _api_goal_command_args(user_message)
         execution_mode = _clean_request_string(body.get("execution_mode")) or "orchestrated"
         if execution_mode not in {"orchestrated", "single_model"}:
@@ -8437,17 +8462,44 @@ class APIServerAdapter(BasePlatformAdapter):
                         or result.get("interrupt_message")
                         or "agent run ended before a final answer"
                     )
-                    _put_event_if_active({
+                    preserved_output = str(
+                        result.get("final_response") or ""
+                    ).strip()
+                    if preserved_output:
+                        preserved_output = _resolve_media_to_data_urls(
+                            _redact_api_error_text(preserved_output)
+                        )
+                    exit_reason = str(result.get("turn_exit_reason") or "")
+                    output_kind = (
+                        "summary"
+                        if exit_reason.startswith("max_iterations_reached")
+                        else "partial"
+                    )
+                    failed_event = {
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
-                    })
+                    }
+                    if preserved_output:
+                        failed_event.update({
+                            "output": preserved_output,
+                            "output_kind": output_kind,
+                        })
+                    _put_event_if_active(failed_event)
                     self._set_run_status(
                         run_id,
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
+                        **(
+                            {
+                                "output": preserved_output,
+                                "output_kind": output_kind,
+                            }
+                            if preserved_output
+                            else {}
+                        ),
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
