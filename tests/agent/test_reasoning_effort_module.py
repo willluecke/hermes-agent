@@ -160,6 +160,22 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"
 
+    def test_picker_contracts_are_provider_and_model_specific(self):
+        from agent.reasoning_effort import supported_efforts_for_runtime
+
+        assert supported_efforts_for_runtime(
+            "openai-codex", "gpt-5.6-sol"
+        )[-1] == "max"
+        assert supported_efforts_for_runtime(
+            "openai-codex", "gpt-5.5"
+        )[-1] == "xhigh"
+        assert supported_efforts_for_runtime(
+            "claude-code", "claude-fable-5"
+        ) == ("low", "medium", "high", "xhigh", "max")
+        assert supported_efforts_for_runtime(
+            "openrouter", "stealth/ox-alpha"
+        ) == ("low", "high", "max")
+
 
 class TestRequestedEffort:
     def test_extracts_effort(self):

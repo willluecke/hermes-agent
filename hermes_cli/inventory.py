@@ -452,12 +452,12 @@ def _apply_capabilities(rows: list[dict]) -> None:
     parameter — a definitive negative from the provider actually serving the
     model outranks the models.dev inference.
 
-    The catalog's `supported_efforts` list is deliberately NOT forwarded: it
-    under-reports. The Portal accepts and honors levels a route doesn't
-    advertise (``z-ai/glm-5.3`` publishes ``max, high, low`` yet serves
-    ``minimal`` at its lowest thinking), so filtering the picker by that list
-    would hide levels that demonstrably work.
+    `supported_efforts` is the provider/model-specific wire vocabulary the
+    picker may safely offer. Known Hermes transport contracts override stale or
+    incomplete aggregator metadata; otherwise the serving provider's catalog
+    wins. This keeps external clients truthful without duplicating clamping.
     """
+    from agent.reasoning_effort import supported_efforts_for_runtime
     from hermes_cli.models import model_supports_fast_mode
 
     try:
@@ -472,6 +472,7 @@ def _apply_capabilities(rows: list[dict]) -> None:
 
         for model in row.get("models") or []:
             reasoning = True
+            detail = None
             if get_model_capabilities is not None and slug:
                 try:
                     meta = get_model_capabilities(slug, model)
@@ -497,6 +498,21 @@ def _apply_capabilities(rows: list[dict]) -> None:
                     entry["reasoning"] = False
                 elif detail:
                     entry["can_disable_reasoning"] = not detail.get("mandatory")
+
+            if entry["reasoning"]:
+                advertised = (
+                    detail.get("supported_efforts")
+                    if isinstance(detail, dict)
+                    else None
+                )
+                supported_efforts = list(
+                    supported_efforts_for_runtime(slug, model, advertised)
+                )
+                if entry.get("can_disable_reasoning") is False:
+                    supported_efforts = [
+                        effort for effort in supported_efforts if effort != "none"
+                    ]
+                entry["supported_efforts"] = supported_efforts
 
             caps[model] = entry
 

@@ -72,6 +72,14 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
     "none", "low", "medium", "high", "xhigh",
 )
 
+#: Claude Code subscription runtime. ``auto`` is represented by omitting the
+#: effort field entirely; these are the explicit values accepted by the native
+#: CLI. Keep this provider vocabulary separate from the OpenAI-compatible
+#: ladder so browser pickers never offer ``minimal``/``none`` to Claude.
+CLAUDE_CODE_EFFORTS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh", "max",
+)
+
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
@@ -154,6 +162,69 @@ def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     if _KIMI_K3_SLUG_RE.search(m):
         return KIMI_K3_EFFORTS
     return KIMI_K2_EFFORTS
+
+
+def supported_efforts_for_runtime(
+    provider: Optional[str],
+    model: Optional[str],
+    advertised: Optional[Sequence[str]] = None,
+) -> tuple[str, ...]:
+    """Return the explicit effort vocabulary a provider/model picker may show.
+
+    Known native/provider contracts win, then a serving aggregator's advertised
+    list, and finally the broad OpenAI-compatible vocabulary. The result carries
+    wire values rather than Hermes' wider internal ladder, so clients never
+    offer a label that only happens to clamp to a different provider value.
+    """
+    provider_name = str(provider or "").strip().lower().replace("_", "-")
+    model_name = str(model or "").strip().lower()
+    flat_model = model_name.rsplit("/", 1)[-1]
+    advertised_set = {
+        str(candidate).strip().lower()
+        for candidate in (advertised or ())
+    }
+    advertised_levels = tuple(
+        level
+        for level in EFFORT_LADDER
+        if level in advertised_set and level != "ultra"
+    )
+
+    # Model-specific contracts that apply through direct and aggregator paths.
+    if "ox-alpha" in model_name or flat_model == "x-preview-f-free":
+        return OX_ALPHA_EFFORTS
+    if "glm-5.3" in model_name:
+        return GLM53_EFFORTS
+    if "glm-5.2" in model_name:
+        return GLM52_EFFORTS
+    if "deepseek-v4" in model_name:
+        return DEEPSEEK_V4_EFFORTS
+
+    if provider_name in {"openai-codex", "openai-api", "openai"}:
+        return codex_supported_efforts(model_name)
+    if provider_name in {"claude-code", "anthropic"}:
+        return CLAUDE_CODE_EFFORTS
+    if provider_name in {"kimi", "moonshot", "kimi-coding"}:
+        return kimi_supported_efforts(model_name)
+    if provider_name in {"tencent", "tokenhub", "tencent-tokenhub"}:
+        return TOKENHUB_EFFORTS
+    if provider_name in {"actual", "actual-computer"}:
+        return ACTUAL_RELAY_EFFORTS
+    if provider_name in {"ollama-cloud", "ollama"}:
+        return OLLAMA_CLOUD_EFFORTS
+    if provider_name in {"meta-ai", "meta"}:
+        return META_AI_EFFORTS
+    if provider_name == "upstage":
+        return SOLAR_EFFORTS
+    if provider_name in {"xai", "x-ai"}:
+        return (
+            XAI_GROK46_EFFORTS
+            if "grok-4.6" in model_name
+            else XAI_LEGACY_EFFORTS
+        )
+
+    if advertised_levels:
+        return advertised_levels
+    return OPENAI_COMPAT_WIRE_EFFORTS
 
 
 def clamp_effort(

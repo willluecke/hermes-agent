@@ -4,9 +4,8 @@ picker payload. The desktop model picker hides its Thinking toggle from this,
 so a route that can't disable reasoning must be describable here — otherwise
 the UI offers an off switch whose setting the upstream rejects.
 
-The catalog's `supported_efforts` is intentionally absent from the payload:
-the Portal honors levels a route doesn't advertise, so publishing it would
-invite a picker filter that hides working levels.
+The payload includes the safe provider/model wire vocabulary so external
+pickers do not have to reproduce Hermes' transport clamping rules.
 """
 
 import hermes_cli.inventory as inv
@@ -40,12 +39,8 @@ def test_optional_reasoning_route_can_disable(monkeypatch):
     assert rows[0]["capabilities"]["deepseek/deepseek-v4-pro"]["can_disable_reasoning"] is True
 
 
-def test_advertised_efforts_never_reach_the_picker(monkeypatch):
-    """The catalog's level list stays off the wire even when it is published.
-
-    It under-reports what the Portal serves, so forwarding it would let the
-    picker hide levels that work. Only the disable verdict crosses.
-    """
+def test_known_model_contract_overrides_underreported_catalog(monkeypatch):
+    """Verified model contracts outrank an aggregator's incomplete list."""
     _patch_catalog(monkeypatch, {
         "deepseek/deepseek-v4-pro": {
             "supports_reasoning": True,
@@ -56,7 +51,12 @@ def test_advertised_efforts_never_reach_the_picker(monkeypatch):
     rows = [{"slug": "nous", "models": ["deepseek/deepseek-v4-pro"]}]
     inv._apply_capabilities(rows)
 
-    assert "supported_efforts" not in rows[0]["capabilities"]["deepseek/deepseek-v4-pro"]
+    assert rows[0]["capabilities"]["deepseek/deepseek-v4-pro"]["supported_efforts"] == [
+        "low",
+        "medium",
+        "high",
+        "max",
+    ]
 
 
 def test_non_reasoning_route_offers_no_reasoning_controls(monkeypatch):
@@ -76,6 +76,7 @@ def test_non_reasoning_route_offers_no_reasoning_controls(monkeypatch):
     caps = rows[0]["capabilities"]["moonshotai/kimi-k3-instruct"]
     assert caps["reasoning"] is False
     assert "can_disable_reasoning" not in caps
+    assert "supported_efforts" not in caps
 
 
 def test_reasoning_mandatory_route_cannot_disable(monkeypatch):
@@ -109,21 +110,36 @@ def test_unlisted_model_states_no_restriction(monkeypatch):
     inv._apply_capabilities(rows)
 
     caps = rows[0]["capabilities"]["mystery/model"]
-    assert "supported_efforts" not in caps
+    assert caps["supported_efforts"] == [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
     assert "can_disable_reasoning" not in caps
     assert caps["reasoning"] is True
 
 
-def test_providers_without_a_reasoning_catalog_are_untouched(monkeypatch):
-    """Only aggregators that publish per-model detail gain the extra keys."""
+def test_native_codex_provider_gets_verified_model_vocabulary(monkeypatch):
+    """Native providers publish known contracts without an aggregator catalog."""
     _patch_catalog(monkeypatch, {
         "gpt-5.6": {"supports_reasoning": True, "supported_efforts": ["high"], "mandatory": True},
     })
-    rows = [{"slug": "openai-api", "models": ["gpt-5.6"]}]
+    rows = [{"slug": "openai-codex", "models": ["gpt-5.6"]}]
     inv._apply_capabilities(rows)
 
     caps = rows[0]["capabilities"]["gpt-5.6"]
-    assert "supported_efforts" not in caps
+    assert caps["supported_efforts"] == [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
     assert "can_disable_reasoning" not in caps
 
 
@@ -137,7 +153,9 @@ def test_openrouter_uses_its_own_catalog(monkeypatch):
     rows = [{"slug": "openrouter", "models": ["x-ai/grok-5"]}]
     inv._apply_capabilities(rows)
 
-    assert rows[0]["capabilities"]["x-ai/grok-5"]["can_disable_reasoning"] is False
+    caps = rows[0]["capabilities"]["x-ai/grok-5"]
+    assert caps["can_disable_reasoning"] is False
+    assert "none" not in caps["supported_efforts"]
 
 
 def test_catalog_failure_never_breaks_the_picker(monkeypatch):
@@ -153,5 +171,5 @@ def test_catalog_failure_never_breaks_the_picker(monkeypatch):
     inv._apply_capabilities(rows)
 
     caps = rows[0]["capabilities"]["deepseek/deepseek-v4-pro"]
-    assert "supported_efforts" not in caps
+    assert caps["supported_efforts"]
     assert caps["reasoning"] is True
