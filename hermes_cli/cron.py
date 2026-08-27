@@ -42,6 +42,12 @@ def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None)
     return normalized
 
 
+def _normalize_toolsets(value: Optional[str]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
 def _cron_api(**kwargs):
     from tools.cronjob_tools import cronjob as cronjob_tool
 
@@ -389,6 +395,7 @@ def cron_create(args):
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        enabled_toolsets=_normalize_toolsets(getattr(args, "toolsets", None)),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -464,6 +471,7 @@ def cron_edit(args):
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        enabled_toolsets=_normalize_toolsets(getattr(args, "toolsets", None)),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),

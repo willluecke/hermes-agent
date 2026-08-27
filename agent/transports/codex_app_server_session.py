@@ -26,12 +26,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import os
 import tempfile
 import threading
 import time
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -62,6 +65,45 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+
+def _read_only_codex_args(codex_home: Optional[str]) -> list[str]:
+    """Build a side-effect-free Codex app-server configuration overlay."""
+    args = [
+        "-c",
+        'sandbox_mode="read-only"',
+        "-c",
+        'approval_policy="never"',
+    ]
+    for feature in (
+        "apps",
+        "browser_use",
+        "computer_use",
+        "hooks",
+        "multi_agent",
+        "plugins",
+        "remote_plugin",
+    ):
+        args.extend(["--disable", feature])
+
+    config_root = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    try:
+        config = tomllib.loads((config_root / "config.toml").read_text(encoding="utf-8"))
+        server_names = (config.get("mcp_servers") or {}).keys()
+    except (OSError, tomllib.TOMLDecodeError, AttributeError):
+        server_names = ()
+    names = sorted(str(value) for value in server_names)
+    if names:
+        # Supply one inline-table value instead of quoted dotted keys. Codex's
+        # CLI path parser treats quotes inside a dotted override literally,
+        # which can create a new incomplete server rather than match a name
+        # containing ``-``. JSON strings are valid TOML basic-string keys, so
+        # this form also handles dots and other punctuation safely.
+        disabled = ",".join(
+            f"{json.dumps(name)}={{enabled=false}}" for name in names
+        )
+        args.extend(["-c", f"mcp_servers={{{disabled}}}"])
+    return args
 
 _DATA_IMAGE_EXTENSIONS = {
     "image/png": "png",
@@ -425,6 +467,7 @@ class CodexAppServerSession:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         require_exact: bool = False,
+        read_only: bool = False,
         permission_profile: Optional[str] = None,
         project_key: Optional[str] = None,
         reversible_deletion_policy: Any = None,
@@ -443,6 +486,7 @@ class CodexAppServerSession:
         self._model = str(model or "").strip()
         self._effort = str(effort or "").strip().lower()
         self._require_exact = bool(require_exact)
+        self._read_only = bool(read_only)
         self._exact_runtime_validated = False
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -590,6 +634,12 @@ class CodexAppServerSession:
                 "codex_bin": self._codex_bin,
                 "codex_home": self._codex_home,
             }
+            if self._read_only:
+                # Pin both axes on the app-server command line. The sandbox
+                # permits reads and read-only shell inspection while denying
+                # filesystem changes; ``never`` prevents an unattended turn
+                # from requesting an escalation out of that boundary.
+                client_extra_args.extend(_read_only_codex_args(self._codex_home))
             if client_env:
                 client_kwargs["env"] = client_env
             if client_extra_args:

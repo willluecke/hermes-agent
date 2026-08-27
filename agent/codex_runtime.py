@@ -971,6 +971,7 @@ def run_codex_app_server_turn(
             if isinstance(model_cfg, dict)
             else False
         )
+        read_only = bool(getattr(agent, "read_only", False))
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             hermes_session_id=str(getattr(agent, "session_id", "") or ""),
@@ -978,6 +979,7 @@ def run_codex_app_server_turn(
             model=getattr(agent, "model", ""),
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
             require_exact=require_exact,
+            read_only=read_only,
             project_key=str(getattr(agent, "session_project", "") or ""),
             reversible_deletion_policy=reversible_deletion_policy,
             workspace_snapshot_policy=workspace_snapshot_policy,
@@ -1001,9 +1003,11 @@ def run_codex_app_server_turn(
         # recovery boundary: it must complete before this turn reaches Codex.
         # This runs for every turn, including turns that reuse a warm app-server
         # session, so files created by an earlier turn are protected too.
-        snapshot = agent._codex_session.capture_workspace_snapshot(
-            str(effective_task_id or "")
-        )
+        snapshot = None
+        if not bool(getattr(agent, "read_only", False)):
+            snapshot = agent._codex_session.capture_workspace_snapshot(
+                str(effective_task_id or "")
+            )
         if snapshot is not None:
             agent._last_workspace_snapshot = snapshot.as_dict()
 

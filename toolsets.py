@@ -228,6 +228,23 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
+
+    "read_only": {
+        "description": (
+            "Read-only inspection tools for unattended reviewers. This toolset "
+            "deliberately excludes terminal execution, file mutation, browsers, "
+            "memory/decision writes, task dispatch, cron control, and MCP tools."
+        ),
+        "tools": [
+            "read_file", "search_files",
+            "web_search", "web_extract",
+            "vision_analyze",
+            "skills_list", "skill_view",
+            "session_search", "current_time",
+            "kanban_show", "kanban_list", "kanban_attachments",
+        ],
+        "includes": [],
+    },
     
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",

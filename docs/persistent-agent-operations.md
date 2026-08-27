@@ -27,9 +27,10 @@ The gateway and sync listeners are loopback-only:
 Do not change either listener to `0.0.0.0` for LAN convenience. SSH and the
 authenticated Cloudflare routes are the supported remote access paths.
 
-The process-driven agentic loop does not add another resident service. It uses
-the existing Hermes cron ticker and a deterministic pre-check script. A
-suppressed tick never constructs an agent.
+The process-driven signal reviewer does not add another resident service. It
+uses the existing Hermes cron ticker and a deterministic pre-check script. A
+suppressed tick never constructs an agent. A wake constructs one read-only
+review turn; implementation remains behind a later user instruction.
 
 ## Required Configuration
 
@@ -159,7 +160,19 @@ with an unreviewed local proposal.
 
 The reusable state-gated cron design is documented in
 [Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md).
-This section contains only command-center deployment commands.
+This section contains only command-center deployment commands. The retained
+job name, `Governed Agentic Loop Gate`, is a stable operational identifier; its
+current role is read-only signal review, not autonomous task execution.
+
+The cron job must have exactly the `read_only` toolset. That posture is enforced
+below prompt level for native runtimes: Codex uses a read-only sandbox with no
+approvals or configured MCP servers, and Claude uses plan mode with strict empty
+MCP configuration and safe mode. The review may inspect primary evidence and
+recommend per-repository Hermes Kanban cards. It may not create cards, edit
+files, dispatch workers, write memory, or change external state. The user starts
+implementation later from an ordinary chat turn, for example with “yes, fix all
+of these” or “tell me more about X.” Do not substitute `projectplan.md`,
+`todo.md`, or another repository file for the Kanban queue.
 
 Install or update the tracked gate idempotently from the deployed canonical
 checkout:
@@ -246,7 +259,11 @@ jq -e '.projects | length > 0' /home/will/.reccli/projects.json
 test -x /home/will/.hermes/scripts/agentic-loop-gate.py
 /home/will/.hermes/scripts/agentic-loop-gate.py status
 jq -e --arg name 'Governed Agentic Loop Gate' \
-  '[(.jobs // .)[] | select(.name == $name and .enabled == true)] | length == 1' \
+  '[(.jobs // .)[]
+    | select(.name == $name
+          and .enabled == true
+          and .enabled_toolsets == ["read_only"])]
+   | length == 1' \
   /home/will/.hermes/cron/jobs.json
 jq -e '
   [(.jobs // .)[]
@@ -425,6 +442,8 @@ Gate batch not acknowledged:
 - Inspect `agentic-loop-gate.py status` and the corresponding cron execution.
 - The gate suppresses duplicates for six hours, then retries within its daily
   budget. A new event changes the batch ID immediately.
+- The scheduler acknowledges the exact trusted gate batch only after a useful,
+  non-empty reviewer response. The model has no gate-mutation authority.
 - Acknowledge manually only after verifying that the event batch was actually
   handled; clearing state is not acknowledgment.
 

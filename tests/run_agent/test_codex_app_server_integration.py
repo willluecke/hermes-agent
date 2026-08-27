@@ -602,6 +602,35 @@ class TestRunConversationCodexPath:
 
         assert captured["cwd"] == str(tmp_path)
 
+    def test_read_only_posture_reaches_native_session_without_snapshot(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-read-only"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="inspected",
+                projected_messages=[{"role": "assistant", "content": "inspected"}],
+                turn_id="turn-read-only",
+                thread_id="thread-read-only",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: self._thread_id
+        )
+        agent = _make_codex_agent()
+        agent.read_only = True
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("inspect")
+
+        assert result["final_response"] == "inspected"
+        assert captured["read_only"] is True
+
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures
         the request_routing passed at construction time, so we can assert how

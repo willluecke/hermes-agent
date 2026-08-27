@@ -40,6 +40,7 @@ if [[ -n "$job_id" ]]; then
     --schedule "$SCHEDULE" \
     --prompt "$prompt" \
     --script agentic-loop-gate.py \
+    --toolsets read_only \
     --workdir /home/will \
     --provider "$PROVIDER" \
     --model "$MODEL" \
@@ -51,6 +52,7 @@ else
     "$HERMES_BIN" cron create "$SCHEDULE" "$prompt" \
       --name "$JOB_NAME" \
       --script agentic-loop-gate.py \
+      --toolsets read_only \
       --workdir /home/will \
       --provider "$PROVIDER" \
       --model "$MODEL" \
@@ -68,7 +70,7 @@ fi
 
 printf '%s\n' "$job_id" >"$HERMES_HOME/agentic-loop/job-id"
 chmod 0600 "$HERMES_HOME/agentic-loop/job-id"
-printf 'Governed agentic loop installed: %s (%s)\n' "$job_id" "$SCHEDULE"
+printf 'Read-only signal review installed: %s (%s)\n' "$job_id" "$SCHEDULE"
 
 for checkpoint_name in "${CHECKPOINT_NAMES[@]}"; do
   checkpoint_id=""

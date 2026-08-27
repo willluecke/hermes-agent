@@ -65,6 +65,7 @@ def claude_code_args(
     effort: Optional[str] = None,
     system_prompt: str = "",
     additional_dirs: Optional[list[str]] = None,
+    read_only: bool = False,
 ) -> list[str]:
     repo_root = str(Path(__file__).resolve().parents[2])
     mcp_config = {
@@ -86,7 +87,7 @@ def claude_code_args(
         "--include-partial-messages",
         "--verbose",
         "--permission-mode",
-        "bypassPermissions",
+        "plan" if read_only else "bypassPermissions",
         "--setting-sources",
         "user,project",
         "--mcp-config",
@@ -97,6 +98,14 @@ def claude_code_args(
         "--name",
         "Hermes Chat",
     ]
+    if read_only:
+        # Ignore user/project MCP registrations as well as the Hermes bridge.
+        # Safe mode also disables hooks, plugins, agents, and other local
+        # customizations that could perform side effects outside Claude's
+        # normal tool permission path. Native Read/Glob/Grep remain available
+        # in plan mode.
+        args[args.index("--mcp-config") + 1] = '{"mcpServers":{}}'
+        args.extend(["--strict-mcp-config", "--safe-mode"])
     if effort:
         args.extend(["--effort", effort])
     args.extend(["--resume" if resume else "--session-id", session_id])
@@ -125,6 +134,7 @@ class ClaudeCodeSession:
         effort: Optional[str] = None,
         system_prompt: str = "",
         additional_dirs: Optional[list[str]] = None,
+        read_only: bool = False,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
@@ -137,6 +147,7 @@ class ClaudeCodeSession:
         self.effort = effort
         self.system_prompt = system_prompt
         self.additional_dirs = list(additional_dirs or [])
+        self.read_only = bool(read_only)
         self.on_event = on_event
         self.on_session_id = on_session_id
         self.inactivity_timeout = inactivity_timeout
@@ -166,6 +177,7 @@ class ClaudeCodeSession:
         model: str,
         effort: Optional[str],
         system_prompt: str,
+        read_only: bool = False,
     ) -> bool:
         """Whether a later turn can safely reuse this frozen CLI process."""
         return bool(
@@ -175,6 +187,7 @@ class ClaudeCodeSession:
             and self.model == model
             and self.effort == effort
             and self.system_prompt == system_prompt
+            and self.read_only == bool(read_only)
         )
 
     def request_interrupt(self) -> None:
@@ -221,6 +234,7 @@ class ClaudeCodeSession:
             effort=self.effort,
             system_prompt=self.system_prompt,
             additional_dirs=self.additional_dirs,
+            read_only=self.read_only,
         )
         env = os.environ.copy()
         # This route must use the signed-in Max subscription. An ambient key

@@ -48,6 +48,23 @@ def test_claude_code_api_mode_dispatches_through_hermes(monkeypatch):
     assert result["agent_persisted"] is True
 
 
+def test_claude_code_read_only_posture_reaches_native_session(monkeypatch):
+    observed = {}
+
+    def _run_turn(session, prompt):
+        observed["read_only"] = session.read_only
+        return ClaudeCodeTurnResult(final_text="inspection only")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    agent = _make_agent()
+    agent.read_only = True
+
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        agent.run_conversation("inspect")
+
+    assert observed["read_only"] is True
+
+
 def test_new_hermes_parent_resumes_same_claude_session(monkeypatch):
     calls = []
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic wake gate for the governed Hermes agentic loop.
+"""Deterministic wake gate for the command-center read-only signal reviewer.
 
 The script is intended to run as a Hermes cron pre-check. Its final stdout
 line is JSON containing ``wakeAgent``. Hermes exits before constructing an
@@ -387,6 +387,29 @@ def _batch_id(events: list[dict[str, Any]]) -> str:
     return "loop_" + _fingerprint(keys)[:16]
 
 
+def _complete_pending_ack(
+    state: dict[str, Any], batch_id: str, now_ms: int, *, source: str
+) -> bool:
+    pending = state.get("pending")
+    if not pending or pending.get("batchId") != batch_id:
+        return False
+    state["lastAck"] = {
+        "batchId": batch_id,
+        "acknowledgedAt": now_ms,
+        "eventCount": len(pending.get("events") or []),
+        "source": source,
+    }
+    backlog = list(state.get("backlog") or [])
+    if backlog:
+        next_events = backlog[:MAX_EVENTS_PER_BATCH]
+        state["pending"] = _new_pending(next_events, now_ms)
+        state["backlog"] = backlog[MAX_EVENTS_PER_BATCH:]
+    else:
+        state["pending"] = None
+        state["backlog"] = []
+    return True
+
+
 def _local_date(now_ms: int, timezone: str) -> str:
     return datetime.fromtimestamp(now_ms / 1000, ZoneInfo(timezone)).date().isoformat()
 
@@ -506,10 +529,10 @@ def evaluate_gate(
             "attempt": pending["attempts"],
             "events": pending["events"],
             "backlogEventCount": len(backlog),
-            "ackCommand": (
-                "/home/will/.hermes/scripts/agentic-loop-gate.py ack "
-                f"--batch-id {pending['batchId']}"
-            ),
+            "ackOnSuccess": {
+                "action": "ack",
+                "batchId": pending["batchId"],
+            },
             "budgetRemaining": config.daily_wake_budget - int(budget["count"]),
         }
 
@@ -527,19 +550,7 @@ def acknowledge(
                 "reason": "batch_not_pending",
                 "pendingBatchId": pending.get("batchId") if pending else None,
             }
-        state["lastAck"] = {
-            "batchId": batch_id,
-            "acknowledgedAt": now_ms,
-            "eventCount": len(pending.get("events") or []),
-        }
-        backlog = list(state.get("backlog") or [])
-        if backlog:
-            next_events = backlog[:MAX_EVENTS_PER_BATCH]
-            state["pending"] = _new_pending(next_events, now_ms)
-            state["backlog"] = backlog[MAX_EVENTS_PER_BATCH:]
-        else:
-            state["pending"] = None
-            state["backlog"] = []
+        _complete_pending_ack(state, batch_id, now_ms, source="explicit_command")
         _write_state(config.state, state)
         return {
             "acknowledged": True,

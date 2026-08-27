@@ -102,7 +102,12 @@ Command-center deploys the guide's state-gated cron pattern through
 `ops/command-center/agentic-loop-gate.py` and
 `ops/command-center/agentic-loop-prompt.md`. Those files are the deployment's
 executable policy; the regular guide is the canonical explanation of the
-pattern. Command-center-specific installation and incident commands remain in
+pattern. This deployment uses the gate only as a read-only signal reviewer:
+the scheduled turn may inspect evidence and recommend per-repository Hermes
+Kanban cards, but it cannot edit files, mutate the board, delegate work, or
+change external state. An ordinary user chat turn is the authorization boundary
+for creating or executing recommended work. Command-center-specific
+installation and incident commands remain in
 `docs/persistent-agent-operations.md`.
 
 ## RecCli Context Gate

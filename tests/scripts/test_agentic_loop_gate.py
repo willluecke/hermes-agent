@@ -148,6 +148,24 @@ def test_orchestration_result_wakes_once_until_exact_ack(configured_gate):
     assert settled["reason"] == "no_actionable_change"
 
 
+def test_wake_requests_host_ack_without_giving_agent_a_command(configured_gate):
+    gate.evaluate_gate(configured_gate, now_ms=1_000, prime=True)
+    _insert_job(
+        configured_gate,
+        job_id="worker-result",
+        status="completed",
+        updated_at=2_000,
+    )
+
+    result = gate.evaluate_gate(configured_gate, now_ms=3_000)
+
+    assert "ackCommand" not in result
+    assert result["ackOnSuccess"] == {
+        "action": "ack",
+        "batchId": result["batchId"],
+    }
+
+
 def test_direct_native_job_does_not_enter_governed_loop(configured_gate):
     gate.evaluate_gate(configured_gate, now_ms=1_000, prime=True)
     _insert_job(

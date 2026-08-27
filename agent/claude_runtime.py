@@ -310,6 +310,14 @@ def run_claude_code_turn(
         "Launch long-lived previews only in tmux or a project service and verify "
         "the reachable URL before reporting it."
     )
+    read_only = bool(getattr(agent, "read_only", False))
+    if read_only:
+        runtime_contract += (
+            " This scheduled review is read-only. Inspect and report only; do "
+            "not edit files, run mutating commands, change external state, "
+            "create tasks, or delegate work. Ask the user to authorize any "
+            "follow-up action in an ordinary chat turn."
+        )
     model = str(getattr(agent, "model", "") or "claude-fable-5")
     effort = _claude_code_effort(getattr(agent, "reasoning_config", None))
     session = getattr(agent, "_claude_code_session", None)
@@ -320,6 +328,7 @@ def run_claude_code_turn(
             model=model,
             effort=effort,
             system_prompt=runtime_contract,
+            read_only=read_only,
         )
         and getattr(session, "history_fingerprint", None) == prior_fingerprint
     )
@@ -365,6 +374,7 @@ def run_claude_code_turn(
                 resume=durable_resume,
                 effort=effort,
                 system_prompt=runtime_contract,
+                read_only=read_only,
                 on_event=make_claude_code_event_bridge(agent),
                 on_session_id=_remember_confirmed_session,
             )

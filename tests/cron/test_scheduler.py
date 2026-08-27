@@ -135,6 +135,65 @@ class TestPerJobToolsetMcpMerge:
             result = _resolve_cron_enabled_toolsets(job, {})
         assert result == ["file", "memory", "web"]
 
+    def test_read_only_posture_does_not_inherit_mcp_servers(self):
+        result = _resolve_cron_enabled_toolsets(
+            {"enabled_toolsets": ["read_only"]}, self.CFG
+        )
+        assert result == ["read_only"]
+
+
+def test_successful_wake_gate_ack_uses_same_script(monkeypatch):
+    import cron.scheduler as scheduler
+
+    calls = []
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script",
+        lambda script_path, **kwargs: calls.append((script_path, kwargs))
+        or (True, '{"acknowledged":true}'),
+    )
+    payload = json.dumps(
+        {
+            "wakeAgent": True,
+            "ackOnSuccess": {
+                "action": "ack",
+                "batchId": "loop_0123456789abcdef",
+            },
+        }
+    )
+
+    batch_id = scheduler._wake_gate_ack_batch_id((True, payload))
+    job = {
+        "id": "review",
+        "script": "agentic-loop-gate.py",
+        "_wake_gate_ack_batch_id": batch_id,
+    }
+    scheduler._ack_successful_wake_gate(job)
+
+    assert calls == [
+        (
+            "agentic-loop-gate.py",
+            {"script_args": ["ack", "--batch-id", "loop_0123456789abcdef"]},
+        )
+    ]
+    assert "_wake_gate_ack_batch_id" not in job
+
+
+def test_wake_gate_ack_rejects_untrusted_batch_id():
+    import cron.scheduler as scheduler
+
+    payload = json.dumps(
+        {
+            "wakeAgent": True,
+            "ackOnSuccess": {
+                "action": "ack",
+                "batchId": "../../not-a-batch",
+            },
+        }
+    )
+
+    assert scheduler._wake_gate_ack_batch_id((True, payload)) is None
+
 
 class TestResolveOrigin:
     def test_full_origin(self):
@@ -1690,10 +1749,12 @@ class TestRunJobWakeGate:
         agent.run_conversation = MagicMock(return_value={
             "final_response": "ok", "messages": []
         })
+        job = self._make_job()
+        job["enabled_toolsets"] = ["read_only"]
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, script_output)), \
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
-            success, doc, final, err = scheduler.run_job(self._make_job())
+            success, doc, final, err = scheduler.run_job(job)
 
         agent_cls.assert_called_once()
         # The script output should be visible in the prompt passed to
@@ -1703,6 +1764,7 @@ class TestRunJobWakeGate:
         assert script_output in prompt_arg
         assert success is True
         assert err is None
+        assert agent.read_only is True
 
 
 class TestBuildJobPromptMissingSkill:

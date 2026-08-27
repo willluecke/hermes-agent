@@ -43,6 +43,19 @@ def test_resume_invocation_is_exclusive_and_uses_selected_effort():
     assert args[args.index("--effort") + 1] == "medium"
 
 
+def test_read_only_invocation_uses_plan_mode_and_no_mcp_servers():
+    args = claude_code_args(
+        model="claude-fable-5",
+        session_id="00000000-0000-4000-8000-000000000000",
+        read_only=True,
+    )
+
+    assert args[args.index("--permission-mode") + 1] == "plan"
+    assert "--strict-mcp-config" in args
+    assert "--safe-mode" in args
+    assert json.loads(args[args.index("--mcp-config") + 1]) == {"mcpServers": {}}
+
+
 def test_error_result_confirms_session_before_returning():
     session_id = "00000000-0000-4000-8000-000000000000"
     stdout = io.StringIO(

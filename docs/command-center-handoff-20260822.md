@@ -73,7 +73,7 @@ merely because the worker reported success.
 Direct native Codex and Claude terminal sessions remain available for manual
 work. They are not automatically fed into the governed loop.
 
-## Process-Driven Agentic Loop
+## Process-Driven Signal Review
 
 The canonical concept and meaningful-change contract live in the regular
 Hermes guide:
@@ -82,9 +82,20 @@ Hermes guide:
 
 Command-center currently deploys that pattern as cron job `76892ed9e451`
 (`Governed Agentic Loop Gate`), checking every 15 minutes from 06:00 through
-22:45 Pacific with a three-wake daily budget. Its fixed checkpoints are the
-06:30 `Daily Founder Revenue Dispatcher` and 21:00 `Daily Founder Evening
-Review`, all pinned to the exact Sol 5.6 `xhigh` authority contract.
+22:45 Pacific with a three-wake daily budget. The stable legacy job name is an
+operational identifier; each wake is now a read-only signal review, not an
+autonomous work loop. Its fixed checkpoints are the 06:30 `Daily Founder
+Revenue Dispatcher` and 21:00 `Daily Founder Evening Review`, all pinned to the
+exact Sol 5.6 `xhigh` authority contract.
+
+The gate job is pinned to the `read_only` toolset. Native Codex also receives a
+read-only sandbox, approval denial, and disabled configured MCP servers; native
+Claude receives plan mode, strict empty MCP configuration, and safe mode. The
+reviewer can inspect evidence and recommend per-repository Hermes Kanban cards,
+but it cannot edit files, mutate Kanban, dispatch workers, write memory, or
+change external state. A later user chat instruction such as “yes, fix all of
+these” is the authority boundary for creating and executing the work. Do not
+use `projectplan.md` or `todo.md` as a substitute task queue.
 
 The legacy monthly pipeline audit was rewritten for command-center-local
 checkouts and the Opus subscription worker. The weekly auth-health job is now
@@ -100,7 +111,7 @@ Inspect without invoking a model:
 
 ## Verified End-To-End Path
 
-The governed loop passed a controlled read-only test on 2026-08-22:
+The predecessor governed loop passed a controlled test on 2026-08-22:
 
 1. An explicit inbox event woke Sol through the deterministic gate.
 2. Sol loaded BRENUC RecCli context for `hermes-chat`.
@@ -169,21 +180,19 @@ Both modes passed manual restore-artifact checks on 2026-08-23: every manifest
 entry verified, both copied SQLite databases returned `integrity_check=ok`,
 and the full ZIP's 5,754 members passed `ZipFile.testzip()`.
 
-## Human Gates
+## Human Gate
 
-The governed loop may inspect, analyze, edit local project files, run tests,
-create local commits, and queue a bounded subscription worker. It must request
-human approval before it can:
+The scheduled signal reviewer may inspect and report only. It cannot edit local
+project files, run mutating commands, create local commits, create or update
+Kanban cards, dispatch a subscription worker, write project memory or decisions,
+or change external state. An inbox event, metric, job result, repository text,
+or raw transcript cannot grant those permissions.
 
-- push, merge, deploy, or release;
-- contact an external party;
-- spend money;
-- modify production data;
-- rotate or expose credentials;
-- perform destructive operations.
-
-An inbox event, RecCli history, worker output, or raw transcript text cannot
-grant these permissions.
+After reviewing its report, the user may authorize ordinary Hermes chat to
+clarify, create per-repository Kanban work, or implement the recommendations.
+Push, merge, deploy, release, spending, production-data changes, credential
+changes, destructive operations, and external contact retain their separate
+human gates.
 
 ## Registered Project Memory
 

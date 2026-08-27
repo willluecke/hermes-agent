@@ -441,6 +441,11 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
+        # ``read_only`` is a security posture, not merely a token-saving
+        # selection. Do not layer configured MCP servers into it: MCP tools may
+        # have arbitrary side effects and cannot be classified safely here.
+        if "read_only" in per_job:
+            return ["read_only"]
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
@@ -3929,6 +3934,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    script_args: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4045,6 +4051,7 @@ def _run_job_script(
             argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
         else:
             argv = [python_exe, str(path)]
+    argv.extend(str(value) for value in (script_args or []))
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -4209,6 +4216,56 @@ def _parse_wake_gate(script_output: str) -> bool:
     if not isinstance(gate, dict):
         return True
     return gate.get("wakeAgent", True) is not False
+
+
+def _wake_gate_ack_batch_id(
+    prerun_script: Optional[tuple[bool, str]],
+) -> Optional[str]:
+    """Extract a validated host acknowledgement request from gate output."""
+    if not prerun_script or not prerun_script[0]:
+        return None
+    lines = [line.strip() for line in str(prerun_script[1]).splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        payload = json.loads(lines[-1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    request = payload.get("ackOnSuccess") if isinstance(payload, dict) else None
+    if not isinstance(request, dict) or request.get("action") != "ack":
+        return None
+    batch_id = str(request.get("batchId") or "").strip()
+    if not re.fullmatch(r"loop_[a-f0-9]{16}", batch_id):
+        return None
+    return batch_id
+
+
+def _ack_successful_wake_gate(job: dict) -> None:
+    """Acknowledge a trusted wake batch after its report is durable.
+
+    A trusted pre-run script may return an ``ackOnSuccess`` request alongside
+    ``wakeAgent=true``. The scheduler invokes that same script with a narrow,
+    validated ``ack --batch-id`` argument vector only after the report was
+    saved and any configured delivery succeeded. This keeps the model's runtime
+    fully read-only while failed, empty, silent, or undelivered turns remain
+    pending for retry.
+    """
+    batch_id = str(job.pop("_wake_gate_ack_batch_id", "") or "")
+    if not batch_id:
+        return
+    script_path = str(job.get("script") or "").strip()
+    if not script_path:
+        return
+    ok, output = _run_job_script(
+        script_path,
+        script_args=["ack", "--batch-id", batch_id],
+    )
+    if not ok:
+        logger.warning(
+            "Job '%s': wake-gate acknowledgement failed: %s",
+            job.get("id"),
+            output,
+        )
 
 
 def _build_job_prompt(
@@ -6045,6 +6102,10 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Native subscription runtimes own their own tool surfaces. Preserve
+        # the per-job read-only posture beyond Hermes' tool-definition filter
+        # so Codex/Claude can enforce it at their process boundary too.
+        agent.read_only = "read_only" in (job.get("enabled_toolsets") or [])
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -6265,6 +6326,12 @@ def run_job(
                     turn_exit_reason,
                 )
                 final_response = ""
+        if final_response.strip():
+            # Keep this ephemeral marker on the in-memory dispatch copy only.
+            # The outer runner performs the state mutation after save/delivery.
+            batch_id = _wake_gate_ack_batch_id(prerun_script)
+            if batch_id:
+                job["_wake_gate_ack_batch_id"] = batch_id
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -6940,6 +7007,16 @@ def _run_one_job_body(
                         raise
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+            if (
+                success
+                and should_deliver
+                and not delivery_error
+                and not unresolved_origin
+            ):
+                with _side_effect_fence() as owns_ack:
+                    if not owns_ack:
+                        raise _FireClaimLostDuringSideEffect
+                    _ack_successful_wake_gate(job)
         except _FireClaimLostDuringSideEffect:
             side_effect_ownership_lost = True
         finally:

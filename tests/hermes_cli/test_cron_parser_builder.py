@@ -41,6 +41,18 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_per_job_toolsets_flags():
+    parser = _build()
+    created = parser.parse_args(
+        ["cron", "create", "30m", "inspect", "--toolsets", "read_only"]
+    )
+    edited = parser.parse_args(
+        ["cron", "edit", "j", "--toolsets", "read_only,web"]
+    )
+    assert created.toolsets == "read_only"
+    assert edited.toolsets == "read_only,web"
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

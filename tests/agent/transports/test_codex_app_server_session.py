@@ -145,6 +145,32 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     )
 
 
+def test_read_only_session_pins_sandbox_and_disables_extensions(tmp_path):
+    captured: dict[str, Any] = {}
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers."write-tools"]\ncommand = "unsafe"\n', encoding="utf-8"
+    )
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient(**kwargs)
+
+    session = CodexAppServerSession(
+        cwd="/tmp",
+        codex_home=str(tmp_path),
+        read_only=True,
+        client_factory=factory,
+    )
+    session.ensure_started()
+
+    args = captured["extra_args"]
+    assert 'sandbox_mode="read-only"' in args
+    assert 'approval_policy="never"' in args
+    assert "hooks" in args
+    assert "plugins" in args
+    assert 'mcp_servers={"write-tools"={enabled=false}}' in args
+
+
 # ---- choice mapping ----
 
 class TestApprovalChoiceMapping:
