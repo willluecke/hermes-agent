@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+from collections import OrderedDict
 import json
 import threading
 import time
@@ -495,12 +496,13 @@ class TestStartRun:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("raises", [False, True])
-    async def test_run_releases_codex_writer_before_terminal_status(
+    async def test_run_keeps_codex_resident_and_retires_only_after_crash(
         self, adapter, raises
     ):
         app = _create_runs_app(adapter)
         codex_session = MagicMock()
         mock_agent = MagicMock()
+        mock_agent.session_id = "codex-writer-release"
         mock_agent._codex_session = codex_session
         mock_agent.session_prompt_tokens = 0
         mock_agent.session_completion_tokens = 0
@@ -511,6 +513,19 @@ class TestStartRun:
         else:
             mock_agent.run_conversation.return_value = {"final_response": "done"}
             terminal_status = "completed"
+
+        def _release(agent):
+            native = agent._codex_session
+            agent._codex_session = None
+            native.close()
+
+        runner = MagicMock()
+        runner._agent_cache = OrderedDict()
+        runner._agent_cache_lock = threading.Lock()
+        runner._enforce_agent_cache_cap.side_effect = lambda: None
+        runner._init_cached_agent_for_turn.side_effect = lambda *_args: None
+        runner._release_evicted_agent_soft.side_effect = _release
+        adapter.gateway_runner = runner
 
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent", return_value=mock_agent):
@@ -527,9 +542,32 @@ class TestStartRun:
                         break
                     await asyncio.sleep(0.025)
 
+                if not raises:
+                    second = await cli.post(
+                        "/v1/runs",
+                        json={
+                            "input": "continue",
+                            "session_id": "codex-writer-release",
+                        },
+                    )
+                    second_run_id = (await second.json())["run_id"]
+                    for _ in range(80):
+                        second_status = await (
+                            await cli.get(f"/v1/runs/{second_run_id}")
+                        ).json()
+                        if second_status["status"] in {"completed", "failed"}:
+                            break
+                        await asyncio.sleep(0.025)
+
         assert status["status"] == terminal_status
-        codex_session.close.assert_called_once_with()
-        assert mock_agent._codex_session is None
+        if raises:
+            codex_session.close.assert_called_once_with()
+            assert mock_agent._codex_session is None
+        else:
+            assert second_status["status"] == "completed"
+            assert mock_agent.run_conversation.call_count == 2
+            codex_session.close.assert_not_called()
+            assert mock_agent._codex_session is codex_session
 
     @pytest.mark.asyncio
     async def test_start_preserves_latest_multimodal_user_message(self, adapter):

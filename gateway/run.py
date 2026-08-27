@@ -6823,13 +6823,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _running_agent_items(self) -> List[tuple]:
         """(session_key, agent) pairs for sessions with a running turn
-        (including pending sentinels), matching the old ``_running_agents``
-        dict contents."""
-        return [
+        (including pending sentinels and API-server-owned turns).
+
+        API turns use the same bounded resident-agent cache but retain their
+        own request registries for stop/SSE semantics. Including those agents
+        here keeps LRU/idle eviction from closing a native Claude/Codex process
+        while its HTTP turn is still running.
+        """
+        items = [
             (key, state.turn.agent)
             for key, state in self._sessions_map().items()
             if state.turn.agent is not None
         ]
+        seen = {id(agent) for _, agent in items}
+        for adapter in list(getattr(self, "adapters", {}).values()):
+            registries = (
+                getattr(adapter, "_active_run_agents", {}),
+                getattr(adapter, "_shutdown_interruptible_agents", {}),
+            )
+            for registry in registries:
+                try:
+                    agents = list(registry.values())
+                except Exception:
+                    continue
+                for agent in agents:
+                    if agent is None or id(agent) in seen:
+                        continue
+                    seen.add(id(agent))
+                    items.append((f"api_server:{id(agent)}", agent))
+        return items
     # Loop-liveness heartbeat / watchdog handles (#66892, #69089). Class-level
     # defaults so partial construction in tests doesn't blow up on access; the
     # real values are set in __init__ / start() / stop().

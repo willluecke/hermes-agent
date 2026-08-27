@@ -1729,6 +1729,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
         self._session_db_cache_closed = False
+        # Stable striped locks serialize turns that target the same durable
+        # conversation without retaining one lock object per historical API
+        # session.  The GatewayRunner cache owns the resident agents/processes;
+        # these locks only protect sequential use of each cached runtime.
+        self._runtime_turn_locks = tuple(threading.Lock() for _ in range(64))
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
         # server requests; "*" is the process-wide fallback), mirroring
@@ -2980,6 +2985,249 @@ class APIServerAdapter(BasePlatformAdapter):
                 "Do not combine it with an explicit 'provider'."
             )
         return None
+
+    @staticmethod
+    def _runtime_cache_key(
+        *,
+        gateway_session_key: Optional[str],
+        session_id: Optional[str],
+        profile: Optional[str],
+    ) -> str:
+        identity = str(gateway_session_key or session_id or "").strip()
+        if not identity:
+            return ""
+        return f"api_server:{profile or 'default'}:{identity}"
+
+    def _runtime_turn_lock(self, cache_key: str):
+        if not cache_key:
+            return nullcontext()
+        digest = hashlib.sha256(cache_key.encode("utf-8")).digest()
+        return self._runtime_turn_locks[
+            int.from_bytes(digest[:2], "big") % len(self._runtime_turn_locks)
+        ]
+
+    @staticmethod
+    def _runtime_request_signature(
+        *,
+        profile: Optional[str],
+        ephemeral_system_prompt: Optional[str],
+        requested_model: Optional[str],
+        requested_provider: Optional[str],
+        model_options: Optional[Dict[str, Any]],
+        route: Optional[Dict[str, Any]],
+        session_model: Optional[str],
+        confirmed_runtime_lock: bool,
+        single_model: bool,
+        cwd: str = "",
+        project: str = "",
+    ) -> str:
+        """Hash every frozen input that makes an AIAgent unsafe to reuse."""
+        from gateway.run import GatewayRunner, _load_gateway_config
+
+        config = _load_gateway_config()
+        payload = {
+            "version": 1,
+            "profile": profile or "default",
+            "ephemeral_system_prompt": ephemeral_system_prompt or "",
+            "requested_model": requested_model or "",
+            "requested_provider": requested_provider or "",
+            "model_options": model_options or {},
+            "route": route or {},
+            "session_model": session_model or "",
+            "confirmed_runtime_lock": bool(confirmed_runtime_lock),
+            "single_model": bool(single_model),
+            "cwd": cwd or "",
+            "project": project or "",
+            "cache_busting_config": GatewayRunner._extract_cache_busting_config(
+                config
+            ),
+            # API toolsets and provider/model selection live outside the
+            # smaller native-gateway cache-busting subset. Hash the full
+            # non-secret config snapshot so live edits rebuild once.
+            "config": config,
+        }
+        blob = json.dumps(
+            payload,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
+    def _create_or_reuse_runtime_agent(
+        self,
+        *,
+        cache_key: str,
+        signature: str,
+        session_id: Optional[str],
+        cwd: str = "",
+        project: str = "",
+        **agent_kwargs: Any,
+    ) -> tuple[Any, bool]:
+        """Acquire the resident AIAgent owned by the gateway's bounded cache."""
+        runner = self.gateway_runner
+        cache = getattr(runner, "_agent_cache", None)
+        cache_lock = getattr(runner, "_agent_cache_lock", None)
+        if not cache_key or cache is None or cache_lock is None:
+            agent = self._create_agent(session_id=session_id, **agent_kwargs)
+            if cwd:
+                agent.session_cwd = cwd
+            agent.session_project = project or ""
+            return agent, False
+
+        current_count = None
+        if session_id:
+            try:
+                row = self._ensure_session_db().get_session(session_id)
+                current_count = row.get("message_count", 0) if row else None
+            except Exception:
+                current_count = None
+
+        evicted_agent = None
+        agent = None
+        with cache_lock:
+            entry = cache.get(cache_key)
+            if isinstance(entry, tuple) and entry:
+                cached_agent = entry[0]
+                cached_signature = entry[1] if len(entry) > 1 else None
+                cached_count = entry[2] if len(entry) > 2 else None
+                cached_session_id = entry[3] if len(entry) > 3 else None
+                same_session = bool(
+                    not session_id
+                    or cached_session_id == session_id
+                    or getattr(cached_agent, "session_id", None) == session_id
+                )
+                transcript_current = bool(
+                    cached_count is None
+                    or current_count is None
+                    or cached_count == current_count
+                )
+                if (
+                    cached_signature == signature
+                    and same_session
+                    and transcript_current
+                ):
+                    agent = cached_agent
+                    if hasattr(cache, "move_to_end"):
+                        cache.move_to_end(cache_key)
+                else:
+                    evicted = cache.pop(cache_key, None)
+                    if isinstance(evicted, tuple) and evicted:
+                        evicted_agent = evicted[0]
+
+        if evicted_agent is not None:
+            try:
+                runner._release_evicted_agent_soft(evicted_agent)
+            except Exception:
+                logger.debug(
+                    "API durable-runtime eviction cleanup failed", exc_info=True
+                )
+
+        reused = agent is not None
+        if agent is None:
+            agent = self._create_agent(session_id=session_id, **agent_kwargs)
+            if cwd:
+                agent.session_cwd = cwd
+            agent.session_project = project or ""
+            with cache_lock:
+                cache[cache_key] = (
+                    agent,
+                    signature,
+                    current_count,
+                    session_id,
+                )
+                runner._enforce_agent_cache_cap()
+        else:
+            runner._init_cached_agent_for_turn(agent, 0)
+            if cwd:
+                agent.session_cwd = cwd
+            agent.session_project = project or ""
+            # These callbacks are request-scoped and must never retain the
+            # preceding browser turn's queues or SSE writer.
+            for field in (
+                "stream_delta_callback",
+                "interim_assistant_callback",
+                "status_callback",
+                "tool_progress_callback",
+                "tool_start_callback",
+                "tool_complete_callback",
+            ):
+                if field in agent_kwargs:
+                    setattr(agent, field, agent_kwargs[field])
+        return agent, reused
+
+    def _refresh_runtime_cache_checkpoint(
+        self, cache_key: str, signature: str, agent: Any
+    ) -> None:
+        """Re-baseline transcript coherence after this process's own writes."""
+        runner = self.gateway_runner
+        cache = getattr(runner, "_agent_cache", None)
+        cache_lock = getattr(runner, "_agent_cache_lock", None)
+        session_id = str(getattr(agent, "session_id", "") or "")
+        if not cache_key or cache is None or cache_lock is None or not session_id:
+            return
+        try:
+            row = self._ensure_session_db().get_session(session_id)
+            message_count = row.get("message_count", 0) if row else None
+        except Exception:
+            return
+        with cache_lock:
+            entry = cache.get(cache_key)
+            if isinstance(entry, tuple) and entry and entry[0] is agent:
+                cache[cache_key] = (
+                    agent,
+                    signature,
+                    message_count,
+                    session_id,
+                )
+
+    def _runtime_conversation_history(
+        self,
+        session_id: Optional[str],
+        fallback: Optional[List[Dict[str, Any]]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Reload canonical history after waiting for the per-session lock.
+
+        API handlers parse their request before entering the runtime lock. A
+        preceding queued turn may commit while this request waits, so replaying
+        the earlier client snapshot would roll the resident agent backward.
+        """
+        if not session_id:
+            return fallback
+        try:
+            getter = getattr(
+                self._ensure_session_db(), "get_messages_as_conversation", None
+            )
+            history = getter(session_id) if callable(getter) else None
+            if history:
+                return list(history)
+        except Exception:
+            logger.debug(
+                "API durable-runtime history refresh failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+        return fallback
+
+    def _evict_runtime_cache_agent(self, cache_key: str, agent: Any) -> None:
+        """Retire one failed resident runtime without ending its transcript."""
+        runner = self.gateway_runner
+        cache = getattr(runner, "_agent_cache", None)
+        cache_lock = getattr(runner, "_agent_cache_lock", None)
+        if not cache_key or cache is None or cache_lock is None or agent is None:
+            return
+        evicted = None
+        with cache_lock:
+            entry = cache.get(cache_key)
+            if isinstance(entry, tuple) and entry and entry[0] is agent:
+                evicted = cache.pop(cache_key, None)
+        if evicted is not None:
+            try:
+                runner._release_evicted_agent_soft(agent)
+            except Exception:
+                logger.debug(
+                    "API failed-runtime cleanup failed", exc_info=True
+                )
 
     def _create_agent(
         self,
@@ -7434,18 +7682,43 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.session_context import clear_session_vars
 
             with self._profile_scope(request_profile):
-                tokens = self._bind_api_server_session(
-                    chat_id=session_id or "",
-                    session_key=gateway_session_key or session_id or "",
-                    session_id=session_id or "",
-                    browser_control_principal=request_browser_control_principal,
-                    browser_control_transport_family=(
-                        request_browser_control_transport_family
-                    ),
+                runtime_cache_key = self._runtime_cache_key(
+                    gateway_session_key=gateway_session_key,
+                    session_id=session_id,
+                    profile=request_profile,
                 )
-                agent = None
+                runtime_signature = self._runtime_request_signature(
+                    profile=request_profile,
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    requested_model=requested_model,
+                    requested_provider=requested_provider,
+                    model_options=model_options,
+                    route=route,
+                    session_model=session_model,
+                    confirmed_runtime_lock=confirmed_runtime_lock,
+                    single_model=False,
+                )
+                runtime_guard = self._runtime_turn_lock(runtime_cache_key)
+                runtime_guard.__enter__()
                 try:
-                    agent = self._create_agent(
+                    tokens = self._bind_api_server_session(
+                        chat_id=session_id or "",
+                        session_key=gateway_session_key or session_id or "",
+                        session_id=session_id or "",
+                        browser_control_principal=request_browser_control_principal,
+                        browser_control_transport_family=(
+                            request_browser_control_transport_family
+                        ),
+                    )
+                except BaseException:
+                    runtime_guard.__exit__(None, None, None)
+                    raise
+                agent = None
+                runtime_failed = False
+                try:
+                    agent, _ = self._create_or_reuse_runtime_agent(
+                        cache_key=runtime_cache_key,
+                        signature=runtime_signature,
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=stream_delta_callback,
@@ -7478,9 +7751,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # ``agent_ref``, and only /v1/runs has a run_id, so neither
                     # is a usable hook for the rest.
                     self._shutdown_interruptible_agents[id(agent)] = agent
+                    run_history = self._runtime_conversation_history(
+                        session_id, conversation_history
+                    )
                     result = agent.run_conversation(
                         user_message=user_message,
-                        conversation_history=conversation_history,
+                        conversation_history=run_history,
                         task_id=effective_task_id,
                     )
                     usage = {
@@ -7599,6 +7875,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         },
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
+                except BaseException:
+                    runtime_failed = True
+                    raise
                 finally:
                     # Turn finished (success, auth failure, or crash) — clear
                     # ownership markers so a disconnect landing after this
@@ -7614,7 +7893,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
-                    clear_session_vars(tokens)
+                        if runtime_failed:
+                            self._evict_runtime_cache_agent(
+                                runtime_cache_key, agent
+                            )
+                        else:
+                            self._refresh_runtime_cache_checkpoint(
+                                runtime_cache_key, runtime_signature, agent
+                            )
+                    try:
+                        clear_session_vars(tokens)
+                    finally:
+                        runtime_guard.__exit__(None, None, None)
 
         # Transfer pending -> in-flight as one externally visible state change;
         # persisting between the two assignments would create a false-idle
@@ -8211,26 +8501,6 @@ class APIServerAdapter(BasePlatformAdapter):
                             last_event="run.completed",
                         )
                         return
-                with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        interim_assistant_callback=_interim_cb,
-                        status_callback=_status_cb,
-                        tool_progress_callback=event_cb,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=agent_overrides.get("requested_model"),
-                        requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
-                        single_model=single_model,
-                    )
-                    if run_cwd:
-                        agent.session_cwd = run_cwd
-                    agent.session_project = project or ""
-                self._active_run_agents[run_id] = agent
-
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
                     # Redact credentials from the command before it enters the
@@ -8272,8 +8542,55 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    agent = None
+                    runtime_failed = False
+                    runtime_cache_key = self._runtime_cache_key(
+                        gateway_session_key=gateway_session_key,
+                        session_id=session_id,
+                        profile=request_profile,
+                    )
+                    runtime_guard = self._runtime_turn_lock(runtime_cache_key)
+                    runtime_guard.__enter__()
                     with self._profile_scope(request_profile):
                         try:
+                            runtime_signature = self._runtime_request_signature(
+                                profile=request_profile,
+                                ephemeral_system_prompt=ephemeral_system_prompt,
+                                requested_model=agent_overrides.get("requested_model"),
+                                requested_provider=agent_overrides.get(
+                                    "requested_provider"
+                                ),
+                                model_options=agent_overrides.get("model_options"),
+                                route=route,
+                                session_model=None,
+                                confirmed_runtime_lock=single_model,
+                                single_model=single_model,
+                                cwd=run_cwd,
+                                project=project or "",
+                            )
+                            agent, _ = self._create_or_reuse_runtime_agent(
+                                cache_key=runtime_cache_key,
+                                signature=runtime_signature,
+                                ephemeral_system_prompt=ephemeral_system_prompt,
+                                session_id=session_id,
+                                stream_delta_callback=_text_cb,
+                                interim_assistant_callback=_interim_cb,
+                                status_callback=_status_cb,
+                                tool_progress_callback=event_cb,
+                                gateway_session_key=gateway_session_key,
+                                requested_model=agent_overrides.get(
+                                    "requested_model"
+                                ),
+                                requested_provider=agent_overrides.get(
+                                    "requested_provider"
+                                ),
+                                model_options=agent_overrides.get("model_options"),
+                                route=route,
+                                single_model=single_model,
+                                cwd=run_cwd,
+                                project=project or "",
+                            )
+                            self._active_run_agents[run_id] = agent
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
                             # environment state.
@@ -8305,7 +8622,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
                             run_message = user_message
-                            run_history = conversation_history
+                            run_history = self._runtime_conversation_history(
+                                session_id, conversation_history
+                            )
                             goal_user_initiated = True
                             goal_turn = 0
                             if goal_directive is not None:
@@ -8390,13 +8709,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                 goal_turn += 1
                                 if run_id in self._stopping_run_ids:
                                     break
+                        except BaseException:
+                            runtime_failed = True
+                            raise
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
                             # stop/cancel can't reap background work this
                             # run deliberately left running (same race-window
                             # guard as gateway/run.py and _run_agent above).
-                            _clear_turn_process_ownership(agent)
+                            if agent is not None:
+                                _clear_turn_process_ownership(agent)
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
@@ -8410,26 +8733,16 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
-                            # Every /v1/runs request owns a fresh AIAgent. Its
-                            # Codex app-server child therefore cannot remain
-                            # open for a later turn on this agent instance. If
-                            # it does, Codex keeps the durable thread's writer
-                            # lock and the next request cannot thread/resume.
-                            # Close only this native transport here: agent.close
-                            # also finalizes the durable Hermes session, which
-                            # must remain available across browser turns.
-                            codex_session = getattr(agent, "_codex_session", None)
-                            if codex_session is not None:
-                                agent._codex_session = None
-                                try:
-                                    codex_session.close()
-                                except Exception:
-                                    logger.warning(
-                                        "Codex app-server cleanup failed for "
-                                        "run=%s",
-                                        run_id,
-                                        exc_info=True,
+                            if agent is not None:
+                                if runtime_failed:
+                                    self._evict_runtime_cache_agent(
+                                        runtime_cache_key, agent
                                     )
+                                else:
+                                    self._refresh_runtime_cache_checkpoint(
+                                        runtime_cache_key, runtime_signature, agent
+                                    )
+                            runtime_guard.__exit__(None, None, None)
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

@@ -4553,6 +4553,20 @@ class AIAgent:
         except Exception:
             pass
 
+        # Native subscription runtimes are LLM client resources too. Their
+        # provider thread/session ids are persisted independently, so a soft
+        # cache eviction must stop the resident subprocess while preserving the
+        # outer Hermes session and tool state. A rebuilt agent will recover the
+        # same native conversation only if its transcript checkpoint matches.
+        for attr in ("_codex_session", "_claude_code_session"):
+            try:
+                native_session = getattr(self, attr, None)
+                if native_session is not None:
+                    setattr(self, attr, None)
+                    native_session.close()
+            except Exception:
+                pass
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 

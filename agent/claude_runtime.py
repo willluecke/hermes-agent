@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import json
 import logging
 from pathlib import Path
 import tempfile
@@ -24,6 +26,19 @@ _TOOL_NAMES = {
     "Grep": "search_files",
 }
 
+_CLAUDE_SESSION_STATE_KEY = "claude_code_session"
+_CLAUDE_SESSION_STATE_VERSION = 1
+_CLAUDE_EFFORT_MAP = {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+    "ultra": "max",
+}
+
 
 def _content_text(content: Any) -> str:
     if isinstance(content, str):
@@ -37,6 +52,83 @@ def _content_text(content: Any) -> str:
         and block.get("type") in {"text", "input_text", "output_text"}
         and str(block.get("text") or "").strip()
     )
+
+
+def _claude_code_effort(reasoning_config: Any) -> Optional[str]:
+    """Translate Hermes's effort ladder to the installed Claude CLI."""
+    if not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        return "low"
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    return _CLAUDE_EFFORT_MAP.get(effort)
+
+
+def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
+    """Hash the outer transcript prefix represented by a Claude session."""
+    digest = hashlib.sha256()
+    for message in messages:
+        payload = [
+            str(message.get("role") or ""),
+            _content_text(message.get("content")),
+        ]
+        digest.update(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8", errors="replace"
+            )
+        )
+        digest.update(b"\n")
+    return f"v1:{len(messages)}:{digest.hexdigest()}"
+
+
+def _normalized_cwd(cwd: str) -> str:
+    return str(Path(cwd).expanduser().resolve())
+
+
+def _load_claude_session_state(agent: Any) -> dict[str, Any]:
+    state = getattr(agent, "_claude_code_resume_state", None)
+    session_db = getattr(agent, "_session_db", None)
+    outer_session_id = str(getattr(agent, "session_id", "") or "")
+    if session_db is not None and outer_session_id:
+        try:
+            stored = session_db.get_session_model_config_value(
+                outer_session_id, _CLAUDE_SESSION_STATE_KEY
+            )
+            if isinstance(stored, dict):
+                state = stored
+        except Exception:
+            logger.warning("Claude Code session-state read failed", exc_info=True)
+    return dict(state) if isinstance(state, dict) else {}
+
+
+def _persist_claude_session_state(
+    agent: Any,
+    *,
+    claude_session_id: str,
+    cwd: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    """Persist a confirmed inner Claude session against the outer Hermes session."""
+    if not claude_session_id:
+        return
+    state = {
+        "version": _CLAUDE_SESSION_STATE_VERSION,
+        "session_id": claude_session_id,
+        "cwd": _normalized_cwd(cwd),
+        "history_fingerprint": _claude_history_fingerprint(messages),
+        "updated_at": time.time(),
+    }
+    agent._claude_code_resume_state = state
+    session_db = getattr(agent, "_session_db", None)
+    outer_session_id = str(getattr(agent, "session_id", "") or "")
+    if session_db is None or not outer_session_id:
+        return
+    try:
+        session_db.patch_session_model_config(
+            outer_session_id, {_CLAUDE_SESSION_STATE_KEY: state}
+        )
+    except Exception:
+        logger.warning("Claude Code session-state persistence failed", exc_info=True)
 
 
 def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) -> str:
@@ -197,6 +289,17 @@ def run_claude_code_turn(
     from agent.transports.claude_code_session import ClaudeCodeSession
 
     cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+    cwd = _normalized_cwd(cwd)
+    prior_messages = messages[:-1]
+    prior_fingerprint = _claude_history_fingerprint(prior_messages)
+    prior_state = _load_claude_session_state(agent)
+    prior_session_id = str(prior_state.get("session_id") or "").strip()
+    durable_resume = bool(
+        prior_session_id
+        and prior_state.get("version") == _CLAUDE_SESSION_STATE_VERSION
+        and prior_state.get("cwd") == cwd
+        and prior_state.get("history_fingerprint") == prior_fingerprint
+    )
     runtime_contract = (
         "You are the selected Claude subscription runtime inside Hermes Chat. "
         "Follow the user's current request and the project's own instructions. "
@@ -207,28 +310,81 @@ def run_claude_code_turn(
         "Launch long-lived previews only in tmux or a project service and verify "
         "the reachable URL before reporting it."
     )
+    model = str(getattr(agent, "model", "") or "claude-fable-5")
+    effort = _claude_code_effort(getattr(agent, "reasoning_config", None))
+    session = getattr(agent, "_claude_code_session", None)
+    resident_continuity = bool(
+        session is not None
+        and session.compatible_with(
+            cwd=cwd,
+            model=model,
+            effort=effort,
+            system_prompt=runtime_contract,
+        )
+        and getattr(session, "history_fingerprint", None) == prior_fingerprint
+    )
+    if session is not None and not resident_continuity:
+        # A project/model/transcript switch is a real continuity boundary. Do
+        # not feed it into the old native process; the durable handoff path
+        # below starts a correctly scoped Claude parent.
+        try:
+            session.close()
+        except Exception:
+            logger.debug("Claude Code stale-session cleanup failed", exc_info=True)
+        agent._claude_code_session = None
+        session = None
+
     with tempfile.TemporaryDirectory(prefix="hermes-claude-images-") as image_dir:
         images = _materialize_images(original_user_message, image_dir)
-        prompt = claude_history_handoff(messages[:-1], user_message)
+        prompt = (
+            user_message
+            if resident_continuity or durable_resume
+            else claude_history_handoff(prior_messages, user_message)
+        )
         if images:
             prompt += "\n\nAttached images are available at:\n" + "\n".join(
                 f"- {path}" for path in images
             )
-        session = ClaudeCodeSession(
-            cwd=cwd,
-            model=str(getattr(agent, "model", "") or "claude-fable-5"),
-            system_prompt=runtime_contract,
-            additional_dirs=[image_dir] if images else [],
-            on_event=make_claude_code_event_bridge(agent),
-        )
-        agent._claude_code_session = session
+
+        def _remember_confirmed_session(claude_session_id: str) -> None:
+            # At stream time the outer list contains the current user message
+            # but not the final assistant answer yet. Persist immediately so
+            # quota errors, cancellation, and process death remain resumable.
+            _persist_claude_session_state(
+                agent,
+                claude_session_id=claude_session_id,
+                cwd=cwd,
+                messages=messages,
+            )
+
+        if session is None:
+            session = ClaudeCodeSession(
+                cwd=cwd,
+                model=model,
+                session_id=prior_session_id if durable_resume else None,
+                resume=durable_resume,
+                effort=effort,
+                system_prompt=runtime_contract,
+                on_event=make_claude_code_event_bridge(agent),
+                on_session_id=_remember_confirmed_session,
+            )
+            session.history_fingerprint = prior_fingerprint
+            agent._claude_code_session = session
+        else:
+            # Event callbacks are per outer turn even though the native process
+            # is per conversation. Rebind them before sending the next message.
+            session.on_event = make_claude_code_event_bridge(agent)
+            session.on_session_id = _remember_confirmed_session
         try:
             turn = session.run_turn(prompt)
         except Exception as exc:
             logger.exception("Claude Code turn failed")
             turn = None
             error = str(exc)
-        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
             agent._claude_code_session = None
 
     if turn is None:
@@ -243,6 +399,7 @@ def run_claude_code_turn(
             "agent_persisted": True,
         }
 
+    transcript_persisted = getattr(agent, "_session_db", None) is None
     if turn.final_text:
         callback = getattr(agent, "_fire_stream_delta", None)
         if callback:
@@ -253,8 +410,36 @@ def run_claude_code_turn(
         if getattr(agent, "_session_db", None) is not None:
             try:
                 agent._flush_messages_to_session_db(messages)
+                transcript_persisted = True
             except Exception:
                 logger.warning("Claude Code transcript persistence failed", exc_info=True)
+
+    if turn.session_confirmed:
+        # If the assistant row could not be persisted, retain the earlier
+        # user-boundary fingerprint rather than claiming the outer transcript
+        # contains an answer it may not be able to reload.
+        synchronized_messages = (
+            messages
+            if not turn.final_text or transcript_persisted
+            else messages[:-1]
+        )
+        _persist_claude_session_state(
+            agent,
+            claude_session_id=turn.session_id,
+            cwd=cwd,
+            messages=synchronized_messages,
+        )
+        session.history_fingerprint = _claude_history_fingerprint(
+            synchronized_messages
+        )
+
+    if turn.should_retire:
+        if getattr(agent, "_claude_code_session", None) is session:
+            agent._claude_code_session = None
+        try:
+            session.close()
+        except Exception:
+            pass
 
     input_tokens = int(turn.usage.get("input_tokens") or 0)
     output_tokens = int(turn.usage.get("output_tokens") or 0)
