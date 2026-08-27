@@ -54,6 +54,7 @@ class ConfigContext:
     custom_providers: list
     excluded_providers: list = None
     openai_runtime: str = ""
+    current_reasoning_effort: str = ""
 
     def with_overrides(
         self,
@@ -85,6 +86,7 @@ def load_picker_context() -> ConfigContext:
     ``tui_gateway/server.py`` (×2 sites) used to do.
     """
     from hermes_cli.config import get_compatible_custom_providers, load_config
+    from hermes_constants import resolve_reasoning_config
 
     cfg = load_config()
     model_cfg = cfg.get("model", {})
@@ -99,6 +101,14 @@ def load_picker_context() -> ConfigContext:
         current_base_url = ""
     raw = cfg.get("providers")
     excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
+    reasoning = resolve_reasoning_config(cfg, current_model)
+    current_reasoning_effort = ""
+    if isinstance(reasoning, dict):
+        current_reasoning_effort = (
+            "none"
+            if reasoning.get("enabled") is False
+            else str(reasoning.get("effort") or "").strip().lower()
+        )
     return ConfigContext(
         current_provider=current_provider,
         current_model=current_model,
@@ -111,6 +121,7 @@ def load_picker_context() -> ConfigContext:
             if isinstance(model_cfg, dict)
             else ""
         ),
+        current_reasoning_effort=current_reasoning_effort,
     )
 
 
@@ -285,6 +296,7 @@ def build_models_payload(
         "providers": rows,
         "model": ctx.current_model,
         "provider": ctx.current_provider,
+        "reasoning_effort": ctx.current_reasoning_effort,
     }
 
 

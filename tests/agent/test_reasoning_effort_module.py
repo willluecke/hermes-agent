@@ -39,14 +39,17 @@ class TestLadderContract:
         for level in VALID_REASONING_EFFORTS:
             assert level in EFFORT_LADDER, level
 
-    def test_no_declared_wire_set_contains_ultra(self):
-        """ultra is internal vocabulary; every wire set must exclude it so it
-        always clamps down."""
+    def test_only_native_codex_sol_terra_accept_ultra(self):
+        """Provider wires clamp ultra; only the verified app-server models
+        may advertise it verbatim."""
         import agent.reasoning_effort as mod
 
         for name in dir(mod):
             if name.endswith("_EFFORTS"):
-                assert "ultra" not in getattr(mod, name), name
+                has_ultra = "ultra" in getattr(mod, name)
+                assert has_ultra == (
+                    name == "CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS"
+                ), name
 
 
 class TestClampEffort:
@@ -165,10 +168,16 @@ class TestCodexVocabulary:
 
         assert supported_efforts_for_runtime(
             "openai-codex", "gpt-5.6-sol"
-        )[-1] == "max"
+        ) == ("low", "medium", "high", "xhigh", "max", "ultra")
+        assert supported_efforts_for_runtime(
+            "openai-codex", "gpt-5.6-terra"
+        ) == ("low", "medium", "high", "xhigh", "max", "ultra")
+        assert supported_efforts_for_runtime(
+            "openai-codex", "gpt-5.6-luna"
+        ) == ("low", "medium", "high", "xhigh", "max")
         assert supported_efforts_for_runtime(
             "openai-codex", "gpt-5.5"
-        )[-1] == "xhigh"
+        ) == ("low", "medium", "high", "xhigh")
         assert supported_efforts_for_runtime(
             "claude-code", "claude-fable-5"
         ) == ("low", "medium", "high", "xhigh", "max")

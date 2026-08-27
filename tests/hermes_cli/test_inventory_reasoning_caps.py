@@ -126,19 +126,19 @@ def test_unlisted_model_states_no_restriction(monkeypatch):
 def test_native_codex_provider_gets_verified_model_vocabulary(monkeypatch):
     """Native providers publish known contracts without an aggregator catalog."""
     _patch_catalog(monkeypatch, {
-        "gpt-5.6": {"supports_reasoning": True, "supported_efforts": ["high"], "mandatory": True},
+        "gpt-5.6-sol": {"supports_reasoning": True, "supported_efforts": ["high"], "mandatory": True},
     })
-    rows = [{"slug": "openai-codex", "models": ["gpt-5.6"]}]
+    rows = [{"slug": "openai-codex", "models": ["gpt-5.6-sol"]}]
     inv._apply_capabilities(rows)
 
-    caps = rows[0]["capabilities"]["gpt-5.6"]
+    caps = rows[0]["capabilities"]["gpt-5.6-sol"]
     assert caps["supported_efforts"] == [
-        "none",
         "low",
         "medium",
         "high",
         "xhigh",
         "max",
+        "ultra",
     ]
     assert "can_disable_reasoning" not in caps
 

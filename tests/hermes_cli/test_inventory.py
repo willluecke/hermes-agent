@@ -57,6 +57,21 @@ def _empty_ctx(provider="orig", model="orig-model", base_url="orig-url"):
     )
 
 
+def test_models_payload_exposes_configured_reasoning_default():
+    ctx = ConfigContext(
+        current_provider="openai-codex",
+        current_model="gpt-5.6-sol",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        current_reasoning_effort="xhigh",
+    )
+    with _list_auth_returning([]):
+        payload = build_models_payload(ctx)
+
+    assert payload["reasoning_effort"] == "xhigh"
+
+
 def test_codex_app_server_subscription_marks_current_provider_authenticated():
     ctx = ConfigContext(
         current_provider="openai-codex",
@@ -568,6 +583,5 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 
 

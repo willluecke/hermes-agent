@@ -51,9 +51,9 @@ EFFORT_LADDER: tuple[str, ...] = (
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 )
 
-# ``ultra`` is Hermes-internal ladder vocabulary (the Codex product tier); no
-# provider wire accepts it verbatim anywhere. Every declared wire set below
-# therefore stops at ``max`` — ``ultra`` always clamps down.
+# ``ultra`` is primarily Hermes/Codex product vocabulary. OpenAI-compatible
+# provider wires stop at ``max`` and clamp it down, while the native Codex app
+# server advertises it for selected models such as GPT-5.6 Sol and Terra.
 
 #: The widest OpenAI-compatible wire vocabulary (OpenRouter, Nous Portal):
 #: exactly max|xhigh|high|medium|low|minimal|none.
@@ -72,6 +72,19 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
     "none", "low", "medium", "high", "xhigh",
 )
 
+#: Native Codex app-server vocabulary reported by ``model/list``. This differs
+#: from the OpenAI Responses API: app-server does not expose ``none`` and the
+#: current GPT-5.6 family may expose ``ultra``.
+CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh", "max", "ultra",
+)
+CODEX_APP_SERVER_GPT56_LUNA_EFFORTS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh", "max",
+)
+CODEX_APP_SERVER_LEGACY_EFFORTS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh",
+)
+
 #: Claude Code subscription runtime. ``auto`` is represented by omitting the
 #: effort field entirely; these are the explicit values accepted by the native
 #: CLI. Keep this provider vocabulary separate from the OpenAI-compatible
@@ -86,6 +99,16 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     if "gpt-5.6" in (model or "").lower():
         return CODEX_GPT56_EFFORTS
     return CODEX_LEGACY_EFFORTS
+
+
+def codex_app_server_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
+    """Supported effort set reported by the native Codex app server."""
+    model_name = (model or "").lower()
+    if "gpt-5.6-sol" in model_name or "gpt-5.6-terra" in model_name:
+        return CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS
+    if "gpt-5.6" in model_name:
+        return CODEX_APP_SERVER_GPT56_LUNA_EFFORTS
+    return CODEX_APP_SERVER_LEGACY_EFFORTS
 
 
 #: Backward-compat alias (pre-#68365-verification name).
@@ -199,7 +222,9 @@ def supported_efforts_for_runtime(
     if "deepseek-v4" in model_name:
         return DEEPSEEK_V4_EFFORTS
 
-    if provider_name in {"openai-codex", "openai-api", "openai"}:
+    if provider_name == "openai-codex":
+        return codex_app_server_supported_efforts(model_name)
+    if provider_name in {"openai-api", "openai"}:
         return codex_supported_efforts(model_name)
     if provider_name in {"claude-code", "anthropic"}:
         return CLAUDE_CODE_EFFORTS
