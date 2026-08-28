@@ -60,7 +60,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory", "decision_log", "opus_code_worker",
+    "todo", "memory", "decision_log", "model_consult", "opus_code_worker",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -285,6 +285,12 @@ TOOLSETS = {
     "decision_log": {
         "description": "Append-only durable decision records owned by the configured authority",
         "tools": ["decision_log"],
+        "includes": []
+    },
+
+    "model_consult": {
+        "description": "Read-only consultation through authenticated Hermes model providers",
+        "tools": ["model_consult"],
         "includes": []
     },
 
@@ -519,7 +525,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "browser_exec",
             # Planning, memory, durable decisions, and governed implementation
-            "todo", "memory", "decision_log", "opus_code_worker",
+            "todo", "memory", "decision_log", "model_consult", "opus_code_worker",
             # Session history search
             "session_search",
             # Local time lookup
