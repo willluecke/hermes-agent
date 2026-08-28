@@ -50,8 +50,17 @@ external party, or perform a destructive action from RecCli history.
 
 ## Safe Gateway Restarts
 
-Do not use a direct `systemctl restart` for command-center deployments. Run
-`ops/command-center/restart-gateway-when-idle.sh`. It requests an external
-drain, waits for the persisted total active-work count to remain at zero for
-two samples, and then restarts. A timeout cancels the drain and does not
-restart the service.
+Never run `systemctl --user stop/restart hermes-gateway.service` from a gateway
+turn, and never run a blocking restart helper in the gateway cgroup. Both wait
+on the active turn that invoked them; an explicit stop also defeats
+`Restart=always` and can leave the unit down.
+
+Run `/home/will/.local/bin/hermes-command-center-restart-gateway`. It hands the
+operation immediately to the external `hermes-gateway-restart-broker.service`
+transient unit. The broker uses Hermes' graceful SIGUSR1/exit-75 contract,
+recovers an inactive failed unit with an idempotent start, and records its
+verified result in
+`/home/will/.hermes/runtime/gateway-restart-broker.json`. Do not claim success
+until that record and live checks prove the old PID exited, a different PID is
+active, gateway and sync services are active, and both `/health` endpoints
+return HTTP 200.

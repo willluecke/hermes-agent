@@ -61,6 +61,14 @@ def test_gateway_and_proxy_dispatch():
     assert px.func is _h_proxy
 
 
+def test_gateway_restart_handoff_flag():
+    parsed = _gateway_parser().parse_args(["gateway", "restart", "--handoff"])
+
+    assert parsed.gateway_command == "restart"
+    assert parsed.handoff is True
+    assert parsed.func is _h_gateway
+
+
 
 
 def test_gateway_enroll_dispatch():

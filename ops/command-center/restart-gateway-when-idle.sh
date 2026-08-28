@@ -1,79 +1,70 @@
 #!/usr/bin/env bash
 
-# Drain command-center, prove the persisted active-work count is stably zero,
-# and only then restart the user gateway service. A timeout never restarts.
+# Queue the command-center restart worker in a sibling user-systemd cgroup.
+# This launcher is safe to invoke from a gateway-hosted terminal: it returns
+# as soon as systemd has exec'd the worker, allowing the originating turn to
+# finish before the external worker asks the gateway to drain and restart.
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-HERMES_PYTHON="${HERMES_PYTHON:-/home/will/.hermes/venvs/hermes-command-center/bin/python}"
-WAIT_SECONDS="${HERMES_RESTART_IDLE_TIMEOUT:-3600}"
-SERVICE="${HERMES_GATEWAY_SERVICE:-hermes-gateway.service}"
+SYSTEMCTL_BIN="${HERMES_SYSTEMCTL_BIN:-systemctl}"
+SYSTEMD_RUN_BIN="${HERMES_SYSTEMD_RUN_BIN:-systemd-run}"
+TIMEOUT_BIN="${HERMES_TIMEOUT_BIN:-timeout}"
+UNIT="${HERMES_RESTART_BROKER_UNIT:-hermes-gateway-restart-broker}"
+LAUNCH_TIMEOUT="${HERMES_RESTART_BROKER_LAUNCH_TIMEOUT:-15}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALLED_WORKER="/home/will/.local/libexec/hermes-command-center-restart-worker"
+WORKER="${HERMES_RESTART_BROKER_WORKER:-$INSTALLED_WORKER}"
 
-if [[ ! -x "$HERMES_PYTHON" ]]; then
-  echo "Hermes Python is not executable: $HERMES_PYTHON" >&2
+if [[ ! -x "$WORKER" && -x "$SCRIPT_DIR/restart-gateway-broker-worker.sh" ]]; then
+  WORKER="$SCRIPT_DIR/restart-gateway-broker-worker.sh"
+fi
+if [[ ! -x "$WORKER" ]]; then
+  echo "Restart broker worker is not executable: $WORKER" >&2
   exit 1
 fi
 
-export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+unit_state="$($SYSTEMCTL_BIN --user show "$UNIT.service" \
+  --property=ActiveState --value 2>/dev/null || true)"
+if [[ "$unit_state" == "active" || "$unit_state" == "activating" || "$unit_state" == "reloading" ]]; then
+  echo "Gateway restart already queued in $UNIT.service"
+  exit 0
+fi
+if [[ "$unit_state" == "failed" ]]; then
+  "$SYSTEMCTL_BIN" --user reset-failed "$UNIT.service" >/dev/null 2>&1 || true
+fi
 
-clear_drain() {
-  "$HERMES_PYTHON" - <<'PY' >/dev/null 2>&1 || true
-from gateway.drain_control import clear_drain_request
-clear_drain_request()
-PY
-}
-trap clear_drain EXIT INT TERM
-
-"$HERMES_PYTHON" - <<'PY'
-from gateway.drain_control import write_drain_request
-write_drain_request(principal="command-center-safe-restart")
-PY
-
-deadline=$((SECONDS + WAIT_SECONDS))
-zero_samples=0
-while (( SECONDS < deadline )); do
-  read -r gateway_state active_agents < <(
-    "$HERMES_PYTHON" - <<'PY'
-from gateway.status import parse_active_agents, read_runtime_status
-state = read_runtime_status() or {}
-print(state.get("gateway_state") or "unknown", parse_active_agents(state.get("active_agents", 0)))
-PY
-  )
-
-  if [[ "$gateway_state" == "draining" && "$active_agents" == "0" ]]; then
-    zero_samples=$((zero_samples + 1))
-    if (( zero_samples >= 2 )); then
-      break
-    fi
-  else
-    zero_samples=0
+run_args=(
+  --user
+  --unit "$UNIT"
+  --collect
+  --property=Type=exec
+  --description="Command-center external gateway restart broker"
+)
+for name in HERMES_HOME PATH PYTHONPATH VIRTUAL_ENV; do
+  value="${!name:-}"
+  if [[ -n "$value" ]]; then
+    run_args+=("--setenv=$name=$value")
   fi
-  sleep 1
 done
 
-if (( zero_samples < 2 )); then
-  echo "Gateway did not become stably idle within ${WAIT_SECONDS}s; restart cancelled." >&2
-  exit 2
-fi
-
-if [[ "$(systemctl --user is-active "$SERVICE")" != "active" ]]; then
-  echo "Gateway service is not active; restart cancelled." >&2
-  exit 3
-fi
-
-systemctl --user restart "$SERVICE"
-clear_drain
-trap - EXIT INT TERM
-
-for _ in $(seq 1 60); do
-  if [[ "$(systemctl --user is-active "$SERVICE" 2>/dev/null || true)" == "active" ]] \
-    && curl --fail --silent --show-error http://127.0.0.1:8642/health >/dev/null; then
-    echo "Gateway restarted after a stable idle drain."
+set +e
+"$TIMEOUT_BIN" "$LAUNCH_TIMEOUT" "$SYSTEMD_RUN_BIN" "${run_args[@]}" "$WORKER"
+launch_rc=$?
+set -e
+if (( launch_rc != 0 )); then
+  unit_state="$($SYSTEMCTL_BIN --user show "$UNIT.service" \
+    --property=ActiveState --value 2>/dev/null || true)"
+  if [[ "$unit_state" == "active" || "$unit_state" == "activating" || "$unit_state" == "reloading" ]]; then
+    echo "Gateway restart queued in $UNIT.service"
     exit 0
   fi
-  sleep 1
-done
+  if (( launch_rc == 124 )); then
+    echo "Restart broker launch timed out before systemd accepted the unit." >&2
+  else
+    echo "Restart broker launch failed with exit code $launch_rc." >&2
+  fi
+  exit "$launch_rc"
+fi
 
-echo "Gateway restart was issued, but health did not recover within 60s." >&2
-exit 4
+echo "Gateway restart queued in $UNIT.service; the external worker will restart after active work drains."

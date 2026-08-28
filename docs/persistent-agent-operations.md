@@ -461,8 +461,17 @@ Daily gate budget exhausted:
 3. Update the `command-center` branch and run targeted tests.
 4. Update one native CLI at a time.
 5. Reapply the Hermes tools MCP migration to Codex configuration if needed.
-6. Run exact-model probes before restarting the gateway.
-7. Restart only the changed service and run the functional canary.
+6. Install or refresh the external restart broker:
+   `ops/command-center/install-gateway-restart-broker.sh`.
+7. Run exact-model probes before requesting a gateway restart.
+8. From any context, including a gateway turn, run
+   `/home/will/.local/bin/hermes-command-center-restart-gateway`. Never call
+   `systemctl --user stop/restart hermes-gateway.service` from a gateway turn.
+9. Reattach after the broker completes. Do not claim success until
+   `~/.hermes/runtime/gateway-restart-broker.json` and independent live checks
+   prove the old PID exited, a different PID is active, both gateway and sync
+   services are active, and both loopback `/health` endpoints return HTTP 200.
+10. Run the functional canary.
 
 ## Rollback
 

@@ -141,6 +141,15 @@ def build_gateway_parser(
         action="store_true",
         help="Kill ALL gateway processes across all profiles before restarting",
     )
+    gateway_restart.add_argument(
+        "--handoff",
+        action="store_true",
+        help=(
+            "Queue the restart in an external systemd transient unit and "
+            "return immediately. Automatically used when restart is invoked "
+            "from a gateway-hosted process."
+        ),
+    )
     _add_compat_platform_flag(gateway_restart)
 
     # gateway status

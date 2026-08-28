@@ -3957,6 +3957,125 @@ def _get_restart_exit_wait_budget() -> float:
     )
 
 
+def _queue_systemd_gateway_restart(
+    *, system: bool = False,
+) -> tuple[bool, str]:
+    """Hand restart ownership to an external transient systemd unit.
+
+    A gateway-hosted command is a descendant of the gateway service cgroup and
+    contributes to that gateway's active-work count. Running the ordinary
+    blocking restart command there makes the caller wait for itself, while a
+    direct ``systemctl stop/restart`` can leave an explicitly stopped unit that
+    ``Restart=always`` will not recover. ``systemd-run`` creates a sibling
+    service owned by the user manager, so this function can return immediately;
+    the broker then waits for the originating turn to finish and drives the
+    existing SIGUSR1 -> exit-75 -> supervisor-relaunch contract externally.
+
+    Returns ``(queued, message)``. A currently active broker is coalesced as a
+    successful request. The transient command explicitly removes
+    ``_HERMES_GATEWAY`` so the child enters the external restart path instead
+    of recursively queueing another broker.
+    """
+    system = _select_systemd_scope(system)
+    if system:
+        _require_root_for_system_service("restart handoff")
+    else:
+        _preflight_user_systemd()
+    _require_service_installed("restart", system=system)
+
+    systemd_run = shutil.which("systemd-run")
+    env_bin = shutil.which("env")
+    if not systemd_run or not env_bin:
+        return False, "systemd-run and env are required for restart handoff"
+
+    service_stem = get_service_name().removesuffix(".service")
+    broker_unit = f"{service_stem}-restart-broker.service"
+
+    def _broker_state() -> str:
+        try:
+            result = _run_systemctl(
+                ["show", broker_unit, "--property=ActiveState", "--value"],
+                system=system,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return str(getattr(result, "stdout", "") or "").strip().lower()
+
+    state = _broker_state()
+    if state in {"active", "activating", "reloading"}:
+        return True, f"Restart handoff already queued in {broker_unit}"
+    if state == "failed":
+        _run_systemctl(
+            ["reset-failed", broker_unit],
+            system=system,
+            check=False,
+            timeout=10,
+        )
+
+    command = [
+        env_bin,
+        "-u",
+        "_HERMES_GATEWAY",
+        sys.executable,
+        "-m",
+        "hermes_cli.main",
+        "gateway",
+        "restart",
+    ]
+    if system:
+        command.append("--system")
+
+    argv = [systemd_run]
+    if not system:
+        argv.append("--user")
+    argv.extend(
+        [
+            "--unit",
+            broker_unit.removesuffix(".service"),
+            "--collect",
+            "--property=Type=exec",
+            f"--description=External restart broker for {get_service_name()}",
+        ]
+    )
+    for name in ("HERMES_HOME", "PATH", "PYTHONPATH", "VIRTUAL_ENV"):
+        value = os.environ.get(name)
+        if value:
+            argv.append(f"--setenv={name}={value}")
+    argv.extend(command)
+
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        # The client may time out after systemd accepted the unit. Re-check
+        # before reporting failure so retrying cannot create two brokers.
+        if _broker_state() in {"active", "activating", "reloading"}:
+            return True, f"Restart handoff queued in {broker_unit}"
+        return False, "systemd restart handoff timed out before the broker started"
+    except OSError as exc:
+        return False, f"could not start systemd restart broker: {exc}"
+
+    if result.returncode != 0:
+        if _broker_state() in {"active", "activating", "reloading"}:
+            return True, f"Restart handoff already queued in {broker_unit}"
+        detail = (result.stderr or result.stdout or "systemd-run failed").strip()
+        return False, detail
+    return True, f"Restart handoff queued in {broker_unit}"
+
+
 def systemd_install(
     force: bool = False,
     system: bool = False,
@@ -8079,14 +8198,40 @@ def _gateway_command_inner(args):
                 print(f"✓ Stopped {get_service_name()} service")
 
     elif subcmd == "restart":
-        # Defense: refuse self-targeting gateway restart from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        if os.getenv("_HERMES_GATEWAY") == "1":
-            print_error(
-                "Refusing to restart the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
-            )
+        # A gateway-hosted restart must outlive its caller. Queue a sibling
+        # systemd transient unit and return so this turn can finish; the broker
+        # then drives the normal graceful restart from outside our cgroup.
+        # ``--handoff`` makes the same safe behavior explicit when an
+        # intermediate tool scrubbed the gateway marker from its environment.
+        inside_gateway = os.getenv("_HERMES_GATEWAY") == "1"
+        handoff = bool(getattr(args, "handoff", False))
+        if inside_gateway or handoff:
+            if bool(getattr(args, "all", False)):
+                print_error("Restart handoff does not support --all.")
+                sys.exit(1)
+            if supports_systemd_services() and (
+                get_systemd_unit_path(system=False).exists()
+                or get_systemd_unit_path(system=True).exists()
+            ):
+                queued, message = _queue_systemd_gateway_restart(
+                    system=bool(getattr(args, "system", False))
+                )
+                if queued:
+                    print_success(message)
+                    return
+                print_error(f"Gateway restart handoff failed: {message}")
+                sys.exit(1)
+            if inside_gateway:
+                print_error(
+                    "Refusing to restart the gateway directly from inside the "
+                    "gateway process because no external systemd broker is "
+                    "available. Run the restart from an independent shell or "
+                    "service manager."
+                )
+            else:
+                print_error(
+                    "Gateway restart handoff requires an installed systemd service."
+                )
             sys.exit(1)
 
         # Try service first, fall back to killing and restarting

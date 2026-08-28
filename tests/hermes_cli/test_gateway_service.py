@@ -20,6 +20,172 @@ from gateway.restart import (
 )
 
 
+class TestExternalSystemdRestartBroker:
+    def _installed_user_service(self, tmp_path, monkeypatch):
+        unit = tmp_path / "hermes-gateway.service"
+        unit.write_text("[Service]\n", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_systemd_unit_path",
+            lambda system=False: unit if not system else tmp_path / "missing-system",
+        )
+
+    def test_gateway_hosted_restart_queues_external_broker(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._installed_user_service(tmp_path, monkeypatch)
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "_queue_systemd_gateway_restart",
+            lambda system=False: calls.append(system)
+            or (True, "Restart handoff queued"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_restart",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("self restart must not run in the gateway cgroup")
+            ),
+        )
+
+        gateway_cli._gateway_command_inner(
+            SimpleNamespace(
+                gateway_command="restart",
+                system=False,
+                all=False,
+                handoff=False,
+            )
+        )
+
+        assert calls == [False]
+        assert "restart handoff queued" in capsys.readouterr().out.lower()
+
+    def test_explicit_handoff_failure_never_falls_back_to_direct_restart(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        self._installed_user_service(tmp_path, monkeypatch)
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_queue_systemd_gateway_restart",
+            lambda system=False: (False, "broker launch failed"),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_restart",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("failed handoff must not fall back to direct restart")
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            gateway_cli._gateway_command_inner(
+                SimpleNamespace(
+                    gateway_command="restart",
+                    system=False,
+                    all=False,
+                    handoff=True,
+                )
+            )
+
+        assert exc.value.code == 1
+        assert "broker launch failed" in capsys.readouterr().out.lower()
+
+    def _queue_setup(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli, "_select_systemd_scope", lambda system=False: False
+        )
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_require_service_installed",
+            lambda _action, system=False: None,
+        )
+        monkeypatch.setattr(
+            gateway_cli.shutil, "which", lambda name: f"/usr/bin/{name}"
+        )
+        monkeypatch.setattr(
+            gateway_cli, "get_service_name", lambda: "hermes-gateway.service"
+        )
+
+    def test_broker_launch_timeout_is_reported_without_direct_recovery(
+        self, monkeypatch
+    ):
+        self._queue_setup(monkeypatch)
+        systemctl_calls = []
+
+        def fake_systemctl(args, **_kwargs):
+            systemctl_calls.append(args)
+            return SimpleNamespace(returncode=1, stdout="inactive\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_systemctl)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                subprocess.TimeoutExpired(args[0], kwargs.get("timeout"))
+            ),
+        )
+
+        queued, message = gateway_cli._queue_systemd_gateway_restart()
+
+        assert queued is False
+        assert "timed out" in message
+        assert all(call[0] == "show" for call in systemctl_calls)
+
+    def test_failed_broker_launch_is_fail_closed(self, monkeypatch):
+        self._queue_setup(monkeypatch)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_run_systemctl",
+            lambda args, **kwargs: SimpleNamespace(
+                returncode=1, stdout="inactive\n", stderr=""
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(
+                returncode=5, stdout="", stderr="unit creation failed"
+            ),
+        )
+
+        queued, message = gateway_cli._queue_systemd_gateway_restart()
+
+        assert queued is False
+        assert message == "unit creation failed"
+
+    def test_stale_failed_broker_is_reset_and_recovered(self, monkeypatch):
+        self._queue_setup(monkeypatch)
+        calls = []
+
+        def fake_systemctl(args, **_kwargs):
+            calls.append(args)
+            if args[0] == "show":
+                return SimpleNamespace(returncode=0, stdout="failed\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_systemctl)
+        spawned = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda argv, **kwargs: spawned.append(argv)
+            or SimpleNamespace(returncode=0, stdout="Running as unit", stderr=""),
+        )
+
+        queued, message = gateway_cli._queue_systemd_gateway_restart()
+
+        assert queued is True
+        assert "queued" in message.lower()
+        assert [call[0] for call in calls] == ["show", "reset-failed"]
+        assert spawned[0][0] == "/usr/bin/systemd-run"
+        assert ["/usr/bin/env", "-u", "_HERMES_GATEWAY"] == spawned[0][-8:-5]
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)

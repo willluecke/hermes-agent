@@ -556,6 +556,8 @@ Background tasks on messaging platforms are fire-and-forget — you don't need t
 hermes gateway install               # Install as user service
 hermes gateway start                 # Start the service
 hermes gateway stop                  # Stop the service
+hermes gateway restart               # Gracefully restart the service
+hermes gateway restart --handoff     # Queue restart in an external transient unit
 hermes gateway status                # Check status
 journalctl --user -u hermes-gateway -f  # View logs
 
@@ -570,6 +572,14 @@ journalctl -u hermes-gateway -f
 ```
 
 Use the user service on laptops and dev boxes. Use the system service on VPS or headless hosts that should come back at boot without relying on systemd linger.
+
+When `hermes gateway restart` is invoked by a gateway-hosted process, Hermes
+automatically uses the `--handoff` behavior: `systemd-run` starts a transient
+sibling service and the caller returns immediately. The broker waits for the
+originating turn to finish, then drives the normal graceful exit and supervisor
+relaunch. Do not call `systemctl stop` or `systemctl restart` from inside a
+gateway turn; the service can wait on its own caller, and an explicit stop is
+not recovered by `Restart=always`.
 
 :::danger Don't add a custom `ExecStopPost` kill drop-in
 The unit Hermes installs already shuts the gateway down cleanly with `KillMode=mixed` + `KillSignal=SIGTERM`, and uses `Restart=always` with `RestartForceExitStatus` so updates and `/restart` respawn correctly. Do **not** add a systemd drop-in such as `ExecStopPost=/bin/kill -9 $MAINPID` — `ExecStopPost` fires on *every* stop, including clean restarts, so it `SIGKILL`s the freshly spawned instance before it stabilizes and `Restart=always` immediately respawns it. The result is an infinite restart loop (and, on Telegram, a flood of restart messages). If you've added such a drop-in, remove it: `systemctl --user edit hermes-gateway` (or `sudo systemctl edit hermes-gateway` for a system service) and delete the `ExecStopPost` line, then `systemctl --user daemon-reload`.

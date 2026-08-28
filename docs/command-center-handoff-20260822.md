@@ -33,7 +33,12 @@ lingering enabled:
 - `hermes-command-center-full-backup.timer`
 
 The Hermes chat application and its synchronization path run from
-`command-center`. Do not restart the gateway while a run is active.
+`command-center`. Never issue a direct systemd stop/restart from a gateway
+turn: the run waits on itself and an explicit stop defeats `Restart=always`.
+Use `/home/will/.local/bin/hermes-command-center-restart-gateway`, which hands
+the operation to an external transient user-systemd broker and records verified
+postconditions in
+`~/.hermes/runtime/gateway-restart-broker.json`.
 
 Verify:
 
