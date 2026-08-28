@@ -368,6 +368,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+MAX_IDEMPOTENCY_KEY_LENGTH = 256
+RUN_IDEMPOTENCY_TTL_SECONDS = 30 * 24 * 60 * 60
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -1094,7 +1096,22 @@ class ResponseStore:
                 response_id TEXT NOT NULL
             )"""
         )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_idempotency (
+                namespace TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (namespace, key_hash)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_run_idempotency_created_at
+               ON run_idempotency(created_at)"""
+        )
         self._conn.commit()
+        self._run_idempotency_lock = threading.Lock()
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
@@ -1204,6 +1221,81 @@ class ResponseStore:
             (name, response_id),
         )
         self._conn.commit()
+
+    @staticmethod
+    def _run_idempotency_key_hash(key: str) -> str:
+        """Keep caller-provided opaque keys out of the durable API store."""
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def get_run_idempotency(
+        self, namespace: str, key: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return a non-expired durable ``/v1/runs`` claim, if one exists."""
+        if not self._db_path:
+            raise RuntimeError("durable API state store is unavailable")
+        cutoff = time.time() - RUN_IDEMPOTENCY_TTL_SECONDS
+        key_hash = self._run_idempotency_key_hash(key)
+        with self._run_idempotency_lock:
+            row = self._conn.execute(
+                "SELECT fingerprint, run_id, created_at "
+                "FROM run_idempotency "
+                "WHERE namespace = ? AND key_hash = ? AND created_at >= ?",
+                (namespace, key_hash, cutoff),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "fingerprint": row[0],
+            "run_id": row[1],
+            "created_at": row[2],
+        }
+
+    def claim_run_idempotency(
+        self,
+        namespace: str,
+        key: str,
+        fingerprint: str,
+        run_id: str,
+    ) -> tuple[str, str]:
+        """Atomically claim a run key or return the prior claimant.
+
+        The SQLite write is committed synchronously before the caller creates
+        any background task.  ``INSERT OR IGNORE`` plus the composite primary
+        key makes this converge across concurrent requests and gateway
+        processes sharing the same profile state directory.
+        """
+        if not self._db_path:
+            raise RuntimeError("durable API state store is unavailable")
+        now = time.time()
+        cutoff = now - RUN_IDEMPOTENCY_TTL_SECONDS
+        key_hash = self._run_idempotency_key_hash(key)
+        with self._run_idempotency_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute(
+                    "DELETE FROM run_idempotency WHERE created_at < ?",
+                    (cutoff,),
+                )
+                cursor = self._conn.execute(
+                    "INSERT OR IGNORE INTO run_idempotency "
+                    "(namespace, key_hash, fingerprint, run_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (namespace, key_hash, fingerprint, run_id, now),
+                )
+                row = self._conn.execute(
+                    "SELECT fingerprint, run_id FROM run_idempotency "
+                    "WHERE namespace = ? AND key_hash = ?",
+                    (namespace, key_hash),
+                ).fetchone()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        if cursor.rowcount == 1:
+            return "claimed", run_id
+        if row is not None and row[0] == fingerprint:
+            return "replay", row[1]
+        return "conflict", row[1] if row is not None else ""
 
     def close(self) -> None:
         """Close the database connection."""
@@ -1499,6 +1591,22 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     from hashlib import sha256
     subset = {k: body.get(k) for k in keys}
     return sha256(repr(subset).encode("utf-8")).hexdigest()
+
+
+def _make_run_request_fingerprint(
+    body: Dict[str, Any], gateway_session_key: Optional[str]
+) -> str:
+    """Fingerprint every input that can change native run semantics."""
+    canonical = json.dumps(
+        {
+            "body": body,
+            "gateway_session_key": gateway_session_key or "",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -8215,17 +8323,20 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        response_headers = (
+            {"X-Hermes-Session-Key": gateway_session_key}
+            if gateway_session_key
+            else {}
+        )
 
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object"), status=400
+            )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -8294,30 +8405,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_id = body.get("session_id") or stored_session_id
 
-        # Existing Hermes sessions are server-authoritative. Browser clients
-        # intentionally project the durable transcript down to user/final-text
-        # bubbles and cannot faithfully round-trip assistant tool-call turns,
-        # tool results, or mid-turn commentary. Trusting that reduced
-        # ``conversation_history`` on resume made an iteration-limited run look
-        # amnesiac even though state.db still held the complete turn. Load the
-        # canonical active transcript whenever this request names an existing
-        # session; client history remains the bootstrap path for a session that
-        # has not reached state.db yet.
-        if session_id:
-            persisted_history = await self._conversation_history_for_session(
-                session_id
-            )
-            if persisted_history:
-                if conversation_history and conversation_history != persisted_history:
-                    logger.info(
-                        "Using canonical session history for /v1/runs resume "
-                        "(session=%s client_messages=%d persisted_messages=%d)",
-                        session_id,
-                        len(conversation_history),
-                        len(persisted_history),
-                    )
-                conversation_history = persisted_history
-
         goal_command_args = _api_goal_command_args(user_message)
         execution_mode = _clean_request_string(body.get("execution_mode")) or "orchestrated"
         if execution_mode not in {"orchestrated", "single_model"}:
@@ -8353,7 +8440,138 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        if idempotency_key and (
+            len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH
+            or re.search(r"[\x00-\x1f\x7f]", idempotency_key)
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Invalid Idempotency-Key header",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+                headers=response_headers,
+            )
+
+        idempotency_namespace = (
+            f"api_server.runs:{_api_request_profile.get() or 'default'}"
+        )
+        idempotency_fingerprint = (
+            _make_run_request_fingerprint(body, gateway_session_key)
+            if idempotency_key
+            else ""
+        )
+        if idempotency_key:
+            try:
+                existing_claim = self._response_store.get_run_idempotency(
+                    idempotency_namespace, idempotency_key
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] durable run idempotency lookup failed"
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Durable run idempotency is temporarily unavailable",
+                        err_type="server_error",
+                        code="idempotency_store_unavailable",
+                    ),
+                    status=503,
+                    headers={**response_headers, "Retry-After": "1"},
+                )
+            if existing_claim is not None:
+                if existing_claim["fingerprint"] != idempotency_fingerprint:
+                    return web.json_response(
+                        _openai_error(
+                            "Idempotency-Key was already used with a different request",
+                            code="idempotency_conflict",
+                        ),
+                        status=409,
+                        headers=response_headers,
+                    )
+                return web.json_response(
+                    {
+                        "run_id": existing_claim["run_id"],
+                        "status": "started",
+                        "idempotent_replay": True,
+                    },
+                    status=202,
+                    headers={**response_headers, "Idempotency-Replayed": "true"},
+                )
+
+        # A replay must bypass the concurrency gate because its original run
+        # may be the work currently occupying the last slot. New claims still
+        # obey the shared cap before they reserve a durable run id.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         run_id = f"run_{uuid.uuid4().hex}"
+        if idempotency_key:
+            try:
+                claim_result, claimed_run_id = (
+                    self._response_store.claim_run_idempotency(
+                        idempotency_namespace,
+                        idempotency_key,
+                        idempotency_fingerprint,
+                        run_id,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "[api_server] durable run idempotency claim failed"
+                )
+                return web.json_response(
+                    _openai_error(
+                        "Durable run idempotency is temporarily unavailable",
+                        err_type="server_error",
+                        code="idempotency_store_unavailable",
+                    ),
+                    status=503,
+                    headers={**response_headers, "Retry-After": "1"},
+                )
+            if claim_result == "conflict":
+                return web.json_response(
+                    _openai_error(
+                        "Idempotency-Key was already used with a different request",
+                        code="idempotency_conflict",
+                    ),
+                    status=409,
+                    headers=response_headers,
+                )
+            if claim_result == "replay":
+                return web.json_response(
+                    {
+                        "run_id": claimed_run_id,
+                        "status": "started",
+                        "idempotent_replay": True,
+                    },
+                    status=202,
+                    headers={**response_headers, "Idempotency-Replayed": "true"},
+                )
+
+        # Existing Hermes sessions are server-authoritative. Browser clients
+        # intentionally project the durable transcript down to user/final-text
+        # bubbles and cannot faithfully round-trip assistant tool-call turns,
+        # tool results, or mid-turn commentary. This is deliberately the first
+        # await after the durable claim: no async session work can race a
+        # duplicate request into creating a second run.
+        if session_id:
+            persisted_history = await self._conversation_history_for_session(
+                session_id
+            )
+            if persisted_history:
+                if conversation_history and conversation_history != persisted_history:
+                    logger.info(
+                        "Using canonical session history for /v1/runs resume "
+                        "(session=%s client_messages=%d persisted_messages=%d)",
+                        session_id,
+                        len(conversation_history),
+                        len(persisted_history),
+                    )
+                conversation_history = persisted_history
+
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -8952,9 +9170,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        response_headers = (
-            {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
-        )
         return web.json_response(
             {"run_id": run_id, "status": "started"},
             status=202,

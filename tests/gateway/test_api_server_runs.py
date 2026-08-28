@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
 import time
@@ -23,6 +24,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    ResponseStore,
     _ReplayableRunEventStream,
     _api_goal_command_args,
     _approval_event_choices,
@@ -109,6 +111,39 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_total_tokens = 0
 
     return mock_agent, ready, interrupted
+
+
+def test_durable_run_claim_is_atomic_across_store_connections(tmp_path):
+    """Two gateway processes sharing one profile must mint one run id."""
+    db_path = str(tmp_path / "response_store.db")
+    first_store = ResponseStore(db_path=db_path)
+    second_store = ResponseStore(db_path=db_path)
+    barrier = threading.Barrier(2)
+
+    def _claim(store, run_id):
+        barrier.wait(timeout=2)
+        return store.claim_run_idempotency(
+            "api_server.runs:default",
+            "same-turn",
+            "same-fingerprint",
+            run_id,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = [
+                future.result(timeout=5)
+                for future in (
+                    pool.submit(_claim, first_store, "run_first"),
+                    pool.submit(_claim, second_store, "run_second"),
+                )
+            ]
+    finally:
+        first_store.close()
+        second_store.close()
+
+    assert sorted(state for state, _run_id in results) == ["claimed", "replay"]
+    assert len({_run_id for _state, _run_id in results}) == 1
 
 
 @pytest.fixture
@@ -303,6 +338,154 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_replay_returns_original_active_run_before_limit(
+        self, adapter, tmp_path
+    ):
+        """A retry must converge even while its original owns the last slot."""
+        adapter._response_store.close()
+        adapter._response_store = ResponseStore(
+            db_path=str(tmp_path / "response_store.db")
+        )
+        adapter._max_concurrent_runs = 1
+        mock_agent, ready, interrupted = _make_slow_agent()
+        app = _create_runs_app(adapter)
+        headers = {"Idempotency-Key": "turn-active-replay"}
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(
+                    adapter, "_create_agent", return_value=mock_agent
+                ) as create_agent:
+                    first = await cli.post(
+                        "/v1/runs", json={"input": "ship it"}, headers=headers
+                    )
+                    assert first.status == 202
+                    first_data = await first.json()
+                    assert await asyncio.to_thread(ready.wait, 2)
+
+                    replay = await cli.post(
+                        "/v1/runs", json={"input": "ship it"}, headers=headers
+                    )
+                    replay_data = await replay.json()
+
+                    assert replay.status == 202
+                    assert replay_data == {
+                        "run_id": first_data["run_id"],
+                        "status": "started",
+                        "idempotent_replay": True,
+                    }
+                    assert replay.headers["Idempotency-Replayed"] == "true"
+                    create_agent.assert_called_once()
+                    interrupted.set()
+                    for _ in range(80):
+                        if not adapter._active_run_tasks:
+                            break
+                        await asyncio.sleep(0.025)
+        finally:
+            interrupted.set()
+            adapter._response_store.close()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_reuse_with_different_request_conflicts(
+        self, adapter, tmp_path
+    ):
+        adapter._response_store.close()
+        adapter._response_store = ResponseStore(
+            db_path=str(tmp_path / "response_store.db")
+        )
+        mock_agent, ready, interrupted = _make_slow_agent()
+        app = _create_runs_app(adapter)
+        headers = {"Idempotency-Key": "turn-conflict"}
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(
+                    adapter, "_create_agent", return_value=mock_agent
+                ) as create_agent:
+                    first = await cli.post(
+                        "/v1/runs", json={"input": "first"}, headers=headers
+                    )
+                    assert first.status == 202
+                    first_run_id = (await first.json())["run_id"]
+                    assert await asyncio.to_thread(ready.wait, 2)
+
+                    conflict = await cli.post(
+                        "/v1/runs", json={"input": "different"}, headers=headers
+                    )
+                    conflict_data = await conflict.json()
+
+                    assert conflict.status == 409
+                    assert conflict_data["error"]["code"] == "idempotency_conflict"
+                    create_agent.assert_called_once()
+                    interrupted.set()
+                    for _ in range(80):
+                        status = await (
+                            await cli.get(f"/v1/runs/{first_run_id}")
+                        ).json()
+                        if status["status"] == "completed":
+                            break
+                        await asyncio.sleep(0.025)
+        finally:
+            interrupted.set()
+            adapter._response_store.close()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_replay_survives_gateway_adapter_restart(self, tmp_path):
+        store_path = tmp_path / "response_store.db"
+        request_body = {
+            "input": "persist this turn",
+            "session_id": "durable-idempotency-session",
+        }
+        headers = {"Idempotency-Key": "turn-after-restart"}
+
+        first_adapter = _make_adapter()
+        first_adapter._response_store.close()
+        first_adapter._response_store = ResponseStore(db_path=str(store_path))
+        first_app = _create_runs_app(first_adapter)
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch.object(
+                first_adapter, "_create_agent", return_value=mock_agent
+            ):
+                first = await cli.post(
+                    "/v1/runs", json=request_body, headers=headers
+                )
+                first_run_id = (await first.json())["run_id"]
+                for _ in range(80):
+                    status = await (
+                        await cli.get(f"/v1/runs/{first_run_id}")
+                    ).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.025)
+                assert status["status"] == "completed"
+        first_adapter._response_store.close()
+
+        restarted_adapter = _make_adapter()
+        restarted_adapter._response_store.close()
+        restarted_adapter._response_store = ResponseStore(db_path=str(store_path))
+        restarted_app = _create_runs_app(restarted_adapter)
+        try:
+            async with TestClient(TestServer(restarted_app)) as cli:
+                with patch.object(restarted_adapter, "_create_agent") as create_agent:
+                    replay = await cli.post(
+                        "/v1/runs", json=request_body, headers=headers
+                    )
+                    replay_data = await replay.json()
+
+            assert replay.status == 202
+            assert replay_data["run_id"] == first_run_id
+            assert replay_data["idempotent_replay"] is True
+            create_agent.assert_not_called()
+        finally:
+            restarted_adapter._response_store.close()
 
     @pytest.mark.asyncio
     async def test_existing_session_uses_canonical_history_over_client_projection(
