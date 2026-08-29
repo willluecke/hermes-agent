@@ -143,6 +143,7 @@ class CodexAppServerClient:
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._notifications: queue.Queue = queue.Queue()
         self._server_requests: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
@@ -303,9 +304,13 @@ class CodexAppServerClient:
             raise RuntimeError("codex app-server client is closed")
         if self._proc.stdin is None:
             raise RuntimeError("codex app-server stdin not available")
+        # request_steer() can fire from a watcher thread while the main thread
+        # is mid turn/interrupt; a line-interleaved write would corrupt the
+        # JSON-RPC stream, so serialize stdin writes.
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            with self._send_lock:
+                self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise RuntimeError(
                 f"codex app-server stdin closed unexpectedly: {exc}"
