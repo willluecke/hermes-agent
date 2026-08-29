@@ -202,6 +202,15 @@ def _run_rsync(command: list[str], timeout_seconds: int) -> None:
     except OSError as exc:
         raise WorkspaceSnapshotError("workspace snapshot could not start") from exc
     if result.returncode != 0:
+        # rsync exit 23/24 ("some files vanished before they could be
+        # transferred") are warnings: every file that still existed was
+        # copied. A recovery point that is missing transient files which the
+        # live workspace deleted mid-copy is strictly better than aborting
+        # the turn — the previous behavior killed runs whenever any temp
+        # file (e.g. .media/run-*/ artifacts) was created and removed during
+        # the snapshot.
+        if result.returncode in (23, 24):
+            return
         detail = (result.stderr or result.stdout or "rsync failed").strip()
         raise WorkspaceSnapshotError(
             f"workspace snapshot failed (rsync exit {result.returncode}): "

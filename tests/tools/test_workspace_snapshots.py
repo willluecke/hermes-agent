@@ -129,3 +129,45 @@ def test_disabled_policy_has_no_filesystem_effect(snapshot_env):
         policy=WorkspaceSnapshotPolicy(enabled=False),
     ) is None
     assert not (home / "workspace-snapshots").exists()
+
+
+def test_vanished_source_files_are_a_warning_not_a_failure(
+    snapshot_env, monkeypatch
+):
+    """rsync exit 24 (files vanished mid-transfer) must not abort the turn.
+
+    Workspaces legitimately contain transient files (run media, temp dirs)
+    that can disappear between rsync's directory scan and the copy. The
+    snapshot is still a valid recovery point for everything that existed.
+    """
+    import subprocess as _subprocess
+
+    home, workspace, policy = snapshot_env
+    (workspace / "file.txt").write_text("data", encoding="utf-8")
+
+    real_run = _subprocess.run
+    from types import SimpleNamespace
+
+    def fake_run(command, **kwargs):
+        assert command[0].endswith("rsync") or "rsync" in command[0]
+        return real_run(command, **kwargs)
+
+    def fake_rsync(command, **kwargs):
+        # Simulate exit 24: some files vanished before transfer.
+        return SimpleNamespace(returncode=24, stderr="", stdout="")
+
+    monkeypatch.setattr(
+        "tools.workspace_snapshots.shutil.which", lambda _name: "/usr/bin/rsync"
+    )
+    monkeypatch.setattr(
+        "tools.workspace_snapshots.subprocess.run", fake_rsync
+    )
+
+    snapshot = _capture(workspace, policy, "turn-vanished")
+    assert snapshot is not None, "exit 24 must not fail the snapshot"
+
+    # The manifest must exist and the snapshot dir must be complete (not
+    # left pending) — the recovery point is usable.
+    record = Path(snapshot.path)
+    assert record.is_dir()
+    assert (record / "manifest.json").is_file()
