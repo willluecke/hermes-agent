@@ -874,9 +874,48 @@ def run_codex_app_server_turn(
     Returns the same dict shape as the chat_completions path.
     """
     from agent.transports.codex_app_server_session import (
+        DEFAULT_FIRST_EVENT_TIMEOUT,
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+    from agent.deadline import resolve_timeout
+
+    first_event_timeout = resolve_timeout(
+        "codex_app_server.first_event",
+        default=DEFAULT_FIRST_EVENT_TIMEOUT,
+    )
+
+    def _watchdog_timeout(payload: dict[str, Any]) -> None:
+        timeout = float(payload.get("timeout_seconds") or 0.0)
+        message = (
+            "Codex accepted the turn but emitted no turn-scoped activity "
+            f"within {timeout:g} seconds—stopping that turn and resetting "
+            "the runtime. The prompt was not replayed."
+        )
+        progress = getattr(agent, "tool_progress_callback", None)
+        if progress is not None:
+            try:
+                progress(
+                    "runtime.first_event_timeout",
+                    "codex-app-server",
+                    message,
+                    None,
+                    **payload,
+                )
+            except Exception:
+                logger.debug(
+                    "Codex app-server watchdog progress callback failed",
+                    exc_info=True,
+                )
+        emit_status = getattr(agent, "_emit_status", None)
+        if emit_status is not None:
+            try:
+                emit_status(message)
+            except Exception:
+                logger.debug(
+                    "Codex app-server watchdog status callback failed",
+                    exc_info=True,
+                )
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -991,7 +1030,15 @@ def run_codex_app_server_turn(
                 guard_no_prompt_file_changes=bounded_no_prompt,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            on_watchdog_timeout=_watchdog_timeout,
+            first_event_timeout=first_event_timeout,
         )
+    else:
+        # These callbacks and deadlines belong to the outer run even when the
+        # native app-server process is reused across multiple Hermes turns.
+        agent._codex_session._on_event = make_codex_app_server_event_bridge(agent)
+        agent._codex_session.on_watchdog_timeout = _watchdog_timeout
+        agent._codex_session.first_event_timeout = first_event_timeout
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
@@ -1217,6 +1264,7 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": effective_error,
+        **({"error_code": turn.error_code} if turn.error_code else {}),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

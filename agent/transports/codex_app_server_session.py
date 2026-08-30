@@ -119,6 +119,7 @@ _MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024
 # across the whole turn instead of imposing a shorter post-tool deadline.
 _DEFAULT_TURN_INACTIVITY_TIMEOUT = 10 * 60.0
 _DEFAULT_ABSOLUTE_TURN_TIMEOUT = 2 * 60 * 60.0
+DEFAULT_FIRST_EVENT_TIMEOUT = 60.0
 
 
 @dataclass
@@ -134,6 +135,7 @@ class TurnResult:
     tool_iterations: int = 0
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
+    error_code: Optional[str] = None
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
@@ -237,6 +239,63 @@ def _notification_belongs_to_turn(
         return False
 
     return True
+
+
+def _is_turn_activity_notification(
+    note: dict,
+    *,
+    thread_id: Optional[str],
+    turn_id: Optional[str],
+) -> bool:
+    """Return whether ``note`` proves the acknowledged turn is progressing.
+
+    Generic thread notifications can be queued during hydration or describe a
+    previous turn, so they must not satisfy the first-event watchdog. Codex's
+    documented turn lifecycle uses ``turn/*``, ``item/*``, and turn-scoped
+    ``hook/*`` notifications after ``turn/start``. First-event acknowledgement
+    is intentionally stricter than general projection: the notification must
+    carry the exact turn id returned by ``turn/start`` so preloaded, unscoped
+    hydration output cannot fake progress for the new prompt.
+    """
+    if not _notification_belongs_to_turn(
+        note,
+        thread_id=thread_id,
+        turn_id=turn_id,
+    ):
+        return False
+    _observed_thread_id, observed_turn_id = _notification_scope_ids(note)
+    if (
+        turn_id is None
+        or observed_turn_id is None
+        or str(observed_turn_id) != str(turn_id)
+    ):
+        return False
+    method = str(note.get("method") or "")
+    return method.startswith(("turn/", "item/", "hook/"))
+
+
+def _is_turn_activity_server_request(
+    request: dict,
+    *,
+    thread_id: Optional[str],
+    turn_id: Optional[str],
+) -> bool:
+    """Return whether a server-initiated request belongs to the active turn."""
+    if not _notification_belongs_to_turn(
+        request,
+        thread_id=thread_id,
+        turn_id=turn_id,
+    ):
+        return False
+    _observed_thread_id, observed_turn_id = _notification_scope_ids(request)
+    if (
+        turn_id is None
+        or observed_turn_id is None
+        or str(observed_turn_id) != str(turn_id)
+    ):
+        return False
+    method = str(request.get("method") or "")
+    return method.startswith(("item/", "tool/", "mcpServer/"))
 
 
 def _image_url_from_content_part(item: dict[str, Any]) -> str:
@@ -474,6 +533,8 @@ class CodexAppServerSession:
         workspace_snapshot_policy: Any = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_watchdog_timeout: Optional[Callable[[dict[str, Any]], None]] = None,
+        first_event_timeout: Optional[float] = DEFAULT_FIRST_EVENT_TIMEOUT,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -499,6 +560,8 @@ class CodexAppServerSession:
         self._workspace_snapshot_policy = workspace_snapshot_policy
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self.on_watchdog_timeout = on_watchdog_timeout
+        self.first_event_timeout = first_event_timeout
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -837,6 +900,12 @@ class CodexAppServerSession:
         when notifications continue to arrive. Set it to ``0`` to disable the
         ceiling. Process exit, protocol failure, and explicit interruption are
         still handled immediately.
+
+        ``first_event_timeout`` is configured on the session. It starts only
+        after ``turn/start`` has acknowledged the prompt with a turn id and
+        requires a turn-scoped notification. On expiry Hermes interrupts that
+        exact acknowledged turn and retires the app-server process; it never
+        replays the prompt automatically because Codex may already be working.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
@@ -928,6 +997,14 @@ class CodexAppServerSession:
         inactivity_timeout = turn_timeout if turn_timeout > 0 else None
         last_activity_at = time.monotonic()
         turn_started_at = last_activity_at
+        configured_first_event_timeout = self.first_event_timeout
+        first_event_timeout = (
+            float(configured_first_event_timeout)
+            if configured_first_event_timeout is not None
+            and float(configured_first_event_timeout) > 0
+            else None
+        )
+        first_event_acknowledged = False
         absolute_timeout = (
             absolute_turn_timeout if absolute_turn_timeout > 0 else None
         )
@@ -935,6 +1012,73 @@ class CodexAppServerSession:
 
         while not turn_complete:
             now = time.monotonic()
+            preloaded_server_request = None
+            preloaded_note = None
+            if self._interrupt_event.is_set():
+                self._issue_interrupt(result.turn_id)
+                result.interrupted = True
+                break
+            if (
+                first_event_timeout is not None
+                and not first_event_acknowledged
+                and (now - turn_started_at) >= first_event_timeout
+            ):
+                # Give already-queued turn activity priority at the exact
+                # deadline boundary. A notification can arrive between the
+                # preceding empty poll and this clock check.
+                preloaded_server_request = self._client.take_server_request(
+                    timeout=0
+                )
+                if (
+                    preloaded_server_request is not None
+                    and _is_turn_activity_server_request(
+                        preloaded_server_request,
+                        thread_id=self._thread_id,
+                        turn_id=result.turn_id,
+                    )
+                ):
+                    first_event_acknowledged = True
+                if preloaded_server_request is None:
+                    preloaded_note = self._client.take_notification(timeout=0)
+                    if (
+                        preloaded_note is not None
+                        and _is_turn_activity_notification(
+                            preloaded_note,
+                            thread_id=self._thread_id,
+                            turn_id=result.turn_id,
+                        )
+                    ):
+                        first_event_acknowledged = True
+                if not first_event_acknowledged:
+                    result.error_code = "codex_first_event_timeout"
+                    result.error = self._format_error_with_stderr(
+                        "codex app-server accepted the turn but emitted no "
+                        f"turn-scoped activity within {first_event_timeout:g}s"
+                    )
+                    payload = {
+                        "code": result.error_code,
+                        "attempt": 1,
+                        "retrying": False,
+                        "timeout_seconds": first_event_timeout,
+                        "thread_id": result.thread_id,
+                        "turn_id": result.turn_id,
+                    }
+                    logger.warning(
+                        "Codex app-server first-event watchdog expired: "
+                        "timeout_seconds=%.1f thread=%s turn=%s",
+                        first_event_timeout,
+                        result.thread_id,
+                        result.turn_id,
+                    )
+                    if self.on_watchdog_timeout is not None:
+                        try:
+                            self.on_watchdog_timeout(payload)
+                        except Exception:
+                            logger.warning(
+                                "Codex app-server watchdog callback failed",
+                                exc_info=True,
+                            )
+                    break
             if (
                 absolute_timeout is not None
                 and (now - turn_started_at) >= absolute_timeout
@@ -948,10 +1092,6 @@ class CodexAppServerSession:
                 inactivity_timeout is not None
                 and (now - last_activity_at) >= inactivity_timeout
             ):
-                break
-            if self._interrupt_event.is_set():
-                self._issue_interrupt(result.turn_id)
-                result.interrupted = True
                 break
 
             # Detect a dead subprocess between iterations. If codex exited
@@ -973,8 +1113,18 @@ class CodexAppServerSession:
 
             # Drain any server-initiated requests (approvals) before
             # reading notifications, so the codex side isn't blocked.
-            sreq = self._client.take_server_request(timeout=0)
+            sreq = (
+                preloaded_server_request
+                if preloaded_server_request is not None
+                else self._client.take_server_request(timeout=0)
+            )
             if sreq is not None:
+                if _is_turn_activity_server_request(
+                    sreq,
+                    thread_id=self._thread_id,
+                    turn_id=result.turn_id,
+                ):
+                    first_event_acknowledged = True
                 # Drain any pending notifications first so per-turn state
                 # (e.g. _pending_file_changes for fileChange approvals) is
                 # up to date when we make the approval decision. Bounded
@@ -996,6 +1146,12 @@ class CodexAppServerSession:
                         continue
                     event_at = time.monotonic()
                     last_activity_at = event_at
+                    if _is_turn_activity_notification(
+                        pending,
+                        thread_id=self._thread_id,
+                        turn_id=result.turn_id,
+                    ):
+                        first_event_acknowledged = True
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -1032,8 +1188,16 @@ class CodexAppServerSession:
                 last_activity_at = time.monotonic()
                 continue
 
-            note = self._client.take_notification(
-                timeout=notification_poll_timeout
+            poll_timeout = notification_poll_timeout
+            if first_event_timeout is not None and not first_event_acknowledged:
+                remaining = first_event_timeout - (
+                    now - turn_started_at
+                )
+                poll_timeout = min(poll_timeout, max(0.0, remaining))
+            note = (
+                preloaded_note
+                if preloaded_note is not None
+                else self._client.take_notification(timeout=poll_timeout)
             )
             if note is None:
                 continue
@@ -1051,6 +1215,12 @@ class CodexAppServerSession:
 
             event_at = time.monotonic()
             last_activity_at = event_at
+            if _is_turn_activity_notification(
+                note,
+                thread_id=self._thread_id,
+                turn_id=result.turn_id,
+            ):
+                first_event_acknowledged = True
             if self._on_event is not None:
                 try:
                     self._on_event(note)

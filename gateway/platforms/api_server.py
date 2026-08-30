@@ -8266,7 +8266,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "text": preview or "",
                 })
             elif event_type == "runtime.first_event_timeout":
-                _push({
+                event = {
                     "event": "runtime.first_event_timeout",
                     "run_id": run_id,
                     "timestamp": ts,
@@ -8276,7 +8276,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     "retrying": bool(kwargs.get("retrying")),
                     "timeout_seconds": float(kwargs.get("timeout_seconds") or 0.0),
                     "message": redact_sensitive_text(str(preview or ""), force=True),
-                })
+                }
+                for key in ("session_id", "thread_id", "turn_id"):
+                    value = kwargs.get(key)
+                    if value:
+                        event[key] = str(value)
+                _push(event)
             elif event_type in {"subagent.start", "subagent.complete"}:
                 event = {
                     "event": event_type,

@@ -86,6 +86,78 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_first_event_watchdog_uses_config_and_reports_durable_ids(
+        self, monkeypatch
+    ):
+        observed = {}
+        progress = []
+        statuses = []
+
+        def fake_resolve_timeout(key, *, default, env_var=None):
+            del default, env_var
+            assert key == "codex_app_server.first_event"
+            return 17.0
+
+        def fake_run_turn(session, user_input, **kwargs):
+            del kwargs
+            observed["input"] = user_input
+            observed["first_event_timeout"] = session.first_event_timeout
+            session.on_watchdog_timeout(
+                {
+                    "code": "codex_first_event_timeout",
+                    "attempt": 1,
+                    "retrying": False,
+                    "timeout_seconds": 17.0,
+                    "thread_id": "thread-stub-1",
+                    "turn_id": "turn-stub-1",
+                }
+            )
+            return TurnResult(
+                interrupted=True,
+                error="Codex accepted the turn but emitted no activity",
+                error_code="codex_first_event_timeout",
+                should_retire=True,
+                thread_id="thread-stub-1",
+                turn_id="turn-stub-1",
+            )
+
+        monkeypatch.setattr("agent.deadline.resolve_timeout", fake_resolve_timeout)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-stub-1",
+        )
+        agent = _make_codex_agent()
+        agent.tool_progress_callback = lambda *args, **kwargs: progress.append(
+            (args, kwargs)
+        )
+        agent.status_callback = lambda *args: statuses.append(args)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("repair the stall")
+
+        message = (
+            "Codex accepted the turn but emitted no turn-scoped activity within "
+            "17 seconds—stopping that turn and resetting the runtime. The prompt "
+            "was not replayed."
+        )
+        assert observed == {
+            "input": "repair the stall",
+            "first_event_timeout": 17.0,
+        }
+        assert progress[0][0][:3] == (
+            "runtime.first_event_timeout",
+            "codex-app-server",
+            message,
+        )
+        assert progress[0][1]["thread_id"] == "thread-stub-1"
+        assert progress[0][1]["turn_id"] == "turn-stub-1"
+        assert statuses == [("lifecycle", message)]
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["error_code"] == "codex_first_event_timeout"
+
     def test_enabled_workspace_snapshot_precedes_native_turn(
         self, fake_session, monkeypatch, tmp_path
     ):

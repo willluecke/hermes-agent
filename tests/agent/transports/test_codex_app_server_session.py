@@ -1403,6 +1403,201 @@ class TestApprovalPromptEnrichment:
         assert "apply some changes" in captured["command"]
 
 
+# ---- first-event watchdog ----
+
+class TestFirstEventWatchdog:
+    def test_silent_acknowledged_turn_is_interrupted_and_retired(self):
+        client = FakeClient()
+        watchdog_events: list[dict[str, Any]] = []
+        session = make_session(
+            client,
+            first_event_timeout=0.02,
+            on_watchdog_timeout=watchdog_events.append,
+        )
+
+        result = session.run_turn(
+            "accepted but silent",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error_code == "codex_first_event_timeout"
+        assert result.error and "accepted the turn" in result.error
+        assert watchdog_events == [
+            {
+                "code": "codex_first_event_timeout",
+                "attempt": 1,
+                "retrying": False,
+                "timeout_seconds": 0.02,
+                "thread_id": "thread-fake-001",
+                "turn_id": "turn-fake-001",
+            }
+        ]
+        assert [method for method, _ in client.requests].count("turn/start") == 1
+        assert [method for method, _ in client.requests].count("turn/interrupt") == 1
+
+    def test_generic_thread_notification_does_not_fake_turn_activity(self):
+        client = FakeClient()
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="t",
+            tokenUsage={"last": {"inputTokens": 10}},
+        )
+        watchdog_events: list[dict[str, Any]] = []
+        session = make_session(
+            client,
+            first_event_timeout=0.02,
+            on_watchdog_timeout=watchdog_events.append,
+        )
+
+        result = session.run_turn(
+            "ignore hydration noise",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+        )
+
+        assert result.error_code == "codex_first_event_timeout"
+        assert len(watchdog_events) == 1
+
+    def test_unscoped_preloaded_item_does_not_fake_turn_activity(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "agentMessage",
+                "id": "stale-preloaded-item",
+                "phase": "commentary",
+                "text": "output from an older turn",
+            },
+        )
+        watchdog_events: list[dict[str, Any]] = []
+        session = make_session(
+            client,
+            first_event_timeout=0.02,
+            on_watchdog_timeout=watchdog_events.append,
+        )
+
+        result = session.run_turn(
+            "new prompt",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+        )
+
+        assert result.error_code == "codex_first_event_timeout"
+        assert len(watchdog_events) == 1
+
+    def test_turn_started_acknowledges_first_event(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/started",
+            threadId="t",
+            turn={"id": "tu1", "status": "inProgress", "items": []},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "agentMessage",
+                "id": "m1",
+                "phase": "final_answer",
+                "text": "done",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        watchdog_events: list[dict[str, Any]] = []
+        session = make_session(
+            client,
+            first_event_timeout=0.02,
+            on_watchdog_timeout=watchdog_events.append,
+        )
+
+        result = session.run_turn(
+            "normal turn",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+        )
+
+        assert result.final_text == "done"
+        assert result.error is None
+        assert result.interrupted is False
+        assert watchdog_events == []
+
+    def test_notification_queued_at_deadline_wins_over_timeout(self):
+        client = FakeClient()
+        original_take_notification = client.take_notification
+        queued = False
+
+        def boundary_take_notification(timeout):
+            nonlocal queued
+            if not queued:
+                queued = True
+                client.queue_notification(
+                    "turn/started",
+                    threadId="t",
+                    turn={"id": "tu1", "status": "inProgress", "items": []},
+                )
+                client.queue_notification(
+                    "item/completed",
+                    item={
+                        "type": "agentMessage",
+                        "id": "m1",
+                        "phase": "final_answer",
+                        "text": "boundary event accepted",
+                    },
+                    threadId="t",
+                    turnId="tu1",
+                )
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="t",
+                    turn={"id": "tu1", "status": "completed", "error": None},
+                )
+                return None
+            return original_take_notification(timeout)
+
+        client.take_notification = boundary_take_notification
+        watchdog_events: list[dict[str, Any]] = []
+        session = make_session(
+            client,
+            first_event_timeout=60.0,
+            on_watchdog_timeout=watchdog_events.append,
+        )
+        monotonic_values = iter(
+            [
+                1000.0,
+                1000.0,
+                1060.0,
+                1060.0,
+                1060.0,
+                1060.0,
+                1060.0,
+                1060.0,
+            ]
+        )
+
+        with patch.object(
+            session_mod.time,
+            "monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            result = session.run_turn(
+                "event at the edge",
+                turn_timeout=600.0,
+                notification_poll_timeout=0.0,
+            )
+
+        assert result.final_text == "boundary event accepted"
+        assert result.error is None
+        assert watchdog_events == []
+
+
 # ---- openclaw beta.8 parity: retire/wedge/oauth/abort marker ----
 
 class TestSessionRetirement:

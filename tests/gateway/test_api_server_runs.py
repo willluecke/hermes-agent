@@ -1754,6 +1754,54 @@ class TestRunToolEventIdentity:
         }
 
     @pytest.mark.asyncio
+    async def test_codex_first_event_timeout_keeps_thread_and_turn_ids(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb(
+                "runtime.first_event_timeout",
+                "codex-app-server",
+                "Codex accepted the turn but emitted no activity.",
+                None,
+                code="codex_first_event_timeout",
+                attempt=1,
+                retrying=False,
+                timeout_seconds=60.0,
+                thread_id="thread-123",
+                turn_id="turn-456",
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+
+        events = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        watchdog = next(
+            event
+            for event in events
+            if event.get("event") == "runtime.first_event_timeout"
+        )
+        assert watchdog["runtime"] == "codex-app-server"
+        assert watchdog["code"] == "codex_first_event_timeout"
+        assert watchdog["retrying"] is False
+        assert watchdog["thread_id"] == "thread-123"
+        assert watchdog["turn_id"] == "turn-456"
+
+    @pytest.mark.asyncio
     async def test_tool_events_carry_stable_ids_and_output(self, adapter):
         """Without caller ids, emission mints {run_id}:tool:{n} and pairs
         completions FIFO by tool name, so replays carry one fixed id."""
