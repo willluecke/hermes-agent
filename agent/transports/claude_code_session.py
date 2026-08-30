@@ -32,11 +32,20 @@ DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT = 60.0
 
 _TURN_ACK_EVENT_TYPES = frozenset({"user", "assistant", "stream_event", "result"})
 
+CLAUDE_AUTH_ERROR_CODE = "claude_authentication_failed"
+CLAUDE_AUTH_REMEDIATION = (
+    "Run `claude auth login --claudeai` on command-center, then retry."
+)
+
 logger = logging.getLogger(__name__)
 
 
 class ClaudeCodeError(RuntimeError):
     """Controlled Claude Code runtime failure."""
+
+    def __init__(self, message: str, *, error_code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 @dataclass
@@ -62,6 +71,55 @@ def find_claude_binary() -> str:
             "Claude Code is not installed or is not on PATH for the Hermes gateway"
         )
     return candidate
+
+
+def claude_subscription_auth_available() -> bool:
+    """Whether Claude Code has the OAuth material required by this route.
+
+    The Claude subscription transport deliberately strips ambient Anthropic
+    API credentials before spawning the CLI.  Checking the same OAuth sources
+    Hermes already understands prevents an API key from making a generic
+    ``claude auth status`` probe look healthy while this route cannot start.
+    """
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+        return True
+    try:
+        from agent.anthropic_adapter import read_claude_code_credentials
+
+        credentials = read_claude_code_credentials()
+    except Exception:
+        logger.warning("Claude Code subscription auth preflight failed", exc_info=True)
+        return False
+    return bool(credentials and credentials.get("accessToken"))
+
+
+def _auth_failure_detail(event: dict[str, Any]) -> Optional[str]:
+    """Extract an authoritative auth failure from Claude stream-json."""
+    raw_error = str(event.get("error") or "").strip().lower()
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    text = "\n".join(
+        str(block.get("text") or "").strip()
+        for block in (message.get("content") or [])
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and str(block.get("text") or "").strip()
+    )
+    result_text = str(event.get("result") or "").strip()
+    detail = text or result_text
+    haystack = f"{raw_error} {detail}".lower()
+    if raw_error == "authentication_failed" or (
+        bool(event.get("isApiErrorMessage") or event.get("is_error"))
+        and any(
+            marker in haystack
+            for marker in (
+                "failed to authenticate",
+                "authentication failed",
+                "oauth session expired",
+            )
+        )
+    ):
+        return detail or "Claude Max authentication failed"
+    return None
 
 
 def claude_code_args(
@@ -256,6 +314,11 @@ class ClaudeCodeSession:
         if self._closed:
             raise ClaudeCodeError("Claude Code session is closed")
         binary = find_claude_binary()
+        if not claude_subscription_auth_available():
+            raise ClaudeCodeError(
+                f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
+                error_code=CLAUDE_AUTH_ERROR_CODE,
+            )
         args = claude_code_args(
             model=self.model,
             session_id=self.session_id,
@@ -269,6 +332,7 @@ class ClaudeCodeSession:
         # This route must use the signed-in Max subscription. An ambient key
         # would silently turn it into metered API usage.
         env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
         process = subprocess.Popen(
             [binary, *args],
             cwd=self.cwd,
@@ -506,6 +570,13 @@ class ClaudeCodeSession:
                     continue
                 _observe_session_id(event.get("session_id"))
                 event_type = event.get("type")
+                auth_failure = _auth_failure_detail(event)
+                if auth_failure:
+                    result.prompt_acknowledged = True
+                    result.error_code = CLAUDE_AUTH_ERROR_CODE
+                    result.error = f"{auth_failure.rstrip('.')}. {CLAUDE_AUTH_REMEDIATION}"
+                    result.should_retire = True
+                    break
                 if not acknowledged and event_type in _TURN_ACK_EVENT_TYPES:
                     acknowledged = True
                     result.prompt_acknowledged = True

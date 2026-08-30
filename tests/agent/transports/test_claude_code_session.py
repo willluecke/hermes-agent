@@ -7,7 +7,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.claude_runtime import make_claude_code_event_bridge
-from agent.transports.claude_code_session import ClaudeCodeSession, claude_code_args
+from agent.transports.claude_code_session import (
+    CLAUDE_AUTH_ERROR_CODE,
+    ClaudeCodeError,
+    ClaudeCodeSession,
+    claude_code_args,
+)
 
 
 def _install_fake_process(session, process, events):
@@ -114,6 +119,9 @@ def test_error_result_confirms_session_before_returning():
         "agent.transports.claude_code_session.find_claude_binary",
         return_value="/usr/bin/claude",
     ), patch(
+        "agent.transports.claude_code_session.claude_subscription_auth_available",
+        return_value=True,
+    ), patch(
         "agent.transports.claude_code_session.subprocess.Popen",
         return_value=process,
     ):
@@ -159,6 +167,9 @@ def test_two_turns_share_one_streaming_process():
         "agent.transports.claude_code_session.find_claude_binary",
         return_value="/usr/bin/claude",
     ), patch(
+        "agent.transports.claude_code_session.claude_subscription_auth_available",
+        return_value=True,
+    ), patch(
         "agent.transports.claude_code_session.subprocess.Popen",
         return_value=process,
     ) as popen, patch(
@@ -174,6 +185,93 @@ def test_two_turns_share_one_streaming_process():
     popen.assert_called_once()
     records = [json.loads(line) for line in stdin.getvalue().splitlines()]
     assert [record["message"]["content"] for record in records] == ["one", "two"]
+
+
+def test_new_process_rejects_missing_subscription_auth_before_spawn():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5")
+
+    with patch(
+        "agent.transports.claude_code_session.find_claude_binary",
+        return_value="/usr/bin/claude",
+    ), patch(
+        "agent.transports.claude_code_session.claude_subscription_auth_available",
+        return_value=False,
+    ), patch(
+        "agent.transports.claude_code_session.subprocess.Popen",
+    ) as popen:
+        try:
+            session.run_turn("continue")
+        except ClaudeCodeError as exc:
+            assert exc.error_code == CLAUDE_AUTH_ERROR_CODE
+            assert "claude auth login --claudeai" in str(exc)
+        else:
+            raise AssertionError("missing subscription auth must fail closed")
+
+    popen.assert_not_called()
+
+
+def test_explicit_claude_oauth_override_satisfies_subscription_preflight(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "subscription-oauth-token")
+
+    with patch(
+        "agent.anthropic_adapter.read_claude_code_credentials"
+    ) as read_credentials:
+        from agent.transports.claude_code_session import (
+            claude_subscription_auth_available,
+        )
+
+        assert claude_subscription_auth_available() is True
+
+    read_credentials.assert_not_called()
+
+
+def test_auth_error_is_terminal_and_not_forwarded_as_commentary():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    forwarded = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_event=forwarded.append,
+    )
+    process = _install_fake_process(
+        session,
+        _fake_process(30001),
+        [
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "error": "authentication_failed",
+                "isApiErrorMessage": True,
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Failed to authenticate: OAuth session expired "
+                                "and could not be refreshed"
+                            ),
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+
+    with patch.object(session, "close") as close:
+        result = session.run_turn("continue")
+
+    assert process.stdin.getvalue()
+    assert result.error_code == CLAUDE_AUTH_ERROR_CODE
+    assert "OAuth session expired" in result.error
+    assert "claude auth login --claudeai" in result.error
+    assert result.should_retire is True
+    assert result.prompt_acknowledged is True
+    assert result.session_confirmed is False
+    assert result.final_text == ""
+    assert forwarded == []
+    close.assert_called_once_with()
 
 
 def test_first_event_watchdog_restarts_unacknowledged_resident_once():

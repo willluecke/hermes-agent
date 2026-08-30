@@ -4,7 +4,12 @@ from uuid import uuid4
 from unittest.mock import patch
 
 import run_agent
-from agent.transports.claude_code_session import ClaudeCodeSession, ClaudeCodeTurnResult
+from agent.transports.claude_code_session import (
+    CLAUDE_AUTH_ERROR_CODE,
+    ClaudeCodeError,
+    ClaudeCodeSession,
+    ClaudeCodeTurnResult,
+)
 from hermes_state import SessionDB
 
 
@@ -63,6 +68,25 @@ def test_claude_code_read_only_posture_reaches_native_session(monkeypatch):
         agent.run_conversation("inspect")
 
     assert observed["read_only"] is True
+
+
+def test_claude_auth_preflight_error_is_structured_and_terminal(monkeypatch):
+    def _run_turn(_session, _prompt):
+        raise ClaudeCodeError(
+            "Claude Max authentication is unavailable. Reauthenticate.",
+            error_code=CLAUDE_AUTH_ERROR_CODE,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    agent = _make_agent()
+
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        result = agent.run_conversation("continue")
+
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["error_code"] == CLAUDE_AUTH_ERROR_CODE
+    assert "Claude Max authentication is unavailable" in result["error"]
 
 
 def test_claude_watchdog_uses_configured_deadlines_and_reports_progress(monkeypatch):

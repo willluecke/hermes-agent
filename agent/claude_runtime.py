@@ -445,6 +445,7 @@ def run_claude_code_turn(
             logger.exception("Claude Code turn failed")
             turn = None
             error = str(exc)
+            error_code = getattr(exc, "error_code", None)
             try:
                 session.close()
             except Exception:
@@ -460,6 +461,7 @@ def run_claude_code_turn(
             "partial": True,
             "interrupted": False,
             "error": error,
+            **({"error_code": error_code} if error_code else {}),
             "agent_persisted": True,
         }
 
