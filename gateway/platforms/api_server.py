@@ -8265,6 +8265,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
+            elif event_type == "runtime.first_event_timeout":
+                _push({
+                    "event": "runtime.first_event_timeout",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "runtime": tool_name or "claude-code",
+                    "code": kwargs.get("code") or "claude_first_event_timeout",
+                    "attempt": int(kwargs.get("attempt") or 1),
+                    "retrying": bool(kwargs.get("retrying")),
+                    "timeout_seconds": float(kwargs.get("timeout_seconds") or 0.0),
+                    "message": redact_sensitive_text(str(preview or ""), force=True),
+                })
             elif event_type in {"subagent.start", "subagent.complete"}:
                 event = {
                     "event": event_type,
@@ -9012,6 +9024,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "error": error_msg,
                     }
+                    error_code = str(result.get("error_code") or "").strip()
+                    if error_code:
+                        failed_event["error_code"] = error_code
                     if preserved_output:
                         failed_event.update({
                             "output": preserved_output,
@@ -9022,6 +9037,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         run_id,
                         "failed",
                         error=error_msg,
+                        **({"error_code": error_code} if error_code else {}),
                         last_event="run.failed",
                         **(
                             {

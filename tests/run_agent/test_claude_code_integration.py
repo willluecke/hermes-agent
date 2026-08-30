@@ -65,6 +65,67 @@ def test_claude_code_read_only_posture_reaches_native_session(monkeypatch):
     assert observed["read_only"] is True
 
 
+def test_claude_watchdog_uses_configured_deadlines_and_reports_progress(monkeypatch):
+    observed = {}
+    progress = []
+    statuses = []
+
+    def _resolve_timeout(key, *, default, env_var=None):
+        del default, env_var
+        return {
+            "claude_code.resident_first_event": 11.0,
+            "claude_code.startup_first_event": 22.0,
+        }[key]
+
+    def _run_turn(session, prompt):
+        observed["prompt"] = prompt
+        observed["resident_timeout"] = session.resident_first_event_timeout
+        observed["startup_timeout"] = session.startup_first_event_timeout
+        session.on_watchdog_timeout(
+            {
+                "code": "claude_first_event_timeout",
+                "attempt": 1,
+                "retrying": True,
+                "timeout_seconds": 11.0,
+                "session_id": session.session_id,
+            }
+        )
+        return ClaudeCodeTurnResult(final_text="recovered", watchdog_retries=1)
+
+    monkeypatch.setattr("agent.deadline.resolve_timeout", _resolve_timeout)
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    agent = _make_agent()
+    agent.tool_progress_callback = lambda *args, **kwargs: progress.append(
+        (args, kwargs)
+    )
+    agent.status_callback = lambda *args: statuses.append(args)
+
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        result = agent.run_conversation("repair")
+
+    assert result["completed"] is True
+    assert result["watchdog_retries"] == 1
+    assert observed == {
+        "prompt": "repair",
+        "resident_timeout": 11.0,
+        "startup_timeout": 22.0,
+    }
+    assert progress[0][0][:3] == (
+        "runtime.first_event_timeout",
+        "claude-code",
+        "Claude did not acknowledge the turn within 11 seconds—resetting the runtime "
+        "and retrying once.",
+    )
+    assert progress[0][1]["code"] == "claude_first_event_timeout"
+    assert statuses == [
+        (
+            "lifecycle",
+            "Claude did not acknowledge the turn within 11 seconds—resetting the "
+            "runtime and retrying once.",
+        )
+    ]
+
+
 def test_new_hermes_parent_resumes_same_claude_session(monkeypatch):
     calls = []
 

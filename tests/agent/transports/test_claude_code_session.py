@@ -2,11 +2,29 @@ from __future__ import annotations
 
 import io
 import json
+import queue
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.claude_runtime import make_claude_code_event_bridge
 from agent.transports.claude_code_session import ClaudeCodeSession, claude_code_args
+
+
+def _install_fake_process(session, process, events):
+    output = queue.Queue()
+    for event in events:
+        output.put(json.dumps(event) + "\n")
+    session._process = process
+    session._output_queue = output
+    return process
+
+
+def _fake_process(pid):
+    return SimpleNamespace(
+        pid=pid,
+        stdin=io.StringIO(),
+        poll=lambda: None,
+    )
 
 
 def test_invocation_uses_subscription_model_and_hermes_mcp(tmp_path):
@@ -156,6 +174,137 @@ def test_two_turns_share_one_streaming_process():
     popen.assert_called_once()
     records = [json.loads(line) for line in stdin.getvalue().splitlines()]
     assert [record["message"]["content"] for record in records] == ["one", "two"]
+
+
+def test_first_event_watchdog_restarts_unacknowledged_resident_once():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    watchdog_events = []
+    confirmed = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_session_id=confirmed.append,
+        on_watchdog_timeout=watchdog_events.append,
+        resident_first_event_timeout=0.03,
+        startup_first_event_timeout=0.2,
+        inactivity_timeout=1.0,
+    )
+    stalled = _install_fake_process(
+        session,
+        _fake_process(31001),
+        [
+            {
+                "type": "system",
+                "subtype": "init",
+                "session_id": session_id,
+            }
+        ],
+    )
+    healthy = _fake_process(31002)
+
+    def _retire(process, *, grace_seconds=5.0):
+        assert grace_seconds > 0
+        if session._process is process:
+            session._process = None
+        return True
+
+    def _restart():
+        return _install_fake_process(
+            session,
+            healthy,
+            [
+                {
+                    "type": "user",
+                    "session_id": session_id,
+                    "message": {"role": "user", "content": "repair"},
+                },
+                {
+                    "type": "result",
+                    "session_id": session_id,
+                    "result": "recovered",
+                },
+            ],
+        )
+
+    with patch.object(session, "_retire_process", side_effect=_retire), patch.object(
+        session, "_start_process", side_effect=_restart
+    ) as start_process:
+        result = session.run_turn("repair")
+
+    assert result.final_text == "recovered"
+    assert result.prompt_acknowledged is True
+    assert result.watchdog_retries == 1
+    assert result.error_code is None
+    assert confirmed == [session_id]
+    assert watchdog_events == [
+        {
+            "code": "claude_first_event_timeout",
+            "attempt": 1,
+            "retrying": True,
+            "timeout_seconds": 0.03,
+            "session_id": session_id,
+        }
+    ]
+    start_process.assert_called_once_with()
+    assert json.loads(stalled.stdin.getvalue())["message"]["content"] == "repair"
+    assert json.loads(healthy.stdin.getvalue())["message"]["content"] == "repair"
+
+
+def test_first_event_watchdog_fails_after_one_fresh_process_retry():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    watchdog_events = []
+    confirmed = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_session_id=confirmed.append,
+        on_watchdog_timeout=watchdog_events.append,
+        resident_first_event_timeout=0.03,
+        startup_first_event_timeout=0.03,
+        inactivity_timeout=1.0,
+    )
+    stalled = _install_fake_process(session, _fake_process(32001), [])
+    retry = _fake_process(32002)
+
+    def _retire(process, *, grace_seconds=5.0):
+        assert grace_seconds > 0
+        if session._process is process:
+            session._process = None
+        return True
+
+    def _restart():
+        return _install_fake_process(
+            session,
+            retry,
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": session_id,
+                }
+            ],
+        )
+
+    with patch.object(session, "_retire_process", side_effect=_retire), patch.object(
+        session, "_start_process", side_effect=_restart
+    ):
+        result = session.run_turn("repair")
+
+    assert result.final_text == ""
+    assert result.error_code == "claude_first_event_timeout"
+    assert result.should_retire is True
+    assert result.prompt_acknowledged is False
+    assert result.session_confirmed is False
+    assert result.watchdog_retries == 1
+    assert confirmed == []
+    assert [event["retrying"] for event in watchdog_events] == [True, False]
+    assert [event["attempt"] for event in watchdog_events] == [1, 2]
+    assert json.loads(stalled.stdin.getvalue())["message"]["content"] == "repair"
+    assert json.loads(retry.stdin.getvalue())["message"]["content"] == "repair"
 
 
 def test_event_bridge_keeps_commentary_tool_and_final_channels_separate():

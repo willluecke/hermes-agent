@@ -285,8 +285,13 @@ def run_claude_code_turn(
 ) -> dict[str, Any]:
     """Run one Claude subscription turn and return the standard agent result."""
     del effective_task_id, should_review_memory
+    from agent.deadline import resolve_timeout
     from agent.runtime_cwd import resolve_agent_cwd
-    from agent.transports.claude_code_session import ClaudeCodeSession
+    from agent.transports.claude_code_session import (
+        DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT,
+        DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT,
+        ClaudeCodeSession,
+    )
 
     cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
     cwd = _normalized_cwd(cwd)
@@ -320,6 +325,14 @@ def run_claude_code_turn(
         )
     model = str(getattr(agent, "model", "") or "claude-fable-5")
     effort = _claude_code_effort(getattr(agent, "reasoning_config", None))
+    resident_first_event_timeout = resolve_timeout(
+        "claude_code.resident_first_event",
+        default=DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT,
+    )
+    startup_first_event_timeout = resolve_timeout(
+        "claude_code.startup_first_event",
+        default=DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT,
+    )
     session = getattr(agent, "_claude_code_session", None)
     resident_continuity = bool(
         session is not None
@@ -366,6 +379,41 @@ def run_claude_code_turn(
                 messages=messages,
             )
 
+        def _watchdog_timeout(payload: dict[str, Any]) -> None:
+            retrying = bool(payload.get("retrying"))
+            timeout = float(payload.get("timeout_seconds") or 0.0)
+            message = (
+                f"Claude did not acknowledge the turn within {timeout:g} seconds—"
+                "resetting the runtime and retrying once."
+                if retrying
+                else "Claude did not acknowledge the turn after the runtime reset; "
+                "ending this run."
+            )
+            progress = getattr(agent, "tool_progress_callback", None)
+            if progress is not None:
+                try:
+                    progress(
+                        "runtime.first_event_timeout",
+                        "claude-code",
+                        message,
+                        None,
+                        **payload,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Claude Code watchdog progress callback failed",
+                        exc_info=True,
+                    )
+            emit_status = getattr(agent, "_emit_status", None)
+            if emit_status is not None:
+                try:
+                    emit_status(message)
+                except Exception:
+                    logger.debug(
+                        "Claude Code watchdog status callback failed",
+                        exc_info=True,
+                    )
+
         if session is None:
             session = ClaudeCodeSession(
                 cwd=cwd,
@@ -377,6 +425,9 @@ def run_claude_code_turn(
                 read_only=read_only,
                 on_event=make_claude_code_event_bridge(agent),
                 on_session_id=_remember_confirmed_session,
+                on_watchdog_timeout=_watchdog_timeout,
+                resident_first_event_timeout=resident_first_event_timeout,
+                startup_first_event_timeout=startup_first_event_timeout,
             )
             session.history_fingerprint = prior_fingerprint
             agent._claude_code_session = session
@@ -385,6 +436,9 @@ def run_claude_code_turn(
             # is per conversation. Rebind them before sending the next message.
             session.on_event = make_claude_code_event_bridge(agent)
             session.on_session_id = _remember_confirmed_session
+            session.on_watchdog_timeout = _watchdog_timeout
+            session.resident_first_event_timeout = resident_first_event_timeout
+            session.startup_first_event_timeout = startup_first_event_timeout
         try:
             turn = session.run_turn(prompt)
         except Exception as exc:
@@ -470,6 +524,12 @@ def run_claude_code_turn(
         "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
         "error": turn.error,
+        **({"error_code": turn.error_code} if turn.error_code else {}),
+        **(
+            {"watchdog_retries": turn.watchdog_retries}
+            if turn.watchdog_retries
+            else {}
+        ),
         "agent_persisted": True,
         "claude_session_id": turn.session_id,
         "input_tokens": input_tokens,

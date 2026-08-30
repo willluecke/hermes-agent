@@ -1297,6 +1297,7 @@ class TestRunEvents:
                     "completed": False,
                     "partial": True,
                     "error": "turn timed out after 600s",
+                    "error_code": "claude_first_event_timeout",
                 }
                 mock_agent.session_prompt_tokens = 10
                 mock_agent.session_completion_tokens = 5
@@ -1307,9 +1308,12 @@ class TestRunEvents:
                 run_id = (await resp.json())["run_id"]
                 events_resp = await cli.get(f"/v1/runs/{run_id}/events")
                 body = await events_resp.text()
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
 
         assert '"event": "run.failed"' in body
         assert "turn timed out after 600s" in body
+        assert '"error_code": "claude_first_event_timeout"' in body
+        assert status["error_code"] == "claude_first_event_timeout"
         assert '"event": "run.completed"' not in body
 
     @pytest.mark.asyncio
@@ -1696,6 +1700,58 @@ class TestRunToolEventIdentity:
             return mock_agent
 
         return create_agent
+
+    @pytest.mark.asyncio
+    async def test_runtime_first_event_timeout_is_durable_and_structured(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb(
+                "runtime.first_event_timeout",
+                "claude-code",
+                "Claude did not acknowledge; resetting the runtime.",
+                None,
+                code="claude_first_event_timeout",
+                attempt=1,
+                retrying=True,
+                timeout_seconds=30.0,
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+
+        events = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        watchdog = next(
+            event
+            for event in events
+            if event.get("event") == "runtime.first_event_timeout"
+        )
+        assert watchdog == {
+            "event": "runtime.first_event_timeout",
+            "run_id": run_id,
+            "timestamp": watchdog["timestamp"],
+            "runtime": "claude-code",
+            "code": "claude_first_event_timeout",
+            "attempt": 1,
+            "retrying": True,
+            "timeout_seconds": 30.0,
+            "message": "Claude did not acknowledge; resetting the runtime.",
+        }
 
     @pytest.mark.asyncio
     async def test_tool_events_carry_stable_ids_and_output(self, adapter):

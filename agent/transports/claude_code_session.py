@@ -27,6 +27,10 @@ from uuid import uuid4
 
 DEFAULT_INACTIVITY_TIMEOUT = 10 * 60.0
 DEFAULT_ABSOLUTE_TIMEOUT = 2 * 60 * 60.0
+DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT = 30.0
+DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT = 60.0
+
+_TURN_ACK_EVENT_TYPES = frozenset({"user", "assistant", "stream_event", "result"})
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +47,11 @@ class ClaudeCodeTurnResult:
     tool_iterations: int = 0
     interrupted: bool = False
     error: Optional[str] = None
+    error_code: Optional[str] = None
     should_retire: bool = False
     session_confirmed: bool = False
+    prompt_acknowledged: bool = False
+    watchdog_retries: int = 0
 
 
 def find_claude_binary() -> str:
@@ -137,8 +144,11 @@ class ClaudeCodeSession:
         read_only: bool = False,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
+        on_watchdog_timeout: Optional[Callable[[dict[str, Any]], None]] = None,
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
         absolute_timeout: float = DEFAULT_ABSOLUTE_TIMEOUT,
+        resident_first_event_timeout: Optional[float] = DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT,
+        startup_first_event_timeout: Optional[float] = DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT,
     ) -> None:
         self.cwd = cwd
         self.model = model
@@ -150,8 +160,11 @@ class ClaudeCodeSession:
         self.read_only = bool(read_only)
         self.on_event = on_event
         self.on_session_id = on_session_id
+        self.on_watchdog_timeout = on_watchdog_timeout
         self.inactivity_timeout = inactivity_timeout
         self.absolute_timeout = absolute_timeout
+        self.resident_first_event_timeout = resident_first_event_timeout
+        self.startup_first_event_timeout = startup_first_event_timeout
         self._interrupt = threading.Event()
         self._process: Optional[subprocess.Popen[str]] = None
         self._output_queue: queue.Queue[Optional[str]] = queue.Queue()
@@ -198,18 +211,34 @@ class ClaudeCodeSession:
         with self._lifecycle_lock:
             self._closed = True
             process = self._process
-            if process is None:
-                return
+        if process is not None:
+            self._retire_process(process)
+
+    def _retire_process(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        grace_seconds: float = 5.0,
+    ) -> bool:
+        """Stop and reap one CLI process without closing the durable session."""
+        with self._lifecycle_lock:
+            if self._process is not process:
+                return True
+            reaped = False
             self._terminate_process(signal.SIGTERM)
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=grace_seconds)
+                reaped = True
             except subprocess.TimeoutExpired:
                 self._terminate_process(signal.SIGKILL)
                 try:
-                    process.wait(timeout=5)
+                    process.wait(timeout=grace_seconds)
+                    reaped = True
                 except subprocess.TimeoutExpired:
                     pass
-            self._process = None
+            if reaped and self._process is process:
+                self._process = None
+            return reaped
 
     def _terminate_process(self, sig: signal.Signals) -> None:
         process = self._process
@@ -255,19 +284,21 @@ class ClaudeCodeSession:
         assert process.stdout is not None
         assert process.stderr is not None
         self._process = process
-        self._output_queue = queue.Queue()
-        self._stderr_tail.clear()
+        output_queue: queue.Queue[Optional[str]] = queue.Queue()
+        stderr_tail: deque[str] = deque(maxlen=40)
+        self._output_queue = output_queue
+        self._stderr_tail = stderr_tail
 
         def _read_stdout() -> None:
             try:
                 for line in process.stdout:
-                    self._output_queue.put(line)
+                    output_queue.put(line)
             finally:
-                self._output_queue.put(None)
+                output_queue.put(None)
 
         def _read_stderr() -> None:
             for line in process.stderr:
-                self._stderr_tail.append(line.rstrip())
+                stderr_tail.append(line.rstrip())
 
         threading.Thread(
             target=_read_stdout,
@@ -305,20 +336,26 @@ class ClaudeCodeSession:
     def run_turn(self, prompt: str) -> ClaudeCodeTurnResult:
         with self._turn_lock:
             self._interrupt.clear()
+            resident_candidate = self._process if self.is_alive() else None
             process = self._ensure_process()
-            assert process.stdin is not None
-            try:
-                process.stdin.write(self._user_record(prompt) + "\n")
-                process.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                self._process = None
-                raise ClaudeCodeError("Claude Code input stream closed") from exc
-
-            started_at = last_activity = time.monotonic()
+            resident_process = process is resident_candidate
+            started_at = time.monotonic()
             result = ClaudeCodeTurnResult(session_id=self.session_id)
             reported_session_ids: set[str] = set()
+            attempt = 0
+            acknowledged = False
 
-            def _confirm_session_id(value: Any) -> None:
+            def _write_prompt(target: subprocess.Popen[str]) -> None:
+                assert target.stdin is not None
+                try:
+                    target.stdin.write(self._user_record(prompt) + "\n")
+                    target.stdin.flush()
+                except (BrokenPipeError, OSError) as exc:
+                    if self._process is target:
+                        self._process = None
+                    raise ClaudeCodeError("Claude Code input stream closed") from exc
+
+            def _observe_session_id(value: Any) -> None:
                 confirmed_id = str(value or "").strip()
                 if not confirmed_id:
                     return
@@ -326,6 +363,11 @@ class ClaudeCodeSession:
                 self._confirmed = True
                 self.resume = True
                 result.session_id = confirmed_id
+
+            def _publish_session_id() -> None:
+                confirmed_id = str(result.session_id or self.session_id or "").strip()
+                if not confirmed_id:
+                    return
                 result.session_confirmed = True
                 if confirmed_id in reported_session_ids:
                     return
@@ -338,6 +380,48 @@ class ClaudeCodeSession:
                             "Claude Code session-id callback failed", exc_info=True
                         )
 
+            def _notify_watchdog(*, timeout: float, retrying: bool) -> None:
+                payload = {
+                    "code": "claude_first_event_timeout",
+                    "attempt": attempt + 1,
+                    "retrying": retrying,
+                    "timeout_seconds": timeout,
+                    "session_id": result.session_id,
+                }
+                logger.warning(
+                    "Claude Code first-event watchdog expired: "
+                    "attempt=%d retrying=%s timeout_seconds=%.1f session=%s pid=%s",
+                    attempt + 1,
+                    retrying,
+                    timeout,
+                    result.session_id,
+                    process.pid,
+                )
+                if self.on_watchdog_timeout is not None:
+                    try:
+                        self.on_watchdog_timeout(payload)
+                    except Exception:
+                        logger.warning(
+                            "Claude Code watchdog callback failed", exc_info=True
+                        )
+
+            def _dispatch(target: subprocess.Popen[str], *, resident: bool) -> tuple[float, float, Optional[float]]:
+                nonlocal process, acknowledged
+                process = target
+                acknowledged = False
+                _write_prompt(target)
+                dispatched_at = time.monotonic()
+                timeout = (
+                    self.resident_first_event_timeout
+                    if resident
+                    else self.startup_first_event_timeout
+                )
+                return dispatched_at, dispatched_at, timeout
+
+            attempt_started_at, last_activity, first_event_timeout = _dispatch(
+                process, resident=resident_process
+            )
+
             while True:
                 if self._interrupt.is_set():
                     result.interrupted = True
@@ -348,13 +432,64 @@ class ClaudeCodeSession:
                     result.error = "Claude Code exceeded the two-hour turn limit"
                     result.should_retire = True
                     break
-                if now - last_activity > self.inactivity_timeout:
-                    result.error = "Claude Code produced no activity for ten minutes"
-                    result.should_retire = True
-                    break
+                wait_timeout = 0.5
+                if first_event_timeout is not None and not acknowledged:
+                    wait_timeout = min(
+                        wait_timeout,
+                        max(0.01, first_event_timeout - (now - attempt_started_at)),
+                    )
+                wait_timeout = min(
+                    wait_timeout,
+                    max(0.01, self.inactivity_timeout - (now - last_activity)),
+                )
                 try:
-                    line = self._output_queue.get(timeout=0.5)
+                    line = self._output_queue.get(timeout=wait_timeout)
                 except queue.Empty:
+                    now = time.monotonic()
+                    if (
+                        first_event_timeout is not None
+                        and not acknowledged
+                        and now - attempt_started_at >= first_event_timeout
+                    ):
+                        retrying = attempt == 0
+                        _notify_watchdog(
+                            timeout=first_event_timeout,
+                            retrying=retrying,
+                        )
+                        if not retrying:
+                            result.error_code = "claude_first_event_timeout"
+                            result.error = (
+                                "Claude Code did not acknowledge the turn after "
+                                "the runtime was reset"
+                            )
+                            result.should_retire = True
+                            break
+                        reaped = self._retire_process(
+                            process, grace_seconds=2.0
+                        )
+                        if not reaped:
+                            result.error_code = "claude_runtime_reap_timeout"
+                            result.error = (
+                                "Claude Code did not acknowledge the turn and its "
+                                "stalled runtime could not be stopped safely"
+                            )
+                            result.should_retire = True
+                            break
+                        if self._interrupt.is_set():
+                            result.interrupted = True
+                            result.should_retire = True
+                            break
+                        attempt += 1
+                        result.watchdog_retries += 1
+                        process = self._start_process()
+                        attempt_started_at, last_activity, first_event_timeout = _dispatch(
+                            process, resident=False
+                        )
+                        continue
+                    if now - last_activity >= self.inactivity_timeout:
+                        result.error = "Claude Code produced no activity for ten minutes"
+                        result.should_retire = True
+                        break
                     continue
                 if line is None:
                     code = process.poll()
@@ -369,19 +504,25 @@ class ClaudeCodeSession:
                     continue
                 if not isinstance(event, dict):
                     continue
-                _confirm_session_id(event.get("session_id"))
+                _observe_session_id(event.get("session_id"))
+                event_type = event.get("type")
+                if not acknowledged and event_type in _TURN_ACK_EVENT_TYPES:
+                    acknowledged = True
+                    result.prompt_acknowledged = True
+                    _publish_session_id()
                 if self.on_event is not None:
                     self.on_event(event)
-                if event.get("type") == "user":
+                if event_type == "user":
                     result.tool_iterations += sum(
                         1
                         for block in ((event.get("message") or {}).get("content") or [])
                         if isinstance(block, dict) and block.get("type") == "tool_result"
                     )
-                if event.get("type") != "result":
+                if event_type != "result":
                     continue
                 result.final_text = str(event.get("result") or "").strip()
-                _confirm_session_id(event.get("session_id"))
+                _observe_session_id(event.get("session_id"))
+                _publish_session_id()
                 result.usage = dict(event.get("usage") or {})
                 if event.get("is_error"):
                     result.error = result.final_text or "Claude Code returned an error"
