@@ -122,6 +122,31 @@ def _auth_failure_detail(event: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _merge_usage(
+    accumulated: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    """Combine usage from multiple autonomous Claude result boundaries."""
+    if not accumulated:
+        return dict(current)
+    merged = dict(accumulated)
+    for key, value in current.items():
+        previous = merged.get(key)
+        if (
+            isinstance(previous, (int, float))
+            and not isinstance(previous, bool)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ):
+            merged[key] = previous + value
+        elif isinstance(previous, dict) and isinstance(value, dict):
+            merged[key] = _merge_usage(previous, value)
+        elif isinstance(previous, list) and isinstance(value, list):
+            merged[key] = [*previous, *value]
+        else:
+            merged[key] = value
+    return merged
+
+
 def claude_code_args(
     *,
     model: str,
@@ -408,6 +433,9 @@ class ClaudeCodeSession:
             reported_session_ids: set[str] = set()
             attempt = 0
             acknowledged = False
+            scheduled_wakeup_tool_ids: set[str] = set()
+            scheduled_wakeup_ready = False
+            waiting_for_scheduled_wakeup = False
 
             def _write_prompt(target: subprocess.Popen[str]) -> None:
                 assert target.stdin is not None
@@ -502,10 +530,11 @@ class ClaudeCodeSession:
                         wait_timeout,
                         max(0.01, first_event_timeout - (now - attempt_started_at)),
                     )
-                wait_timeout = min(
-                    wait_timeout,
-                    max(0.01, self.inactivity_timeout - (now - last_activity)),
-                )
+                if not waiting_for_scheduled_wakeup:
+                    wait_timeout = min(
+                        wait_timeout,
+                        max(0.01, self.inactivity_timeout - (now - last_activity)),
+                    )
                 try:
                     line = self._output_queue.get(timeout=wait_timeout)
                 except queue.Empty:
@@ -550,7 +579,10 @@ class ClaudeCodeSession:
                             process, resident=False
                         )
                         continue
-                    if now - last_activity >= self.inactivity_timeout:
+                    if (
+                        not waiting_for_scheduled_wakeup
+                        and now - last_activity >= self.inactivity_timeout
+                    ):
                         result.error = "Claude Code produced no activity for ten minutes"
                         result.should_retire = True
                         break
@@ -583,24 +615,64 @@ class ClaudeCodeSession:
                     _publish_session_id()
                 if self.on_event is not None:
                     self.on_event(event)
+                message = (
+                    event.get("message")
+                    if isinstance(event.get("message"), dict)
+                    else {}
+                )
+                blocks = message.get("content") or []
+                if not isinstance(blocks, list):
+                    blocks = []
+                if event_type == "assistant":
+                    for block in blocks:
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and str(block.get("name") or "").casefold()
+                            == "schedulewakeup"
+                        ):
+                            tool_use_id = str(block.get("id") or "").strip()
+                            if tool_use_id:
+                                scheduled_wakeup_tool_ids.add(tool_use_id)
                 if event_type == "user":
-                    result.tool_iterations += sum(
-                        1
-                        for block in ((event.get("message") or {}).get("content") or [])
-                        if isinstance(block, dict) and block.get("type") == "tool_result"
-                    )
+                    for block in blocks:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        result.tool_iterations += 1
+                        tool_use_id = str(block.get("tool_use_id") or "").strip()
+                        if tool_use_id not in scheduled_wakeup_tool_ids:
+                            continue
+                        scheduled_wakeup_tool_ids.discard(tool_use_id)
+                        if not block.get("is_error"):
+                            scheduled_wakeup_ready = True
                 if event_type != "result":
                     continue
                 result.final_text = str(event.get("result") or "").strip()
                 _observe_session_id(event.get("session_id"))
                 _publish_session_id()
-                result.usage = dict(event.get("usage") or {})
+                result.usage = _merge_usage(
+                    result.usage, dict(event.get("usage") or {})
+                )
                 if event.get("is_error"):
                     result.error = result.final_text or "Claude Code returned an error"
+                if result.error or result.final_text:
+                    break
+                if scheduled_wakeup_ready or waiting_for_scheduled_wakeup:
+                    if not waiting_for_scheduled_wakeup:
+                        logger.info(
+                            "Claude Code scheduled an autonomous continuation; "
+                            "keeping the current Hermes turn open: session=%s pid=%s",
+                            result.session_id,
+                            process.pid,
+                        )
+                    scheduled_wakeup_ready = False
+                    waiting_for_scheduled_wakeup = True
+                    continue
                 break
 
-            if result.should_retire:
-                self.close()
             if not result.final_text and not result.error and not result.interrupted:
                 result.error = "Claude Code completed without an authoritative final answer"
+                result.should_retire = True
+            if result.should_retire:
+                self.close()
             return result

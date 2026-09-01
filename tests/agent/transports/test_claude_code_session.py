@@ -4,6 +4,7 @@ import io
 import json
 import queue
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 from agent.claude_runtime import make_claude_code_event_bridge
@@ -185,6 +186,139 @@ def test_two_turns_share_one_streaming_process():
     popen.assert_called_once()
     records = [json.loads(line) for line in stdin.getvalue().splitlines()]
     assert [record["message"]["content"] for record in records] == ["one", "two"]
+
+
+def test_scheduled_wakeup_keeps_same_turn_open_until_authoritative_result():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    forwarded = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_event=forwarded.append,
+        inactivity_timeout=0.0,
+    )
+    process = _install_fake_process(
+        session,
+        _fake_process(20001),
+        [
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_wakeup",
+                            "name": "ScheduleWakeup",
+                            "input": {"delaySeconds": 1200},
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_wakeup",
+                            "content": (
+                                "Next wakeup scheduled. Nothing more to do this turn — "
+                                "the harness re-invokes you when a task-notification arrives."
+                            ),
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+            {
+                "type": "system",
+                "subtype": "task_notification",
+                "session_id": session_id,
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "",
+                "origin": {"kind": "task-notification"},
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {"content": [{"type": "text", "text": "Resuming."}]},
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "Implemented the missing pieces.",
+                "usage": {"input_tokens": 30, "output_tokens": 40},
+            },
+        ],
+    )
+    queued_output = session._output_queue
+
+    class _DeferredGapQueue:
+        calls = 0
+
+        def get(self, timeout):
+            del timeout
+            if self.calls == 3:
+                self.calls += 1
+                raise queue.Empty
+            self.calls += 1
+            return queued_output.get_nowait()
+
+    session._output_queue = cast(queue.Queue[str | None], _DeferredGapQueue())
+
+    result = session.run_turn("Continue")
+
+    assert process.stdin.getvalue()
+    assert result.final_text == "Implemented the missing pieces."
+    assert result.error is None
+    assert result.should_retire is False
+    assert result.usage["input_tokens"] == 40
+    assert result.usage["output_tokens"] == 60
+    assert [event["type"] for event in forwarded] == [
+        "assistant",
+        "user",
+        "result",
+        "system",
+        "result",
+        "assistant",
+        "result",
+    ]
+
+
+def test_empty_result_without_scheduled_wakeup_fails_closed():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+    )
+    _install_fake_process(
+        session,
+        _fake_process(20002),
+        [{"type": "result", "session_id": session_id, "result": ""}],
+    )
+
+    with patch.object(session, "close") as close:
+        result = session.run_turn("Continue")
+
+    assert result.final_text == ""
+    assert result.error == "Claude Code completed without an authoritative final answer"
+    assert result.should_retire is True
+    close.assert_called_once_with()
 
 
 def test_new_process_rejects_missing_subscription_auth_before_spawn():
