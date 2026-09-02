@@ -1120,11 +1120,10 @@ PLATFORM_HINTS = {
         "brief and natural. "
         "File/media delivery: images referenced as MEDIA:/absolute/path tags "
         "(.png/.jpg/.jpeg/.gif/.webp/.bmp, up to 5MB) are inlined as base64 data "
-        "URLs in responses on the chat, completions, and responses endpoints. "
-        "Non-image files are NOT intercepted anywhere, and the runs endpoint "
-        "intercepts nothing — a MEDIA: tag there renders as literal text exposing "
-        "a raw host filesystem path. For those cases, state the plain file path "
-        "in your response text instead of a MEDIA: tag."
+        "URLs on every OpenAI-compatible endpoint, including /v1/runs. Always use "
+        "MEDIA: for an image the user needs to see; never return a local image path "
+        "or claim an image is attached without its MEDIA: tag. Non-image files are "
+        "not transferred by the API server, so state their plain file path instead."
     ),
     "webui": (
         "You are in the Hermes WebUI, a browser-based chat interface. "

@@ -1354,15 +1354,25 @@ _MEDIA_MIME = {
     ".bmp": "image/bmp",
 }
 _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
+_LOCAL_IMAGE_MARKDOWN_RE = re.compile(
+    r"!?\[(?P<label>[^\]\r\n]{0,500})\]\("
+    r"(?P<angle><)?(?P<path>(?:~/|/|[A-Za-z]:[/\\])"
+    r"[^)\r\n>]{1,4096}\.(?:png|jpg|jpeg|gif|webp|bmp))"
+    r"(?(angle)>)\)",
+    re.IGNORECASE,
+)
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
-    """Replace ``MEDIA:<path>`` image tags with inline base64 data URLs.
+    """Replace local-image delivery references with inline base64 data URLs.
 
     Remote OpenAI-compatible frontends can't read local file paths, so
     ``MEDIA:`` tags referencing images on the server are useless to them.
-    Inline small local images as markdown data URLs; non-image or unreadable
-    paths are left untouched.
+    Inline small local images as markdown data URLs. Also recover Markdown
+    links to local images: models sometimes render ``[label](/tmp/shot.png)``
+    even after being instructed to use ``MEDIA:``, and those links otherwise
+    become guaranteed 404s in a remote browser. Non-image, unreadable, and
+    unsafe paths are left untouched.
 
     Uses the same anchored ``MEDIA_TAG_CLEANUP_RE`` matcher and
     ``validate_media_delivery_path`` safety check every other platform
@@ -1375,11 +1385,11 @@ def _resolve_media_to_data_urls(text: str) -> str:
     process could see was base64-exfiltrated to the API caller if its path
     merely appeared in the model's own final reply text.
     """
-    if not text or "MEDIA:" not in text:
+    if not text:
         return text
     import base64
 
-    def _to_data_url(path_str: str) -> Optional[str]:
+    def _read_data_url(path_str: str) -> Optional[str]:
         # validate_media_delivery_path() strips wrapping quotes/backticks
         # and trailing punctuation internally, same as MEDIA_TAG_CLEANUP_RE's
         # other callers (extract_media / _strip_media_tag_directives) rely on.
@@ -1396,13 +1406,26 @@ def _resolve_media_to_data_urls(text: str) -> str:
             b64 = base64.b64encode(p.read_bytes()).decode()
         except OSError:
             return None
-        return f"![image](data:{_MEDIA_MIME[suffix]};base64,{b64})"
+        return f"data:{_MEDIA_MIME[suffix]};base64,{b64}"
 
-    def _repl(m: "re.Match[str]") -> str:
-        return _to_data_url(m.group("path")) or m.group(0)
+    def _media_repl(m: "re.Match[str]") -> str:
+        data_url = _read_data_url(m.group("path"))
+        return f"![image]({data_url})" if data_url else m.group(0)
+
+    def _markdown_repl(m: "re.Match[str]") -> str:
+        data_url = _read_data_url(m.group("path"))
+        if not data_url:
+            return m.group(0)
+        label = m.group("label").replace("[", "").replace("]", "").strip()
+        return f"![{label or 'image'}]({data_url})"
 
     try:
-        return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
+        resolved = (
+            MEDIA_TAG_CLEANUP_RE.sub(_media_repl, text)
+            if "MEDIA:" in text
+            else text
+        )
+        return _LOCAL_IMAGE_MARKDOWN_RE.sub(_markdown_repl, resolved)
     except Exception:
         return text
 

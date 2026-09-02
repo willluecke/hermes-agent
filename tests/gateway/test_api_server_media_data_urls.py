@@ -42,12 +42,28 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         out = _resolve_media_to_data_urls(f"See `MEDIA:{p}` above")
         self.assertIn("data:image/png;base64,", out)
 
+    def test_local_markdown_link_inlined_as_image(self):
+        p = self._write_png()
+        out = _resolve_media_to_data_urls(f"[Shop owner controls]({p})")
+        self.assertIn("![Shop owner controls](data:image/png;base64,", out)
+        self.assertNotIn(str(p), out)
+
+    def test_angle_wrapped_local_markdown_image_inlined(self):
+        p = self._write_png("hermes media test ")
+        out = _resolve_media_to_data_urls(f"![Owner view](<{p}>)")
+        self.assertIn("![Owner view](data:image/png;base64,", out)
+        self.assertNotIn(str(p), out)
+
     def test_missing_file_left_untouched(self):
         text = "MEDIA:/nonexistent/path/shot.png"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
 
     def test_non_image_left_untouched(self):
         text = "MEDIA:/tmp/archive.zip"
+        self.assertEqual(_resolve_media_to_data_urls(text), text)
+
+    def test_non_image_markdown_link_left_untouched(self):
+        text = "[Download](/tmp/archive.zip)"
         self.assertEqual(_resolve_media_to_data_urls(text), text)
 
 
