@@ -1361,6 +1361,103 @@ _LOCAL_IMAGE_MARKDOWN_RE = re.compile(
     r"(?(angle)>)\)",
     re.IGNORECASE,
 )
+_REMOTE_OR_INLINE_IMAGE_MARKDOWN_RE = re.compile(
+    r"!\[[^\]\r\n]{0,500}\]\(\s*(?:data:image/|https?://)",
+    re.IGNORECASE,
+)
+_VISUAL_DELIVERY_REQUEST_RE = re.compile(
+    r"(?:"
+    r"\b(?:show|send|attach|display|include|share|give)\b.{0,160}"
+    r"\b(?:screenshot|screen|image|picture|photo|render|preview|view|page|catalog)\b"
+    r"|\b(?:screenshot|screen|image|picture|photo|render|preview)\b.{0,160}"
+    r"\b(?:show|send|attach|display|include|share|give|again|through)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+_REATTACHED_IMAGE_NOTE_RE = re.compile(
+    r"\n?\(Re-attached for reference[^\n]*\)\n?(?:\[screenshot\])?",
+    re.IGNORECASE,
+)
+_CODEX_IMAGE_VIEW_PREFIX = "[codex imageView] "
+
+
+def _promote_current_run_codex_image_view(
+    text: str,
+    *,
+    user_message: Any,
+    messages: Any,
+    run_started_at: float,
+) -> str:
+    """Append a newly-created Codex ``imageView`` artifact when delivery was requested.
+
+    Codex app-server records its native image inspection as an opaque transcript
+    row instead of a normal tool result. That means a model can create and
+    inspect the requested screenshot, then truthfully describe it in its final
+    answer while omitting the separate ``MEDIA:`` carrier. Remote ``/v1/runs``
+    clients consequently receive text only.
+
+    This is deliberately a narrow fallback rather than a general local-file
+    scraper. It requires all of the following:
+
+    * the current user turn explicitly asks to see/send a visual;
+    * the final answer has no existing image-delivery reference;
+    * Codex emitted a real ``imageView`` transcript item;
+    * the referenced raster file is safe, bounded, and was created or modified
+      during this run.
+
+    Only the most recently viewed qualifying image is promoted. Agents that
+    intend to deliver multiple images must still use explicit ``MEDIA:`` tags.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text
+    if "MEDIA:" in text or _REMOTE_OR_INLINE_IMAGE_MARKDOWN_RE.search(text):
+        return text
+
+    request_text = _REATTACHED_IMAGE_NOTE_RE.sub("", str(user_message or ""))
+    if not _VISUAL_DELIVERY_REQUEST_RE.search(request_text):
+        return text
+    if not isinstance(messages, list):
+        return text
+
+    newest_path: Optional[str] = None
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.startswith(
+            _CODEX_IMAGE_VIEW_PREFIX
+        ):
+            continue
+        try:
+            payload = json.loads(content[len(_CODEX_IMAGE_VIEW_PREFIX) :])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "imageView":
+            continue
+        raw_path = payload.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        safe_path = validate_media_delivery_path(raw_path)
+        if not safe_path:
+            continue
+        path = Path(safe_path)
+        if path.suffix.lower() not in _MEDIA_IMG_EXT:
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if (
+            stat.st_size <= 0
+            or stat.st_size > _MEDIA_DATA_URL_MAX_BYTES
+            or stat.st_mtime < run_started_at - 2.0
+        ):
+            continue
+        newest_path = str(path)
+
+    if newest_path is None:
+        return text
+    return f"{text.rstrip()}\n\nMEDIA:{newest_path}"
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -9037,6 +9134,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         result.get("final_response") or ""
                     ).strip()
                     if preserved_output:
+                        preserved_output = _promote_current_run_codex_image_view(
+                            preserved_output,
+                            user_message=user_message,
+                            messages=result.get("messages", []),
+                            run_started_at=created_at,
+                        )
                         preserved_output = _resolve_media_to_data_urls(
                             _redact_api_error_text(preserved_output)
                         )
@@ -9097,6 +9200,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Apply the same validated raster-image delivery used by
                     # the other API response paths before this output enters
                     # SSE replay, run status, and the durable chat archive.
+                    final_response = _promote_current_run_codex_image_view(
+                        final_response,
+                        user_message=user_message,
+                        messages=result.get("messages", []),
+                        run_started_at=created_at,
+                    )
                     final_response = _resolve_media_to_data_urls(final_response)
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so

@@ -1217,6 +1217,60 @@ class TestRunEvents:
         assert "MEDIA:" not in status["output"]
 
     @pytest.mark.asyncio
+    async def test_completed_run_promotes_requested_codex_image_view(
+        self, adapter, tmp_path
+    ):
+        image = tmp_path / "catalog.png"
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def run_conversation(**_kwargs):
+                    image.write_bytes(
+                        b"\x89PNG\r\n\x1a\n"
+                        b"\x00\x00\x00\rIHDR"
+                        b"\x00\x00\x00\x01\x00\x00\x00\x01"
+                    )
+                    image_view = {
+                        "type": "imageView",
+                        "id": "view_catalog",
+                        "path": str(image),
+                    }
+                    return {
+                        "final_response": "This is the catalog-only view.",
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": (
+                                    "[codex imageView] "
+                                    + json.dumps(image_view)
+                                ),
+                            }
+                        ],
+                    }
+
+                mock_agent.run_conversation.side_effect = run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "Can you show me the catalog screenshot?"},
+                )
+                run_id = (await response.json())["run_id"]
+                events_response = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_response.text()
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+
+        assert "data:image/png;base64," in body
+        assert str(image) not in body
+        assert "data:image/png;base64," in status["output"]
+        assert str(image) not in status["output"]
+
+    @pytest.mark.asyncio
     async def test_interim_assistant_text_has_its_own_run_event(self, adapter):
         """Tool-call commentary must not masquerade as final answer text."""
         app = _create_runs_app(adapter)
