@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -30,7 +31,16 @@ DEFAULT_ABSOLUTE_TIMEOUT = 2 * 60 * 60.0
 DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT = 30.0
 DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT = 60.0
 
-_TURN_ACK_EVENT_TYPES = frozenset({"user", "assistant", "stream_event", "result"})
+_ASYNC_AGENT_LAUNCH_MARKER = "async agent launched successfully"
+_TASK_NOTIFICATION_TOOL_USE_ID_RE = re.compile(
+    r"<tool-use-id>\s*([^<]+?)\s*</tool-use-id>", re.IGNORECASE
+)
+_TASK_NOTIFICATION_STATUS_RE = re.compile(
+    r"<status>\s*([^<]+?)\s*</status>", re.IGNORECASE
+)
+_TERMINAL_TASK_STATUSES = frozenset(
+    {"completed", "failed", "stopped", "cancelled", "canceled"}
+)
 
 CLAUDE_AUTH_ERROR_CODE = "claude_authentication_failed"
 CLAUDE_AUTH_REMEDIATION = (
@@ -145,6 +155,64 @@ def _merge_usage(
         else:
             merged[key] = value
     return merged
+
+
+def _content_text(content: Any) -> str:
+    """Flatten Claude message content without interpreting tool metadata."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text") or "").strip()
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") in {"text", "input_text", "output_text"}
+        and str(block.get("text") or "").strip()
+    )
+
+
+def _is_prompt_replay(event: dict[str, Any], prompt: str) -> bool:
+    """Whether ``event`` is Claude's echo of this exact submitted turn."""
+    if event.get("type") != "user":
+        return False
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return False
+    return _content_text(message.get("content")) == prompt.strip()
+
+
+def _is_async_agent_launch_result(block: dict[str, Any]) -> bool:
+    return _ASYNC_AGENT_LAUNCH_MARKER in _content_text(
+        block.get("content")
+    ).casefold()
+
+
+def _completed_agent_tool_ids(event: dict[str, Any]) -> set[str]:
+    """Extract terminal native-Agent ids from Claude task notifications."""
+    text_parts: list[str] = []
+    direct_content = event.get("content")
+    if isinstance(direct_content, str):
+        text_parts.append(direct_content)
+    message = event.get("message")
+    if isinstance(message, dict):
+        message_text = _content_text(message.get("content"))
+        if message_text:
+            text_parts.append(message_text)
+    text = "\n".join(text_parts)
+    if "<task-notification>" not in text.casefold():
+        return set()
+    status_match = _TASK_NOTIFICATION_STATUS_RE.search(text)
+    if (
+        status_match is None
+        or status_match.group(1).strip().casefold() not in _TERMINAL_TASK_STATUSES
+    ):
+        return set()
+    return {
+        match.group(1).strip()
+        for match in _TASK_NOTIFICATION_TOOL_USE_ID_RE.finditer(text)
+        if match.group(1).strip()
+    }
 
 
 def claude_code_args(
@@ -436,6 +504,16 @@ class ClaudeCodeSession:
             scheduled_wakeup_tool_ids: set[str] = set()
             scheduled_wakeup_ready = False
             waiting_for_scheduled_wakeup = False
+            agent_tool_ids: set[str] = set()
+            pending_background_agent_tool_ids: set[str] = set()
+            waiting_for_background_agents = False
+
+            def _waiting_for_autonomous_work() -> bool:
+                return bool(
+                    waiting_for_scheduled_wakeup
+                    or waiting_for_background_agents
+                    or pending_background_agent_tool_ids
+                )
 
             def _write_prompt(target: subprocess.Popen[str]) -> None:
                 assert target.stdin is not None
@@ -530,7 +608,7 @@ class ClaudeCodeSession:
                         wait_timeout,
                         max(0.01, first_event_timeout - (now - attempt_started_at)),
                     )
-                if not waiting_for_scheduled_wakeup:
+                if not _waiting_for_autonomous_work():
                     wait_timeout = min(
                         wait_timeout,
                         max(0.01, self.inactivity_timeout - (now - last_activity)),
@@ -580,7 +658,7 @@ class ClaudeCodeSession:
                         )
                         continue
                     if (
-                        not waiting_for_scheduled_wakeup
+                        not _waiting_for_autonomous_work()
                         and now - last_activity >= self.inactivity_timeout
                     ):
                         result.error = "Claude Code produced no activity for ten minutes"
@@ -609,7 +687,15 @@ class ClaudeCodeSession:
                     result.error = f"{auth_failure.rstrip('.')}. {CLAUDE_AUTH_REMEDIATION}"
                     result.should_retire = True
                     break
-                if not acknowledged and event_type in _TURN_ACK_EVENT_TYPES:
+                if not acknowledged:
+                    if not _is_prompt_replay(event, prompt):
+                        logger.debug(
+                            "Quarantining Claude output emitted before the current "
+                            "prompt replay: session=%s type=%s",
+                            result.session_id,
+                            event_type,
+                        )
+                        continue
                     acknowledged = True
                     result.prompt_acknowledged = True
                     _publish_session_id()
@@ -625,26 +711,36 @@ class ClaudeCodeSession:
                     blocks = []
                 if event_type == "assistant":
                     for block in blocks:
-                        if (
-                            isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and str(block.get("name") or "").casefold()
-                            == "schedulewakeup"
-                        ):
-                            tool_use_id = str(block.get("id") or "").strip()
-                            if tool_use_id:
-                                scheduled_wakeup_tool_ids.add(tool_use_id)
+                        if not isinstance(block, dict) or block.get("type") != "tool_use":
+                            continue
+                        tool_use_id = str(block.get("id") or "").strip()
+                        tool_name = str(block.get("name") or "").casefold()
+                        if tool_use_id and tool_name == "schedulewakeup":
+                            scheduled_wakeup_tool_ids.add(tool_use_id)
+                        elif tool_use_id and tool_name == "agent":
+                            agent_tool_ids.add(tool_use_id)
+                completed_agent_tool_ids = _completed_agent_tool_ids(event)
+                if completed_agent_tool_ids:
+                    pending_background_agent_tool_ids.difference_update(
+                        completed_agent_tool_ids
+                    )
                 if event_type == "user":
                     for block in blocks:
                         if not isinstance(block, dict) or block.get("type") != "tool_result":
                             continue
                         result.tool_iterations += 1
                         tool_use_id = str(block.get("tool_use_id") or "").strip()
-                        if tool_use_id not in scheduled_wakeup_tool_ids:
-                            continue
-                        scheduled_wakeup_tool_ids.discard(tool_use_id)
-                        if not block.get("is_error"):
-                            scheduled_wakeup_ready = True
+                        if tool_use_id in agent_tool_ids:
+                            agent_tool_ids.discard(tool_use_id)
+                            if (
+                                not block.get("is_error")
+                                and _is_async_agent_launch_result(block)
+                            ):
+                                pending_background_agent_tool_ids.add(tool_use_id)
+                        if tool_use_id in scheduled_wakeup_tool_ids:
+                            scheduled_wakeup_tool_ids.discard(tool_use_id)
+                            if not block.get("is_error"):
+                                scheduled_wakeup_ready = True
                 if event_type != "result":
                     continue
                 result.final_text = str(event.get("result") or "").strip()
@@ -655,6 +751,21 @@ class ClaudeCodeSession:
                 )
                 if event.get("is_error"):
                     result.error = result.final_text or "Claude Code returned an error"
+                if not result.error and pending_background_agent_tool_ids:
+                    waiting_for_background_agents = True
+                    logger.info(
+                        "Claude Code has %d native background agent(s) outstanding; "
+                        "keeping the current Hermes turn open: session=%s pid=%s",
+                        len(pending_background_agent_tool_ids),
+                        result.session_id,
+                        process.pid,
+                    )
+                    result.final_text = ""
+                    continue
+                if waiting_for_background_agents:
+                    if not result.final_text:
+                        continue
+                    waiting_for_background_agents = False
                 if result.error or result.final_text:
                     break
                 if scheduled_wakeup_ready or waiting_for_scheduled_wakeup:

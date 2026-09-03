@@ -90,6 +90,13 @@ def test_error_result_confirms_session_before_returning():
                 ),
                 json.dumps(
                     {
+                        "type": "user",
+                        "session_id": session_id,
+                        "message": {"role": "user", "content": "Continue"},
+                    }
+                ),
+                json.dumps(
+                    {
                         "type": "result",
                         "session_id": session_id,
                         "is_error": True,
@@ -143,7 +150,21 @@ def test_two_turns_share_one_streaming_process():
                     {"type": "system", "subtype": "init", "session_id": session_id}
                 ),
                 json.dumps(
+                    {
+                        "type": "user",
+                        "session_id": session_id,
+                        "message": {"role": "user", "content": "one"},
+                    }
+                ),
+                json.dumps(
                     {"type": "result", "session_id": session_id, "result": "first"}
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "session_id": session_id,
+                        "message": {"role": "user", "content": "two"},
+                    }
                 ),
                 json.dumps(
                     {"type": "result", "session_id": session_id, "result": "second"}
@@ -203,6 +224,11 @@ def test_scheduled_wakeup_keeps_same_turn_open_until_authoritative_result():
         session,
         _fake_process(20001),
         [
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {"role": "user", "content": "Continue"},
+            },
             {
                 "type": "assistant",
                 "session_id": session_id,
@@ -271,7 +297,7 @@ def test_scheduled_wakeup_keeps_same_turn_open_until_authoritative_result():
 
         def get(self, timeout):
             del timeout
-            if self.calls == 3:
+            if self.calls == 4:
                 self.calls += 1
                 raise queue.Empty
             self.calls += 1
@@ -288,11 +314,212 @@ def test_scheduled_wakeup_keeps_same_turn_open_until_authoritative_result():
     assert result.usage["input_tokens"] == 40
     assert result.usage["output_tokens"] == 60
     assert [event["type"] for event in forwarded] == [
+        "user",
         "assistant",
         "user",
         "result",
         "system",
         "result",
+        "assistant",
+        "result",
+    ]
+
+
+def test_async_agent_completion_stays_in_originating_turn():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    tool_use_id = "toolu_background_agent"
+    forwarded = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_event=forwarded.append,
+        inactivity_timeout=0.0,
+    )
+    process = _install_fake_process(
+        session,
+        _fake_process(20003),
+        [
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {"role": "user", "content": "Run the checks"},
+            },
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_use_id,
+                            "name": "Agent",
+                            "input": {"description": "Check the implementation"},
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Async agent launched successfully. "
+                                        "The agent is working in the background."
+                                    ),
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "The check is still running.",
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "The check is still running.",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            },
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "<task-notification>\n"
+                        "<task-id>agent-1</task-id>\n"
+                        f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                        "<status>completed</status>\n"
+                        "<result>Everything passed.</result>\n"
+                        "</task-notification>"
+                    ),
+                },
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "",
+                "origin": {"kind": "task-notification"},
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "All checks passed and the fix is complete.",
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "All checks passed and the fix is complete.",
+                "usage": {"input_tokens": 30, "output_tokens": 40},
+            },
+        ],
+    )
+
+    result = session.run_turn("Run the checks")
+
+    assert process.stdin.getvalue()
+    assert result.final_text == "All checks passed and the fix is complete."
+    assert result.error is None
+    assert result.should_retire is False
+    assert result.usage["input_tokens"] == 40
+    assert result.usage["output_tokens"] == 60
+    assert [event["type"] for event in forwarded] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "result",
+        "user",
+        "result",
+        "assistant",
+        "result",
+    ]
+
+
+def test_stale_autonomous_output_cannot_claim_the_next_turn():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    forwarded = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_event=forwarded.append,
+    )
+    process = _install_fake_process(
+        session,
+        _fake_process(20004),
+        [
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Two of three are complete."}
+                    ]
+                },
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "Two of three are complete.",
+            },
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {"role": "user", "content": "Did they get back?"},
+            },
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Yes, all three came back."}
+                    ]
+                },
+            },
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "Yes, all three came back.",
+            },
+        ],
+    )
+
+    result = session.run_turn("Did they get back?")
+
+    assert process.stdin.getvalue()
+    assert result.prompt_acknowledged is True
+    assert result.final_text == "Yes, all three came back."
+    assert [event["type"] for event in forwarded] == [
+        "user",
         "assistant",
         "result",
     ]
@@ -309,7 +536,14 @@ def test_empty_result_without_scheduled_wakeup_fails_closed():
     _install_fake_process(
         session,
         _fake_process(20002),
-        [{"type": "result", "session_id": session_id, "result": ""}],
+        [
+            {
+                "type": "user",
+                "session_id": session_id,
+                "message": {"role": "user", "content": "Continue"},
+            },
+            {"type": "result", "session_id": session_id, "result": ""},
+        ],
     )
 
     with patch.object(session, "close") as close:
