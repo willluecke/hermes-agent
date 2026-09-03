@@ -10,6 +10,7 @@ from unittest.mock import patch
 from agent.claude_runtime import make_claude_code_event_bridge
 from agent.transports.claude_code_session import (
     CLAUDE_AUTH_ERROR_CODE,
+    _ClaudeTranscriptPromptProbe,
     ClaudeCodeError,
     ClaudeCodeSession,
     claude_code_args,
@@ -523,6 +524,106 @@ def test_stale_autonomous_output_cannot_claim_the_next_turn():
         "assistant",
         "result",
     ]
+
+
+def test_transcript_probe_only_accepts_prompt_appended_after_dispatch(
+    tmp_path, monkeypatch
+):
+    session_id = "00000000-0000-4000-8000-000000000001"
+    prompt = "Inspect the two images"
+    transcript = tmp_path / "projects" / "-tmp" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    record = {
+        "type": "user",
+        "session_id": session_id,
+        "message": {"role": "user", "content": prompt},
+    }
+    transcript.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    probe = _ClaudeTranscriptPromptProbe.begin(session_id, prompt)
+
+    assert probe.acknowledged() is False
+    with transcript.open("a", encoding="utf-8") as output:
+        output.write(json.dumps({**record, "message": {"content": "other"}}) + "\n")
+    assert probe.acknowledged() is False
+    with transcript.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record) + "\n")
+    assert probe.acknowledged() is True
+
+
+def test_durable_prompt_append_stops_watchdog_but_not_stream_quarantine(
+    tmp_path, monkeypatch
+):
+    session_id = "00000000-0000-4000-8000-000000000002"
+    prompt = "[2 images] Inspect this request\n" + ("A" * 350_000)
+    transcript = tmp_path / "projects" / "-tmp" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    forwarded = []
+    watchdog_events = []
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+        on_event=forwarded.append,
+        on_watchdog_timeout=watchdog_events.append,
+        resident_first_event_timeout=0.0,
+        inactivity_timeout=1.0,
+    )
+    process = _fake_process(20005)
+    session._process = process
+    events = [
+        {
+            "type": "result",
+            "session_id": session_id,
+            "result": "Stale autonomous result",
+        },
+        {
+            "type": "user",
+            "session_id": session_id,
+            "message": {"role": "user", "content": prompt},
+        },
+        {
+            "type": "result",
+            "session_id": session_id,
+            "result": "Current turn result",
+        },
+    ]
+
+    class _TranscriptBeforeOutputQueue:
+        first = True
+
+        def get(self, timeout):
+            del timeout
+            if self.first:
+                self.first = False
+                with transcript.open("a", encoding="utf-8") as output:
+                    output.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "session_id": session_id,
+                                "message": {"role": "user", "content": prompt},
+                            }
+                        )
+                        + "\n"
+                    )
+                raise queue.Empty
+            return json.dumps(events.pop(0)) + "\n"
+
+    session._output_queue = cast(queue.Queue[str | None], _TranscriptBeforeOutputQueue())
+
+    with patch.object(session, "_start_process") as restart:
+        result = session.run_turn(prompt)
+
+    restart.assert_not_called()
+    assert watchdog_events == []
+    assert result.prompt_acknowledged is True
+    assert result.final_text == "Current turn result"
+    assert [event["type"] for event in forwarded] == ["user", "result"]
 
 
 def test_empty_result_without_scheduled_wakeup_fails_closed():

@@ -182,6 +182,79 @@ def _is_prompt_replay(event: dict[str, Any], prompt: str) -> bool:
     return _content_text(message.get("content")) == prompt.strip()
 
 
+def _claude_transcript_root() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+@dataclass
+class _ClaudeTranscriptPromptProbe:
+    """Detect this turn's durable Claude transcript append.
+
+    Claude persists streaming-input user records before it necessarily replays
+    them on stdout.  The first-event watchdog may trust that append as proof the
+    runtime accepted the turn, but output forwarding must still wait for the
+    stdout replay so queued autonomous frames cannot claim a later prompt.
+    """
+
+    session_id: str
+    prompt: str
+    offsets: dict[Path, int]
+
+    @classmethod
+    def begin(cls, session_id: str, prompt: str) -> "_ClaudeTranscriptPromptProbe":
+        probe = cls(session_id=session_id, prompt=prompt, offsets={})
+        for path in probe._candidates():
+            try:
+                probe.offsets[path] = path.stat().st_size
+            except OSError:
+                continue
+        return probe
+
+    def _candidates(self) -> list[Path]:
+        projects_dir = _claude_transcript_root() / "projects"
+        try:
+            project_dirs = list(projects_dir.iterdir())
+        except OSError:
+            return []
+        filename = f"{self.session_id}.jsonl"
+        return [path / filename for path in project_dirs if path.is_dir()]
+
+    def acknowledged(self) -> bool:
+        for path in self._candidates():
+            offset = self.offsets.setdefault(path, 0)
+            try:
+                size = path.stat().st_size
+                if size < offset:
+                    # A replacement/truncation is not evidence for this dispatch.
+                    self.offsets[path] = size
+                    continue
+                with path.open("rb") as transcript:
+                    transcript.seek(offset)
+                    while True:
+                        line = transcript.readline()
+                        if not line:
+                            break
+                        if not line.endswith(b"\n"):
+                            # Claude is still appending this record. Re-read it on
+                            # the next poll rather than advancing past partial JSON.
+                            break
+                        next_offset = transcript.tell()
+                        try:
+                            event = json.loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            self.offsets[path] = next_offset
+                            continue
+                        self.offsets[path] = next_offset
+                        if isinstance(event, dict) and _is_prompt_replay(
+                            event, self.prompt
+                        ):
+                            return True
+            except OSError:
+                continue
+        return False
+
+
 def _is_async_agent_launch_result(block: dict[str, Any]) -> bool:
     return _ASYNC_AGENT_LAUNCH_MARKER in _content_text(
         block.get("content")
@@ -500,7 +573,11 @@ class ClaudeCodeSession:
             result = ClaudeCodeTurnResult(session_id=self.session_id)
             reported_session_ids: set[str] = set()
             attempt = 0
-            acknowledged = False
+            prompt_accepted = False
+            stream_synchronized = False
+            transcript_probe = _ClaudeTranscriptPromptProbe.begin(
+                result.session_id, prompt
+            )
             scheduled_wakeup_tool_ids: set[str] = set()
             scheduled_wakeup_ready = False
             waiting_for_scheduled_wakeup = False
@@ -575,10 +652,17 @@ class ClaudeCodeSession:
                             "Claude Code watchdog callback failed", exc_info=True
                         )
 
-            def _dispatch(target: subprocess.Popen[str], *, resident: bool) -> tuple[float, float, Optional[float]]:
-                nonlocal process, acknowledged
+            def _dispatch(
+                target: subprocess.Popen[str], *, resident: bool
+            ) -> tuple[float, float, Optional[float]]:
+                nonlocal process
+                nonlocal prompt_accepted, stream_synchronized, transcript_probe
                 process = target
-                acknowledged = False
+                prompt_accepted = False
+                stream_synchronized = False
+                transcript_probe = _ClaudeTranscriptPromptProbe.begin(
+                    result.session_id, prompt
+                )
                 _write_prompt(target)
                 dispatched_at = time.monotonic()
                 timeout = (
@@ -602,8 +686,12 @@ class ClaudeCodeSession:
                     result.error = "Claude Code exceeded the two-hour turn limit"
                     result.should_retire = True
                     break
+                if not prompt_accepted and transcript_probe.acknowledged():
+                    prompt_accepted = True
+                    result.prompt_acknowledged = True
+                    _publish_session_id()
                 wait_timeout = 0.5
-                if first_event_timeout is not None and not acknowledged:
+                if first_event_timeout is not None and not prompt_accepted:
                     wait_timeout = min(
                         wait_timeout,
                         max(0.01, first_event_timeout - (now - attempt_started_at)),
@@ -617,9 +705,13 @@ class ClaudeCodeSession:
                     line = self._output_queue.get(timeout=wait_timeout)
                 except queue.Empty:
                     now = time.monotonic()
+                    if not prompt_accepted and transcript_probe.acknowledged():
+                        prompt_accepted = True
+                        result.prompt_acknowledged = True
+                        _publish_session_id()
                     if (
                         first_event_timeout is not None
-                        and not acknowledged
+                        and not prompt_accepted
                         and now - attempt_started_at >= first_event_timeout
                     ):
                         retrying = attempt == 0
@@ -687,7 +779,7 @@ class ClaudeCodeSession:
                     result.error = f"{auth_failure.rstrip('.')}. {CLAUDE_AUTH_REMEDIATION}"
                     result.should_retire = True
                     break
-                if not acknowledged:
+                if not stream_synchronized:
                     if not _is_prompt_replay(event, prompt):
                         logger.debug(
                             "Quarantining Claude output emitted before the current "
@@ -696,7 +788,8 @@ class ClaudeCodeSession:
                             event_type,
                         )
                         continue
-                    acknowledged = True
+                    stream_synchronized = True
+                    prompt_accepted = True
                     result.prompt_acknowledged = True
                     _publish_session_id()
                 if self.on_event is not None:
