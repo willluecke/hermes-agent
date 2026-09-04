@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+from difflib import SequenceMatcher
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
@@ -598,6 +600,113 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     return "", False
 
 
+_FILE_CHANGE_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024
+_FILE_CHANGE_EXACT_DIFF_CELLS = 250_000
+
+
+def _codex_file_change_path(agent: Any, value: Any) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(
+            getattr(agent, "session_cwd", None) or Path.cwd()
+        ) / candidate
+    try:
+        return candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _codex_file_lines(path: Path) -> list[bytes] | None:
+    try:
+        if (
+            not path.is_file()
+            or path.stat().st_size > _FILE_CHANGE_SNAPSHOT_MAX_BYTES
+        ):
+            return [] if not path.exists() else None
+        content = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in content:
+        return None
+    return content.splitlines()
+
+
+def _codex_file_change_snapshot(
+    agent: Any,
+    item: dict,
+) -> dict[str, list[bytes] | None]:
+    snapshot: dict[str, list[bytes] | None] = {}
+    for change in item.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        path = _codex_file_change_path(agent, change.get("path"))
+        if path is not None:
+            snapshot[str(path)] = _codex_file_lines(path)
+    return snapshot
+
+
+def _line_change_counts(before: list[bytes], after: list[bytes]) -> tuple[int, int]:
+    if before == after:
+        return 0, 0
+    if len(before) * len(after) <= _FILE_CHANGE_EXACT_DIFF_CELLS:
+        matcher = SequenceMatcher(a=before, b=after, autojunk=False)
+        added = 0
+        removed = 0
+        for tag, left_start, left_end, right_start, right_end in matcher.get_opcodes():
+            if tag in {"replace", "delete"}:
+                removed += left_end - left_start
+            if tag in {"replace", "insert"}:
+                added += right_end - right_start
+        return added, removed
+
+    prefix = 0
+    while (
+        prefix < len(before)
+        and prefix < len(after)
+        and before[prefix] == after[prefix]
+    ):
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < len(before) - prefix
+        and suffix < len(after) - prefix
+        and before[-1 - suffix] == after[-1 - suffix]
+    ):
+        suffix += 1
+    return len(after) - prefix - suffix, len(before) - prefix - suffix
+
+
+def _codex_file_change_line_counts(
+    agent: Any,
+    item: dict,
+    before: dict[str, list[bytes] | None],
+) -> dict[str, int]:
+    if item.get("type") != "fileChange":
+        return {}
+    if item.get("status") not in {"completed", "applied", "success"}:
+        return {}
+    added = 0
+    removed = 0
+    measured = False
+    for change in item.get("changes") or []:
+        if not isinstance(change, dict):
+            continue
+        path = _codex_file_change_path(agent, change.get("path"))
+        if path is None:
+            continue
+        before_lines = before.get(str(path))
+        after_lines = _codex_file_lines(path)
+        if before_lines is None or after_lines is None:
+            continue
+        file_added, file_removed = _line_change_counts(before_lines, after_lines)
+        added += file_added
+        removed += file_removed
+        measured = True
+    return {"lines_added": added, "lines_removed": removed} if measured else {}
+
+
 def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     """Build an ``on_event`` callback that wires codex app-server JSON-RPC
     notifications into Hermes' gateway UI callbacks.
@@ -630,6 +739,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    file_change_snapshots: dict[str, dict[str, list[bytes] | None]] = {}
     agent_message_phases: dict[str, str] = {}
     buffered_agent_deltas: dict[str, list[str]] = {}
 
@@ -660,6 +770,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         args = _codex_item_to_args(item)
         if item_id:
             started[item_id] = (name, args, time.monotonic())
+            if item.get("type") == "fileChange":
+                file_change_snapshots[item_id] = _codex_file_change_snapshot(
+                    agent, item
+                )
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
@@ -698,12 +812,17 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         elif prior is not None:
             duration = time.monotonic() - prior[2]
         result, is_error = _codex_item_completion_payload(item)
+        line_counts = _codex_file_change_line_counts(
+            agent,
+            item,
+            file_change_snapshots.pop(item_id, {}),
+        )
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
                 cb("tool.completed", name, None, None,
                    duration=duration, is_error=is_error, result=result,
-                   tool_call_id=_stable_call_id(item, name))
+                   tool_call_id=_stable_call_id(item, name), **line_counts)
             except Exception:
                 logger.debug(
                     "tool_progress_callback raised on tool.completed for %s",

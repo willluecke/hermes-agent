@@ -1910,6 +1910,7 @@ class TestRunToolEventIdentity:
                tool_call_id="call_abc123")
             cb("tool.completed", "exec_command", None, None,
                duration=1.5, is_error=False, result="ok",
+               lines_added=7, lines_removed=3,
                tool_call_id="call_abc123")
 
         async with TestClient(TestServer(app)) as cli:
@@ -1922,6 +1923,8 @@ class TestRunToolEventIdentity:
                 body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
 
         assert body.count('"tool_call_id": "call_abc123"') == 2
+        assert '"lines_added": 7' in body
+        assert '"lines_removed": 3' in body
 
     @pytest.mark.asyncio
     async def test_live_tool_output_is_ordered_redacted_capped_and_replayable(

@@ -104,6 +104,30 @@ def test_failed_command_result_and_error_flag_are_preserved():
     assert calls["tool_complete"][0][3] == "[exit 2]\nboom"
 
 
+def test_file_change_completion_reports_exact_line_counts(tmp_path):
+    agent, calls = _recording_agent()
+    agent.session_cwd = str(tmp_path)
+    target = tmp_path / "example.py"
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    bridge = make_codex_app_server_event_bridge(agent)
+    started = {
+        "type": "fileChange",
+        "id": "patch-counts",
+        "changes": [{"kind": {"type": "update"}, "path": str(target)}],
+    }
+
+    bridge({"method": "item/started", "params": {"item": started}})
+    target.write_text("one\nsecond\nthree\nfour\n", encoding="utf-8")
+    bridge({
+        "method": "item/completed",
+        "params": {"item": {**started, "status": "completed"}},
+    })
+
+    _args, kwargs = calls["tool_progress"][-1]
+    assert kwargs["lines_added"] == 2
+    assert kwargs["lines_removed"] == 1
+
+
 def test_command_output_delta_keeps_stable_id_and_wire_order():
     agent, calls = _recording_agent()
     bridge = make_codex_app_server_event_bridge(agent)
@@ -146,6 +170,3 @@ def test_command_output_delta_keeps_stable_id_and_wire_order():
         for args, kwargs in calls["tool_progress"]
         if args[0] == "tool.output.delta"
     ] == ["hel", "lo"]
-
-
-

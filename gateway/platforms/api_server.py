@@ -8377,6 +8377,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 output = _tool_output_text(kwargs.get("result"))
                 if output is not None:
                     event["output"] = output
+                for field in ("lines_added", "lines_removed"):
+                    value = kwargs.get(field)
+                    if (
+                        isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value >= 0
+                    ):
+                        event[field] = value
                 _push(event)
             elif event_type == "reasoning.available":
                 _push({
