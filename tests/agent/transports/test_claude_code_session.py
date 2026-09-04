@@ -464,6 +464,97 @@ def test_async_agent_completion_stays_in_originating_turn():
     ]
 
 
+def test_queued_command_completion_absent_from_stdout_releases_final(
+    tmp_path, monkeypatch
+):
+    session_id = "00000000-0000-4000-8000-000000000006"
+    tool_use_id = "toolu_queued_background_agent"
+    prompt = "Run the checks"
+    transcript = tmp_path / "projects" / "-tmp" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.touch()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+    )
+    process = _fake_process(20006)
+    session._process = process
+    events = [
+        {
+            "type": "user",
+            "session_id": session_id,
+            "message": {"role": "user", "content": prompt},
+        },
+        {
+            "type": "assistant",
+            "session_id": session_id,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": "Agent",
+                        "input": {"description": "Check the implementation"},
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "session_id": session_id,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "Async agent launched successfully.",
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "session_id": session_id,
+            "result": "All checks passed and the fix is complete.",
+        },
+    ]
+
+    class _CompletionInTranscriptQueue:
+        def get(self, timeout):
+            del timeout
+            event = events.pop(0)
+            if event["type"] == "result":
+                notification = {
+                    "type": "attachment",
+                    "attachment": {
+                        "type": "queued_command",
+                        "prompt": (
+                            "<task-notification>\n"
+                            f"<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                            "<status>completed</status>\n"
+                            "</task-notification>"
+                        ),
+                    },
+                }
+                with transcript.open("a", encoding="utf-8") as output:
+                    output.write(json.dumps(notification) + "\n")
+            return json.dumps(event) + "\n"
+
+    session._output_queue = cast(
+        queue.Queue[str | None], _CompletionInTranscriptQueue()
+    )
+
+    result = session.run_turn(prompt)
+
+    assert process.stdin.getvalue()
+    assert result.final_text == "All checks passed and the fix is complete."
+    assert result.error is None
+    assert result.should_retire is False
+
+
 def test_stale_autonomous_output_cannot_claim_the_next_turn():
     session_id = "00000000-0000-4000-8000-000000000000"
     forwarded = []

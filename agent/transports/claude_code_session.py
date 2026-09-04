@@ -255,6 +255,72 @@ class _ClaudeTranscriptPromptProbe:
         return False
 
 
+@dataclass
+class _ClaudeTranscriptTaskCompletionProbe:
+    """Read terminal task notifications Claude may omit from stream-json.
+
+    A native background agent can finish while Claude is inside another model
+    call.  Claude durably records that notification as a ``queued_command``
+    attachment, but that attachment is not always replayed on stdout.  Track
+    the transcript independently so an already-finished agent cannot leave the
+    enclosing Hermes turn waiting forever or hide its final answer.
+    """
+
+    session_id: str
+    offsets: dict[Path, int]
+
+    @classmethod
+    def begin(cls, session_id: str) -> "_ClaudeTranscriptTaskCompletionProbe":
+        probe = cls(session_id=session_id, offsets={})
+        for path in probe._candidates():
+            try:
+                probe.offsets[path] = path.stat().st_size
+            except OSError:
+                continue
+        return probe
+
+    def _candidates(self) -> list[Path]:
+        projects_dir = _claude_transcript_root() / "projects"
+        try:
+            project_dirs = list(projects_dir.iterdir())
+        except OSError:
+            return []
+        filename = f"{self.session_id}.jsonl"
+        return [path / filename for path in project_dirs if path.is_dir()]
+
+    def completed_agent_tool_ids(self) -> set[str]:
+        completed: set[str] = set()
+        for path in self._candidates():
+            offset = self.offsets.setdefault(path, 0)
+            try:
+                size = path.stat().st_size
+                if size < offset:
+                    # Replaced/truncated transcripts do not prove completion.
+                    self.offsets[path] = size
+                    continue
+                with path.open("rb") as transcript:
+                    transcript.seek(offset)
+                    while True:
+                        line = transcript.readline()
+                        if not line:
+                            break
+                        if not line.endswith(b"\n"):
+                            # Re-read a record Claude is still appending.
+                            break
+                        next_offset = transcript.tell()
+                        try:
+                            event = json.loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            self.offsets[path] = next_offset
+                            continue
+                        self.offsets[path] = next_offset
+                        if isinstance(event, dict):
+                            completed.update(_completed_agent_tool_ids(event))
+            except OSError:
+                continue
+        return completed
+
+
 def _is_async_agent_launch_result(block: dict[str, Any]) -> bool:
     return _ASYNC_AGENT_LAUNCH_MARKER in _content_text(
         block.get("content")
@@ -272,6 +338,11 @@ def _completed_agent_tool_ids(event: dict[str, Any]) -> set[str]:
         message_text = _content_text(message.get("content"))
         if message_text:
             text_parts.append(message_text)
+    attachment = event.get("attachment")
+    if isinstance(attachment, dict):
+        attachment_prompt = attachment.get("prompt")
+        if isinstance(attachment_prompt, str):
+            text_parts.append(attachment_prompt)
     text = "\n".join(text_parts)
     if "<task-notification>" not in text.casefold():
         return set()
@@ -578,6 +649,9 @@ class ClaudeCodeSession:
             transcript_probe = _ClaudeTranscriptPromptProbe.begin(
                 result.session_id, prompt
             )
+            task_completion_probe = _ClaudeTranscriptTaskCompletionProbe.begin(
+                result.session_id
+            )
             scheduled_wakeup_tool_ids: set[str] = set()
             scheduled_wakeup_ready = False
             waiting_for_scheduled_wakeup = False
@@ -813,6 +887,9 @@ class ClaudeCodeSession:
                         elif tool_use_id and tool_name == "agent":
                             agent_tool_ids.add(tool_use_id)
                 completed_agent_tool_ids = _completed_agent_tool_ids(event)
+                completed_agent_tool_ids.update(
+                    task_completion_probe.completed_agent_tool_ids()
+                )
                 if completed_agent_tool_ids:
                     pending_background_agent_tool_ids.difference_update(
                         completed_agent_tool_ids
