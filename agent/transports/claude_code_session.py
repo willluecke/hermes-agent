@@ -83,24 +83,83 @@ def find_claude_binary() -> str:
     return candidate
 
 
-def claude_subscription_auth_available() -> bool:
+def _current_claude_auth_generation() -> str:
+    explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if explicit:
+        from agent.claude_auth_lease import claude_auth_generation
+
+        return claude_auth_generation(explicit)
+    try:
+        from agent.claude_auth_lease import acquire_claude_auth_lease
+
+        return acquire_claude_auth_lease(0).generation
+    except Exception:
+        logger.debug("Could not fingerprint Claude Code credentials", exc_info=True)
+        return ""
+
+
+def claude_subscription_auth_available(
+    *, min_validity_seconds: float = 0
+) -> bool:
     """Whether Claude Code has the OAuth material required by this route.
 
     The Claude subscription transport deliberately strips ambient Anthropic
-    API credentials before spawning the CLI.  Checking the same OAuth sources
-    Hermes already understands prevents an API key from making a generic
-    ``claude auth status`` probe look healthy while this route cannot start.
+    API credentials before spawning the CLI.  Prefer the cheap credential
+    sources Hermes understands, then ask Claude itself.  The native fallback
+    matters because newer Claude Code builds can keep a valid login in a
+    platform credential store that is not mirrored to
+    ``~/.claude/.credentials.json``.  After a gateway restart there is no
+    resident Claude process to bridge that gap, so rejecting the login here
+    would incorrectly force the user through OAuth again.
+
+    A native status is accepted only when it explicitly identifies a signed-in
+    claude.ai Max subscription.  Anthropic API variables are removed from the
+    probe environment so an API key cannot make this subscription-only route
+    pass its preflight.
     """
     if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
         return True
     try:
-        from agent.anthropic_adapter import read_claude_code_credentials
+        from agent.claude_auth_lease import acquire_claude_auth_lease
 
-        credentials = read_claude_code_credentials()
+        lease = acquire_claude_auth_lease(min_validity_seconds)
     except Exception:
         logger.warning("Claude Code subscription auth preflight failed", exc_info=True)
+        lease = None
+    if lease and lease.available:
+        return True
+    if lease and lease.credentials_found:
         return False
-    return bool(credentials and credentials.get("accessToken"))
+
+    try:
+        env = os.environ.copy()
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_TOKEN",
+        ):
+            env.pop(key, None)
+        status = subprocess.run(
+            [find_claude_binary(), "auth", "status", "--json"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if status.returncode != 0:
+            return False
+        payload = json.loads(status.stdout)
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        logger.debug("Claude Code native auth preflight failed", exc_info=True)
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("loggedIn") is True
+        and str(payload.get("authMethod") or "").casefold() == "claude.ai"
+        and str(payload.get("subscriptionType") or "").casefold() == "max"
+    )
 
 
 def _auth_failure_detail(event: dict[str, Any]) -> Optional[str]:
@@ -468,6 +527,7 @@ class ClaudeCodeSession:
         self._lifecycle_lock = threading.Lock()
         self._closed = False
         self._confirmed = bool(resume and session_id)
+        self._auth_generation = ""
 
     @property
     def pid(self) -> Optional[int]:
@@ -551,7 +611,9 @@ class ClaudeCodeSession:
         if self._closed:
             raise ClaudeCodeError("Claude Code session is closed")
         binary = find_claude_binary()
-        if not claude_subscription_auth_available():
+        if not claude_subscription_auth_available(
+            min_validity_seconds=self.absolute_timeout + 10 * 60
+        ):
             raise ClaudeCodeError(
                 f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
                 error_code=CLAUDE_AUTH_ERROR_CODE,
@@ -570,6 +632,7 @@ class ClaudeCodeSession:
         # would silently turn it into metered API usage.
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env.pop("ANTHROPIC_TOKEN", None)
         process = subprocess.Popen(
             [binary, *args],
             cwd=self.cwd,
@@ -585,6 +648,7 @@ class ClaudeCodeSession:
         assert process.stdout is not None
         assert process.stderr is not None
         self._process = process
+        self._auth_generation = _current_claude_auth_generation()
         output_queue: queue.Queue[Optional[str]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
         self._output_queue = output_queue
@@ -638,6 +702,24 @@ class ClaudeCodeSession:
         with self._turn_lock:
             self._interrupt.clear()
             resident_candidate = self._process if self.is_alive() else None
+            if resident_candidate is not None and self._auth_generation:
+                if not claude_subscription_auth_available(
+                    min_validity_seconds=self.absolute_timeout + 10 * 60
+                ):
+                    raise ClaudeCodeError(
+                        f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
+                        error_code=CLAUDE_AUTH_ERROR_CODE,
+                    )
+                current_generation = _current_claude_auth_generation()
+                if (
+                    current_generation
+                    and current_generation != self._auth_generation
+                ):
+                    # A different Hermes/Claude process rotated the shared OAuth
+                    # pair.  Resume through a fresh CLI so this process never
+                    # reaches expiry with its stale in-memory refresh token.
+                    self._retire_process(resident_candidate)
+                    resident_candidate = None
             process = self._ensure_process()
             resident_process = process is resident_candidate
             started_at = time.monotonic()

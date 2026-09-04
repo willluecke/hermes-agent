@@ -474,11 +474,29 @@ class TestWriteClaudeCodeCredentials:
         cred_dir = tmp_path / ".claude"
         cred_dir.mkdir()
         cred_file = cred_dir / ".credentials.json"
-        cred_file.write_text(json.dumps({"otherField": "keep-me"}))
+        cred_file.write_text(json.dumps({
+            "otherField": "keep-me",
+            "claudeAiOauth": {
+                "accessToken": "old-token",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1,
+                "refreshTokenExpiresAt": 9_999_999_999_999,
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_20x",
+                "scopes": ["user:inference", "user:sessions:claude_code"],
+            },
+        }))
         _write_claude_code_credentials("new-tok", "new-ref", 99999)
         data = json.loads(cred_file.read_text())
         assert data["otherField"] == "keep-me"
         assert data["claudeAiOauth"]["accessToken"] == "new-tok"
+        assert data["claudeAiOauth"]["refreshTokenExpiresAt"] == 9_999_999_999_999
+        assert data["claudeAiOauth"]["subscriptionType"] == "max"
+        assert data["claudeAiOauth"]["rateLimitTier"] == "default_claude_max_20x"
+        assert data["claudeAiOauth"]["scopes"] == [
+            "user:inference",
+            "user:sessions:claude_code",
+        ]
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
     def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):

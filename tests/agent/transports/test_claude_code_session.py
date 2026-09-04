@@ -210,6 +210,65 @@ def test_two_turns_share_one_streaming_process():
     assert [record["message"]["content"] for record in records] == ["one", "two"]
 
 
+def test_rotated_oauth_generation_recycles_resident_process():
+    session_id = "00000000-0000-4000-8000-000000000010"
+    session = ClaudeCodeSession(
+        cwd="/tmp",
+        model="claude-fable-5",
+        session_id=session_id,
+        resume=True,
+    )
+    stale_process = _fake_process(12347)
+    session._process = stale_process
+    session._auth_generation = "stale-generation"
+    fresh_process = _fake_process(12348)
+
+    def retire(process):
+        assert process is stale_process
+        session._process = None
+        return True
+
+    def start():
+        _install_fake_process(
+            session,
+            fresh_process,
+            [
+                {
+                    "type": "user",
+                    "session_id": session_id,
+                    "message": {"role": "user", "content": "continue"},
+                },
+                {
+                    "type": "result",
+                    "session_id": session_id,
+                    "result": "continued safely",
+                },
+            ],
+        )
+        session._auth_generation = "current-generation"
+        return fresh_process
+
+    with patch(
+        "agent.transports.claude_code_session.claude_subscription_auth_available",
+        return_value=True,
+    ) as auth_available, patch(
+        "agent.transports.claude_code_session._current_claude_auth_generation",
+        return_value="current-generation",
+    ), patch.object(session, "_retire_process", side_effect=retire) as retired, patch.object(
+        session, "_start_process", side_effect=start
+    ) as started:
+        result = session.run_turn("continue")
+
+    auth_available.assert_called_once_with(
+        min_validity_seconds=session.absolute_timeout + 10 * 60
+    )
+    retired.assert_called_once_with(stale_process)
+    started.assert_called_once_with()
+    assert stale_process.stdin.getvalue() == ""
+    assert fresh_process.stdin.getvalue()
+    assert result.final_text == "continued safely"
+
+
 def test_scheduled_wakeup_keeps_same_turn_open_until_authoritative_result():
     session_id = "00000000-0000-4000-8000-000000000000"
     forwarded = []
@@ -783,6 +842,86 @@ def test_explicit_claude_oauth_override_satisfies_subscription_preflight(monkeyp
         assert claude_subscription_auth_available() is True
 
     read_credentials.assert_not_called()
+
+
+def test_native_claude_max_status_satisfies_preflight_without_credentials_file(
+    monkeypatch,
+):
+    from agent.claude_auth_lease import ClaudeAuthLease
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "metered-api-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "metered-auth-token")
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "metered-oauth-token")
+    native_status = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "subscriptionType": "max",
+            }
+        ),
+    )
+
+    with patch(
+        "agent.claude_auth_lease.acquire_claude_auth_lease",
+        return_value=ClaudeAuthLease(available=False),
+    ), patch(
+        "agent.transports.claude_code_session.find_claude_binary",
+        return_value="/usr/bin/claude",
+    ), patch(
+        "agent.transports.claude_code_session.subprocess.run",
+        return_value=native_status,
+    ) as run:
+        from agent.transports.claude_code_session import (
+            claude_subscription_auth_available,
+        )
+
+        assert claude_subscription_auth_available() is True
+
+    assert run.call_args.args[0] == [
+        "/usr/bin/claude",
+        "auth",
+        "status",
+        "--json",
+    ]
+    probe_env = run.call_args.kwargs["env"]
+    assert "ANTHROPIC_API_KEY" not in probe_env
+    assert "ANTHROPIC_AUTH_TOKEN" not in probe_env
+    assert "ANTHROPIC_TOKEN" not in probe_env
+
+
+def test_native_api_key_status_does_not_satisfy_subscription_preflight(monkeypatch):
+    from agent.claude_auth_lease import ClaudeAuthLease
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    native_status = SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "loggedIn": True,
+                "authMethod": "api_key",
+                "subscriptionType": None,
+            }
+        ),
+    )
+
+    with patch(
+        "agent.claude_auth_lease.acquire_claude_auth_lease",
+        return_value=ClaudeAuthLease(available=False),
+    ), patch(
+        "agent.transports.claude_code_session.find_claude_binary",
+        return_value="/usr/bin/claude",
+    ), patch(
+        "agent.transports.claude_code_session.subprocess.run",
+        return_value=native_status,
+    ):
+        from agent.transports.claude_code_session import (
+            claude_subscription_auth_available,
+        )
+
+        assert claude_subscription_auth_available() is False
 
 
 def test_auth_error_is_terminal_and_not_forwarded_as_commentary():

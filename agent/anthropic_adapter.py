@@ -1080,18 +1080,25 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     return None
 
 
+def claude_code_credentials_path() -> Path:
+    """Return the credential file used by the active Claude Code config root."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    root = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    return root / ".credentials.json"
+
+
 def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
-    """Read Claude Code OAuth credentials from ~/.claude/.credentials.json.
+    """Read Claude Code OAuth credentials from its active config directory.
 
     Returns dict with {accessToken, refreshToken?, expiresAt?, source} or None.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_path = claude_code_credentials_path()
     if not cred_path.exists():
         return None
     try:
         data = json.loads(cred_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, IOError) as e:
-        logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+        logger.debug("Failed to read Claude Code credentials at %s: %s", cred_path, e)
         return None
 
     oauth_data = data.get("claudeAiOauth")
@@ -1294,25 +1301,26 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_path = claude_code_credentials_path()
     try:
         # Read existing file to preserve other fields
         existing = {}
         if cred_path.exists():
             existing = json.loads(cred_path.read_text(encoding="utf-8"))
 
-        oauth_data: Dict[str, Any] = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
+        previous_oauth = existing.get("claudeAiOauth")
+        oauth_data: Dict[str, Any] = (
+            dict(previous_oauth) if isinstance(previous_oauth, dict) else {}
+        )
+        oauth_data.update(
+            {
+                "accessToken": access_token,
+                "refreshToken": refresh_token,
+                "expiresAt": expires_at_ms,
+            }
+        )
         if scopes is not None:
             oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-            # Preserve previously-stored scopes when the refresh response
-            # does not include a scope field.
-            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
-
         existing["claudeAiOauth"] = oauth_data
 
         cred_path.parent.mkdir(parents=True, exist_ok=True)
