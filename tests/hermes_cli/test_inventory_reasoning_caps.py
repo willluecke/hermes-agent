@@ -143,6 +143,25 @@ def test_native_codex_provider_gets_verified_model_vocabulary(monkeypatch):
     assert "can_disable_reasoning" not in caps
 
 
+def test_gpt6_astra_gets_its_verified_reasoning_vocabulary(monkeypatch):
+    """GPT-6 Astra supports low through max, without none or ultra."""
+    _patch_catalog(monkeypatch, {
+        "gpt-6-astra": {"supports_reasoning": True, "supported_efforts": ["high"], "mandatory": True},
+    })
+    rows = [{"slug": "openai-codex", "models": ["gpt-6-astra"]}]
+    inv._apply_capabilities(rows)
+
+    caps = rows[0]["capabilities"]["gpt-6-astra"]
+    assert caps["supported_efforts"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert "can_disable_reasoning" not in caps
+
+
 def test_openrouter_uses_its_own_catalog(monkeypatch):
     """The reader is chosen per provider row, not hardcoded to one aggregator."""
     _patch_catalog(

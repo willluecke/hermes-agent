@@ -35,6 +35,19 @@ def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
 
 
+def test_gpt6_astra_is_forward_compatible_during_entitlement_rollout(monkeypatch):
+    """Entitled accounts can select Astra before live discovery lists it."""
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_api",
+        lambda access_token: ["gpt-5.6-sol"],
+    )
+
+    model_ids = get_codex_model_ids(access_token="codex-access-token")
+
+    assert "gpt-6-astra" in model_ids
+    assert model_ids.index("gpt-6-astra") > model_ids.index("gpt-5.6-sol")
+
+
 
 
 def test_setup_wizard_codex_import_resolves():
@@ -209,4 +222,3 @@ class TestNormalizeModelForProvider:
         assert changed is True
         # Uses first from available list
         assert cli.model == "gpt-5.3-codex"
-

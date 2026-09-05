@@ -61,10 +61,14 @@ OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = (
     "none", "minimal", "low", "medium", "high", "xhigh", "max",
 )
 
-#: OpenAI/Codex Responses backend — per-model vocabulary, live-verified
-#: (Aug 2026): ``minimal`` is rejected by both generations (clamps to low);
-#: ``max`` is gpt-5.6-only — gpt-5.5 rejects it with "Supported values are:
-#: 'none', 'low', 'medium', 'high', 'xhigh'" (#68365's premise, confirmed).
+#: OpenAI/Codex Responses backend — per-model vocabulary. GPT-6 Astra starts
+#: at ``low`` (reasoning cannot be disabled) and supports through ``max``.
+#: For GPT-5.x, ``minimal`` is rejected (clamps to low); ``max`` is
+#: gpt-5.6-only — gpt-5.5 rejects it with "Supported values are: 'none',
+#: 'low', 'medium', 'high', 'xhigh'" (#68365's premise, confirmed).
+CODEX_GPT6_ASTRA_EFFORTS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh", "max",
+)
 CODEX_GPT56_EFFORTS: tuple[str, ...] = (
     "none", "low", "medium", "high", "xhigh", "max",
 )
@@ -96,7 +100,10 @@ CLAUDE_CODE_EFFORTS: tuple[str, ...] = (
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
-    if "gpt-5.6" in (model or "").lower():
+    model_name = (model or "").lower()
+    if "gpt-6" in model_name:
+        return CODEX_GPT6_ASTRA_EFFORTS
+    if "gpt-5.6" in model_name:
         return CODEX_GPT56_EFFORTS
     return CODEX_LEGACY_EFFORTS
 
@@ -104,6 +111,8 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
 def codex_app_server_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set reported by the native Codex app server."""
     model_name = (model or "").lower()
+    if "gpt-6" in model_name:
+        return CODEX_GPT6_ASTRA_EFFORTS
     if "gpt-5.6-sol" in model_name or "gpt-5.6-terra" in model_name:
         return CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS
     if "gpt-5.6" in model_name:
