@@ -144,7 +144,7 @@ def test_native_codex_provider_gets_verified_model_vocabulary(monkeypatch):
 
 
 def test_gpt6_astra_gets_its_verified_reasoning_vocabulary(monkeypatch):
-    """GPT-6 Astra supports low through max, without none or ultra."""
+    """Native GPT-6 Astra supports low through ultra, without none."""
     _patch_catalog(monkeypatch, {
         "gpt-6-astra": {"supports_reasoning": True, "supported_efforts": ["high"], "mandatory": True},
     })
@@ -158,6 +158,7 @@ def test_gpt6_astra_gets_its_verified_reasoning_vocabulary(monkeypatch):
         "high",
         "xhigh",
         "max",
+        "ultra",
     ]
     assert "can_disable_reasoning" not in caps
 

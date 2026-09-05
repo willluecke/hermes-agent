@@ -78,7 +78,10 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
 
 #: Native Codex app-server vocabulary reported by ``model/list``. This differs
 #: from the OpenAI Responses API: app-server does not expose ``none`` and the
-#: current GPT-5.6 family may expose ``ultra``.
+#: current GPT-6 Astra and selected GPT-5.6 models expose ``ultra``.
+CODEX_APP_SERVER_GPT6_ASTRA_EFFORTS: tuple[str, ...] = (
+    "low", "medium", "high", "xhigh", "max", "ultra",
+)
 CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS: tuple[str, ...] = (
     "low", "medium", "high", "xhigh", "max", "ultra",
 )
@@ -112,7 +115,7 @@ def codex_app_server_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set reported by the native Codex app server."""
     model_name = (model or "").lower()
     if "gpt-6" in model_name:
-        return CODEX_GPT6_ASTRA_EFFORTS
+        return CODEX_APP_SERVER_GPT6_ASTRA_EFFORTS
     if "gpt-5.6-sol" in model_name or "gpt-5.6-terra" in model_name:
         return CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS
     if "gpt-5.6" in model_name:

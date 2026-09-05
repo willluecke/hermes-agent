@@ -35,17 +35,29 @@ def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
 
 
-def test_gpt6_astra_is_forward_compatible_during_entitlement_rollout(monkeypatch):
-    """Entitled accounts can select Astra before live discovery lists it."""
+def test_gpt6_astra_requires_account_and_app_server_catalog_agreement(monkeypatch):
+    """Never advertise Astra to a Codex client that cannot execute it."""
     monkeypatch.setattr(
         "hermes_cli.codex_models._fetch_models_from_api",
-        lambda access_token: ["gpt-5.6-sol"],
+        lambda access_token: ["gpt-6-astra", "gpt-5.6-sol"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._read_cache_models",
+        lambda codex_home: ["gpt-5.6-sol"],
     )
 
     model_ids = get_codex_model_ids(access_token="codex-access-token")
 
-    assert "gpt-6-astra" in model_ids
-    assert model_ids.index("gpt-6-astra") > model_ids.index("gpt-5.6-sol")
+    assert "gpt-6-astra" not in model_ids
+
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._read_cache_models",
+        lambda codex_home: ["gpt-6-astra", "gpt-5.6-sol"],
+    )
+
+    assert "gpt-6-astra" in get_codex_model_ids(
+        access_token="codex-access-token"
+    )
 
 
 

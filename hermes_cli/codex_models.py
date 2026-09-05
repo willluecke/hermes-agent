@@ -13,10 +13,6 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
-    # GPT-6 Astra. Access is entitlement-gated, so keep it in the curated
-    # fallback and synthesize it from the current GPT-5.6 lineup while the
-    # per-account Codex catalog rollout catches up.
-    "gpt-6-astra",
     # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
     # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
     # so the curated offline fallback must not surface those dead choices.
@@ -55,7 +51,6 @@ DEFAULT_CODEX_MODELS: List[str] = [
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
-    ("gpt-6-astra", ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")),
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-luna", ("gpt-5.5", "gpt-5.4")),
@@ -68,6 +63,11 @@ _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
     # entitlement; Hermes does not.
     ("gpt-5.3-codex-spark", ("gpt-5.3-codex",)),
 ]
+
+# These models are both entitlement- and client-gated. The account catalog can
+# advertise one before the installed Codex app-server understands it, so only
+# surface it after the app-server's own cache confirms local compatibility.
+_LOCAL_CATALOG_REQUIRED_MODELS = {"gpt-6-astra"}
 
 
 def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
@@ -237,14 +237,26 @@ def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:
     if access_token:
         api_models = _fetch_models_from_api(access_token)
         if api_models:
-            return _add_forward_compat_models(api_models)
+            local_models = set(_read_cache_models(codex_home))
+            compatible_api_models = [
+                model_id
+                for model_id in api_models
+                if model_id not in _LOCAL_CATALOG_REQUIRED_MODELS
+                or model_id in local_models
+            ]
+            return _add_forward_compat_models(compatible_api_models)
 
     # Fall back to local sources
+    cached_models = _read_cache_models(codex_home)
+    cached_model_set = set(cached_models)
     default_model = _read_default_model(codex_home)
-    if default_model:
+    if default_model and (
+        default_model not in _LOCAL_CATALOG_REQUIRED_MODELS
+        or default_model in cached_model_set
+    ):
         ordered.append(default_model)
 
-    for model_id in _read_cache_models(codex_home):
+    for model_id in cached_models:
         if model_id not in ordered:
             ordered.append(model_id)
 
