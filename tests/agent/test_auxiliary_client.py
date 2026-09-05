@@ -2555,7 +2555,7 @@ class TestAuxiliaryAuthRefreshRetry:
 
             assert _refresh_provider_credentials("anthropic") is True
 
-        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
+        mock_refresh_oauth.assert_called_once_with("refresh-token")
         mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
         stale_client.close.assert_called_once()
 

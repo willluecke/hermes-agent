@@ -134,7 +134,7 @@ def acquire_claude_auth_lease(
             refresh_token = str((current or initial).get("refreshToken") or "")
             if not refresh_token:
                 return _lease_from_credentials(current or initial)
-            refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+            refreshed = refresh_anthropic_oauth_pure(refresh_token)
             _write_claude_code_credentials(
                 refreshed["access_token"],
                 refreshed["refresh_token"],

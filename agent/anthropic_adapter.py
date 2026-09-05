@@ -1170,42 +1170,32 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
     return now_ms < (expires_at - 60_000)
 
 
-def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> Dict[str, Any]:
+def refresh_anthropic_oauth_pure(refresh_token: str) -> Dict[str, Any]:
     """Refresh an Anthropic OAuth token without mutating local credential files."""
     import time
-    import urllib.parse
+    import urllib.error
     import urllib.request
 
     if not refresh_token:
         raise ValueError("refresh_token is required")
 
-    client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    if use_json:
-        data = json.dumps({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-        }).encode()
-        content_type = "application/json"
-    else:
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-        }).encode()
-        content_type = "application/x-www-form-urlencoded"
+    data = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+    }).encode()
 
     token_endpoints = [
         "https://platform.claude.com/v1/oauth/token",
         "https://console.anthropic.com/v1/oauth/token",
     ]
-    last_error = None
+    first_error = None
     for endpoint in token_endpoints:
         req = urllib.request.Request(
             endpoint,
             data=data,
             headers={
-                "Content-Type": content_type,
+                "Content-Type": "application/json",
                 "User-Agent": _OAUTH_TOKEN_USER_AGENT,
             },
             method="POST",
@@ -1213,8 +1203,20 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            # The legacy console host exists only as a compatibility fallback
+            # for a deployment where the canonical platform endpoint is absent.
+            # Do not turn a meaningful primary error such as invalid_grant or
+            # rate limiting into the fallback host's unhelpful 404.
+            if exc.code != 404:
+                raise
+            if first_error is None:
+                first_error = exc
+            logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
+            continue
         except Exception as exc:
-            last_error = exc
+            if first_error is None:
+                first_error = exc
             logger.debug("Anthropic token refresh failed at %s: %s", endpoint, exc)
             continue
 
@@ -1229,8 +1231,8 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
             "expires_at_ms": int(time.time() * 1000) + (expires_in * 1000),
         }
 
-    if last_error is not None:
-        raise last_error
+    if first_error is not None:
+        raise first_error
     raise ValueError("Anthropic token refresh failed")
 
 
@@ -1274,7 +1276,21 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         return None
 
     try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+        refresh_source = current or creds
+        if refresh_source.get("source") == "claude_code_credentials_file":
+            # All file-backed Claude Code refreshes must share the lease
+            # module's cross-process lock.  Refreshing here independently can
+            # consume the rotating refresh token immediately before a native
+            # Claude session or the subscription worker tries to use it.
+            from agent.claude_auth_lease import acquire_claude_auth_lease
+
+            lease = acquire_claude_auth_lease(0)
+            latest = read_claude_code_credentials()
+            if lease.available and latest and latest.get("accessToken"):
+                return str(latest["accessToken"])
+            return None
+
+        refreshed = refresh_anthropic_oauth_pure(refresh_token)
         _write_claude_code_credentials(
             refreshed["access_token"],
             refreshed["refresh_token"],

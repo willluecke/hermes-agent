@@ -1319,6 +1319,20 @@ class CredentialPool:
         # resolve_codex_runtime_credentials()).  When a waiter finally acquires
         # the lock, the in-lock re-sync below picks up the rotated token the
         # winner persisted and skips the POST.
+        if self.provider == "anthropic" and entry.source == "claude_code":
+            from agent.anthropic_adapter import claude_code_credentials_path
+
+            # The Claude Code refresh token rotates after one use.  Share the
+            # same credential-file lock as the native-session lease so the
+            # direct Anthropic pool cannot consume that token concurrently.
+            with _auth_store_lock(target_path=claude_code_credentials_path()):
+                synced = self._sync_anthropic_entry_from_credentials_file(entry)
+                if (
+                    synced.access_token != entry.access_token
+                    or synced.refresh_token != entry.refresh_token
+                ) and not self._entry_needs_refresh(synced):
+                    return synced
+                return self._refresh_entry_impl(synced, force=force)
         if self.provider in ("openai-codex", "xai-oauth"):
             sync_entry = (
                 self._sync_codex_entry_from_auth_store
@@ -1369,10 +1383,7 @@ class CredentialPool:
             if self.provider == "anthropic":
                 from agent.anthropic_adapter import refresh_anthropic_oauth_pure
 
-                refreshed = refresh_anthropic_oauth_pure(
-                    entry.refresh_token,
-                    use_json=entry.source.endswith("hermes_pkce"),
-                )
+                refreshed = refresh_anthropic_oauth_pure(entry.refresh_token)
                 updated = replace(
                     entry,
                     access_token=refreshed["access_token"],
@@ -1450,10 +1461,7 @@ class CredentialPool:
                     logger.debug("Retrying refresh with synced token from credentials file")
                     try:
                         from agent.anthropic_adapter import refresh_anthropic_oauth_pure
-                        refreshed = refresh_anthropic_oauth_pure(
-                            synced.refresh_token,
-                            use_json=synced.source.endswith("hermes_pkce"),
-                        )
+                        refreshed = refresh_anthropic_oauth_pure(synced.refresh_token)
                         updated = replace(
                             synced,
                             access_token=refreshed["access_token"],
