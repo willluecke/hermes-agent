@@ -186,16 +186,21 @@ def _read_default_model(codex_home: Path) -> Optional[str]:
     return None
 
 
-def _read_cache_models(codex_home: Path) -> List[str]:
+def _read_cache_catalog(codex_home: Path) -> tuple[List[str], Optional[str]]:
     cache_path = codex_home / "models_cache.json"
     if not cache_path.exists():
-        return []
+        return [], None
     try:
         raw = json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return [], None
 
     entries = raw.get("models") if isinstance(raw, dict) else None
+    client_version = raw.get("client_version") if isinstance(raw, dict) else None
+    if not isinstance(client_version, str) or not client_version.strip():
+        client_version = None
+    else:
+        client_version = client_version.strip()
     sortable = []
     if isinstance(entries, list):
         for item in entries:
@@ -220,7 +225,130 @@ def _read_cache_models(codex_home: Path) -> List[str]:
     for _, slug in sortable:
         if slug not in deduped:
             deduped.append(slug)
-    return deduped
+    return deduped, client_version
+
+
+def _read_cache_models(codex_home: Path) -> List[str]:
+    return _read_cache_catalog(codex_home)[0]
+
+
+def _installed_codex_version(codex_bin: str = "codex") -> Optional[str]:
+    try:
+        from agent.transports.codex_app_server import check_codex_binary
+
+        ok, version = check_codex_binary(codex_bin, min_version=(0, 0, 0))
+        return version if ok else None
+    except Exception:
+        return None
+
+
+def _visible_app_server_model_ids(entries: object) -> List[str]:
+    ordered: List[str] = []
+    if not isinstance(entries, list):
+        return ordered
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(
+            item.get("id")
+            or item.get("model")
+            or item.get("slug")
+            or ""
+        ).strip()
+        visibility = str(item.get("visibility") or "").lower()
+        if (
+            model_id
+            and item.get("hidden") is not True
+            and visibility not in {"hide", "hidden"}
+            and model_id not in ordered
+        ):
+            ordered.append(model_id)
+    return ordered
+
+
+def _fetch_models_from_app_server(
+    codex_home: Path,
+    *,
+    codex_bin: str = "codex",
+) -> Optional[List[str]]:
+    """Ask the installed, authenticated app-server for its executable catalog.
+
+    This performs only the initialize + model/list handshake. It never starts
+    a thread or model turn, so it cannot consume inference quota.
+    """
+    try:
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        client = CodexAppServerClient(
+            codex_bin=codex_bin,
+            codex_home=str(codex_home),
+        )
+        try:
+            client.initialize(
+                client_name="hermes-model-inventory",
+                client_title="Hermes Model Inventory",
+                client_version="1",
+            )
+            ordered: List[str] = []
+            cursor: Optional[str] = None
+            for _ in range(20):
+                params = {"includeHidden": True}
+                if cursor:
+                    params["cursor"] = cursor
+                response = client.request("model/list", params, timeout=15)
+                entries = response.get("data", response.get("models", []))
+                for model_id in _visible_app_server_model_ids(entries):
+                    if model_id not in ordered:
+                        ordered.append(model_id)
+                cursor = response.get("nextCursor")
+                if not cursor:
+                    break
+            return ordered
+        finally:
+            client.close()
+    except Exception as exc:
+        logger.debug("Failed to query Codex app-server model catalog: %s", exc)
+        return None
+
+
+def get_codex_app_server_model_ids(
+    *,
+    force_refresh: bool = False,
+    codex_bin: str = "codex",
+) -> List[str]:
+    """Return models the installed Codex app-server can actually execute.
+
+    Codex's shared cache can be rewritten by a resident older app-server after
+    an in-place CLI upgrade. Trust it only when its recorded client version
+    matches the currently installed executable; otherwise refresh through the
+    executable itself. If that verification fails, client-gated models remain
+    hidden instead of being advertised optimistically.
+    """
+    codex_home_str = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+    codex_home = Path(codex_home_str).expanduser()
+    cached_models, cached_version = _read_cache_catalog(codex_home)
+    installed_version = _installed_codex_version(codex_bin)
+    cache_matches = bool(
+        installed_version
+        and cached_version
+        and cached_version == installed_version
+    )
+    if cached_models and cache_matches and not force_refresh:
+        return cached_models
+
+    live_models = _fetch_models_from_app_server(
+        codex_home,
+        codex_bin=codex_bin,
+    )
+    if live_models is not None:
+        return live_models
+    if cache_matches:
+        return cached_models
+    return [
+        model_id
+        for model_id in cached_models
+        if model_id not in _LOCAL_CATALOG_REQUIRED_MODELS
+    ]
 
 
 def get_codex_model_ids(access_token: Optional[str] = None) -> List[str]:

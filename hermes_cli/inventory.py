@@ -281,7 +281,7 @@ def build_models_payload(
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
     if picker_hints:
         _apply_picker_hints(rows)
-        _apply_subscription_runtime_hints(rows, ctx)
+        _apply_subscription_runtime_hints(rows, ctx, refresh=refresh)
     if canonical_order:
         rows = _reorder_canonical(rows)
     if pricing:
@@ -829,7 +829,12 @@ def _apply_picker_hints(rows: list[dict]) -> None:
         )
 
 
-def _apply_subscription_runtime_hints(rows: list[dict], ctx: ConfigContext) -> None:
+def _apply_subscription_runtime_hints(
+    rows: list[dict],
+    ctx: ConfigContext,
+    *,
+    refresh: bool = False,
+) -> None:
     """Mark the selected Codex app-server subscription as the auth transport.
 
     The generic provider inventory looks for an API credential or a Hermes
@@ -845,6 +850,13 @@ def _apply_subscription_runtime_hints(rows: list[dict], ctx: ConfigContext) -> N
     for row in rows:
         if str(row.get("slug") or "").strip().lower() != "openai-codex":
             continue
+        from hermes_cli.codex_models import get_codex_app_server_model_ids
+
+        runtime_models = get_codex_app_server_model_ids(
+            force_refresh=refresh
+        )
+        row["models"] = runtime_models
+        row["total_models"] = len(runtime_models)
         row["authenticated"] = True
         row["auth_type"] = "codex_cli_subscription"
         row["source"] = "codex-app-server"

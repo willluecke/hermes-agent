@@ -81,7 +81,10 @@ def test_codex_app_server_subscription_marks_current_provider_authenticated():
         custom_providers=[],
         openai_runtime="codex_app_server",
     )
-    with _list_auth_returning([]):
+    with _list_auth_returning([]), patch(
+        "hermes_cli.codex_models.get_codex_app_server_model_ids",
+        return_value=["gpt-6-astra", "gpt-5.6-sol"],
+    ):
         payload = build_models_payload(
             ctx,
             include_unconfigured=True,
@@ -96,6 +99,8 @@ def test_codex_app_server_subscription_marks_current_provider_authenticated():
     assert row["authenticated"] is True
     assert row["auth_type"] == "codex_cli_subscription"
     assert row["source"] == "codex-app-server"
+    assert row["models"] == ["gpt-6-astra", "gpt-5.6-sol"]
+    assert row["total_models"] == 2
     assert "warning" not in row
 
 
@@ -583,5 +588,4 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
-
 

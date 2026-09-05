@@ -4,6 +4,8 @@ from unittest.mock import patch
 from hermes_cli.codex_models import (
     DEFAULT_CODEX_MODELS,
     _FORWARD_COMPAT_TEMPLATE_MODELS,
+    _visible_app_server_model_ids,
+    get_codex_app_server_model_ids,
     get_codex_model_ids,
 )
 
@@ -58,6 +60,51 @@ def test_gpt6_astra_requires_account_and_app_server_catalog_agreement(monkeypatc
     assert "gpt-6-astra" in get_codex_model_ids(
         access_token="codex-access-token"
     )
+
+
+def test_app_server_catalog_refreshes_after_cli_upgrade(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._read_cache_catalog",
+        lambda codex_home: (["gpt-5.6-sol"], "0.149.0"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._installed_codex_version",
+        lambda codex_bin: "0.153.4",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_app_server",
+        lambda codex_home, codex_bin: ["gpt-6-astra", "gpt-5.6-sol"],
+    )
+
+    assert get_codex_app_server_model_ids() == [
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+    ]
+
+
+def test_app_server_catalog_excludes_hidden_internal_models():
+    assert _visible_app_server_model_ids([
+        {"id": "gpt-6-astra", "hidden": False},
+        {"id": "gpt-reserve", "hidden": True},
+        {"id": "codex-auto-review", "visibility": "hide"},
+    ]) == ["gpt-6-astra"]
+
+
+def test_app_server_catalog_hides_client_gated_models_if_refresh_fails(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._read_cache_catalog",
+        lambda codex_home: (["gpt-6-astra", "gpt-5.6-sol"], "0.153.4"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._installed_codex_version",
+        lambda codex_bin: "0.149.0",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_app_server",
+        lambda codex_home, codex_bin: None,
+    )
+
+    assert get_codex_app_server_model_ids() == ["gpt-5.6-sol"]
 
 
 
