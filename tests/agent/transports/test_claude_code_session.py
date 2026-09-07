@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
+import pytest
+
 from agent.claude_runtime import make_claude_code_event_bridge
 from agent.transports.claude_code_session import (
     CLAUDE_AUTH_ERROR_CODE,
@@ -32,6 +34,13 @@ def _fake_process(pid):
         stdin=io.StringIO(),
         poll=lambda: None,
     )
+
+
+def test_user_record_rejects_non_text_prompt_before_dispatch():
+    with pytest.raises(ClaudeCodeError, match="prompts must be plain text"):
+        ClaudeCodeSession._user_record(
+            cast(str, [{"type": "text", "text": "malformed boundary"}])
+        )
 
 
 def test_invocation_uses_subscription_model_and_hermes_mcp(tmp_path):

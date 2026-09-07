@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from uuid import uuid4
 from unittest.mock import patch
 
@@ -148,6 +149,44 @@ def test_claude_watchdog_uses_configured_deadlines_and_reports_progress(monkeypa
             "runtime and retrying once.",
         )
     ]
+
+
+def test_continuing_claude_turn_materializes_multimodal_input(monkeypatch):
+    prompts = []
+
+    def _run_turn(session, prompt):
+        prompts.append(prompt)
+        session.on_session_id(session.session_id)
+        return ClaudeCodeTurnResult(
+            final_text=f"answer {len(prompts)}",
+            session_id=session.session_id,
+            session_confirmed=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-image-continuation-{uuid4()}"
+    agent = _make_agent(session_id=outer_session_id, session_db=db)
+
+    agent.run_conversation("Start the repair.")
+    history = db.get_messages_as_conversation(outer_session_id)
+    image_data = base64.b64encode(b"small test image").decode("ascii")
+    content = [
+        {"type": "text", "text": "Inspect this screenshot."},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{image_data}"},
+        },
+    ]
+    result = agent.run_conversation(content, conversation_history=history)
+
+    assert result["completed"] is True
+    assert isinstance(prompts[1], str)
+    assert prompts[1].startswith("Inspect this screenshot.\n\n")
+    assert "Attached images are available at:" in prompts[1]
+    assert "hermes-image-1.png" in prompts[1]
+    assert "data:image" not in prompts[1]
+    db.close()
 
 
 def test_new_hermes_parent_resumes_same_claude_session(monkeypatch):

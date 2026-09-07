@@ -253,7 +253,10 @@ def _materialize_images(original_user_message: Any, directory: str) -> list[str]
         return []
     paths: list[str] = []
     for index, part in enumerate(original_user_message):
-        if not isinstance(part, dict) or part.get("type") != "image_url":
+        if not isinstance(part, dict) or part.get("type") not in {
+            "image_url",
+            "input_image",
+        }:
             continue
         image_url = part.get("image_url")
         value = image_url.get("url") if isinstance(image_url, dict) else image_url
@@ -262,7 +265,12 @@ def _materialize_images(original_user_message: Any, directory: str) -> list[str]
         try:
             header, encoded = value.split(",", 1)
             media_type = header[5:].split(";", 1)[0].lower()
-            suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(media_type)
+            suffix = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+            }.get(media_type)
             data = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error):
             continue
@@ -357,15 +365,31 @@ def run_claude_code_turn(
         session = None
 
     with tempfile.TemporaryDirectory(prefix="hermes-claude-images-") as image_dir:
-        images = _materialize_images(original_user_message, image_dir)
-        prompt = (
+        image_content = (
+            original_user_message
+            if isinstance(original_user_message, list)
+            else user_message
+        )
+        images = _materialize_images(image_content, image_dir)
+        prompt_text = (
             user_message
+            if isinstance(user_message, str)
+            else _content_text(user_message)
+        )
+        if not prompt_text and images:
+            prompt_text = "Please inspect the attached image(s)."
+        prompt = (
+            prompt_text
             if resident_continuity or durable_resume
-            else claude_history_handoff(prior_messages, user_message)
+            else claude_history_handoff(prior_messages, prompt_text)
         )
         if images:
-            prompt += "\n\nAttached images are available at:\n" + "\n".join(
-                f"- {path}" for path in images
+            prompt = "\n\n".join(
+                (
+                    prompt,
+                    "Attached images are available at:\n"
+                    + "\n".join(f"- {path}" for path in images),
+                )
             )
 
         def _remember_confirmed_session(claude_session_id: str) -> None:

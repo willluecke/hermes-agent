@@ -725,6 +725,8 @@ class ClaudeCodeSession:
 
     @staticmethod
     def _user_record(prompt: str) -> str:
+        if not isinstance(prompt, str):
+            raise ClaudeCodeError("Claude Code prompts must be plain text")
         return json.dumps(
             {
                 "type": "user",
