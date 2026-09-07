@@ -30,6 +30,7 @@ DEFAULT_INACTIVITY_TIMEOUT = 10 * 60.0
 DEFAULT_ABSOLUTE_TIMEOUT = 2 * 60 * 60.0
 DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT = 30.0
 DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT = 60.0
+_DEBUG_LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 _ASYNC_AGENT_LAUNCH_MARKER = "async agent launched successfully"
 _TASK_NOTIFICATION_TOOL_USE_ID_RE = re.compile(
@@ -427,6 +428,7 @@ def claude_code_args(
     system_prompt: str = "",
     additional_dirs: Optional[list[str]] = None,
     read_only: bool = False,
+    debug_file: Optional[str] = None,
 ) -> list[str]:
     repo_root = str(Path(__file__).resolve().parents[2])
     mcp_config = {
@@ -474,6 +476,8 @@ def claude_code_args(
         args.extend(["--append-system-prompt", system_prompt.strip()])
     for directory in additional_dirs or []:
         args.extend(["--add-dir", directory])
+    if debug_file:
+        args.extend(["--debug-file", debug_file])
     return args
 
 
@@ -523,6 +527,7 @@ class ClaudeCodeSession:
         self._process: Optional[subprocess.Popen[str]] = None
         self._output_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=40)
+        self._debug_file: Optional[str] = None
         self._turn_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._closed = False
@@ -607,6 +612,38 @@ class ClaudeCodeSession:
             except ProcessLookupError:
                 pass
 
+    def _next_debug_file(self) -> Optional[str]:
+        """Path for this process's Claude debug log, or None when disabled.
+
+        A watchdog kill discards the CLI's stdout and stderr, so a stall before
+        Claude's first event leaves no trace of what the CLI was doing.  Its
+        own debug log is the only record.  Keep one per process under the
+        Hermes logs directory and prune old ones so the directory stays bounded.
+        """
+        if os.environ.get("HERMES_CLAUDE_CODE_DEBUG", "1").strip().lower() in {"0", "false", "no"}:
+            return None
+        configured = os.environ.get("HERMES_CLAUDE_CODE_DEBUG_DIR", "").strip()
+        directory = (
+            Path(configured).expanduser()
+            if configured
+            else Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser() / "logs" / "claude-code"
+        )
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            cutoff = time.time() - _DEBUG_LOG_RETENTION_SECONDS
+            for entry in directory.glob("*.log"):
+                try:
+                    if entry.stat().st_mtime < cutoff:
+                        entry.unlink()
+                except OSError:
+                    continue
+        except OSError:
+            logger.debug("Claude Code debug log directory unavailable", exc_info=True)
+            return None
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        self._debug_file = str(directory / f"{self.session_id or 'session'}-{stamp}.log")
+        return self._debug_file
+
     def _start_process(self) -> subprocess.Popen[str]:
         if self._closed:
             raise ClaudeCodeError("Claude Code session is closed")
@@ -626,6 +663,7 @@ class ClaudeCodeSession:
             system_prompt=self.system_prompt,
             additional_dirs=self.additional_dirs,
             read_only=self.read_only,
+            debug_file=self._next_debug_file(),
         )
         env = os.environ.copy()
         # This route must use the signed-in Max subscription. An ambient key
@@ -793,12 +831,15 @@ class ClaudeCodeSession:
                 }
                 logger.warning(
                     "Claude Code first-event watchdog expired: "
-                    "attempt=%d retrying=%s timeout_seconds=%.1f session=%s pid=%s",
+                    "attempt=%d retrying=%s timeout_seconds=%.1f session=%s pid=%s "
+                    "debug_file=%s stderr_tail=%s",
                     attempt + 1,
                     retrying,
                     timeout,
                     result.session_id,
                     process.pid,
+                    self._debug_file,
+                    (" | ".join(self._stderr_tail).strip() or "<empty>")[-2000:],
                 )
                 if self.on_watchdog_timeout is not None:
                     try:

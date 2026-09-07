@@ -1134,3 +1134,33 @@ def test_event_bridge_keeps_commentary_tool_and_final_channels_separate():
     assert commentary == ["I will inspect the repository."]
     assert any(args[0] == "tool.started" and args[1] == "exec_command" for args, _ in activity)
     assert any(args[0] == "tool.completed" and args[1] == "exec_command" for args, _ in activity)
+
+
+def test_claude_code_args_include_debug_file_only_when_requested():
+    from agent.transports.claude_code_session import claude_code_args
+
+    args = claude_code_args(model="claude-opus-5", session_id="sid", debug_file="/tmp/claude-debug.log")
+    assert args[args.index("--debug-file") + 1] == "/tmp/claude-debug.log"
+    assert "--debug-file" not in claude_code_args(model="claude-opus-5", session_id="sid")
+
+
+def test_next_debug_file_is_bounded_and_can_be_disabled(tmp_path, monkeypatch):
+    import os
+    import time
+    from agent.transports.claude_code_session import ClaudeCodeSession
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_DEBUG_DIR", str(tmp_path))
+    monkeypatch.delenv("HERMES_CLAUDE_CODE_DEBUG", raising=False)
+    stale = tmp_path / "old-session.log"
+    stale.write_text("old")
+    os.utime(stale, (time.time() - 30 * 24 * 3600, time.time() - 30 * 24 * 3600))
+    fresh = tmp_path / "recent-session.log"
+    fresh.write_text("recent")
+    session = ClaudeCodeSession.__new__(ClaudeCodeSession)
+    session.session_id = "abc"
+    session._debug_file = None
+    path = session._next_debug_file()
+    assert path is not None and path.startswith(str(tmp_path)) and "abc-" in path
+    assert not stale.exists() and fresh.exists()
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_DEBUG", "0")
+    assert session._next_debug_file() is None
