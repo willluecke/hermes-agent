@@ -501,14 +501,31 @@ class TestHermesHomeLeakGuard:
         assert env.get("HERMES_HOME") == real_path
 
     def test_runtime_context_is_whitelisted_for_mcp_child(self):
-        """Codex must forward per-turn identity into the stdio MCP process."""
+        """Codex must forward per-turn identity and the parent runtime into
+        the stdio MCP process. The child builds its own tool list, so without
+        HERMES_PARENT_* it would decide the governed Opus handoff from a
+        config snapshot instead of the runtime actually in charge."""
         entry = _build_hermes_tools_mcp_entry()
 
         assert entry["env_vars"] == [
             "HERMES_GATEWAY_SESSION_ID",
             "HERMES_HOME",
             "PYTHONPATH",
+            "HERMES_PARENT_PROVIDER",
+            "HERMES_PARENT_MODEL",
+            "HERMES_PARENT_EFFORT",
+            "HERMES_PARENT_OPUS_WORKER",
         ]
+
+    def test_whitelist_carries_no_credential_keys(self):
+        """The propagated parent runtime is non-secret by construction."""
+        entry = _build_hermes_tools_mcp_entry()
+
+        for name in entry["env_vars"]:
+            assert not any(
+                needle in name.upper()
+                for needle in ("KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH")
+            ), name
 
     def test_unset_hermes_home_omits_env_key(self, monkeypatch):
         """When HERMES_HOME is unset in the environment, the MCP entry MUST

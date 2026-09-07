@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
+from agent.opus_delegation import parent_runtime_env
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
@@ -525,6 +526,8 @@ class CodexAppServerSession:
         resume_thread_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        parent_provider: Optional[str] = None,
+        opus_worker_enabled: bool = False,
         require_exact: bool = False,
         read_only: bool = False,
         permission_profile: Optional[str] = None,
@@ -546,6 +549,13 @@ class CodexAppServerSession:
         self._resumed_existing_thread = False
         self._model = str(model or "").strip()
         self._effort = str(effort or "").strip().lower()
+        # Non-secret parent runtime facts propagated to managed children (the
+        # hermes-tools stdio MCP server codex spawns). Codex builds that
+        # child's tool list itself and cannot see this agent's
+        # ``disabled_toolsets``, so the governed Opus decision has to travel
+        # with it. Absent metadata keeps the child's config-derived fallback.
+        self._parent_provider = str(parent_provider or "").strip().lower()
+        self._opus_worker_enabled = bool(opus_worker_enabled)
         self._require_exact = bool(require_exact)
         self._read_only = bool(read_only)
         self._exact_runtime_validated = False
@@ -649,6 +659,17 @@ class CodexAppServerSession:
             client_extra_args: list[str] = []
             if self._hermes_session_id:
                 client_env["HERMES_GATEWAY_SESSION_ID"] = self._hermes_session_id
+            # Whitelisted in the managed Codex MCP entry's ``env_vars`` so the
+            # restricted stdio MCP child validates the real parent authority
+            # instead of exposing Opus off a stale config snapshot.
+            client_env.update(
+                parent_runtime_env(
+                    provider=self._parent_provider,
+                    model=self._model,
+                    effort=self._effort,
+                    opus_worker_enabled=self._opus_worker_enabled,
+                )
+            )
             policy = self._reversible_deletion_policy
             if (
                 self._project_key

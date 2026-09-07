@@ -145,6 +145,115 @@ class TestApiServerAdapterToolset:
         assert runtime["execution_mode"] == "single_model"
         assert runtime["route_source"] == "direct_model"
 
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_single_model_gpt6_astra_keeps_governed_opus_handoff(self):
+        """The one bounded single_model exception: a resolved openai-codex /
+        gpt-6-astra parent keeps opus_worker while generic delegation stays
+        denied. Hermes Chat's existing single_model request must become
+        eligible without any frontend change."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        selected_runtime = {
+            "api_key": "codex-key",
+            "base_url": None,
+            "provider": "openai-codex",
+            "api_mode": "codex_app_server",
+            "command": None,
+            "args": [],
+        }
+
+        with patch(
+            "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+            return_value=dict(selected_runtime),
+        ), patch(
+            "gateway.run._load_gateway_config", return_value={}
+        ), patch(
+            "gateway.run.GatewayRunner._load_fallback_model"
+        ) as fallback_loader, patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            agent_cls.return_value = MagicMock()
+
+            adapter._create_agent(
+                requested_model="gpt-6-astra",
+                requested_provider="openai-codex",
+                single_model=True,
+                session_id="astra-session",
+            )
+
+        fallback_loader.assert_not_called()
+        kwargs = agent_cls.call_args.kwargs
+        assert kwargs["model"] == "gpt-6-astra"
+        assert kwargs["disabled_toolsets"] == ["delegation"]
+        assert "opus_worker" in kwargs["enabled_toolsets"]
+        assert kwargs["fallback_model"] is None
+        assert kwargs["skip_context_files"] is True
+        runtime = agent_cls.return_value._hermes_api_runtime
+        assert runtime["execution_mode"] == "single_model"
+        assert runtime["opus_worker_enabled"] is True
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_single_model_other_provider_keeps_both_denials(self):
+        """A non-eligible single_model selection keeps delegation AND the Opus
+        handoff denied, even when it names the same model slug."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        for provider, model in (
+            ("openrouter", "gpt-6-astra"),
+            ("openai-codex", "gpt-5.6-sol"),
+            ("anthropic", "claude-opus-5"),
+        ):
+            with patch(
+                "gateway.platforms.api_server._resolve_request_runtime_agent_kwargs",
+                return_value={
+                    "api_key": "k",
+                    "base_url": None,
+                    "provider": provider,
+                    "api_mode": "chat_completions",
+                    "command": None,
+                    "args": [],
+                },
+            ), patch(
+                "gateway.run._load_gateway_config", return_value={}
+            ), patch(
+                "run_agent.AIAgent"
+            ) as agent_cls:
+                agent_cls.return_value = MagicMock()
+
+                adapter._create_agent(
+                    requested_model=model,
+                    requested_provider=provider,
+                    single_model=True,
+                    session_id=f"direct-{provider}",
+                )
+
+            kwargs = agent_cls.call_args.kwargs
+            assert kwargs["disabled_toolsets"] == ["delegation", "opus_worker"], (
+                provider,
+                model,
+            )
+            runtime = agent_cls.return_value._hermes_api_runtime
+            assert runtime["opus_worker_enabled"] is False, (provider, model)
+
+    def test_gpt6_exception_denylist_keeps_generic_delegation_removed(self):
+        from model_tools import get_tool_definitions
+        from tools.registry import discover_builtin_tools
+
+        discover_builtin_tools()
+        tools = get_tool_definitions(
+            enabled_toolsets=["hermes-api-server"],
+            disabled_toolsets=["delegation"],
+            quiet_mode=True,
+        )
+        names = {tool["function"]["name"] for tool in tools}
+        assert "delegate_task" not in names
+        assert "terminal" in names
+
     def test_direct_mode_denylist_removes_every_model_spawning_tool(self):
         from model_tools import get_tool_definitions
         from tools.registry import discover_builtin_tools

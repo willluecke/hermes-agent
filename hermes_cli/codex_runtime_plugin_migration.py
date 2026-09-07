@@ -666,6 +666,8 @@ def _build_hermes_tools_mcp_entry() -> dict:
     sees the same config + module layout the user is running."""
     import sys
 
+    from agent.opus_delegation import PARENT_RUNTIME_ENV_VARS
+
     env: dict[str, str] = {}
     # HERMES_HOME passes through IF SET so the MCP subprocess sees the same
     # config / auth / sessions DB as the parent CLI. Read from os.environ
@@ -699,12 +701,16 @@ def _build_hermes_tools_mcp_entry() -> dict:
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
         # Codex starts stdio MCP servers with a restricted environment. These
         # non-secret runtime values must be explicitly whitelisted so the
-        # callback can bind durable worker jobs to the originating Hermes turn
-        # and resolve the same profile/worktree paths as its parent process.
+        # callback can bind durable worker jobs to the originating Hermes turn,
+        # resolve the same profile/worktree paths as its parent process, and
+        # validate the actual parent authority before exposing the governed
+        # Opus handoff (HERMES_PARENT_*; see agent/opus_delegation.py). No
+        # credential is whitelisted here.
         "env_vars": [
             "HERMES_GATEWAY_SESSION_ID",
             "HERMES_HOME",
             "PYTHONPATH",
+            *PARENT_RUNTIME_ENV_VARS,
         ],
     }
     if env:

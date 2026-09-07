@@ -22,6 +22,16 @@ Scope (what we expose):
   - decision_log                         — append-only governed decisions
   - model_consult                        — read-only cross-provider advice
   - opus_code_worker                     — governed Claude Code implementation
+                                           handoff. Registration is NOT
+                                           unconditional: this process builds
+                                           its own tool list and cannot see the
+                                           parent's disabled_toolsets, so the
+                                           parent's non-secret provider/model/
+                                           effort/Opus-enabled state arrives
+                                           through the managed MCP env
+                                           whitelist (HERMES_PARENT_*) and is
+                                           validated before the tool is
+                                           exposed. See agent/opus_delegation.py.
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
@@ -184,8 +194,8 @@ def _build_server() -> Any:
             "doesn't cover: web search/extract, browser automation, "
             "subagent delegation, vision, image generation, persistent "
             "memory, skills, cross-session search, the governed decision log, "
-            "cross-provider model consultation, and exact Opus 5 "
-            "implementation handoffs."
+            "cross-provider model consultation, and — only for a validated "
+            "parent authority — exact Opus 5 implementation handoffs."
         ),
     )
 

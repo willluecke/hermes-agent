@@ -448,14 +448,16 @@ Codex's built-in toolset covers shell/file ops/patches but doesn't have web sear
 command = "/path/to/python"
 args = ["-m", "agent.transports.hermes_tools_mcp_server"]
 env = { HERMES_HOME = "/your/.hermes", PYTHONPATH = "...", HERMES_QUIET = "1" }
-env_vars = ["HERMES_GATEWAY_SESSION_ID", "HERMES_HOME", "PYTHONPATH"]
+env_vars = ["HERMES_GATEWAY_SESSION_ID", "HERMES_HOME", "PYTHONPATH", "HERMES_PARENT_PROVIDER", "HERMES_PARENT_MODEL", "HERMES_PARENT_EFFORT", "HERMES_PARENT_OPUS_WORKER"]
 startup_timeout_sec = 30.0
 tool_timeout_sec = 600.0
 ```
 
 When the model calls `web_search` (or another exposed Hermes tool), codex spawns the `hermes_tools_mcp_server` subprocess via stdio, the request is dispatched through `model_tools.handle_function_call()`, and the result is projected back to codex like any other MCP response.
 
-**Tools available via the callback:** `web_search`, `web_extract`, `browser_navigate`, `browser_click`, `browser_type`, `browser_press`, `browser_snapshot`, `browser_scroll`, `browser_back`, `browser_get_images`, `browser_console`, `browser_vision`, `vision_analyze`, `image_generate`, `skill_view`, `skills_list`, `text_to_speech`, `decision_log`, and `opus_code_worker`.
+**Tools available via the callback:** `web_search`, `web_extract`, `browser_navigate`, `browser_click`, `browser_type`, `browser_press`, `browser_snapshot`, `browser_scroll`, `browser_back`, `browser_get_images`, `browser_console`, `browser_vision`, `vision_analyze`, `image_generate`, `skill_view`, `skills_list`, `text_to_speech`, `decision_log`, and — for a validated parent authority only — `opus_code_worker`.
+
+**Why `env_vars` carries `HERMES_PARENT_*`:** codex starts stdio MCP servers with a restricted environment, and the MCP child builds its own tool list without seeing the parent turn's disabled toolsets. The parent's non-secret provider, model, reasoning effort, and Opus-enabled state are therefore whitelisted through to the child, which validates them before exposing the governed `opus_code_worker` handoff. It accepts the exact `gpt-5.6-sol` xhigh orchestrator and an eligible `openai-codex` / `gpt-6-astra` single-model parent, and rejects any other direct parent. A path that carries no such metadata keeps the earlier config-derived authority. No credential is ever whitelisted.
 
 **Tools NOT available:** `delegate_task`, `memory`, `session_search`, `todo`. These need the running AIAgent context to dispatch (mid-loop state) and a stateless MCP callback can't drive them. Use the default Hermes runtime (`/codex-runtime auto`) when you need these.
 

@@ -14,6 +14,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.opus_delegation import (
+    ORCHESTRATOR_EFFORT,
+    ORCHESTRATOR_MODEL,
+    authority_label,
+    parent_runtime_from_env,
+    validate_parent_authority,
+)
 from tools.interrupt import is_interrupted
 from tools.registry import registry
 
@@ -44,10 +51,29 @@ def _key_path() -> Path:
 
 
 def _authority() -> dict[str, str]:
+    """Resolve the authority that may accept an Opus implementation handoff.
+
+    A managed child (the hermes-tools stdio MCP server codex spawns) is handed
+    its parent's non-secret runtime through the env whitelist. When that
+    metadata is present it is authoritative: the exact gpt-5.6-sol xhigh
+    orchestrator and an eligible openai-codex/gpt-6-astra single-model parent
+    are accepted, and any other direct parent is rejected — a config snapshot
+    must not vouch for a runtime that is not actually running.
+
+    Paths that carry no runtime metadata (native/non-gateway callers) keep the
+    existing config-derived orchestrator authority.
+    """
+    runtime = parent_runtime_from_env()
+    if runtime is not None:
+        return validate_parent_authority(runtime)
+
     from tools.decision_log_tool import _authority as decision_authority
 
     authority = decision_authority()
-    if authority.get("model") != "gpt-5.6-sol" or authority.get("effort") != "xhigh":
+    if (
+        authority.get("model") != ORCHESTRATOR_MODEL
+        or authority.get("effort") != ORCHESTRATOR_EFFORT
+    ):
         raise ValueError(
             "Opus delegation requires exact gpt-5.6-sol at xhigh as decision authority"
         )
@@ -282,12 +308,14 @@ def _wait_for_job(job: dict[str, Any], wait_seconds: int) -> dict[str, Any]:
 
 
 def _brief(
+    authority: dict[str, str],
     specification: str,
     acceptance_checks: list[str],
     constraints: list[str],
 ) -> str:
     lines = [
-        "Hermes/Sol has accepted the following bounded implementation specification.",
+        f"{authority_label(authority)} has accepted the following bounded "
+        "implementation specification.",
         "",
         "Specification:",
         specification,
@@ -353,7 +381,7 @@ def _run_job(
     if not _worker_available():
         raise ValueError("no fresh authenticated Claude worker is available")
 
-    brief = _brief(specification, checks, limits)
+    brief = _brief(authority, specification, checks, limits)
     job_payload = {
         "id": job_id,
         "title": title[:500],
@@ -363,7 +391,7 @@ def _run_job(
         "chatTitle": title[:500],
         "contextType": "hermes-orchestration",
         "contextId": thread,
-        "contextTitle": "Hermes/Sol implementation handoff",
+        "contextTitle": f"{authority_label(authority)} implementation handoff",
         "contextDetail": (
             f"Authority: {authority['model']} at {authority['effort']}; "
             f"worker: claude-opus-5 at high; attempt: {attempt}"
@@ -425,8 +453,9 @@ OPUS_CODE_WORKER_SCHEMA = {
     "name": "opus_code_worker",
     "description": (
         "Delegate an accepted, bounded code implementation to the exact native "
-        "Claude Code Opus 5 worker, then recover its durable result for Hermes/Sol "
-        "review in this same conversation. Use action='run' only after Hermes has "
+        "Claude Code Opus 5 worker, then recover its durable result for review by "
+        "the accepting Hermes authority in this same conversation. Use "
+        "action='run' only after Hermes has "
         "resolved product and architecture choices and stated observable acceptance "
         "checks. The worker edits an isolated Git worktree and may create a local "
         "commit, but cannot push, merge, deploy, contact anyone, or write decisions. "

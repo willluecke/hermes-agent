@@ -217,6 +217,148 @@ def test_cancel_updates_owned_nonterminal_job(monkeypatch):
     )
 
 
+# ---- Parent-runtime authority propagated through the managed MCP child ----
+
+
+def _clear_parent_runtime(monkeypatch):
+    for name in (
+        "HERMES_PARENT_PROVIDER",
+        "HERMES_PARENT_MODEL",
+        "HERMES_PARENT_EFFORT",
+        "HERMES_PARENT_OPUS_WORKER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _set_parent_runtime(monkeypatch, provider, model, effort, opus="1"):
+    monkeypatch.setenv("HERMES_PARENT_PROVIDER", provider)
+    monkeypatch.setenv("HERMES_PARENT_MODEL", model)
+    monkeypatch.setenv("HERMES_PARENT_EFFORT", effort)
+    monkeypatch.setenv("HERMES_PARENT_OPUS_WORKER", opus)
+
+
+def test_eligible_gpt6_astra_parent_is_an_accepted_authority(monkeypatch):
+    """The bounded single-model exception reaches the MCP child through the
+    whitelisted env, and the child accepts it on its own runtime facts."""
+    _set_parent_runtime(monkeypatch, "openai-codex", "gpt-6-astra", "high")
+
+    assert worker._authority() == {
+        "provider": "openai-codex",
+        "model": "gpt-6-astra",
+        "effort": "high",
+        "runtime": "codex_app_server",
+    }
+
+
+def test_exact_sol_orchestrator_runtime_is_still_accepted(monkeypatch):
+    _set_parent_runtime(monkeypatch, "openai-codex", "gpt-5.6-sol", "xhigh")
+
+    assert worker._authority()["model"] == "gpt-5.6-sol"
+
+
+def test_disallowed_direct_parent_is_rejected(monkeypatch, tmp_path):
+    """A runtime that is neither the exact orchestrator nor the eligible
+    GPT-6 Astra parent must not reach Opus, even though the host config still
+    describes a valid Sol authority and the sync key is present — so the tool
+    is not merely unusable, it is never registered."""
+    monkeypatch.setattr(
+        "tools.decision_log_tool._authority", _authority, raising=False
+    )
+    key_file = tmp_path / "hermes-api-key"
+    key_file.write_text("test-key", encoding="utf-8")
+    monkeypatch.setattr(worker, "_key_path", lambda: key_file)
+
+    _set_parent_runtime(monkeypatch, "openai-codex", "gpt-6-astra", "high")
+    assert worker._configured() is True
+
+    for provider, model, effort in (
+        ("openrouter", "gpt-6-astra", "high"),
+        ("openai-codex", "gpt-5.5", "high"),
+        ("openai-codex", "gpt-5.6-sol", "high"),
+        ("anthropic", "claude-opus-5", "high"),
+    ):
+        _set_parent_runtime(monkeypatch, provider, model, effort)
+        try:
+            worker._authority()
+        except ValueError as exc:
+            assert "Opus delegation requires" in str(exc)
+        else:  # pragma: no cover - contract violation
+            raise AssertionError(f"{provider}/{model} was accepted")
+        assert worker._configured() is False
+
+
+def test_parent_that_denied_opus_worker_is_rejected(monkeypatch):
+    _set_parent_runtime(monkeypatch, "openai-codex", "gpt-6-astra", "high", opus="0")
+
+    try:
+        worker._authority()
+    except ValueError as exc:
+        assert "disabled opus_worker" in str(exc)
+    else:  # pragma: no cover - contract violation
+        raise AssertionError("a denied parent was accepted")
+
+
+def test_absent_runtime_metadata_falls_back_to_config_authority(monkeypatch):
+    """Native/non-gateway paths that carry no runtime metadata keep the
+    existing config-derived orchestrator authority."""
+    _clear_parent_runtime(monkeypatch)
+    monkeypatch.setattr(
+        "tools.decision_log_tool._authority", _authority, raising=False
+    )
+
+    assert worker._authority()["model"] == "gpt-5.6-sol"
+
+
+def test_run_names_the_actual_gpt6_authority_in_job_metadata(monkeypatch):
+    """Queued job metadata and the worker brief must name the authority that
+    actually accepted the specification, not a hard-coded Hermes/Sol."""
+    _set_parent_runtime(monkeypatch, "openai-codex", "gpt-6-astra", "high")
+    captured = {}
+
+    def request(method, path, payload=None, **kwargs):
+        if method == "GET" and path.startswith("/management/jobs/"):
+            raise worker._SyncError("not found", status=404)
+        if method == "GET" and path == "/management/workers":
+            return {
+                "workers": [
+                    {
+                        "updatedAt": worker.time.time() * 1_000,
+                        "providers": {
+                            "claude": {"available": True, "authenticated": True}
+                        },
+                    }
+                ]
+            }
+        if method == "POST" and path == "/management/jobs":
+            captured.update(payload)
+            return {"job": _completed_job(payload["id"], payload["threadId"])}
+        raise AssertionError((method, path, payload))
+
+    monkeypatch.setattr(worker, "_sync_request", request)
+    result = json.loads(
+        worker.opus_code_worker_tool(
+            "run",
+            session_id="astra-session",
+            project="hermes-agent",
+            title="Implement the bounded exception",
+            specification="Make the delegation contract explicit.",
+            acceptance_checks=["pytest -q tests/tools/test_opus_worker_tool.py"],
+            wait_seconds=0,
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["contextDetail"].startswith("Authority: gpt-6-astra at high;")
+    assert captured["contextTitle"] == "Hermes/gpt-6-astra at high implementation handoff"
+    assert captured["brief"].startswith(
+        "Hermes/gpt-6-astra at high has accepted the following bounded"
+    )
+    assert "Hermes/Sol" not in captured["brief"]
+    # The worker itself stays pinned to exact Opus 5 regardless of authority.
+    assert captured["model"] == "claude-opus-5"
+    assert captured["effort"] == "high"
+
+
 def test_tool_is_core_registered_and_exposed():
     from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
     from tools.registry import registry

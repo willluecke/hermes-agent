@@ -80,6 +80,14 @@ user request
   -> the human separately authorizes push, merge, deploy, or release
 ```
 
+Delegation authority is the runtime actually in charge, not a config snapshot.
+The exact `gpt-5.6-sol` xhigh orchestrator holds it. One bounded exception
+exists: a Hermes API `execution_mode=single_model` turn whose resolved provider
+is `openai-codex` and whose model is `gpt-6-astra` keeps `opus_code_worker`
+while generic `delegate_task` stays denied. Every other single-model selection
+keeps both denials, and any other direct parent is rejected outright. The
+accepting authority is named in the queued job metadata and worker brief.
+
 `opus_code_worker` supports `run`, `status`, and `cancel`. A run receives a
 deterministic job ID derived from the Hermes session, specification, and
 explicit attempt number. Retrying a lost request therefore recovers the same
@@ -134,6 +142,10 @@ Meaningful project outcomes are saved back to RecCli once at the end of work.
 A save failure is reported and does not cause an unbounded retry loop.
 
 ## Authority Matrix
+
+Rows below name Sol as the standing orchestrator; an eligible GPT-6 Astra
+single-model parent holds the same delegation and review duties for the turns
+it accepts.
 
 | Activity | Hermes / Sol 5.6 xhigh | Claude Opus 5 | Human |
 | --- | --- | --- | --- |

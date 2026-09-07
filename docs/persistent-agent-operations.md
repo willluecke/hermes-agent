@@ -129,11 +129,28 @@ The standard Hermes path exposes `opus_code_worker` through the Hermes tools
 MCP bridge. Its sync client uses the local bearer-gated management service at
 `http://127.0.0.1:8643`; the sync credential is read from
 `~/.hermes-api-key` and is never passed to either model. The Codex app-server
-process receives only a non-secret Hermes session identifier so worker jobs can
-be bound to the originating conversation. The managed Codex MCP entry
-whitelists `HERMES_GATEWAY_SESSION_ID` through `env_vars`; passing it only to
-the parent app-server is insufficient because Codex restricts the environment
-of stdio MCP children.
+process receives only non-secret runtime facts: the Hermes session identifier
+that binds worker jobs to the originating conversation, plus the parent's
+provider, model, reasoning effort, and Opus-enabled state. The managed Codex
+MCP entry whitelists `HERMES_GATEWAY_SESSION_ID` and `HERMES_PARENT_*` through
+`env_vars`; passing them only to the parent app-server is insufficient because
+Codex restricts the environment of stdio MCP children.
+
+The MCP child builds its own tool list and cannot see the parent turn's
+disabled toolsets, so it validates that propagated runtime before registering
+`opus_code_worker`. It accepts the exact `gpt-5.6-sol` xhigh orchestrator and
+an eligible `openai-codex` / `gpt-6-astra` single-model parent, and rejects any
+other direct parent — a config snapshot must not vouch for a runtime that is
+not the one actually running. Paths carrying no runtime metadata keep the
+config-derived orchestrator authority. Queued job metadata and the worker brief
+name whichever authority actually accepted the specification.
+
+`execution_mode=single_model` remains an exact, no-fallback contract. Generic
+`delegate_task` stays denied there in every case; the governed Opus handoff is
+the single bounded exception, and only for a resolved `openai-codex` /
+`gpt-6-astra` parent. Every other single-model selection keeps both denials.
+Worker policy is unchanged: Opus still edits an isolated worktree, cannot push,
+merge, deploy, or write decisions, and completion is not acceptance.
 
 The command-center Git configuration must also have a local author name and
 email. Claude does not need permission to commit: after the native session

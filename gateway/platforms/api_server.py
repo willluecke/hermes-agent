@@ -3514,9 +3514,14 @@ class APIServerAdapter(BasePlatformAdapter):
         bypasses session/global model selection and identity/context files,
         disables model-spawning tools and background review, and carries no
         fallback chain. The selected provider/model is therefore the only LLM
-        runtime that can answer or delegate work for the turn.
+        runtime that can answer work for the turn. Generic ``delegate_task``
+        delegation is always denied here; the single bounded exception is the
+        governed ``opus_worker`` handoff for a resolved ``openai-codex`` /
+        GPT-6 Astra parent (see ``agent/opus_delegation.py``), which stays a
+        reviewed implementation handoff rather than a free model spawn.
         """
         from run_agent import AIAgent
+        from agent.opus_delegation import single_model_disabled_toolsets
         from gateway.run import (
             _checkpoint_agent_kwargs,
             _current_max_iterations,
@@ -3768,7 +3773,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
-        disabled_toolsets = ["delegation", "opus_worker"] if single_model else None
+        # single_model stays an exact, no-fallback contract: no generic
+        # model-spawning tool is ever restored. The one bounded exception is
+        # the governed Opus handoff for an eligible GPT-6 Astra parent, keyed
+        # off the *resolved* provider so a route or alias cannot smuggle a
+        # different runtime into it. See agent/opus_delegation.py.
+        resolved_provider = runtime_kwargs.get("provider") or request_provider or ""
+        disabled_toolsets = (
+            single_model_disabled_toolsets(resolved_provider, model)
+            if single_model
+            else None
+        )
+        opus_worker_enabled = "opus_worker" in enabled_toolsets and "opus_worker" not in (
+            disabled_toolsets or []
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -3827,6 +3845,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
             "execution_mode": "single_model" if single_model else "orchestrated",
+            "opus_worker_enabled": bool(opus_worker_enabled),
             "route_source": (
                 "direct_model"
                 if single_model
