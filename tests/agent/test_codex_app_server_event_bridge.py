@@ -106,13 +106,12 @@ class TestCodexItemToArgs:
 
 
 class TestCodexItemToPreview:
-    def test_command_preview_truncated(self):
-        long_cmd = "echo " + "x" * 500
+    def test_command_details_keep_full_batched_command(self):
+        long_cmd = "echo " + "x" * 500 + "\ngit status --short"
         preview = _codex_item_to_preview({
             "type": "commandExecution", "command": long_cmd
         })
-        assert preview is not None
-        assert len(preview) <= 120
+        assert preview == long_cmd
 
     def test_file_change_preview_lists_first_three_paths(self):
         preview = _codex_item_to_preview({

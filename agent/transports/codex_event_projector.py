@@ -13,7 +13,8 @@ Codex emits items with a discriminator field `type`:
   - fileChange          → assistant tool_call(name="apply_patch") + tool result
   - mcpToolCall         → assistant tool_call(name=f"mcp.{server}.{tool}") + tool result
   - dynamicToolCall     → assistant tool_call(name=tool) + tool result
-  - plan/hookPrompt/collabAgentToolCall → recorded as opaque assistant notes
+  - collabAgentToolCall/subAgentActivity/sleep → coordination tool + result
+  - plan/hookPrompt → recorded as opaque assistant notes
 
 Each item maps to AT MOST one assistant entry + one tool entry, preserving
 Hermes' message-alternation invariants (system → user → assistant → user/tool
@@ -32,6 +33,8 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from agent.transports.codex_coordination import COORDINATION_ITEM_TYPES, coordination_item
 
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
@@ -112,13 +115,30 @@ class CodexEventProjector:
             return self._project_dynamic_tool_call(item, item_id)
         if item_type == "userMessage":
             return self._project_user_message(item)
+        if item_type in COORDINATION_ITEM_TYPES:
+            return self._project_coordination(item, item_id)
 
-        # Unknown / rare items (plan, hookPrompt, collabAgentToolCall, etc.)
+        # Unknown / rare items (plan, hookPrompt, etc.)
         # — record as opaque assistant note so memory review can still see
         # *something* happened, but don't fabricate tool_call structure.
         return self._project_opaque(item, item_type)
 
     # ---------- per-type projections ----------
+
+    def _project_coordination(self, item: dict, item_id: str) -> ProjectionResult:
+        name, args, result, _, _ = coordination_item(item)
+        call_id = _deterministic_call_id(name, item_id)
+        assistant = {"role": "assistant", "content": None, "tool_calls": [{
+            "id": call_id, "type": "function", "function": {
+                "name": name, "arguments": _format_tool_args(args),
+            },
+        }]}
+        if self._pending_reasoning:
+            assistant["reasoning"] = "\n".join(self._pending_reasoning)
+            self._pending_reasoning = []
+        return ProjectionResult(messages=[assistant, {
+            "role": "tool", "tool_call_id": call_id, "content": result,
+        }], is_tool_iteration=item["type"] != "subAgentActivity")
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""

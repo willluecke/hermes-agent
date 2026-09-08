@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.transports.codex_coordination import COORDINATION_ITEM_TYPES, coordination_item
 
 logger = logging.getLogger(__name__)
 
@@ -468,7 +469,7 @@ def _record_codex_app_server_compaction(
 # entry (codex handles it internally) but still deserves a bubble.
 _CODEX_TOOL_ITEM_TYPES = frozenset(
     {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
-)
+) | COORDINATION_ITEM_TYPES
 
 # Internal MCP server that wraps Hermes' native tools for codex. When
 # codex calls back through it, the inner dispatch runs in a SEPARATE
@@ -487,6 +488,8 @@ def _codex_item_to_tool_name(item: dict) -> str:
     CodexEventProjector so the progress bubble and the projected
     tool_calls entry use the same identifier."""
     item_type = item.get("type") or ""
+    if item_type in COORDINATION_ITEM_TYPES:
+        return coordination_item(item)[0]
     if item_type == "commandExecution":
         return "exec_command"
     if item_type == "fileChange":
@@ -509,6 +512,8 @@ def _codex_item_to_args(item: dict) -> dict:
     Mirrors the projector's _project_command / _project_file_change /
     _project_mcp_tool_call / _project_dynamic_tool_call shapes."""
     item_type = item.get("type") or ""
+    if item_type in COORDINATION_ITEM_TYPES:
+        return coordination_item(item)[1]
     if item_type == "commandExecution":
         return {"command": item.get("command") or "",
                 "cwd": item.get("cwd") or ""}
@@ -527,12 +532,17 @@ def _codex_item_to_args(item: dict) -> dict:
 
 
 def _codex_item_to_preview(item: dict) -> Any:
-    """Short human-readable preview for the tool.started bubble. Returns
-    None when no useful preview is available (Hermes' UI tolerates None)."""
+    """Tool details for both collapsed and expanded displays.
+
+    The gateway owns redaction and disclosed transport limits. Cutting the
+    command here silently also cuts the expanded view and durable archive.
+    """
     item_type = item.get("type") or ""
+    if item_type in COORDINATION_ITEM_TYPES:
+        return coordination_item(item)[4]
     if item_type == "commandExecution":
         cmd = item.get("command") or ""
-        return cmd[:120] if cmd else None
+        return cmd or None
     if item_type == "fileChange":
         paths = [c.get("path") for c in (item.get("changes") or [])
                  if isinstance(c, dict) and c.get("path")]
@@ -547,12 +557,12 @@ def _codex_item_to_preview(item: dict) -> Any:
         if not isinstance(args, dict) or not args:
             return None
         try:
-            return json.dumps(args, ensure_ascii=False)[:120]
+            return json.dumps(args, ensure_ascii=False)
         except (TypeError, ValueError):
             return None
     if item_type == "webSearch":
         query = item.get("query") or ""
-        return query[:120] if query else None
+        return query or None
     return None
 
 
@@ -561,6 +571,9 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     Mirrors the projector's tool-result content so the bubble shows the
     same outcome string that ends up in the messages list."""
     item_type = item.get("type") or ""
+    if item_type in COORDINATION_ITEM_TYPES:
+        _, _, result, is_error, _ = coordination_item(item)
+        return result, is_error
     if item_type == "commandExecution":
         out = item.get("aggregatedOutput") or ""
         exit_code = item.get("exitCode")
@@ -579,12 +592,12 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         error = item.get("error")
         if error:
             return (
-                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}",
+                f"[error] {json.dumps(error, ensure_ascii=False)}",
                 True,
             )
         result = item.get("result")
         return (
-            json.dumps(result, ensure_ascii=False)[:4000]
+            json.dumps(result, ensure_ascii=False)
             if result is not None else "",
             False,
         )
@@ -592,7 +605,7 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
             return (
-                json.dumps(content_items, ensure_ascii=False)[:4000],
+                json.dumps(content_items, ensure_ascii=False),
                 not bool(item.get("success", True)),
             )
         success = item.get("success", True)
@@ -742,6 +755,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     file_change_snapshots: dict[str, dict[str, list[bytes] | None]] = {}
     agent_message_phases: dict[str, str] = {}
     buffered_agent_deltas: dict[str, list[str]] = {}
+    active_agent_paths: dict[str, str] = {}
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -777,7 +791,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.started", name, _codex_item_to_preview(item), args,
+                preview = _codex_item_to_preview(item)
+                if name == "wait_agent" and active_agent_paths:
+                    preview += "\nActive agents: " + ", ".join(active_agent_paths.values())
+                cb("tool.started", name, preview, args,
                    tool_call_id=_stable_call_id(item, name))
             except Exception:
                 logger.debug(
@@ -800,6 +817,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_tool_completed(item: dict) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
+        # Lifecycle notifications may arrive only as completed items. Retain
+        # their path/kind label instead of emitting an anonymous result row.
+        if item.get("type") in COORDINATION_ITEM_TYPES and item_id not in started:
+            _fire_tool_started(item)
         prior = started.pop(item_id, None)
         # Prefer codex's own durationMs when present so the bubble shows
         # exact tool wall-time; fall back to our started timestamp; fall
@@ -941,6 +962,12 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if item_type == "subAgentActivity" and method in {"item/started", "item/completed"}:
+            agent_id = item.get("agentThreadId") or ""
+            if item.get("kind") == "started" and agent_id:
+                active_agent_paths[agent_id] = item.get("agentPath") or agent_id
+            elif item.get("kind") in {"completed", "interrupted"}:
+                active_agent_paths.pop(agent_id, None)
         if method == "item/started":
             if item_type in _CODEX_TOOL_ITEM_TYPES:
                 _fire_tool_started(item)
