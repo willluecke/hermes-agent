@@ -1417,8 +1417,8 @@ class TestRunEvents:
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             first = await cli.get(f"/v1/runs/{run_id}/events")
-            line = await first.content.readline()
-            assert b"before-" in line
+            frame = await first.content.readuntil(b"\n\n")
+            assert b"before-" in frame
             first.close()
             await asyncio.sleep(0)
 
@@ -1795,7 +1795,9 @@ class TestRunToolEventIdentity:
             for event in events
             if event.get("event") == "runtime.first_event_timeout"
         )
-        assert watchdog == {
+        assert watchdog["run_seq"] > 0
+        assert watchdog["emitted_at_ms"] > 0
+        assert {k: v for k, v in watchdog.items() if k not in {"run_seq", "emitted_at_ms"}} == {
             "event": "runtime.first_event_timeout",
             "run_id": run_id,
             "timestamp": watchdog["timestamp"],
@@ -2026,7 +2028,7 @@ class TestRunToolEventIdentity:
         big = "x" * (adapter._RUN_TOOL_OUTPUT_EVENT_CHARS + 500)
 
         def script(cb):
-            cb("tool.started", "terminal", "env", {"command": "env"})
+            cb("tool.started", "terminal", f"echo {secret}\n{big}", {"command": "env"})
             cb("tool.completed", "terminal", None, None,
                duration=0.1, is_error=False,
                result=f"key={secret}\n{big}")

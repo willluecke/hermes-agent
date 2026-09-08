@@ -1838,8 +1838,14 @@ class _ReplayableRunEventStream:
         if event is None:
             self._closed = True
         else:
-            self._events.append(event)
             self._next_index += 1
+            # Run-wide transport identity is independent of tool-output sequence.
+            # Stamp once at emission; every subscriber and archive sees the same ID.
+            self._events.append({
+                **event,
+                "run_seq": self._next_index,
+                "emitted_at_ms": time.time() * 1000,
+            })
             overflow = len(self._events) - self._history_limit
             if overflow > 0:
                 del self._events[:overflow]
@@ -8359,7 +8365,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool_call_id": _tool_id_for_start(
                         tool_name, kwargs.get("tool_call_id")
                     ),
-                    "preview": preview,
+                    "preview": _tool_output_text(preview),
                 })
             elif event_type == "tool.output.delta":
                 call_id = _tool_id_for_output(
@@ -9388,7 +9394,12 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         stream = self._run_streams[run_id]
-        cursor = stream.first_index
+        raw_cursor = request.query.get("after", request.headers.get("Last-Event-ID", "0"))
+        if len(raw_cursor) > 16 or not raw_cursor.isascii() or not raw_cursor.isdigit():
+            return web.json_response({"error": "invalid_event_cursor"}, status=400)
+        cursor = int(raw_cursor)
+        if cursor > stream._next_index:
+            return web.json_response({"error": "event_cursor_ahead"}, status=409)
         self._run_stream_subscribers[run_id] = (
             self._run_stream_subscribers.get(run_id, 0) + 1
         )
@@ -9405,9 +9416,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             while True:
+                if cursor < stream.first_index:
+                    await response.write(_sse_frame({
+                        "event": "run.replay.gap", "run_id": run_id,
+                        "event_id": f"{run_id}:replay-gap:{cursor + 1}:{stream.first_index}",
+                        "missing_events": stream.first_index - cursor,
+                    }))
                 events, cursor, closed = stream.read_from(cursor)
                 for event in events:
-                    await response.write(_sse_frame(event))
+                    await response.write(
+                        f"id: {event['run_seq']}\n".encode() + _sse_frame(event)
+                    )
                 if closed:
                     await response.write(b": stream closed\n\n")
                     break
