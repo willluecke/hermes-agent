@@ -143,6 +143,7 @@ class TurnResult:
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
+    compaction_completed_at: Optional[float] = None
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level or absolute timeout fired, or token-refresh failure
     # killed the child). The caller should retire
@@ -906,6 +907,7 @@ class CodexAppServerSession:
         turn_timeout: float = _DEFAULT_TURN_INACTIVITY_TIMEOUT,
         notification_poll_timeout: float = 0.25,
         absolute_turn_timeout: float = _DEFAULT_ABSOLUTE_TURN_TIMEOUT,
+        post_compaction_grace: float = 600.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -919,7 +921,10 @@ class CodexAppServerSession:
 
         ``absolute_turn_timeout`` is the wall-clock ceiling for one turn even
         when notifications continue to arrive. Set it to ``0`` to disable the
-        ceiling. Process exit, protocol failure, and explicit interruption are
+        ceiling. A completed native compaction can extend this ceiling once,
+        allowing up to ``post_compaction_grace`` seconds for continuation,
+        bounded by the original deadline plus that grace. Compaction start
+        alone grants no extension. Process exit and explicit interruption are
         still handled immediately.
 
         ``first_event_timeout`` is configured on the session. It starts only
@@ -1104,11 +1109,26 @@ class CodexAppServerSession:
                 absolute_timeout is not None
                 and (now - turn_started_at) >= absolute_timeout
             ):
-                result.error = self._format_error_with_stderr(
-                    f"turn exceeded absolute timeout of "
-                    f"{absolute_turn_timeout:g}s"
+                # A completed compaction may already be queued at the exact
+                # deadline. Observe it before deciding to retire the turn.
+                if preloaded_note is None:
+                    preloaded_note = self._client.take_notification(timeout=0)
+                if preloaded_note is not None and _notification_belongs_to_turn(
+                    preloaded_note, thread_id=self._thread_id, turn_id=result.turn_id
+                ):
+                    _apply_compaction_notification(result, preloaded_note)
+                grace_deadline = _post_compaction_deadline(
+                    turn_started_at + absolute_timeout,
+                    result.compaction_completed_at,
+                    post_compaction_grace,
                 )
-                break
+                if now >= grace_deadline:
+                    result.error = self._format_error_with_stderr(
+                        f"turn exceeded absolute timeout of {absolute_turn_timeout:g}s"
+                        + (" including bounded post-compaction continuation grace"
+                           if grace_deadline > turn_started_at + absolute_timeout else "")
+                    )
+                    break
             if (
                 inactivity_timeout is not None
                 and (now - last_activity_at) >= inactivity_timeout
@@ -2047,6 +2067,12 @@ def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:
         result.model_context_window = window
 
 
+def _post_compaction_deadline(deadline: float, completed_at: Optional[float], grace: float) -> float:
+    if completed_at is None or grace <= 0:
+        return deadline
+    return max(deadline, min(completed_at + grace, deadline + grace))
+
+
 def _apply_compaction_notification(result: TurnResult, note: dict) -> None:
     """Capture Codex-native context compaction boundaries.
 
@@ -2063,11 +2089,13 @@ def _apply_compaction_notification(result: TurnResult, note: dict) -> None:
 
     if method == "thread/compacted":
         result.compacted = True
+        if result.compaction_completed_at is None:
+            result.compaction_completed_at = time.monotonic()
         result.thread_id = params.get("threadId") or result.thread_id
         result.turn_id = params.get("turnId") or result.turn_id
         return
 
-    if method not in {"item/started", "item/completed"}:
+    if method != "item/completed":
         return
 
     item = params.get("item") or {}
@@ -2075,6 +2103,8 @@ def _apply_compaction_notification(result: TurnResult, note: dict) -> None:
         return
 
     result.compacted = True
+    if result.compaction_completed_at is None:
+        result.compaction_completed_at = time.monotonic()
     result.thread_id = params.get("threadId") or result.thread_id
     result.turn_id = params.get("turnId") or result.turn_id
 

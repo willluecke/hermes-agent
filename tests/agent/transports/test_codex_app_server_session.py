@@ -2017,3 +2017,71 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize('method', ['item/completed', 'thread/compacted'])
+def test_completed_compaction_at_deadline_continues_to_final(method):
+    client = FakeClient()
+    client.queue_notification(method, threadId='t', turnId='tu1',
+                              item={'type': 'contextCompaction', 'id': 'compact-1'})
+    client.queue_notification('item/completed', threadId='t', turnId='tu1',
+                              item={'type': 'commandExecution', 'id': 'tool-after-compact',
+                                    'command': 'echo continued', 'status': 'completed',
+                                    'aggregatedOutput': 'continued', 'exitCode': 0})
+    client.queue_notification('item/completed', threadId='t', turnId='tu1',
+                              item={'type': 'agentMessage', 'id': 'answer',
+                                    'text': 'continued work finished', 'phase': 'final_answer'})
+    client.queue_notification('turn/completed', threadId='t',
+                              turn={'id': 'tu1', 'status': 'completed'})
+    session = make_session(client)
+    clock = iter([0.0, 10.0])
+    with patch.object(session_mod.time, 'monotonic', side_effect=lambda: next(clock, 11.0)):
+        result = session.run_turn('continue', absolute_turn_timeout=10,
+                                  post_compaction_grace=5, notification_poll_timeout=0)
+    assert result.compacted
+    assert result.tool_iterations == 1
+    assert result.final_text == 'continued work finished'
+    assert not result.interrupted and not result.should_retire
+    assert result.error is None
+    assert not any(method == 'turn/interrupt' for method, _ in client.requests)
+
+
+@pytest.mark.parametrize('method,foreign', [('item/started', False), ('item/completed', True)])
+def test_incomplete_or_foreign_compaction_does_not_extend_deadline(method, foreign):
+    client = FakeClient()
+    client.queue_notification(method, threadId='other' if foreign else 't', turnId='tu1',
+                              item={'type': 'contextCompaction', 'id': 'compact-1'})
+    session = make_session(client)
+    clock = iter([0.0, 10.0])
+    with patch.object(session_mod.time, 'monotonic', side_effect=lambda: next(clock, 10.0)):
+        result = session.run_turn('continue', absolute_turn_timeout=10, notification_poll_timeout=0)
+    assert not result.compacted
+    assert result.interrupted and result.should_retire
+    assert 'absolute timeout' in result.error
+
+
+def test_compaction_grace_is_bounded_and_duplicates_do_not_reset_it():
+    result = session_mod.TurnResult()
+    note = {'method': 'item/completed', 'params': {'item': {'type': 'contextCompaction'}}}
+    with patch.object(session_mod.time, 'monotonic', side_effect=[9.0, 14.0]):
+        session_mod._apply_compaction_notification(result, note)
+        session_mod._apply_compaction_notification(result, note)
+    assert result.compaction_completed_at == 9
+    assert session_mod._post_compaction_deadline(10, 9, 5) == 14
+    assert session_mod._post_compaction_deadline(10, 100, 5) == 15
+    assert session_mod._post_compaction_deadline(10, None, 5) == 10
+    assert session_mod._post_compaction_deadline(10, 9, 0) == 10
+
+
+def test_compaction_without_final_expires_after_bounded_grace():
+    client = FakeClient()
+    client.queue_notification('item/completed', threadId='t', turnId='tu1',
+                              item={'type': 'contextCompaction', 'id': 'compact-1'})
+    session = make_session(client)
+    clock = iter([0.0, 10.0, 10.0, 10.0, 16.0])
+    with patch.object(session_mod.time, 'monotonic', side_effect=lambda: next(clock, 16.0)):
+        result = session.run_turn('continue', absolute_turn_timeout=10,
+                                  post_compaction_grace=5, notification_poll_timeout=0)
+    assert result.compacted and result.interrupted and result.should_retire
+    assert result.final_text == ''
+    assert 'post-compaction continuation grace' in result.error
