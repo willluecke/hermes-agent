@@ -84,6 +84,19 @@ def find_claude_binary() -> str:
     return candidate
 
 
+def claude_subscription_env() -> dict[str, str]:
+    """Keep native OAuth, but never inherit an API or third-party route."""
+    env = os.environ.copy()
+    for key in (
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN",
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
+        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
+    ):
+        env.pop(key, None)
+    return env
+
+
 def _current_claude_auth_generation() -> str:
     explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if explicit:
@@ -133,16 +146,9 @@ def claude_subscription_auth_available(
         return False
 
     try:
-        env = os.environ.copy()
-        for key in (
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_TOKEN",
-        ):
-            env.pop(key, None)
         status = subprocess.run(
             [find_claude_binary(), "auth", "status", "--json"],
-            env=env,
+            env=claude_subscription_env(),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -428,8 +434,10 @@ def claude_code_args(
     system_prompt: str = "",
     additional_dirs: Optional[list[str]] = None,
     read_only: bool = False,
+    no_tools: bool = False,
     debug_file: Optional[str] = None,
 ) -> list[str]:
+    read_only = read_only or no_tools
     repo_root = str(Path(__file__).resolve().parents[2])
     mcp_config = {
         "mcpServers": {
@@ -469,6 +477,11 @@ def claude_code_args(
         # in plan mode.
         args[args.index("--mcp-config") + 1] = '{"mcpServers":{}}'
         args.extend(["--strict-mcp-config", "--safe-mode"])
+    if no_tools:
+        # An advisor sees only the supplied context. Plan mode alone still
+        # exposes file tools, so explicitly remove the entire built-in set.
+        args[args.index("--setting-sources") + 1] = ""
+        args.extend(["--tools", "", "--no-chrome", "--no-session-persistence"])
     if effort:
         args.extend(["--effort", effort])
     args.extend(["--resume" if resume else "--session-id", session_id])
@@ -500,6 +513,7 @@ class ClaudeCodeSession:
         system_prompt: str = "",
         additional_dirs: Optional[list[str]] = None,
         read_only: bool = False,
+        no_tools: bool = False,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
         on_watchdog_timeout: Optional[Callable[[dict[str, Any]], None]] = None,
@@ -515,7 +529,8 @@ class ClaudeCodeSession:
         self.effort = effort
         self.system_prompt = system_prompt
         self.additional_dirs = list(additional_dirs or [])
-        self.read_only = bool(read_only)
+        self.no_tools = bool(no_tools)
+        self.read_only = bool(read_only or no_tools)
         self.on_event = on_event
         self.on_session_id = on_session_id
         self.on_watchdog_timeout = on_watchdog_timeout
@@ -551,6 +566,7 @@ class ClaudeCodeSession:
         effort: Optional[str],
         system_prompt: str,
         read_only: bool = False,
+        no_tools: bool = False,
     ) -> bool:
         """Whether a later turn can safely reuse this frozen CLI process."""
         return bool(
@@ -560,7 +576,8 @@ class ClaudeCodeSession:
             and self.model == model
             and self.effort == effort
             and self.system_prompt == system_prompt
-            and self.read_only == bool(read_only)
+            and self.read_only == bool(read_only or no_tools)
+            and self.no_tools == bool(no_tools)
         )
 
     def request_interrupt(self) -> None:
@@ -663,14 +680,12 @@ class ClaudeCodeSession:
             system_prompt=self.system_prompt,
             additional_dirs=self.additional_dirs,
             read_only=self.read_only,
+            no_tools=self.no_tools,
             debug_file=self._next_debug_file(),
         )
-        env = os.environ.copy()
         # This route must use the signed-in Max subscription. An ambient key
         # would silently turn it into metered API usage.
-        env.pop("ANTHROPIC_API_KEY", None)
-        env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        env.pop("ANTHROPIC_TOKEN", None)
+        env = claude_subscription_env()
         process = subprocess.Popen(
             [binary, *args],
             cwd=self.cwd,
@@ -882,7 +897,7 @@ class ClaudeCodeSession:
                     break
                 now = time.monotonic()
                 if now - started_at > self.absolute_timeout:
-                    result.error = "Claude Code exceeded the two-hour turn limit"
+                    result.error = f"Claude Code exceeded the {self.absolute_timeout:g}-second turn limit"
                     result.should_retire = True
                     break
                 if not prompt_accepted and transcript_probe.acknowledged():

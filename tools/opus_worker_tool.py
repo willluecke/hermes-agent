@@ -161,6 +161,23 @@ def _thread_id(session_id: str = "") -> str:
     return f"hermes_{stem}_{digest}"[:64]
 
 
+def _parent_context(session_id: str = "") -> dict[str, str]:
+    raw = str(session_id or os.environ.get("HERMES_GATEWAY_SESSION_ID", "")).strip()
+    prefix = "hermes-chat-"
+    conversation_id = raw[len(prefix):] if raw.startswith(prefix) else ""
+    if not _ID_RE.fullmatch(conversation_id):
+        return {}
+    return {"parentConversationId": conversation_id, "parentSessionId": raw}
+
+
+def _belongs_to_thread(job: dict[str, Any], thread_id: str) -> bool:
+    return job.get("threadId") == thread_id or (
+        job.get("contextType") == "hermes-orchestration"
+        and bool(job.get("parentConversationId"))
+        and job.get("contextId") == thread_id
+    )
+
+
 def _job_id(
     *,
     thread_id: str,
@@ -226,7 +243,7 @@ def _owned_job(job_id: str, thread_id: str) -> dict[str, Any]:
     if not _ID_RE.fullmatch(job_id):
         raise ValueError("job_id must be a valid Hermes job identifier")
     job = _get_job(job_id)
-    if job.get("threadId") != thread_id:
+    if not _belongs_to_thread(job, thread_id):
         raise ValueError("worker job does not belong to this Hermes conversation")
     if job.get("provider") != "claude" or job.get("mode") != "implement":
         raise ValueError("worker job is not a governed Claude implementation")
@@ -242,6 +259,9 @@ def _job_result(job: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "job_id": job.get("id"),
         "thread_id": job.get("threadId"),
+        "parent_conversation_id": job.get("parentConversationId"),
+        "parent_run_id": job.get("parentRunId"),
+        "agent_deck_url": f"/agents?job={job.get('id', '')}",
         "provider": job.get("provider"),
         "model": job.get("model") or "claude-opus-5",
         "effort": job.get("effort") or "high",
@@ -304,7 +324,19 @@ def _wait_for_job(job: dict[str, Any], wait_seconds: int) -> dict[str, Any]:
             break
         time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
         current = _get_job(str(current["id"]))
-    return _job_result(current)
+    result = _job_result(current)
+    if current.get("parentSessionId") and current.get("status") in _TERMINAL_STATUSES:
+        try:
+            _sync_request(
+                "POST", f"/management/orchestration/jobs/{current['id']}/observed",
+                {"parentSessionId": current["parentSessionId"]},
+            )
+            result["parent_receipt_saved"] = True
+        except _SyncError:
+            # The result is still available for this parent to review. A later
+            # status call can record the receipt without rerunning the worker.
+            result["parent_receipt_saved"] = False
+    return result
 
 
 def _brief(
@@ -375,7 +407,7 @@ def _run_job(
 
     existing = _get_job_or_none(job_id)
     if existing is not None:
-        if existing.get("threadId") != thread or existing.get("project") != project:
+        if not _belongs_to_thread(existing, thread) or existing.get("project") != project:
             raise ValueError("deterministic worker job identity collision")
         return _wait_for_job(existing, wait_seconds)
     if not _worker_available():
@@ -383,6 +415,7 @@ def _run_job(
 
     brief = _brief(authority, specification, checks, limits)
     job_payload = {
+        **_parent_context(session_id),
         "id": job_id,
         "title": title[:500],
         "brief": brief[:50_000],
@@ -459,6 +492,10 @@ OPUS_CODE_WORKER_SCHEMA = {
         "resolved product and architecture choices and stated observable acceptance "
         "checks. The worker edits an isolated Git worktree and may create a local "
         "commit, but cannot push, merge, deploy, contact anyone, or write decisions. "
+        "The existing Hermes conversation stays the parent; independent jobs receive "
+        "separate execution threads/worktrees and appear in Agent Deck. Include relevant "
+        "parent decisions and context in the specification; the worker does not inherit "
+        "the entire transcript. "
         "If a run remains queued/running, call action='status' with its job_id; use "
         "action='cancel' only for an explicit stop. Increment attempt only for a "
         "deliberate rerun of the same specification."

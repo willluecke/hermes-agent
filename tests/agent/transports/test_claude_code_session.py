@@ -90,6 +90,36 @@ def test_read_only_invocation_uses_plan_mode_and_no_mcp_servers():
     assert json.loads(args[args.index("--mcp-config") + 1]) == {"mcpServers": {}}
 
 
+def test_no_tools_consultation_cannot_reuse_a_writable_session(tmp_path):
+    session = ClaudeCodeSession(cwd=str(tmp_path), model="claude-fable-5", no_tools=True)
+    assert session.read_only is True
+    assert session.compatible_with(cwd=str(tmp_path), model=session.model,
+        effort=None, system_prompt="", no_tools=True)
+    assert not session.compatible_with(cwd=str(tmp_path), model=session.model,
+        effort=None, system_prompt="", read_only=True)
+    args = claude_code_args(model=session.model, session_id=session.session_id, no_tools=True)
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--permission-mode") + 1] == "plan"
+    assert args[args.index("--setting-sources") + 1] == ""
+    assert "--no-session-persistence" in args
+    assert "--safe-mode" in args
+
+
+def test_subscription_environment_preserves_oauth_not_api_routes(monkeypatch):
+    from agent.transports.claude_code_session import claude_subscription_env
+    forbidden = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN",
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE")
+    for key in forbidden:
+        monkeypatch.setenv(key, "test-not-a-credential")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "fake-subscription-token")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/test-native-claude")
+    env = claude_subscription_env()
+    assert not set(forbidden).intersection(env)
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fake-subscription-token"
+    assert env["CLAUDE_CONFIG_DIR"] == "/tmp/test-native-claude"
+
+
 def test_error_result_confirms_session_before_returning():
     session_id = "00000000-0000-4000-8000-000000000000"
     stdout = io.StringIO(
