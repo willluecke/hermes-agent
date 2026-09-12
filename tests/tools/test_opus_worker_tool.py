@@ -1,5 +1,6 @@
 """Governed Sol-to-Opus implementation orchestration tests."""
 
+import pytest
 import json
 
 import tools.opus_worker_tool as worker
@@ -368,3 +369,54 @@ def test_tool_is_core_registered_and_exposed():
     assert "opus_code_worker" in toolsets._HERMES_CORE_TOOLS
     assert toolsets.TOOLSETS["opus_worker"]["tools"] == ["opus_code_worker"]
     assert "opus_code_worker" in EXPOSED_TOOLS
+
+
+# Parent continuity: a browser-authorized worker must stay reachable from the
+# conversation that dispatched it, without that parent identity ever being
+# mistaken for the worker's own execution identity.
+def test_browser_parent_identity_is_not_a_worker_execution_identity():
+    assert worker._parent_context("hermes-chat-parent_123") == {
+        "parentConversationId": "parent_123", "parentSessionId": "hermes-chat-parent_123"
+    }
+    assert worker._parent_context("cli-session") == {}
+    assert worker._parent_context("hermes-chat-../../outside") == {}
+
+
+def test_owned_isolated_child_and_legacy_jobs_are_both_recoverable(monkeypatch):
+    parent_thread = worker._thread_id("hermes-chat-parent_123")
+    job = {"id": "job_one", "threadId": "worker_one", "contextId": parent_thread,
+           "contextType": "hermes-orchestration", "parentConversationId": "parent_123",
+           "provider": "claude", "mode": "implement"}
+    monkeypatch.setattr(worker, "_get_job", lambda _: job)
+    assert worker._owned_job("job_one", parent_thread) == job
+    with pytest.raises(ValueError, match="does not belong"):
+        worker._owned_job("job_one", "another_parent")
+    assert worker._belongs_to_thread({"threadId": parent_thread}, parent_thread)
+
+
+def test_completion_receipt_is_saved_without_marking_human_review(monkeypatch):
+    calls = []
+    monkeypatch.setattr(worker, "_sync_request", lambda *args, **kwargs: calls.append(args) or {"ok": True})
+    result = worker._wait_for_job({"id": "job_one", "status": "completed",
+        "parentSessionId": "hermes-chat-parent", "parentConversationId": "parent",
+        "result": "Tests pass", "threadId": "worker_one"}, 0)
+    assert result["parent_receipt_saved"] is True
+    assert result["review_required"] is True
+    assert result["parent_conversation_id"] == "parent"
+    assert calls == [("POST", "/management/orchestration/jobs/job_one/observed", {"parentSessionId": "hermes-chat-parent"})]
+
+
+def test_dispatch_attaches_parent_metadata_and_accepts_host_isolated_thread(monkeypatch):
+    posted = []
+    monkeypatch.setattr(worker, "_authority", lambda: {"model": "gpt-6-astra", "effort": "high"})
+    monkeypatch.setattr(worker, "_get_job_or_none", lambda _: None)
+    monkeypatch.setattr(worker, "_worker_available", lambda: True)
+    def request(method, path, payload):
+        posted.append(payload)
+        return {"job": {**payload, "threadId": "worker_isolated", "status": "queued"}}
+    monkeypatch.setattr(worker, "_sync_request", request)
+    result = worker._run_job(project="hermes-chat", title="Navigation", specification="Implement saved choices",
+        acceptance_checks=["Mobile checks pass"], session_id="hermes-chat-parent", wait_seconds=0)
+    assert posted[0]["parentConversationId"] == "parent"
+    assert posted[0]["parentSessionId"] == "hermes-chat-parent"
+    assert result["thread_id"] == "worker_isolated"
