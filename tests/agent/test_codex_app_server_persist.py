@@ -43,7 +43,43 @@ def _make_turn():
         tool_iterations=0,
         final_text="CODEX_ASSISTANT",
         should_retire=False,
+        # Added to TurnResult by the turn-scoped first-event watchdog
+        # (e09db22fe); the result dict reads it on every success path.
+        error_code=None,
     )
+
+
+def _bind_resident_thread(agent, thread_id="thread-1", prior_messages=()):
+    """Model a warm session whose native thread really does hold this
+    transcript.
+
+    The runtime now refuses to reuse a resident Codex session it cannot prove
+    is current — a warm process is not continuity, since the same agent object
+    survives a model switch. A mock session with no recorded provenance is
+    indistinguishable from a stale one, so these fixtures must state what the
+    thread has consumed.
+    """
+    from agent.codex_runtime import (
+        _codex_dialogue_entries,
+        _codex_history_fingerprint,
+        _normalized_codex_cwd,
+    )
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    cwd = getattr(agent, "session_cwd", None)
+    if not isinstance(cwd, str) or not cwd:
+        cwd = str(resolve_agent_cwd())
+        agent.session_cwd = cwd
+    entries = _codex_dialogue_entries(list(prior_messages))
+    agent._codex_session._thread_id = thread_id
+    agent._codex_thread_state = {
+        "version": 1,
+        "thread_id": thread_id,
+        "cwd": _normalized_codex_cwd(cwd),
+        "seen_count": len(entries),
+        "fingerprint": _codex_history_fingerprint(entries),
+        "updated_at": 0.0,
+    }
 
 
 def _make_agent(session_db=None, session_id="sess-codex"):
@@ -58,6 +94,7 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent._session_db = session_db
     agent._session_db_created = True
     agent.session_id = session_id
+    _bind_resident_thread(agent)
     return agent
 
 
@@ -130,6 +167,7 @@ def test_codex_turn_persists_each_message_exactly_once():
         agent._codex_session = MagicMock()
         agent._codex_session.run_turn.return_value = _make_turn()
         agent.tool_progress_callback = None
+        _bind_resident_thread(agent)
 
         # Model the real flow: the inbound user turn is flushed at turn start
         # (turn_context._persist_session) on the SAME `messages` list the codex

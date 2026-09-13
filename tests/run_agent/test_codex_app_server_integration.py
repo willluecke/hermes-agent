@@ -270,13 +270,23 @@ class TestRunConversationCodexPath:
         assert result["partial"] is True
         assert "without final assistant text" in result["error"]
 
-    def test_fresh_agent_resumes_thread_bound_to_hermes_session(
-        self, monkeypatch, tmp_path
-    ):
-        from hermes_state import SessionDB
+    def _thread_state(self, entries, thread_id, cwd=None):
+        from agent.codex_runtime import (
+            _codex_history_fingerprint,
+            _normalized_codex_cwd,
+        )
+        from agent.runtime_cwd import resolve_agent_cwd
 
-        captured: dict = {}
+        return {
+            "version": 1,
+            "thread_id": thread_id,
+            "cwd": _normalized_codex_cwd(cwd or str(resolve_agent_cwd())),
+            "seen_count": len(entries),
+            "fingerprint": _codex_history_fingerprint(entries),
+            "updated_at": 0.0,
+        }
 
+    def _patch_session(self, monkeypatch, captured):
         def fake_init(self, **kwargs):
             captured["resume_thread_id"] = kwargs.get("resume_thread_id")
             self._thread_id = kwargs.get("resume_thread_id") or "thread-new"
@@ -301,8 +311,22 @@ class TestRunConversationCodexPath:
         )
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
 
+    def test_thread_without_recorded_history_is_not_resumed(
+        self, monkeypatch, tmp_path
+    ):
+        """A bare thread id proves nothing about what that thread contains.
+
+        This is the shape every conversation bound before thread state existed
+        arrives in: resuming it would silently continue from whatever tail the
+        native thread happens to hold.
+        """
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+        self._patch_session(monkeypatch, captured)
+
         db = SessionDB(tmp_path / "state.db")
-        session_id = "hermes-chat-context-resume"
+        session_id = "hermes-chat-context-legacy"
         db.create_session(session_id, "api_server")
         db.patch_session_model_config(
             session_id,
@@ -311,7 +335,7 @@ class TestRunConversationCodexPath:
         agent = _make_codex_agent(session_id=session_id, session_db=db)
 
         with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation(
+            agent.run_conversation(
                 "continue",
                 conversation_history=[
                     {"role": "user", "content": "Work on RegWatch"},
@@ -319,9 +343,221 @@ class TestRunConversationCodexPath:
                 ],
             )
 
-        assert result["final_response"] == "continued"
-        assert captured["resume_thread_id"] == "thread-existing-regwatch"
+        assert captured["resume_thread_id"] in {None, ""}
+        assert "<hermes_conversation_history>" in captured["user_input"]
+        assert "RegWatch is loaded" in captured["user_input"]
+
+    def test_thread_matching_the_transcript_resumes_untouched(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+        self._patch_session(monkeypatch, captured)
+
+        history = [
+            {"role": "user", "content": "Work on RegWatch"},
+            {"role": "assistant", "content": "RegWatch is loaded"},
+        ]
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-current"
+        db.create_session(session_id, "api_server")
+        db.patch_session_model_config(
+            session_id,
+            {
+                "_codex_app_server_thread_id": "thread-current",
+                "_codex_app_server_thread_state": self._thread_state(
+                    [
+                        ("user", "Work on RegWatch"),
+                        ("assistant", "RegWatch is loaded"),
+                    ],
+                    "thread-current",
+                ),
+            },
+        )
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("continue", conversation_history=history)
+
+        assert captured["resume_thread_id"] == "thread-current"
+        # Nothing was missed, so the turn carries the user message alone.
         assert captured["user_input"] == "continue"
+
+    def test_thread_behind_the_transcript_gets_only_the_missed_messages(
+        self, monkeypatch, tmp_path
+    ):
+        """The regwatch failure: turns answered by another runtime while the
+        native thread stood still. The thread is still usable — it just has to
+        be told what it missed, and only what it missed."""
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+        self._patch_session(monkeypatch, captured)
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-behind"
+        db.create_session(session_id, "api_server")
+        db.patch_session_model_config(
+            session_id,
+            {
+                "_codex_app_server_thread_id": "thread-behind",
+                # The thread stopped after the first exchange.
+                "_codex_app_server_thread_state": self._thread_state(
+                    [
+                        ("user", "Set up the mailbox"),
+                        ("assistant", "Mailbox is Pending"),
+                    ],
+                    "thread-behind",
+                ),
+            },
+        )
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation(
+                "Did you see this or no?",
+                conversation_history=[
+                    {"role": "user", "content": "Set up the mailbox"},
+                    {"role": "assistant", "content": "Mailbox is Pending"},
+                    {"role": "user", "content": "I have been sending 3 a day"},
+                    {
+                        "role": "assistant",
+                        "content": "Warmup started Sep 3 across three accounts",
+                    },
+                ],
+            )
+
+        assert captured["resume_thread_id"] == "thread-behind"
+        user_input = captured["user_input"]
+        assert "<hermes_missed_messages>" in user_input
+        assert "I have been sending 3 a day" in user_input
+        assert "Warmup started Sep 3 across three accounts" in user_input
+        # The thread already holds the opening exchange; re-sending it would
+        # duplicate context the native thread can see for itself.
+        assert "Mailbox is Pending" not in user_input
+        assert "<current_user_request>\nDid you see this or no?" in user_input
+
+    def test_transcript_rewrite_forces_a_fresh_thread(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+        self._patch_session(monkeypatch, captured)
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-rewritten"
+        db.create_session(session_id, "api_server")
+        db.patch_session_model_config(
+            session_id,
+            {
+                "_codex_app_server_thread_id": "thread-rewritten",
+                "_codex_app_server_thread_state": self._thread_state(
+                    [
+                        ("user", "Work on RegWatch"),
+                        ("assistant", "RegWatch is loaded"),
+                    ],
+                    "thread-rewritten",
+                ),
+            },
+        )
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    # Same length, different content: a rewind/branch, not an
+                    # append. The recorded prefix no longer describes it.
+                    {"role": "user", "content": "Work on ToneTrace instead"},
+                    {"role": "assistant", "content": "ToneTrace is loaded"},
+                ],
+            )
+
+        assert captured["resume_thread_id"] in {None, ""}
+        assert "<hermes_conversation_history>" in captured["user_input"]
+
+    def test_resident_session_is_retired_when_its_thread_went_stale(
+        self, monkeypatch, tmp_path
+    ):
+        """A warm process is not continuity. The same AIAgent survives a model
+        switch, so a resident thread can be exactly as stale as a persisted one
+        — and it never reaches the resume path at all."""
+        from hermes_state import SessionDB
+
+        captured: dict = {}
+        self._patch_session(monkeypatch, captured)
+        closed: list[str] = []
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-resident"
+        db.create_session(session_id, "api_server")
+        db.patch_session_model_config(
+            session_id,
+            {"_codex_app_server_thread_id": "thread-resident"},
+        )
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+        agent._codex_session = SimpleNamespace(
+            _thread_id="thread-resident",
+            _resumed_existing_thread=True,
+            close=lambda: closed.append("thread-resident"),
+        )
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    {"role": "user", "content": "Work on RegWatch"},
+                    {"role": "assistant", "content": "RegWatch is loaded"},
+                ],
+            )
+
+        assert closed == ["thread-resident"]
+        assert "<hermes_conversation_history>" in captured["user_input"]
+
+    def test_completed_turn_records_what_the_thread_consumed(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+        from agent.codex_runtime import (
+            _codex_dialogue_entries,
+            _codex_history_fingerprint,
+        )
+
+        captured: dict = {}
+        self._patch_session(monkeypatch, captured)
+
+        db = SessionDB(tmp_path / "state.db")
+        session_id = "hermes-chat-context-record"
+        db.create_session(session_id, "api_server")
+        agent = _make_codex_agent(session_id=session_id, session_db=db)
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    {"role": "user", "content": "Work on RegWatch"},
+                    {"role": "assistant", "content": "RegWatch is loaded"},
+                ],
+            )
+
+        state = db.get_session_model_config_value(
+            session_id, "_codex_app_server_thread_state"
+        )
+        assert state["thread_id"] == "thread-new"
+        # prior exchange + this user message + the projected answer
+        assert state["seen_count"] == 4
+        assert state["fingerprint"] == _codex_history_fingerprint(
+            _codex_dialogue_entries(
+                [
+                    {"role": "user", "content": "Work on RegWatch"},
+                    {"role": "assistant", "content": "RegWatch is loaded"},
+                    {"role": "user", "content": "continue"},
+                    {"role": "assistant", "content": "continued"},
+                ]
+            )
+        )
 
     def test_fresh_thread_receives_durable_history_handoff(
         self, monkeypatch, tmp_path
@@ -887,76 +1123,23 @@ class TestRunConversationCodexPath:
         assert routing.auto_approve_apply_patch is True
 
 
-class TestReviewForkApiModeDowngrade:
-    """When the parent agent runs on codex_app_server, the background
-    review fork must downgrade to codex_responses — otherwise the fork
-    can't dispatch agent-loop tools (memory, skill_manage) which is the
-    whole point of the review."""
+class TestReviewForkNativeCredentials:
+    """Automatic HTTP reviews cannot inherit native child-process credentials."""
 
-    def test_codex_app_server_parent_downgrades_review_fork(self):
-        """Live test against the real _spawn_background_review code path:
-        verify the review_agent gets api_mode=codex_responses when the
-        parent is codex_app_server."""
-        from unittest.mock import MagicMock, patch as _patch
+    def test_codex_app_server_parent_skips_automatic_review(self):
         agent = _make_codex_agent()
-        # Pretend memory + skills are configured so the review fork
-        # reaches the AIAgent constructor.
         agent._memory_store = MagicMock()
         agent._memory_enabled = True
         agent._user_profile_enabled = True
-        # Mock _current_main_runtime to return the parent's codex_app_server
-        # state so we can confirm the helper detects + downgrades it.
-        agent._current_main_runtime = lambda: {
-            "api_mode": "codex_app_server",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "stub-token",
-        }
-        # Capture what AIAgent gets constructed with inside the helper.
-        captured = {}
-
-        def _capture_init(self, **kwargs):
-            captured.update(kwargs)
-            # Set bare attributes the rest of the spawn function reads
-            # so it can finish without exploding.
-            self.api_mode = kwargs.get("api_mode")
-            self.provider = kwargs.get("provider")
-            self.model = kwargs.get("model")
-            self._memory_write_origin = None
-            self._memory_write_context = None
-            self._memory_store = None
-            self._memory_enabled = False
-            self._user_profile_enabled = False
-            self._memory_nudge_interval = 0
-            self._skill_nudge_interval = 0
-            self.suppress_status_output = False
-            self._session_messages = []
-
-            def _no_op_run_conv(*a, **kw):
-                return {"final_response": "", "messages": []}
-            self.run_conversation = _no_op_run_conv
-
-            def _no_op_close(*a, **kw):
-                return None
-            self.close = _no_op_close
-
-        with _patch("run_agent.AIAgent.__init__", _capture_init):
+        # Even with reviewable memory, native credentials remain in the child.
+        # The main turn must never spawn an HTTP fork with placeholder auth.
+        with patch("agent.background_review.spawn_background_review_thread") as spawn:
             agent._spawn_background_review(
                 messages_snapshot=[{"role": "user", "content": "x"}],
                 review_memory=True,
                 review_skills=False,
             )
-            # Wait for the spawned thread to actually execute
-            import time
-            for _ in range(30):
-                if "api_mode" in captured:
-                    break
-                time.sleep(0.1)
-
-        assert captured.get("api_mode") == "codex_responses", (
-            f"review fork should be downgraded to codex_responses when "
-            f"parent is codex_app_server; got {captured.get('api_mode')!r}"
-        )
-
+        spawn.assert_not_called()
 
 class TestErrorHandling:
     def test_session_exception_returns_partial_with_error(self, monkeypatch):

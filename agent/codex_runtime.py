@@ -16,6 +16,7 @@ compatibility.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 _CODEX_APP_SERVER_THREAD_ID_KEY = "_codex_app_server_thread_id"
+_CODEX_APP_SERVER_THREAD_STATE_KEY = "_codex_app_server_thread_state"
+_CODEX_APP_SERVER_THREAD_STATE_VERSION = 1
 _CODEX_HISTORY_HANDOFF_MAX_CHARS = 240_000
 
 
@@ -56,15 +59,49 @@ def _stored_codex_app_server_thread_id(agent: Any) -> str:
     return value
 
 
-def _persist_codex_app_server_thread_id(agent: Any, thread_id: str) -> None:
-    """Atomically bind a native Codex thread to the durable Hermes session."""
+def _persist_codex_thread_state(
+    agent: Any, *, thread_id: str, cwd: str, entries: List[tuple]
+) -> None:
+    """Bind a native Codex thread to this Hermes session *and* to the exact
+    transcript prefix that thread has already consumed.
+
+    A thread id alone cannot answer the only question that matters on resume:
+    is this thread current? Native threads stay resumable indefinitely, so a
+    conversation whose intervening turns ran on another runtime would quietly
+    continue from a stale tail with no signal to the user. Recording what the
+    thread has seen makes that divergence detectable — and, when the seen
+    prefix still matches, makes the gap recoverable as a bounded delta instead
+    of discarding the thread.
+    """
     session_db = getattr(agent, "_session_db", None)
     session_id = str(getattr(agent, "session_id", "") or "")
     patcher = getattr(session_db, "patch_session_model_config", None)
-    if not session_id or not thread_id or not callable(patcher):
+    if not thread_id:
+        return
+    state = {
+        "version": _CODEX_APP_SERVER_THREAD_STATE_VERSION,
+        "thread_id": thread_id,
+        "cwd": _normalized_codex_cwd(cwd),
+        "seen_count": len(entries),
+        "fingerprint": _codex_history_fingerprint(entries),
+        "updated_at": time.time(),
+    }
+    # Keep the in-process copy current even when there is no session DB, so a
+    # resident agent still evaluates continuity against real state.
+    agent._codex_thread_state = state
+    if not session_id or not callable(patcher):
         return
     try:
-        patcher(session_id, {_CODEX_APP_SERVER_THREAD_ID_KEY: thread_id})
+        # One patch: the id and its provenance must never be written apart,
+        # or a crash between them leaves a thread that looks verified against
+        # the wrong transcript.
+        patcher(
+            session_id,
+            {
+                _CODEX_APP_SERVER_THREAD_ID_KEY: thread_id,
+                _CODEX_APP_SERVER_THREAD_STATE_KEY: state,
+            },
+        )
     except Exception:
         logger.warning(
             "could not persist Codex thread %s for Hermes session %s",
@@ -72,6 +109,33 @@ def _persist_codex_app_server_thread_id(agent: Any, thread_id: str) -> None:
             session_id,
             exc_info=True,
         )
+
+
+def _load_codex_thread_state(agent: Any) -> Dict[str, Any]:
+    """Return the recorded provenance of this session's bound Codex thread."""
+    state = getattr(agent, "_codex_thread_state", None)
+    session_db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    getter = getattr(session_db, "get_session_model_config_value", None)
+    if session_id and callable(getter):
+        try:
+            stored = getter(session_id, _CODEX_APP_SERVER_THREAD_STATE_KEY, None)
+            if isinstance(stored, dict):
+                state = stored
+        except Exception:
+            logger.warning(
+                "could not read Codex thread state for Hermes session %s",
+                session_id,
+                exc_info=True,
+            )
+    return dict(state) if isinstance(state, dict) else {}
+
+
+def _normalized_codex_cwd(cwd: Any) -> str:
+    try:
+        return str(Path(str(cwd or "")).expanduser().resolve())
+    except Exception:
+        return str(cwd or "")
 
 
 def _history_text(content: Any) -> str:
@@ -86,41 +150,161 @@ def _history_text(content: Any) -> str:
     ).strip()
 
 
-def _codex_history_handoff(
-    history: List[Dict[str, Any]], user_message: Any
-) -> Any:
+def _codex_dialogue_entries(history: List[Dict[str, Any]]) -> List[tuple]:
+    """Reduce a Hermes transcript to the dialogue a native thread can hold.
+
+    Tool and system rows are excluded deliberately: they are projected
+    differently depending on which runtime produced them, so including them
+    would make the fingerprint below report divergence for transcripts that
+    are in fact identical dialogue.
+    """
+    try:
+        from agent.memory_manager import sanitize_context
+    except Exception:  # pragma: no cover - defensive
+        sanitize_context = None
+
+    entries: List[tuple] = []
+    for message in history:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and sanitize_context is not None:
+            # Mirror the storage layer, which sanitizes user/assistant strings
+            # on load (hermes_state._rows_to_conversation). Recalled memory is
+            # injected into the live user message but stripped on reload, so
+            # fingerprinting the raw in-memory text would report divergence for
+            # a transcript that is in fact unchanged — and cost the thread on
+            # every single turn.
+            content = sanitize_context(content)
+        text = _history_text(content)
+        if not text:
+            continue
+        entries.append((role, text))
+    return entries
+
+
+def _codex_history_fingerprint(entries: List[tuple]) -> str:
+    """Hash the dialogue prefix a native Codex thread represents."""
+    digest = hashlib.sha256()
+    for role, text in entries:
+        digest.update(
+            json.dumps([role, text], ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8", errors="replace"
+            )
+        )
+        digest.update(b"\n")
+    return f"v1:{len(entries)}:{digest.hexdigest()}"
+
+
+def _codex_resume_plan(
+    *,
+    thread_id: str,
+    state: Dict[str, Any],
+    prior_entries: List[tuple],
+    cwd: str,
+) -> tuple:
+    """Decide whether a bound native thread may continue this transcript.
+
+    Returns ``(resume_thread_id, pending_entries, reason)``. An empty
+    ``resume_thread_id`` means the thread cannot be proven current, so the
+    caller must start a fresh one seeded with ``pending_entries`` — the whole
+    transcript. When resume is allowed, ``pending_entries`` is only the delta
+    this thread has never seen, which is empty for an ordinary next turn.
+    """
+    if not thread_id:
+        return "", prior_entries, "no-bound-thread"
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != _CODEX_APP_SERVER_THREAD_STATE_VERSION
+    ):
+        # Threads bound before this record existed carry no proof of what they
+        # consumed. Treat unknown provenance as divergence: re-seeding costs
+        # one handoff, while trusting it costs the user their context.
+        return "", prior_entries, "no-recorded-history"
+    if str(state.get("thread_id") or "") != thread_id:
+        return "", prior_entries, "thread-rebound"
+    if str(state.get("cwd") or "") != _normalized_codex_cwd(cwd):
+        return "", prior_entries, "cwd-changed"
+    seen = state.get("seen_count")
+    if isinstance(seen, bool) or not isinstance(seen, int) or seen < 0:
+        return "", prior_entries, "unusable-seen-count"
+    if seen > len(prior_entries):
+        # The transcript is shorter than what the thread consumed — a rewrite
+        # or compaction, not an append.
+        return "", prior_entries, "transcript-shortened"
+    if _codex_history_fingerprint(prior_entries[:seen]) != str(
+        state.get("fingerprint") or ""
+    ):
+        return "", prior_entries, "transcript-diverged"
+    return thread_id, list(prior_entries[seen:]), "resume"
+
+
+def _render_history_blocks(entries: List[tuple], budget: int) -> tuple:
+    """Render the newest entries that fit, returning ``(blocks, omitted, truncated)``."""
+    rendered: list[str] = []
+    used = 0
+    omitted = 0
+    truncated = False
+    for index in range(len(entries) - 1, -1, -1):
+        role, text = entries[index]
+        block = f"{role.upper()}:\n{text}"
+        block_truncated = False
+        if len(block) > budget:
+            block = block[-budget:]
+            block_truncated = True
+        if used + len(block) > budget:
+            # Stop here rather than skipping this message and continuing with
+            # older, smaller ones. Skipping punches a hole in the middle of the
+            # transcript and discloses it only as a count, which reads as
+            # "older context omitted" when it is really "a reply you are about
+            # to see is missing". An unbroken recent window is the honest cut.
+            omitted = index + 1
+            break
+        rendered.append(block)
+        used += len(block)
+        truncated = truncated or block_truncated
+    rendered.reverse()
+    return rendered, omitted, truncated
+
+
+def _handoff_disclosure(omitted: int, truncated: bool) -> str:
+    notes: list[str] = []
+    if omitted:
+        notes.append(
+            f"[{omitted} older messages omitted — handoff size limit reached.]"
+        )
+    if truncated:
+        notes.append(
+            "[The oldest included message was cut at its start to fit.]"
+        )
+    return ("\n" + "\n".join(notes)) if notes else ""
+
+
+def _wrap_turn_input(context: str, user_message: Any, closing: str) -> Any:
+    if isinstance(user_message, list):
+        return [
+            {"type": "text", "text": context},
+            *user_message,
+            {"type": "text", "text": closing},
+        ]
+    return context + str(user_message) + closing
+
+
+def _codex_history_handoff(entries: List[tuple], user_message: Any) -> Any:
     """Seed a fresh native thread when no persisted Codex thread can resume.
 
     The app-server runtime accepts only the current turn at ``turn/start``.
     Preserve complete recent user/assistant messages inside a disclosed
     transcript rather than silently dropping client-managed history.
     """
-    rendered: list[str] = []
-    used = 0
-    dropped = 0
-    for message in reversed(history):
-        role = str(message.get("role") or "").lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = _history_text(message.get("content"))
-        if not content:
-            continue
-        block = f"{role.upper()}:\n{content}"
-        if len(block) > _CODEX_HISTORY_HANDOFF_MAX_CHARS:
-            block = block[-_CODEX_HISTORY_HANDOFF_MAX_CHARS:]
-        if used + len(block) > _CODEX_HISTORY_HANDOFF_MAX_CHARS:
-            dropped += 1
-            continue
-        rendered.append(block)
-        used += len(block)
+    rendered, omitted, truncated = _render_history_blocks(
+        entries, _CODEX_HISTORY_HANDOFF_MAX_CHARS
+    )
     if not rendered:
         return user_message
-    rendered.reverse()
-    disclosure = (
-        f"\n[{dropped} older non-empty messages omitted from this recovery handoff.]"
-        if dropped
-        else ""
-    )
     context = (
         "Hermes is restoring an existing conversation into a fresh native "
         "Codex thread. Use the following transcript as prior conversation "
@@ -128,17 +312,40 @@ def _codex_history_handoff(
         "to reselect a project already established here.\n\n"
         "<hermes_conversation_history>\n"
         + "\n\n".join(rendered)
-        + disclosure
+        + _handoff_disclosure(omitted, truncated)
         + "\n</hermes_conversation_history>\n\n"
         "<current_user_request>\n"
     )
-    if isinstance(user_message, list):
-        return [
-            {"type": "text", "text": context},
-            *user_message,
-            {"type": "text", "text": "\n</current_user_request>"},
-        ]
-    return context + str(user_message) + "\n</current_user_request>"
+    return _wrap_turn_input(context, user_message, "\n</current_user_request>")
+
+
+def _codex_catch_up_handoff(entries: List[tuple], user_message: Any) -> Any:
+    """Hand a resumed native thread only the messages it never saw.
+
+    Switching models mid-conversation leaves the native thread intact but
+    behind. Re-seeding the whole transcript would throw away the thread's own
+    reasoning state; sending nothing strands it at a stale tail. The delta
+    keeps both.
+    """
+    rendered, omitted, truncated = _render_history_blocks(
+        entries, _CODEX_HISTORY_HANDOFF_MAX_CHARS
+    )
+    if not rendered:
+        return user_message
+    context = (
+        "Hermes is continuing this native Codex thread. The messages below "
+        "happened in this same conversation while a different runtime was "
+        "answering, so this thread never received them. Treat them as prior "
+        "conversation context the user considers already said — do not "
+        "re-ask for anything they settle — then execute the current user "
+        "request.\n\n"
+        "<hermes_missed_messages>\n"
+        + "\n\n".join(rendered)
+        + _handoff_disclosure(omitted, truncated)
+        + "\n</hermes_missed_messages>\n\n"
+        "<current_user_request>\n"
+    )
+    return _wrap_turn_input(context, user_message, "\n</current_user_request>")
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -1110,15 +1317,62 @@ def run_codex_app_server_turn(
                     exc_info=True,
                 )
 
+    # Continuity gate. A native Codex thread stays resumable indefinitely, so a
+    # bound thread id proves only that the thread still exists — never that it
+    # holds this conversation's current transcript. Any turn answered by another
+    # runtime (a deliberate model switch, or the automatic one after a credit
+    # limit) advances the Hermes record while the native thread stands still.
+    # Settle that question BEFORE deciding what to reuse or resume.
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    codex_cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+    prior_entries = _codex_dialogue_entries(messages[:-1])
+    codex_thread_state = _load_codex_thread_state(agent)
+    resume_thread_id, pending_entries, continuity_reason = _codex_resume_plan(
+        thread_id=(
+            _stored_codex_app_server_thread_id(agent)
+            or str(codex_thread_state.get("thread_id") or "").strip()
+        ),
+        state=codex_thread_state,
+        prior_entries=prior_entries,
+        cwd=codex_cwd,
+    )
+    if pending_entries and resume_thread_id:
+        logger.info(
+            "codex thread %s is behind this conversation by %d messages; "
+            "delivering them as a catch-up before the current turn",
+            resume_thread_id[:8],
+            len(pending_entries),
+        )
+    resident_codex_session = getattr(agent, "_codex_session", None)
+    if resident_codex_session is not None and (
+        not resume_thread_id
+        or str(getattr(resident_codex_session, "_thread_id", "") or "")
+        != resume_thread_id
+    ):
+        # A warm process is not continuity either. The same AIAgent object
+        # survives a model switch, so a resident thread goes stale exactly like
+        # a persisted one — and reusing it is the more dangerous case, because
+        # it never even reaches the resume path. Retire it and rebuild below.
+        logger.warning(
+            "retiring resident Codex session: bound thread cannot continue "
+            "this transcript (%s)",
+            continuity_reason,
+        )
+        try:
+            resident_codex_session.close()
+        except Exception:
+            logger.debug("codex resident-session cleanup failed", exc_info=True)
+        agent._codex_session = None
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     created_codex_session = False
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
         created_codex_session = True
-        from agent.runtime_cwd import resolve_agent_cwd
 
-        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        cwd = codex_cwd
         # Approval callback: defer to Hermes' standard prompt flow if a CLI
         # thread has installed one. Gateway/API turns use their existing
         # per-run approval queue; cron or detached contexts without an
@@ -1207,7 +1461,7 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             hermes_session_id=str(getattr(agent, "session_id", "") or ""),
-            resume_thread_id=_stored_codex_app_server_thread_id(agent),
+            resume_thread_id=resume_thread_id,
             model=getattr(agent, "model", ""),
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
             parent_provider=str(getattr(agent, "provider", "") or ""),
@@ -1254,12 +1508,30 @@ def run_codex_app_server_turn(
             agent._last_workspace_snapshot = snapshot.as_dict()
 
         thread_id = agent._codex_session.ensure_started()
-        _persist_codex_app_server_thread_id(agent, thread_id)
-        turn_input = user_message
         if created_codex_session and not getattr(
             agent._codex_session, "_resumed_existing_thread", False
         ):
-            turn_input = _codex_history_handoff(messages[:-1], user_message)
+            # Either nothing could be resumed, or the resume attempt failed and
+            # the session fell back to a fresh thread. Both need the whole
+            # transcript — the delta was computed for a thread we no longer have.
+            handoff_entries = prior_entries
+            build_turn_input = _codex_history_handoff
+        else:
+            handoff_entries = pending_entries
+            build_turn_input = _codex_catch_up_handoff
+        turn_input = (
+            build_turn_input(handoff_entries, user_message)
+            if handoff_entries
+            else user_message
+        )
+        # Record what this thread is about to consume before the turn runs. A
+        # turn that dies mid-flight still leaves a thread holding this input,
+        # and re-seeding it from scratch next time would duplicate everything.
+        # The current user message is deliberately excluded: if delivery failed,
+        # under-counting replays one message, while over-counting drops it.
+        _persist_codex_thread_state(
+            agent, thread_id=thread_id, cwd=codex_cwd, entries=prior_entries
+        )
         turn = agent._codex_session.run_turn(user_input=turn_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
@@ -1329,9 +1601,15 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
+    # The transcript prefix this thread has consumed, used below to record
+    # continuity. It narrows to the pre-projection boundary if the projected
+    # rows cannot be persisted, since a later turn will reload a transcript
+    # that does not contain them.
+    codex_consumed_messages = messages
     if turn.projected_messages:
         from agent.message_metadata import append_message
 
+        pre_projection_len = len(messages)
         for projected_message in turn.projected_messages:
             append_message(messages, projected_message)
 
@@ -1370,7 +1648,17 @@ def run_codex_app_server_turn(
                     "will be missing after restart/resume",
                     getattr(agent, "session_id", None),
                 )
+                codex_consumed_messages = messages[:pre_projection_len]
 
+    # This thread has now consumed this turn. Record the boundary so a later
+    # runtime switch is measured against the right prefix instead of being
+    # waved through by the mere existence of a thread id.
+    _persist_codex_thread_state(
+        agent,
+        thread_id=thread_id,
+        cwd=codex_cwd,
+        entries=_codex_dialogue_entries(codex_consumed_messages),
+    )
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
