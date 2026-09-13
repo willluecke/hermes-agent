@@ -468,7 +468,8 @@ def _record_codex_app_server_compaction(
 # webSearch is codex's built-in web search tool — it has no projector
 # entry (codex handles it internally) but still deserves a bubble.
 _CODEX_TOOL_ITEM_TYPES = frozenset(
-    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch",
+     "imageGeneration", "imageView"}
 ) | COORDINATION_ITEM_TYPES
 
 # Internal MCP server that wraps Hermes' native tools for codex. When
@@ -504,6 +505,10 @@ def _codex_item_to_tool_name(item: dict) -> str:
         return item.get("tool") or "dynamic"
     if item_type == "webSearch":
         return "web_search"
+    if item_type == "imageGeneration":
+        return "image_generate"
+    if item_type == "imageView":
+        return "view_image"
     return item_type or "unknown"
 
 
@@ -528,6 +533,8 @@ def _codex_item_to_args(item: dict) -> dict:
         return args if isinstance(args, dict) else {"arguments": args}
     if item_type == "webSearch":
         return {"query": item.get("query") or ""}
+    if item_type in {"imageGeneration", "imageView"}:
+        return {"path": item.get("savedPath") or item.get("path") or ""}
     return {}
 
 
@@ -563,6 +570,8 @@ def _codex_item_to_preview(item: dict) -> Any:
     if item_type == "webSearch":
         query = item.get("query") or ""
         return query or None
+    if item_type in {"imageGeneration", "imageView"}:
+        return item.get("savedPath") or item.get("path") or "Generating image"
     return None
 
 
@@ -610,6 +619,14 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
             )
         success = item.get("success", True)
         return f"success={success}", not bool(success)
+    if item_type in {"imageGeneration", "imageView"}:
+        failed = bool(item.get("failure")) or item.get("status") in {
+            "failed", "cancelled", "error",
+        }
+        if failed:
+            return "Image tool failed", True
+        path = item.get("savedPath") or item.get("path")
+        return str(path or "Image tool completed without a saved file"), False
     return "", False
 
 

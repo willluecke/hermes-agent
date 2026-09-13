@@ -113,6 +113,8 @@ class CodexEventProjector:
             return self._project_mcp_tool_call(item, item_id)
         if item_type == "dynamicToolCall":
             return self._project_dynamic_tool_call(item, item_id)
+        if item_type in {"imageGeneration", "imageView"}:
+            return self._project_image(item, params.get("turnId"))
         if item_type == "userMessage":
             return self._project_user_message(item)
         if item_type in COORDINATION_ITEM_TYPES:
@@ -332,6 +334,28 @@ class CodexEventProjector:
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )
+
+    def _project_image(self, item: dict, turn_id: Any) -> ProjectionResult:
+        """Keep the delivery reference intact without retaining prompts or base64.
+
+        Native image results are display artifacts, not final assistant answers.
+        The API adapter needs the originating turn to distinguish a repost from
+        an image merely present in the conversation's older history.
+        """
+        payload = {
+            "type": item["type"],
+            "id": item.get("id"),
+            "turnId": turn_id,
+            "status": item.get("status", "completed"),
+            "path": item.get("savedPath") if item["type"] == "imageGeneration"
+            else item.get("path"),
+        }
+        if item.get("failure"):
+            payload["status"] = "failed"
+        return ProjectionResult(messages=[{
+            "role": "assistant",
+            "content": f"[codex {item['type']}] " + json.dumps(payload, ensure_ascii=False),
+        }])
 
     def _project_opaque(self, item: dict, item_type: str) -> ProjectionResult:
         # Record the existence of the item without inventing tool_calls.

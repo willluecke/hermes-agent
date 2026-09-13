@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("aiohttp")
 
 from gateway.platforms.api_server import (  # noqa: E402
-    _promote_current_run_codex_image_view,
+    _promote_current_run_codex_images,
     _resolve_media_to_data_urls,
 )
 
@@ -84,7 +84,7 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         started_at = time.time()
         p = self._write_png()
 
-        promoted = _promote_current_run_codex_image_view(
+        promoted = _promote_current_run_codex_images(
             "This is the catalog-only view.",
             user_message="Can you show me his catalog lower on the screen?",
             messages=[self._image_view_message(p)],
@@ -100,7 +100,7 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         p = self._write_png()
         text = "The visual regression test passed."
 
-        promoted = _promote_current_run_codex_image_view(
+        promoted = _promote_current_run_codex_images(
             text,
             user_message="Fix the responsive layout regression.",
             messages=[self._image_view_message(p)],
@@ -115,7 +115,7 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         os.utime(p, (old, old))
         text = "This is the requested screenshot."
 
-        promoted = _promote_current_run_codex_image_view(
+        promoted = _promote_current_run_codex_images(
             text,
             user_message="Please show me the screenshot.",
             messages=[self._image_view_message(p)],
@@ -129,7 +129,7 @@ class TestResolveMediaToDataUrls(unittest.TestCase):
         p = self._write_png()
         text = "![Catalog](https://example.com/catalog.png)"
 
-        promoted = _promote_current_run_codex_image_view(
+        promoted = _promote_current_run_codex_images(
             text,
             user_message="Please show me the catalog screenshot.",
             messages=[self._image_view_message(p)],

@@ -1367,10 +1367,10 @@ _REMOTE_OR_INLINE_IMAGE_MARKDOWN_RE = re.compile(
 )
 _VISUAL_DELIVERY_REQUEST_RE = re.compile(
     r"(?:"
-    r"\b(?:show|send|attach|display|include|share|give)\b.{0,160}"
+    r"\b(?:show|send|attach|display|include|share|give|post|repost)\b.{0,160}"
     r"\b(?:screenshot|screen|image|picture|photo|render|preview|view|page|catalog)\b"
     r"|\b(?:screenshot|screen|image|picture|photo|render|preview)\b.{0,160}"
-    r"\b(?:show|send|attach|display|include|share|give|again|through)\b"
+    r"\b(?:show|send|attach|display|include|share|give|post|repost|again|through)\b"
     r")",
     re.IGNORECASE | re.DOTALL,
 )
@@ -1378,61 +1378,66 @@ _REATTACHED_IMAGE_NOTE_RE = re.compile(
     r"\n?\(Re-attached for reference[^\n]*\)\n?(?:\[screenshot\])?",
     re.IGNORECASE,
 )
-_CODEX_IMAGE_VIEW_PREFIX = "[codex imageView] "
+_CODEX_IMAGE_PREFIXES = ("[codex imageView] ", "[codex imageGeneration] ")
 
 
-def _promote_current_run_codex_image_view(
+def _promote_current_run_codex_images(
     text: str,
     *,
     user_message: Any,
     messages: Any,
     run_started_at: float,
+    codex_turn_id: Optional[str] = None,
 ) -> str:
-    """Append a newly-created Codex ``imageView`` artifact when delivery was requested.
+    """Deliver native image artifacts through the normal final-output carrier.
 
-    Codex app-server records its native image inspection as an opaque transcript
-    row instead of a normal tool result. That means a model can create and
-    inspect the requested screenshot, then truthfully describe it in its final
-    answer while omitting the separate ``MEDIA:`` carrier. Remote ``/v1/runs``
-    clients consequently receive text only.
-
-    This is deliberately a narrow fallback rather than a general local-file
-    scraper. It requires all of the following:
-
-    * the current user turn explicitly asks to see/send a visual;
-    * the final answer has no existing image-delivery reference;
-    * Codex emitted a real ``imageView`` transcript item;
-    * the referenced raster file is safe, bounded, and was created or modified
-      during this run.
-
-    Only the most recently viewed qualifying image is promoted. Agents that
-    intend to deliver multiple images must still use explicit ``MEDIA:`` tags.
+    Generated images belong to the generating turn. Inspection only implies
+    delivery when the user asked to see an image; select the latest such view.
+    Match the native turn identity, not the file's age, so requested reposts
+    work without leaking images from earlier conversation turns. Legacy view
+    notes lack turn identity and retain their conservative file-age fallback.
+    Explicit media references take precedence over automatic promotion.
     """
     if not isinstance(text, str) or not text.strip():
         return text
-    if "MEDIA:" in text or _REMOTE_OR_INLINE_IMAGE_MARKDOWN_RE.search(text):
+    if ("MEDIA:" in text or _REMOTE_OR_INLINE_IMAGE_MARKDOWN_RE.search(text)
+            or _LOCAL_IMAGE_MARKDOWN_RE.search(text)):
         return text
 
     request_text = _REATTACHED_IMAGE_NOTE_RE.sub("", str(user_message or ""))
-    if not _VISUAL_DELIVERY_REQUEST_RE.search(request_text):
-        return text
+    delivery_requested = bool(_VISUAL_DELIVERY_REQUEST_RE.search(request_text))
     if not isinstance(messages, list):
         return text
 
-    newest_path: Optional[str] = None
+    generated_paths: list[str] = []
+    newest_view: Optional[str] = None
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
         content = message.get("content")
-        if not isinstance(content, str) or not content.startswith(
-            _CODEX_IMAGE_VIEW_PREFIX
-        ):
+        if not isinstance(content, str):
+            continue
+        prefix = next((p for p in _CODEX_IMAGE_PREFIXES if content.startswith(p)), None)
+        if prefix is None:
             continue
         try:
-            payload = json.loads(content[len(_CODEX_IMAGE_VIEW_PREFIX) :])
+            payload = json.loads(content[len(prefix) :])
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-        if not isinstance(payload, dict) or payload.get("type") != "imageView":
+        if not isinstance(payload, dict):
+            continue
+        generated = payload.get("type") == "imageGeneration"
+        if not generated and (payload.get("type") != "imageView" or not delivery_requested):
+            continue
+        if payload.get("status", "completed") != "completed":
+            continue
+        native_turn = payload.get("turnId")
+        if native_turn:
+            if not codex_turn_id or native_turn != codex_turn_id:
+                continue
+        elif generated:
+            # Old opaque generation notes can be truncated or refer to a
+            # previous turn; never infer a delivery from their prompt text.
             continue
         raw_path = payload.get("path")
         if not isinstance(raw_path, str):
@@ -1450,14 +1455,19 @@ def _promote_current_run_codex_image_view(
         if (
             stat.st_size <= 0
             or stat.st_size > _MEDIA_DATA_URL_MAX_BYTES
-            or stat.st_mtime < run_started_at - 2.0
+            or (not native_turn and stat.st_mtime < run_started_at - 2.0)
         ):
             continue
-        newest_path = str(path)
+        if generated:
+            if str(path) not in generated_paths:
+                generated_paths.append(str(path))
+        else:
+            newest_view = str(path)
 
-    if newest_path is None:
+    paths = generated_paths or ([newest_view] if newest_view else [])
+    if not paths:
         return text
-    return f"{text.rstrip()}\n\nMEDIA:{newest_path}"
+    return text.rstrip() + "".join(f"\n\nMEDIA:{path}" for path in paths)
 
 
 def _resolve_media_to_data_urls(text: str) -> str:
@@ -9167,11 +9177,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         result.get("final_response") or ""
                     ).strip()
                     if preserved_output:
-                        preserved_output = _promote_current_run_codex_image_view(
+                        preserved_output = _promote_current_run_codex_images(
                             preserved_output,
                             user_message=user_message,
                             messages=result.get("messages", []),
                             run_started_at=created_at,
+                            codex_turn_id=result.get("codex_turn_id"),
                         )
                         preserved_output = _resolve_media_to_data_urls(
                             _redact_api_error_text(preserved_output)
@@ -9233,11 +9244,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Apply the same validated raster-image delivery used by
                     # the other API response paths before this output enters
                     # SSE replay, run status, and the durable chat archive.
-                    final_response = _promote_current_run_codex_image_view(
+                    final_response = _promote_current_run_codex_images(
                         final_response,
                         user_message=user_message,
                         messages=result.get("messages", []),
                         run_started_at=created_at,
+                        codex_turn_id=result.get("codex_turn_id"),
                     )
                     final_response = _resolve_media_to_data_urls(final_response)
                     # Undelivered steer text (accepted after the final response;
