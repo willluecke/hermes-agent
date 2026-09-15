@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from uuid import uuid4
 from unittest.mock import patch
 
@@ -187,6 +188,111 @@ def test_continuing_claude_turn_materializes_multimodal_input(monkeypatch):
     assert "hermes-image-1.png" in prompts[1]
     assert "data:image" not in prompts[1]
     db.close()
+
+
+def test_reattached_history_images_are_reference_not_new_uploads(monkeypatch):
+    prompts = []
+
+    def _run_turn(session, prompt):
+        prompts.append(prompt)
+        session.on_session_id(session.session_id)
+        return ClaudeCodeTurnResult(
+            final_text=f"answer {len(prompts)}",
+            session_id=session.session_id,
+            session_confirmed=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-image-reference-{uuid4()}"
+    agent = _make_agent(session_id=outer_session_id, session_db=db)
+    image = "data:image/png;base64," + base64.b64encode(b"small test image").decode("ascii")
+
+    agent.run_conversation(
+        [
+            {"type": "text", "text": "Move the artwork behind the headline."},
+            {"type": "image_url", "image_url": {"url": image}},
+        ]
+    )
+    history = db.get_messages_as_conversation(outer_session_id)
+    note = (
+        "(Re-attached for reference — image the user shared earlier in this "
+        "conversation, not a new upload: IMG_8807.png.)"
+    )
+    result = agent.run_conversation(
+        [
+            {"type": "text", "text": "Also remove the play/pause button"},
+            {"type": "text", "text": note},
+            {"type": "image_url", "image_url": {"url": image}},
+        ],
+        conversation_history=history,
+    )
+
+    assert result["completed"] is True
+    assert "Attached images are available at:" in prompts[0]
+    followup = prompts[1]
+    assert followup.startswith("Also remove the play/pause button\n\n")
+    assert "Re-attached for reference" not in followup
+    assert "Attached images are available at:" not in followup
+    assert "re-supplied for reference only" in followup
+    assert "hermes-image-2.png" in followup
+    db.close()
+
+
+def test_materialize_images_splits_new_uploads_from_reattached_history(tmp_path):
+    from agent.claude_runtime import _materialize_images
+
+    image = "data:image/png;base64," + base64.b64encode(b"small test image").decode("ascii")
+    attached, referenced = _materialize_images(
+        [
+            {"type": "text", "text": "Compare these."},
+            {"type": "image_url", "image_url": {"url": image}},
+            {
+                "type": "text",
+                "text": "(Re-attached for reference — image the user shared earlier in this conversation: old.png.)",
+            },
+            {"type": "image_url", "image_url": {"url": image}},
+        ],
+        str(tmp_path),
+    )
+
+    assert [Path(path).name for path in attached] == ["hermes-image-1.png"]
+    assert [Path(path).name for path in referenced] == ["hermes-image-3.png"]
+
+
+def test_history_handoff_drops_reattach_notes_and_their_placeholders():
+    from agent.claude_runtime import claude_history_handoff
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "It should sit behind the headline."},
+                {"type": "text", "text": "[screenshot]"},
+                {
+                    "type": "text",
+                    "text": "(Re-attached for reference — images the user shared earlier in this conversation: a.png, b.gif.)",
+                },
+                {"type": "text", "text": "[screenshot]"},
+                {"type": "text", "text": "[screenshot]"},
+            ],
+        },
+        {"role": "assistant", "content": "Done."},
+        {
+            "role": "user",
+            "content": "Continue\n(Re-attached for reference — images the user shared earlier in this conversation: a.png, b.gif.)\n[screenshot]\n[screenshot]",
+        },
+        {"role": "assistant", "content": "Continuing."},
+    ]
+
+    handoff = claude_history_handoff(messages, "Also remove the play/pause button")
+
+    assert (
+        "Will: It should sit behind the headline.\n[screenshot]\n\nAssistant: Done.\n\nWill: Continue\n\nAssistant: Continuing."
+        in handoff
+    )
+    assert "Re-attached" not in handoff
+    assert handoff.endswith("Current request:\nAlso remove the play/pause button")
 
 
 def test_new_hermes_parent_resumes_same_claude_session(monkeypatch):

@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 import tempfile
 import time
 from typing import Any, Callable, Optional
@@ -64,13 +65,36 @@ def _claude_code_effort(reasoning_config: Any) -> Optional[str]:
     return _CLAUDE_EFFORT_MAP.get(effort)
 
 
+def _fingerprint_text(content: Any) -> str:
+    """Render content the way the session store replays it.
+
+    Stored history replaces each image part with a ``[screenshot]`` text
+    placeholder. Hash the same shape for the in-memory message so a turn that
+    carried an image does not permanently break Claude session resume.
+    """
+    if not isinstance(content, list):
+        return _content_text(content)
+    pieces: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type in {"image", "image_url", "input_image"}:
+            pieces.append("[screenshot]")
+        elif block_type in {"text", "input_text", "output_text"}:
+            text = str(block.get("text") or "").strip()
+            if text:
+                pieces.append(text)
+    return "\n".join(pieces)
+
+
 def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
     """Hash the outer transcript prefix represented by a Claude session."""
     digest = hashlib.sha256()
     for message in messages:
         payload = [
             str(message.get("role") or ""),
-            _content_text(message.get("content")),
+            _fingerprint_text(message.get("content")),
         ]
         digest.update(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
@@ -138,6 +162,8 @@ def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) ->
         if role not in {"user", "assistant"}:
             continue
         text = _content_text(message.get("content"))
+        if role == "user":
+            text = strip_reattached_image_notes(text)
         if not text:
             continue
         blocks.append(f"{'Will' if role == 'user' else 'Assistant'}: {text}")
@@ -248,15 +274,58 @@ def make_claude_code_event_bridge(agent: Any) -> Callable[[dict[str, Any]], None
     return on_event
 
 
-def _materialize_images(original_user_message: Any, directory: str) -> list[str]:
+# Hermes Chat re-supplies up to two recent history images on every send
+# because the run API keeps only text for older messages. The browser places
+# this note between the turn's own uploads and those copies, and the API
+# server recognizes the same prefix. Anything after the note was shared on an
+# earlier turn; presenting it as a fresh attachment made plain-text follow-ups
+# read as "the user sent another photo".
+_REATTACHED_IMAGE_NOTE_PREFIX = "(re-attached for reference"
+_REATTACHED_IMAGE_NOTE_RE = re.compile(
+    r"\n*[ \t]*\(Re-attached for reference[^\n]*\)[ \t]*"
+    r"(?:\n+[ \t]*\[screenshot\][ \t]*)*",
+    re.IGNORECASE,
+)
+
+
+def _is_reattached_image_note(text: str) -> bool:
+    return text.strip().lower().startswith(_REATTACHED_IMAGE_NOTE_PREFIX)
+
+
+def strip_reattached_image_notes(text: str) -> str:
+    """Drop the browser's re-attach note and the image placeholders after it.
+
+    Stored history renders every image as ``[screenshot]``; the placeholders
+    that follow the note stand for the re-supplied copies, not for anything
+    the user attached on that turn.
+    """
+    if not text or _REATTACHED_IMAGE_NOTE_PREFIX not in text.lower():
+        return text
+    return _REATTACHED_IMAGE_NOTE_RE.sub("", text).strip()
+
+
+def _materialize_images(
+    original_user_message: Any, directory: str
+) -> tuple[list[str], list[str]]:
+    """Write inline images to ``directory``.
+
+    Returns ``(attached, referenced)`` paths. Images after the re-attach note
+    are earlier-turn copies the browser re-supplied for reference.
+    """
     if not isinstance(original_user_message, list):
-        return []
-    paths: list[str] = []
+        return [], []
+    attached: list[str] = []
+    referenced: list[str] = []
+    after_note = False
     for index, part in enumerate(original_user_message):
-        if not isinstance(part, dict) or part.get("type") not in {
-            "image_url",
-            "input_image",
-        }:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type in {"text", "input_text"}:
+            if _is_reattached_image_note(str(part.get("text") or "")):
+                after_note = True
+            continue
+        if part_type not in {"image_url", "input_image"}:
             continue
         image_url = part.get("image_url")
         value = image_url.get("url") if isinstance(image_url, dict) else image_url
@@ -278,8 +347,8 @@ def _materialize_images(original_user_message: Any, directory: str) -> list[str]
             continue
         path = Path(directory, f"hermes-image-{index}{suffix}")
         path.write_bytes(data)
-        paths.append(str(path))
-    return paths
+        (referenced if after_note else attached).append(str(path))
+    return attached, referenced
 
 
 def run_claude_code_turn(
@@ -370,27 +439,35 @@ def run_claude_code_turn(
             if isinstance(original_user_message, list)
             else user_message
         )
-        images = _materialize_images(image_content, image_dir)
-        prompt_text = (
+        attached_images, reference_images = _materialize_images(
+            image_content, image_dir
+        )
+        prompt_text = strip_reattached_image_notes(
             user_message
             if isinstance(user_message, str)
             else _content_text(user_message)
         )
-        if not prompt_text and images:
+        if not prompt_text and attached_images:
             prompt_text = "Please inspect the attached image(s)."
         prompt = (
             prompt_text
             if resident_continuity or durable_resume
             else claude_history_handoff(prior_messages, prompt_text)
         )
-        if images:
-            prompt = "\n\n".join(
-                (
-                    prompt,
-                    "Attached images are available at:\n"
-                    + "\n".join(f"- {path}" for path in images),
-                )
+        sections = [prompt]
+        if attached_images:
+            sections.append(
+                "Attached images are available at:\n"
+                + "\n".join(f"- {path}" for path in attached_images)
             )
+        if reference_images:
+            sections.append(
+                "Images the user shared on earlier turns, re-supplied for "
+                "reference only. They are not new attachments; the current "
+                "request is the text above:\n"
+                + "\n".join(f"- {path}" for path in reference_images)
+            )
+        prompt = "\n\n".join(sections)
 
         def _remember_confirmed_session(claude_session_id: str) -> None:
             # At stream time the outer list contains the current user message
