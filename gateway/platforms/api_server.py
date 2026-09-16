@@ -157,6 +157,8 @@ def _resolve_run_workspace(
         return ("", "", "'project' must be a configured project key", 400)
     raw_path = projects.get(project)
     if not isinstance(raw_path, str) or not raw_path.strip():
+        if project == _scratch_project_key(workspace_cfg):
+            return _scratch_run_workspace(project)
         return ("", "", f"Unknown project {project!r}", 400)
 
     configured_path = Path(raw_path).expanduser()
@@ -168,6 +170,36 @@ def _resolve_run_workspace(
         return ("", "", f"Configured workspace for {project!r} is unavailable", 503)
     if not resolved.is_dir():
         return ("", "", f"Configured workspace for {project!r} is not a directory", 503)
+    return (project, str(resolved), None, 0)
+
+
+def _scratch_project_key(workspace_cfg: Any) -> str:
+    """The project key that means "no project": conversations that belong to
+    no registered workspace run in an ephemeral scratch directory instead."""
+    configured = (
+        workspace_cfg.get("scratch_project") if isinstance(workspace_cfg, dict) else None
+    )
+    key = str(configured or "general").strip()
+    return key if re.fullmatch(r"[A-Za-z0-9._-]+", key) else "general"
+
+
+def _scratch_run_workspace(project: str) -> tuple[str, str, Optional[str], int]:
+    """Create or reuse the ephemeral workspace for the scratch project.
+
+    Nothing under it predates the conversation, so recovery snapshots and
+    project memory do not apply; the directory exists only so the runtime
+    has a real cwd. A registered key with the same name always wins.
+    """
+    from tools.workspace_snapshots import scratch_workspace_root
+
+    workspace = scratch_workspace_root() / project
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        resolved = workspace.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return ("", "", f"Scratch workspace for {project!r} is unavailable", 503)
+    if not resolved.is_dir():
+        return ("", "", f"Scratch workspace for {project!r} is not a directory", 503)
     return (project, str(resolved), None, 0)
 
 

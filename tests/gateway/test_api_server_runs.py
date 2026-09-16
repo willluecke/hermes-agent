@@ -198,6 +198,44 @@ class TestStartRun:
         assert (project, cwd, status) == ("", "", 400)
         assert "configured project key" in error
 
+    def test_workspace_resolver_gives_the_scratch_project_an_ephemeral_workspace(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        project_root = tmp_path / "reg-watch"
+        project_root.mkdir()
+        config = {
+            "codex_runtime": {
+                "workspaces": {
+                    "default_project": "reg-watch",
+                    "projects": {"reg-watch": str(project_root)},
+                }
+            }
+        }
+
+        scratch = hermes_home / "scratch" / "general"
+        assert not scratch.exists()
+        assert _resolve_run_workspace(config, "general") == (
+            "general",
+            str(scratch.resolve()),
+            None,
+            0,
+        )
+        assert scratch.is_dir()
+        # Only the scratch key gets this treatment; other unknown keys still fail closed.
+        assert _resolve_run_workspace(config, "nowhere")[3] == 400
+        # A registered workspace with the same key always wins over scratch.
+        general_root = tmp_path / "general"
+        general_root.mkdir()
+        config["codex_runtime"]["workspaces"]["projects"]["general"] = str(general_root)
+        assert _resolve_run_workspace(config, "general")[1] == str(general_root.resolve())
+        # The key is configurable.
+        config["codex_runtime"]["workspaces"]["scratch_project"] = "loose"
+        assert _resolve_run_workspace(config, "loose")[1] == str(
+            (hermes_home / "scratch" / "loose").resolve()
+        )
+
     def test_workspace_resolver_reloads_server_owned_project_registry(self, tmp_path):
         first = tmp_path / "first"
         second = tmp_path / "second"

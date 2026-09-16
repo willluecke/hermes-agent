@@ -98,6 +98,21 @@ def workspace_snapshot_store_root() -> Path:
     return get_hermes_home() / "workspace-snapshots"
 
 
+def scratch_workspace_root() -> Path:
+    """Ephemeral workspaces for conversations that belong to no project."""
+    return get_hermes_home() / "scratch"
+
+
+def is_scratch_workspace(path: "Path | str") -> bool:
+    """True when ``path`` is the scratch root or lives inside it."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+        root = scratch_workspace_root().resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved == root or root in resolved.parents
+
+
 def _safe_project_component(project: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", project.strip()).strip("-._")
     readable = normalized[:48] or "workspace"
@@ -242,6 +257,12 @@ def capture_workspace_snapshot(
     workspace = Path(workspace_root).expanduser().resolve()
     if not workspace.is_dir():
         raise WorkspaceSnapshotError("selected workspace is not a directory")
+    if is_scratch_workspace(workspace):
+        # A scratch workspace holds nothing that predates the conversation
+        # using it, so there is no recovery point worth taking. Skipping here
+        # is a policy decision, not a failure, and callers still fail closed
+        # for every real project workspace.
+        return None
     store = workspace_snapshot_store_root().resolve()
     try:
         store.relative_to(workspace)

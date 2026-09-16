@@ -119,6 +119,25 @@ def test_snapshot_failure_is_explicit_and_leaves_no_partial(snapshot_env, monkey
     assert pending == []
 
 
+def test_scratch_workspaces_are_never_snapshotted(snapshot_env):
+    hermes_home, _workspace, policy = snapshot_env
+    scratch = hermes_home / "scratch" / "general"
+    scratch.mkdir(parents=True)
+    (scratch / "note.txt").write_text("nothing here predates the conversation", encoding="utf-8")
+
+    assert (
+        capture_workspace_snapshot(
+            workspace_root=str(scratch),
+            project="general",
+            session_id="session-1",
+            task_id="task-1",
+            policy=policy,
+        )
+        is None
+    )
+    assert not (hermes_home / "workspace-snapshots").exists()
+
+
 def test_disabled_policy_has_no_filesystem_effect(snapshot_env):
     home, workspace, _policy = snapshot_env
     assert capture_workspace_snapshot(
