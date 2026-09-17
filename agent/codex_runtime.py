@@ -944,6 +944,194 @@ def _codex_file_change_line_counts(
     return {"lines_added": added, "lines_removed": removed} if measured else {}
 
 
+def _hermes_tool_name(raw: str) -> str:
+    """Map a projected codex call name onto the Hermes tool it stands for."""
+    if raw == "exec_command":
+        return "terminal"
+    if raw == "apply_patch":
+        return "patch"
+    if raw.startswith("mcp."):
+        return raw.split(".", 2)[-1]
+    return raw
+
+
+def _codex_projected_tool_calls(projected_messages: list) -> list:
+    """(tool_name, args, result, call_id) for each projected call/result pair."""
+    results: Dict[str, Any] = {}
+    for message in projected_messages or []:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            results[str(message.get("tool_call_id") or "")] = message.get("content")
+    calls = []
+    for message in projected_messages or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            raw_name = str(function.get("name") or "")
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            if not isinstance(args, dict):
+                args = {"arguments": args}
+            call_id = str(call.get("id") or "")
+            calls.append((_hermes_tool_name(raw_name), args, results.get(call_id, ""), call_id))
+    return calls
+
+
+def _codex_hook_parity(
+    agent: Any,
+    turn: Any,
+    messages: List[Dict[str, Any]],
+    original_user_message: Any,
+    effective_task_id: str,
+) -> int:
+    """Give a codex turn the observer hooks and the verify gate of the default loop.
+
+    codex executes tools inside its own process, so ``post_tool_call``,
+    ``post_llm_call`` and ``pre_verify`` never fire on this path unless they
+    are emitted from the projected rows. The verify gate may keep the turn
+    going: a ``continue`` directive is sent to the same codex thread as one
+    more user turn, its rows are spliced and persisted like the first, and the
+    turn object is updated to the follow-up's outcome. Bounded by
+    ``agent.max_verify_nudges``. Returns the number of follow-up turns run.
+    """
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+
+    session_id = getattr(agent, "session_id", "") or ""
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    platform = getattr(agent, "platform", "") or ""
+    model = getattr(agent, "model", "") or ""
+    changed: set = set()
+
+    def emit_tool_hooks(projected: list) -> None:
+        for name, args, result, call_id in _codex_projected_tool_calls(projected):
+            if name == "patch":
+                for change in args.get("changes") or []:
+                    path = _codex_file_change_path(
+                        agent, change.get("path") if isinstance(change, dict) else None
+                    )
+                    if path is not None:
+                        changed.add(str(path))
+            if not has_hook("post_tool_call"):
+                continue
+            try:
+                invoke_hook(
+                    "post_tool_call",
+                    tool_name=name,
+                    args=args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=session_id,
+                    tool_call_id=call_id,
+                    turn_id=turn_id,
+                    api_request_id="",
+                    duration_ms=0,
+                    status="ok",
+                    error_type=None,
+                    error_message=None,
+                    middleware_trace=[],
+                )
+            except Exception:
+                logger.debug("codex post_tool_call parity failed", exc_info=True)
+
+    emit_tool_hooks(list(turn.projected_messages or []))
+
+    follow_ups = 0
+    try:
+        from agent.verify_hooks import max_verify_nudges
+
+        limit = int(max_verify_nudges())
+    except Exception:
+        limit = 0
+    attempt = int(getattr(agent, "_pre_verify_nudges", 0) or 0)
+    while (
+        changed
+        and attempt < limit
+        and isinstance(turn.final_text, str)
+        and turn.final_text.strip()
+        and not turn.interrupted
+        and turn.error is None
+        and getattr(agent, "_codex_session", None) is not None
+        and has_hook("pre_verify")
+    ):
+        from hermes_cli.plugins import get_pre_verify_continue_message
+
+        nudge = get_pre_verify_continue_message(
+            session_id=session_id,
+            platform=platform,
+            model=model,
+            coding=True,
+            attempt=attempt,
+            final_response=turn.final_text,
+            changed_paths=sorted(changed),
+        )
+        if not nudge:
+            break
+        attempt += 1
+        agent._pre_verify_nudges = attempt
+        from agent.message_metadata import append_message
+
+        # The nudge is synthetic and stripped from the durable transcript,
+        # exactly as the default loop does; the codex thread did consume it.
+        append_message(
+            messages,
+            {"role": "user", "content": nudge, "_pre_verify_synthetic": True},
+        )
+        try:
+            follow = agent._codex_session.run_turn(user_input=nudge)
+        except Exception:
+            logger.warning("codex pre_verify follow-up turn failed", exc_info=True)
+            break
+        follow_ups += 1
+        for message in follow.projected_messages or []:
+            append_message(messages, message)
+        if getattr(agent, "_session_db", None) is not None:
+            try:
+                agent._flush_messages_to_session_db(messages)
+            except Exception:
+                logger.debug("codex pre_verify follow-up flush failed", exc_info=True)
+        emit_tool_hooks(list(follow.projected_messages or []))
+        turn.projected_messages = list(turn.projected_messages or []) + list(
+            follow.projected_messages or []
+        )
+        turn.tool_iterations = int(getattr(turn, "tool_iterations", 0) or 0) + int(
+            getattr(follow, "tool_iterations", 0) or 0
+        )
+        turn.final_text = follow.final_text
+        turn.interrupted = follow.interrupted
+        turn.error = follow.error
+        turn.error_code = getattr(follow, "error_code", None)
+        if getattr(follow, "should_retire", False):
+            turn.should_retire = True
+        logger.debug("codex pre_verify nudge issued (attempt %d)", attempt)
+
+    if (
+        isinstance(turn.final_text, str)
+        and turn.final_text.strip()
+        and not turn.interrupted
+        and turn.error is None
+        and has_hook("post_llm_call")
+    ):
+        try:
+            invoke_hook(
+                "post_llm_call",
+                session_id=session_id,
+                task_id=effective_task_id or "",
+                turn_id=turn_id,
+                user_message=original_user_message,
+                assistant_response=turn.final_text,
+                conversation_history=list(messages),
+                model=model,
+                platform=platform,
+            )
+        except Exception:
+            logger.debug("codex post_llm_call parity failed", exc_info=True)
+    return follow_ups
+
+
 def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     """Build an ``on_event`` callback that wires codex app-server JSON-RPC
     notifications into Hermes' gateway UI callbacks.
@@ -1650,6 +1838,15 @@ def run_codex_app_server_turn(
                 )
                 codex_consumed_messages = messages[:pre_projection_len]
 
+    # Hook parity with the default loop (observer hooks + the pre_verify gate),
+    # which may extend this turn with bounded follow-up turns on the thread.
+    _codex_follow_ups = 0
+    try:
+        _codex_follow_ups = _codex_hook_parity(
+            agent, turn, messages, original_user_message, effective_task_id
+        )
+    except Exception:
+        logger.debug("codex hook parity failed", exc_info=True)
     # This thread has now consumed this turn. Record the boundary so a later
     # runtime switch is measured against the right prefix instead of being
     # waved through by the mere existence of a thread id.
@@ -1672,7 +1869,7 @@ def run_codex_app_server_turn(
     )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    api_calls = 1 + _codex_follow_ups
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
