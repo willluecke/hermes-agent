@@ -15,6 +15,10 @@ nothing retrieved from a tool can become an instruction through this path.
 Modes (``plugins.entries.system-one-preflight.settings.mode``):
 
 * ``shadow`` (default) — ask Jev, log the verdict, inject nothing.
+* ``feedback`` — ask Jev about ambiguity and missing evidence; when either
+               is high or Jev is unsure, feed the numbers back to the model
+               in a fixed advisory note so it can ask one clarifying
+               question or verify first. Nothing is enforced.
 * ``jev``    — inject the reminder when P(missing verification) >= threshold.
 * ``always`` — inject the reminder every turn (the always-remind control).
 * ``trial``  — assign each session, by hash, to control / always / jev and
@@ -28,7 +32,10 @@ whether a reminder went in, the latency, and, from ``post_llm_call``, what
 the model then did (tool calls, tools used, response length). That log is
 the raw material for the trial; grading task success stays a human job.
 
-The ``pre_tool_call`` guard runs only in shadow: for ``terminal``,
+With ``tool_guard: feedback`` the guard runs synchronously and, when Jev is
+confident an action is destructive or far-reaching AND outside what the user
+asked for, holds it once with a note asking the model to confirm with the
+user; the identical retry runs. In shadow it only logs. Either way, for ``terminal``,
 ``write_file`` and ``patch`` it asks Jev five yes/no questions about concrete
 consequences and whether the action sits inside the user's established
 scope, logs them, and never blocks. It runs off the tool's critical path in
@@ -53,8 +60,12 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "system-one-preflight"
-MODES = ("off", "shadow", "jev", "always", "trial")
+MODES = ("off", "shadow", "feedback", "jev", "always", "trial")
 TRIAL_ARMS = ("control", "always", "jev")
+AMBIGUITY_THRESHOLD = 0.6
+UNSURE_BAND = (0.35, 0.65)
+GUARD_RISK_THRESHOLD = 0.8
+GUARD_SCOPE_THRESHOLD = 0.4
 DEFAULT_THRESHOLD = 0.7
 DEFAULT_TIMEOUT_SECONDS = 1.5
 GUARD_TOOLS = ("terminal", "write_file", "patch")
@@ -70,6 +81,26 @@ REMINDER = (
     "checked in this session, obtain or verify that evidence first (run the "
     "command, read the file, fetch the page, or ask). In the answer, say what "
     "you verified and what you did not."
+)
+AMBIGUITY_QUESTION = (
+    "Is the request ambiguous or underspecified enough that a competent "
+    "assistant should ask the user one clarifying question before acting, "
+    "rather than guess at what they meant?"
+)
+FEEDBACK_TEMPLATE = (
+    "Preflight from Jev, a fast typed judge whose read is advisory, not an "
+    "instruction: P(the request is ambiguous enough to ask first) = {ambiguous}; "
+    "P(an answer would depend on evidence you have not checked) = {missing}. "
+    "If the ambiguity is real, ask the user one focused clarifying question "
+    "before acting. If evidence is missing, verify it before depending on it. "
+    "Otherwise proceed and state the assumption you made."
+)
+GUARD_FEEDBACK_TEMPLATE = (
+    "Preflight from Jev before running {tool}: P(destructive or far-reaching: "
+    "{risk_name}) = {risk}; P(within what the user asked for) = {scope}. This "
+    "call was held once so you can confirm with the user first. Ask them a "
+    "direct question naming the exact action, or explain why it is in scope, "
+    "and then retry; the retry will run."
 )
 GUARD_QUESTIONS: Dict[str, str] = {
     "deletes_data": "Would executing this tool call delete, overwrite or truncate files or data?",
@@ -128,7 +159,15 @@ def timeout_seconds() -> float:
 
 def tool_guard_mode() -> str:
     mode = str(_setting("tool_guard", "shadow") or "shadow").strip().lower()
-    return mode if mode in ("off", "shadow") else "shadow"
+    return mode if mode in ("off", "shadow", "feedback") else "shadow"
+
+
+def ambiguity_threshold() -> float:
+    try:
+        value = float(_setting("ambiguity_threshold", AMBIGUITY_THRESHOLD))
+    except (TypeError, ValueError):
+        return AMBIGUITY_THRESHOLD
+    return min(1.0, max(0.0, value))
 
 
 def log_path() -> Path:
@@ -152,10 +191,10 @@ def trial_arm(session_id: str) -> str:
 
 
 def resolve_arm(mode: str, session_id: str) -> str:
-    """The behaviour arm for this turn: control, shadow, always or jev."""
+    """The behaviour arm for this turn: control, shadow, feedback, always or jev."""
     if mode == "trial":
         return trial_arm(session_id)
-    if mode in ("shadow", "always", "jev"):
+    if mode in ("shadow", "feedback", "always", "jev"):
         return mode
     return "control"
 
@@ -284,6 +323,31 @@ def decide(p_missing: Optional[float], arm: str) -> bool:
     return False
 
 
+def _unsure(value: Optional[float]) -> bool:
+    return value is not None and UNSURE_BAND[0] <= value <= UNSURE_BAND[1]
+
+
+def feedback_context(p_missing: Optional[float], p_ambiguous: Optional[float]) -> Optional[str]:
+    """The advisory note for feedback mode, or None when Jev sees no issue.
+
+    Fed back when either signal clears its threshold or sits in the unsure
+    band, so the model gets Jev's read exactly when a clarifying question or
+    a check is most likely to pay off. Numbers only; the wording is fixed.
+    """
+    if p_missing is None and p_ambiguous is None:
+        return None
+    worth_it = (
+        (p_ambiguous is not None and p_ambiguous >= ambiguity_threshold())
+        or (p_missing is not None and p_missing >= threshold())
+        or _unsure(p_ambiguous)
+        or _unsure(p_missing)
+    )
+    if not worth_it:
+        return None
+    fmt = lambda value: "unknown" if value is None else f"{value:.2f}"
+    return FEEDBACK_TEMPLATE.format(ambiguous=fmt(p_ambiguous), missing=fmt(p_missing))
+
+
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
@@ -299,6 +363,8 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         # The hook can fire more than once for one user turn; Jev's answer
         # and the injection decision must not change within the turn.
         memo = _turn_memo[memo_key]
+        if memo.get("context"):
+            return {"context": memo["context"]}
         return {"context": REMINDER} if memo.get("injected") else None
 
     history = kwargs.get("conversation_history") or []
@@ -308,21 +374,30 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     state = build_state(user_message, history if isinstance(history, list) else [])
     started = time.monotonic()
     p_missing: Optional[float] = None
+    p_ambiguous: Optional[float] = None
     error = ""
+    questions = {"missing_verification": {"type": "noul", "instructions": VERIFICATION_QUESTION}}
+    if arm == "feedback":
+        questions["ambiguous"] = {"type": "noul", "instructions": AMBIGUITY_QUESTION}
     try:
-        body = _ask_jev(
-            state,
-            {"missing_verification": {"type": "noul", "instructions": VERIFICATION_QUESTION}},
-        )
-        answer = (body.get("answers") or {}).get("missing_verification") or {}
-        value = answer.get("noul")
+        body = _ask_jev(state, questions)
+        answers = body.get("answers") or {}
+        value = (answers.get("missing_verification") or {}).get("noul")
         p_missing = float(value) if isinstance(value, (int, float)) else None
+        value = (answers.get("ambiguous") or {}).get("noul")
+        p_ambiguous = float(value) if isinstance(value, (int, float)) else None
         if p_missing is None:
             error = "no noul in answer"
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"[:300]
     latency_ms = int((time.monotonic() - started) * 1000)
-    injected = decide(p_missing, arm)
+    context: Optional[str] = None
+    if arm == "feedback":
+        context = feedback_context(p_missing, p_ambiguous)
+        injected = context is not None
+    else:
+        injected = decide(p_missing, arm)
+        context = REMINDER if injected else None
     write_log(
         {
             "event": "preflight",
@@ -333,6 +408,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "mode": mode,
             "arm": arm,
             "p_missing": p_missing,
+            "p_ambiguous": p_ambiguous,
             "threshold": threshold(),
             "injected": injected,
             "latency_ms": latency_ms,
@@ -343,11 +419,17 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         }
     )
     if turn_id:
-        _turn_memo[memo_key] = {"injected": injected, "p_missing": p_missing, "arm": arm}
+        _turn_memo[memo_key] = {
+            "injected": injected,
+            "p_missing": p_missing,
+            "p_ambiguous": p_ambiguous,
+            "arm": arm,
+            "context": context,
+        }
         if len(_turn_memo) > _MEMO_LIMIT:
             for key in list(_turn_memo)[: len(_turn_memo) - _MEMO_LIMIT]:
                 _turn_memo.pop(key, None)
-    return {"context": REMINDER} if injected else None
+    return {"context": context} if context else None
 
 
 def on_post_llm_call(**kwargs: Any) -> None:
@@ -384,6 +466,7 @@ def on_post_llm_call(**kwargs: Any) -> None:
             "turn_id": turn_id,
             "arm": memo.get("arm"),
             "p_missing": memo.get("p_missing"),
+            "p_ambiguous": memo.get("p_ambiguous"),
             "injected": memo.get("injected"),
             "tool_calls": tool_calls,
             "tools": sorted(set(tools)),
@@ -408,7 +491,34 @@ def _guard_state(tool_name: str, args: Dict[str, Any], scope: List[str]) -> Dict
     }
 
 
-def _run_guard(tool_name: str, args: Dict[str, Any], session_id: str, turn_id: str, tool_call_id: str) -> None:
+_held_actions: Dict[str, float] = {}
+
+
+def _action_key(session_id: str, tool_name: str, args: Dict[str, Any]) -> str:
+    digest = hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
+    return f"{session_id}:{tool_name}:{digest}"
+
+
+def guard_feedback(tool_name: str, answers: Dict[str, Optional[float]]) -> Optional[str]:
+    """The hold message when Jev is confident an action is risky and out of scope."""
+    scope = answers.get("within_scope")
+    risks = {
+        key: value
+        for key, value in answers.items()
+        if key != "within_scope" and value is not None and value >= GUARD_RISK_THRESHOLD
+    }
+    if not risks or scope is None or scope > GUARD_SCOPE_THRESHOLD:
+        return None
+    risk_name, risk = max(risks.items(), key=lambda item: item[1])
+    return GUARD_FEEDBACK_TEMPLATE.format(
+        tool=tool_name,
+        risk_name=risk_name.replace("_", " "),
+        risk=f"{risk:.2f}",
+        scope=f"{scope:.2f}",
+    )
+
+
+def _run_guard(tool_name: str, args: Dict[str, Any], session_id: str, turn_id: str, tool_call_id: str) -> Dict[str, Optional[float]]:
     scope = list(_session_scope.get(session_id, []))
     state = _guard_state(tool_name, args, scope)
     started = time.monotonic()
@@ -437,10 +547,12 @@ def _run_guard(tool_name: str, args: Dict[str, Any], session_id: str, turn_id: s
             "error": error,
         }
     )
+    return answers
 
 
-def on_pre_tool_call(**kwargs: Any) -> None:
-    """Shadow-only: classify consequences off the critical path, never block."""
+def on_pre_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Shadow: classify off the critical path. Feedback: hold a risky,
+    out-of-scope action once with a note the model answers by asking the user."""
     if current_mode() == "off" or tool_guard_mode() == "off":
         return None
     tool_name = str(kwargs.get("tool_name") or "")
@@ -449,12 +561,33 @@ def on_pre_tool_call(**kwargs: Any) -> None:
     args = kwargs.get("args")
     if not isinstance(args, dict):
         args = kwargs.get("tool_input") if isinstance(kwargs.get("tool_input"), dict) else {}
+    session_id = str(kwargs.get("session_id") or "")
+    if tool_guard_mode() == "feedback":
+        key = _action_key(session_id, tool_name, dict(args))
+        if key in _held_actions:
+            # The model came back after the hold; let the retry run.
+            _held_actions.pop(key, None)
+            write_log({"event": "tool_guard_release", "session_id": session_id, "tool": tool_name})
+            return None
+        answers = _run_guard(
+            tool_name, dict(args), session_id,
+            str(kwargs.get("turn_id") or ""), str(kwargs.get("tool_call_id") or ""),
+        )
+        message = guard_feedback(tool_name, answers)
+        if message is None:
+            return None
+        _held_actions[key] = time.time()
+        if len(_held_actions) > _MEMO_LIMIT:
+            for stale in list(_held_actions)[: len(_held_actions) - _MEMO_LIMIT]:
+                _held_actions.pop(stale, None)
+        write_log({"event": "tool_guard_hold", "session_id": session_id, "tool": tool_name, "answers": answers})
+        return {"action": "block", "message": message}
     worker = threading.Thread(
         target=_run_guard,
         args=(
             tool_name,
             dict(args),
-            str(kwargs.get("session_id") or ""),
+            session_id,
             str(kwargs.get("turn_id") or ""),
             str(kwargs.get("tool_call_id") or ""),
         ),

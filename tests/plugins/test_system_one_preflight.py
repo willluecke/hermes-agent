@@ -229,3 +229,95 @@ def test_register_wires_the_three_hooks_and_the_settings_reader(monkeypatch):
     assert manager._hooks["pre_llm_call"] == [preflight.on_pre_llm_call]
     assert ("hook", "pre_llm_call") in manager.tracked
     assert preflight.current_mode() == "jev"
+
+
+class _FeedbackJev(_FakeJev):
+    def __init__(self, p=0.1, ambiguous=0.1, guard=None, raise_exc=None):
+        super().__init__(p=p, guard=guard, raise_exc=raise_exc)
+        self.ambiguous = ambiguous
+
+    def __call__(self, state, questions, timeout=None):
+        body = super().__call__(state, questions, timeout=timeout)
+        if "ambiguous" in questions:
+            body["answers"]["ambiguous"] = {"type": "noul", "noul": self.ambiguous}
+        return body
+
+
+@pytest.fixture
+def feedback(harness, monkeypatch):
+    harness["settings"]["mode"] = "feedback"
+    harness["settings"]["tool_guard"] = "feedback"
+    jev = _FeedbackJev()
+    monkeypatch.setattr(preflight, "_ask", jev)
+    preflight._held_actions.clear()
+    harness["jev"] = jev
+    return harness
+
+
+def test_feedback_mode_asks_both_questions_and_stays_quiet_when_jev_sees_no_issue(feedback):
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="What time is it in Lisbon?", conversation_history=[])
+    assert result is None
+    questions = feedback["jev"].calls[0]["questions"]
+    assert set(questions) == {"missing_verification", "ambiguous"}
+    [record] = feedback["records"]("preflight")
+    assert record["arm"] == "feedback" and record["injected"] is False
+    assert record["p_ambiguous"] == 0.1 and record["p_missing"] == 0.1
+
+
+def test_feedback_mode_feeds_the_numbers_back_when_the_request_is_ambiguous(feedback):
+    feedback["jev"].ambiguous = 0.82
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix it", conversation_history=[])
+    assert result is not None
+    note = result["context"]
+    assert "advisory" in note and "0.82" in note and "0.10" in note
+    assert "ask the user one focused clarifying question" in note
+    assert preflight.REMINDER not in note
+    [record] = feedback["records"]("preflight")
+    assert record["injected"] is True and record["p_ambiguous"] == 0.82
+
+
+def test_feedback_mode_feeds_back_when_jev_is_unsure_or_evidence_is_missing(feedback):
+    feedback["jev"].ambiguous = 0.5  # unsure band
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) is not None
+    feedback["jev"].ambiguous = 0.05
+    feedback["jev"].p = 0.9  # evidence missing
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="x", conversation_history=[]) is not None
+    feedback["jev"].p = 0.05
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="x", conversation_history=[]) is None
+    feedback["jev"].raise_exc = RuntimeError("down")
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="x", conversation_history=[]) is None, "no answer, no note"
+
+
+def test_feedback_mode_repeats_the_same_note_within_a_turn(feedback):
+    feedback["jev"].ambiguous = 0.9
+    first = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[])
+    second = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[])
+    assert first == second and len(feedback["jev"].calls) == 1
+
+
+def test_feedback_guard_holds_a_risky_out_of_scope_action_once_then_lets_the_retry_run(feedback):
+    feedback["jev"].guard = {"deletes_data": 0.93, "within_scope": 0.15}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="tidy the readme wording", conversation_history=[])
+    held = preflight.on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf ~/projects/old"}, session_id="s1", turn_id="t1", tool_call_id="c1")
+    assert held is not None and held["action"] == "block"
+    assert "deletes data" in held["message"] and "0.93" in held["message"] and "0.15" in held["message"]
+    assert "confirm with the user" in held["message"]
+    [hold] = feedback["records"]("tool_guard_hold")
+    assert hold["tool"] == "terminal"
+    # The model asked, the user agreed, the model retries the identical call.
+    again = preflight.on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf ~/projects/old"}, session_id="s1", turn_id="t1", tool_call_id="c2")
+    assert again is None
+    assert len(feedback["records"]("tool_guard_release")) == 1
+    # A different command is judged afresh.
+    feedback["jev"].guard = {"deletes_data": 0.02, "within_scope": 0.95}
+    assert preflight.on_pre_tool_call(tool_name="terminal", args={"command": "ls"}, session_id="s1", turn_id="t1", tool_call_id="c3") is None
+
+
+def test_feedback_guard_passes_in_scope_or_low_risk_actions_and_fails_open(feedback):
+    feedback["jev"].guard = {"deletes_data": 0.95, "within_scope": 0.9}
+    assert preflight.on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf build"}, session_id="s1") is None, "in scope: runs"
+    feedback["jev"].guard = {"external_disclosure": 0.3, "within_scope": 0.1}
+    assert preflight.on_pre_tool_call(tool_name="write_file", args={"path": "x", "content": "y"}, session_id="s1") is None, "low risk: runs"
+    feedback["jev"].raise_exc = RuntimeError("down")
+    assert preflight.on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf /"}, session_id="s1") is None, "Jev unavailable: fail open, log only"
+    assert feedback["records"]("tool_guard_hold") == []
