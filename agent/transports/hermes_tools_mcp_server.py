@@ -21,6 +21,8 @@ Scope (what we expose):
   - skill_view, skills_list              — Hermes' skill library
   - decision_log                         — append-only governed decisions
   - model_consult                        — read-only cross-provider advice
+  - typesafe_decide                      — TypeSafe Jev typed decisions (noul /
+                                           choice / score with probabilities)
   - opus_code_worker                     — governed Claude Code implementation
                                            handoff. Registration is NOT
                                            unconditional: this process builds
@@ -58,6 +60,7 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 import json
 import logging
 import os
@@ -142,6 +145,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "text_to_speech",
     "decision_log",
     "model_consult",
+    "typesafe_decide",
     "opus_code_worker",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
@@ -165,6 +169,31 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+
+# Hosts that only want part of the surface set HERMES_TOOLS_MCP_ONLY to a
+# comma-separated list of names. The hermes-chat subscription worker uses
+# this to hand Claude Code just `typesafe_decide` (Claude Code has its own
+# web/browser tools). The variable can only narrow EXPOSED_TOOLS, never
+# widen it: unknown names are logged and ignored.
+ONLY_ENV = "HERMES_TOOLS_MCP_ONLY"
+
+
+def selected_tools(env: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
+    """EXPOSED_TOOLS, narrowed to the names in HERMES_TOOLS_MCP_ONLY when set."""
+    source = os.environ if env is None else env
+    raw = (source.get(ONLY_ENV) or "").strip()
+    if not raw:
+        return EXPOSED_TOOLS
+    wanted = {name.strip() for name in raw.split(",") if name.strip()}
+    unknown = sorted(wanted - set(EXPOSED_TOOLS))
+    if unknown:
+        logger.warning(
+            "%s names tools outside EXPOSED_TOOLS, ignored: %s",
+            ONLY_ENV,
+            ", ".join(unknown),
+        )
+    return tuple(name for name in EXPOSED_TOOLS if name in wanted)
 
 
 def _build_server() -> Any:
@@ -208,8 +237,9 @@ def _build_server() -> Any:
     }
 
     exposed_count = 0
+    wanted = selected_tools()
 
-    for name in EXPOSED_TOOLS:
+    for name in wanted:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -263,7 +293,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(wanted),
     )
     return mcp
 

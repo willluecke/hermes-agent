@@ -112,6 +112,67 @@ class TestModuleSurface:
 
 
 
+class TestSelectedTools:
+    """HERMES_TOOLS_MCP_ONLY narrows the surface for hosts like the
+    hermes-chat Claude lane; it can never widen it."""
+
+    def test_typesafe_decide_is_exposed(self):
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        assert "typesafe_decide" in EXPOSED_TOOLS
+
+    def test_default_is_the_full_surface(self):
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, selected_tools
+        assert selected_tools({}) == EXPOSED_TOOLS
+        assert selected_tools({"HERMES_TOOLS_MCP_ONLY": "   "}) == EXPOSED_TOOLS
+
+    def test_only_env_narrows_and_ignores_unknown_names(self):
+        from agent.transports.hermes_tools_mcp_server import selected_tools
+        env = {"HERMES_TOOLS_MCP_ONLY": " typesafe_decide , terminal,nope, web_search"}
+        assert selected_tools(env) == ("web_search", "typesafe_decide")
+
+    def test_build_server_honours_only_env(self, monkeypatch):
+        """The builder registers only the selected names, even when Hermes
+        has more of the exposed tools available."""
+        import sys
+        import types
+
+        import agent.transports.hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_TOOLS_MCP_ONLY", "typesafe_decide")
+        added: list[str] = []
+
+        class FakeMCPServer:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def add_tool(self, fn, name=None, description=None):
+                added.append(name)
+
+        defs = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in ("web_search", "typesafe_decide", "terminal")
+        ]
+        fake_mcp = types.ModuleType("mcp")
+        fake_mcp_server = types.ModuleType("mcp.server")
+        fake_mcp_server.MCPServer = FakeMCPServer
+        fake_mcp.server = fake_mcp_server
+        fake_model_tools = types.ModuleType("model_tools")
+        fake_model_tools.get_tool_definitions = lambda quiet_mode=True: defs
+        fake_model_tools.handle_function_call = lambda *a, **k: ""
+        monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
+        monkeypatch.setitem(sys.modules, "mcp.server", fake_mcp_server)
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        m._build_server()
+        assert added == ["typesafe_decide"]
+
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):
         """When the mcp package isn't installed, main() should exit
