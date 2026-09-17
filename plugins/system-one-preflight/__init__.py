@@ -43,6 +43,18 @@ a daemon thread, so it adds no latency.
 
 Jev is bounded by ``timeout_seconds``; a slow or failed call is logged and
 the turn proceeds without advice (the always arm still inserts its reminder).
+
+The verify judge (``pre_verify``) turns Jev into a per-feature pass/fail gate
+on the model's own work. ``post_tool_call`` remembers the session's todo
+list (the model is nudged to write acceptance criteria there on build-type
+requests) and the last few test, lint or build outputs. When the model has
+edited files and is about to finish, the judge gathers the git diff of the
+changed paths, the matching RecCli ``.devproject`` features, those check
+outputs and the draft final message, asks Jev one yes/no question per
+criterion plus "do the checks show a failure" and "does the message claim
+results the evidence does not show", and keeps the model going with a
+findings note when something is confidently unmet. Bounded by
+``agent.max_verify_nudges``; Jev being unavailable fails open.
 """
 
 from __future__ import annotations
@@ -52,6 +64,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -95,6 +108,34 @@ FEEDBACK_TEMPLATE = (
     "before acting. If evidence is missing, verify it before depending on it. "
     "Otherwise proceed and state the assumption you made."
 )
+BUILD_QUESTION = (
+    "Does the request ask to write, change, or fix code or files in a project, "
+    "as opposed to answering, explaining, or discussing?"
+)
+CRITERIA_NUDGE = (
+    "Preflight: this looks like a change to code or files. Before editing, write "
+    "the acceptance criteria for this change as todo items with the todo tool; "
+    "they will be checked against your diff and check output before you finish."
+)
+VERIFY_TEMPLATE = (
+    "Preflight judge (Jev, advisory) reviewed your diff and check output before "
+    "you finish. {findings} Fix what is unmet and run the checks again, or say "
+    "precisely why a criterion does not apply and cancel its todo, then finish."
+)
+VERIFY_FAIL_THRESHOLD = 0.2
+VERIFY_FLAG_THRESHOLD = 0.8
+VERIFY_TIMEOUT_SECONDS = 4.0
+BUILD_THRESHOLD = 0.7
+MAX_DIFF_CHARS = 60_000
+MAX_FILE_DIFF_CHARS = 20_000
+MAX_CHECK_CHARS = 2_000
+CHECK_COMMAND_RE = re.compile(
+    r"\b(pytest|npm (run )?(test|lint|build|typecheck)|pnpm (test|lint|build)|"
+    r"yarn (test|lint|build)|vitest|jest|mocha|go test|cargo (test|check|clippy)|"
+    r"make (test|check|lint)|node --test|tsc\b|eslint|ruff|mypy|flake8|"
+    r"black --check|prettier --check)",
+    re.IGNORECASE,
+)
 GUARD_FEEDBACK_TEMPLATE = (
     "Preflight from Jev before running {tool}: P(destructive or far-reaching: "
     "{risk_name}) = {risk}; P(within what the user asked for) = {scope}. This "
@@ -121,7 +162,15 @@ _ask: Optional[Callable[..., Dict[str, Any]]] = None
 _log_lock = threading.Lock()
 _turn_memo: Dict[str, Dict[str, Any]] = {}
 _session_scope: Dict[str, List[str]] = {}
+_session_todos: Dict[str, List[Dict[str, str]]] = {}
+_session_checks: Dict[str, List[Dict[str, str]]] = {}
 _MEMO_LIMIT = 256
+
+
+def _bound(store: Dict[str, Any]) -> None:
+    if len(store) > _MEMO_LIMIT:
+        for key in list(store)[: len(store) - _MEMO_LIMIT]:
+            store.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +217,32 @@ def ambiguity_threshold() -> float:
     except (TypeError, ValueError):
         return AMBIGUITY_THRESHOLD
     return min(1.0, max(0.0, value))
+
+
+def verify_judge_enabled() -> bool:
+    value = str(_setting("verify_judge", "on") or "on").strip().lower()
+    return value not in ("off", "false", "0", "no")
+
+
+def criteria_nudge_enabled() -> bool:
+    value = str(_setting("criteria_nudge", "on") or "on").strip().lower()
+    return value not in ("off", "false", "0", "no")
+
+
+def verify_fail_threshold() -> float:
+    try:
+        value = float(_setting("verify_fail_threshold", VERIFY_FAIL_THRESHOLD))
+    except (TypeError, ValueError):
+        return VERIFY_FAIL_THRESHOLD
+    return min(1.0, max(0.0, value))
+
+
+def verify_timeout_seconds() -> float:
+    try:
+        value = float(_setting("verify_timeout_seconds", VERIFY_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        return VERIFY_TIMEOUT_SECONDS
+    return min(15.0, max(0.5, value))
 
 
 def log_path() -> Path:
@@ -375,10 +450,12 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     started = time.monotonic()
     p_missing: Optional[float] = None
     p_ambiguous: Optional[float] = None
+    p_build: Optional[float] = None
     error = ""
     questions = {"missing_verification": {"type": "noul", "instructions": VERIFICATION_QUESTION}}
     if arm == "feedback":
         questions["ambiguous"] = {"type": "noul", "instructions": AMBIGUITY_QUESTION}
+        questions["is_build"] = {"type": "noul", "instructions": BUILD_QUESTION}
     try:
         body = _ask_jev(state, questions)
         answers = body.get("answers") or {}
@@ -386,6 +463,8 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         p_missing = float(value) if isinstance(value, (int, float)) else None
         value = (answers.get("ambiguous") or {}).get("noul")
         p_ambiguous = float(value) if isinstance(value, (int, float)) else None
+        value = (answers.get("is_build") or {}).get("noul")
+        p_build = float(value) if isinstance(value, (int, float)) else None
         if p_missing is None:
             error = "no noul in answer"
     except Exception as exc:
@@ -394,6 +473,14 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     context: Optional[str] = None
     if arm == "feedback":
         context = feedback_context(p_missing, p_ambiguous)
+        if (
+            criteria_nudge_enabled()
+            and verify_judge_enabled()
+            and p_build is not None
+            and p_build >= BUILD_THRESHOLD
+            and not _session_todos.get(session_id)
+        ):
+            context = f"{context}\n\n{CRITERIA_NUDGE}" if context else CRITERIA_NUDGE
         injected = context is not None
     else:
         injected = decide(p_missing, arm)
@@ -409,6 +496,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "arm": arm,
             "p_missing": p_missing,
             "p_ambiguous": p_ambiguous,
+            "p_build": p_build,
             "threshold": threshold(),
             "injected": injected,
             "latency_ms": latency_ms,
@@ -598,10 +686,286 @@ def on_pre_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Verify judge: per-criterion pass/fail on the diff before the turn finishes
+# ---------------------------------------------------------------------------
+
+def _tail(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "…" + text[-(limit - 1):]
+
+
+def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
+    """The todo tool's result is JSON with a ``todos`` array; keep id/content/status."""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    items = payload.get("todos") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    todos: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        todos.append(
+            {
+                "id": str(item.get("id") or len(todos) + 1),
+                "content": _clip(content, 400),
+                "status": str(item.get("status") or "pending"),
+            }
+        )
+    return todos
+
+
+def on_post_tool_call(**kwargs: Any) -> None:
+    """Remember the session's todo list and its latest check outputs."""
+    if current_mode() == "off":
+        return None
+    session_id = str(kwargs.get("session_id") or "")
+    tool_name = str(kwargs.get("tool_name") or "")
+    args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+    result = kwargs.get("result")
+    if isinstance(result, str):
+        text = result
+    elif result is None:
+        text = ""
+    else:
+        try:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(result)
+    if tool_name == "todo":
+        todos = parse_todos(text)
+        if todos is not None:
+            _session_todos[session_id] = todos
+            _bound(_session_todos)
+    elif tool_name == "terminal":
+        command = str(args.get("command") or "")
+        if CHECK_COMMAND_RE.search(command):
+            checks = _session_checks.setdefault(session_id, [])
+            checks.append({"command": _clip(command, 300), "output": _tail(text, MAX_CHECK_CHARS)})
+            del checks[:-3]
+            _bound(_session_checks)
+    return None
+
+
+def _git(root: str, args: List[str]) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", root, *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def _git_root(path: str) -> Optional[str]:
+    directory = path if os.path.isdir(path) else os.path.dirname(path) or "."
+    root = _git(directory, ["rev-parse", "--show-toplevel"])
+    return root.strip() if root and root.strip() else None
+
+
+def _read_file(path: str, limit: int) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(limit + 1)
+    except OSError:
+        return ""
+    return text if len(text) <= limit else text[:limit] + "\n… [truncated]"
+
+
+def matching_features(root: Optional[str], relative_paths: List[str]) -> List[Dict[str, str]]:
+    """Feature titles and descriptions from the RecCli project map whose files overlap the change."""
+    if not root:
+        return []
+    try:
+        candidates = [name for name in os.listdir(root) if name.endswith(".devproject")]
+    except OSError:
+        return []
+    changed = set(relative_paths)
+    found: List[Dict[str, str]] = []
+    for name in candidates[:1]:
+        try:
+            with open(os.path.join(root, name), "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        for feature in payload.get("features") or []:
+            if not isinstance(feature, dict):
+                continue
+            files = {str(item) for item in (feature.get("files_touched") or [])}
+            if files & changed:
+                found.append(
+                    {
+                        "title": _clip(str(feature.get("title") or ""), 120),
+                        "description": _clip(str(feature.get("description") or ""), 400),
+                        "status": str(feature.get("status") or ""),
+                    }
+                )
+            if len(found) >= 5:
+                break
+    return found
+
+
+def collect_evidence(changed_paths: List[str]) -> Dict[str, Any]:
+    """The diff for the changed paths (git when possible), bounded, plus feature context."""
+    paths = [str(path) for path in changed_paths if path]
+    root = _git_root(paths[0]) if paths else None
+    parts: List[str] = []
+    total = 0
+    truncated = False
+    relative: List[str] = []
+    for path in paths[:40]:
+        if root and os.path.abspath(path).startswith(root + os.sep):
+            rel = os.path.relpath(path, root)
+            relative.append(rel)
+            diff = _git(root, ["diff", "HEAD", "--", rel]) or ""
+            if not diff.strip() and _git(root, ["ls-files", "--error-unmatch", rel]) is None:
+                diff = f"+++ new file: {rel}\n" + _read_file(path, MAX_FILE_DIFF_CHARS)
+        else:
+            diff = f"+++ file: {path}\n" + _read_file(path, MAX_FILE_DIFF_CHARS)
+        if len(diff) > MAX_FILE_DIFF_CHARS:
+            diff = diff[:MAX_FILE_DIFF_CHARS] + "\n… [truncated]"
+            truncated = True
+        if total + len(diff) > MAX_DIFF_CHARS:
+            truncated = True
+            break
+        total += len(diff)
+        parts.append(diff)
+    return {
+        "root": root,
+        "diff": "\n".join(parts),
+        "truncated": truncated,
+        "features": matching_features(root, relative),
+    }
+
+
+def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Judge the finished change against its acceptance criteria before the turn ends."""
+    if current_mode() == "off" or not verify_judge_enabled():
+        return None
+    session_id = str(kwargs.get("session_id") or "")
+    changed = [str(path) for path in (kwargs.get("changed_paths") or []) if path]
+    if not changed:
+        return None
+    attempt = int(kwargs.get("attempt") or 0)
+    final_response = str(kwargs.get("final_response") or "")
+    todos = list(_session_todos.get(session_id, []))
+    criteria = [item for item in todos if item.get("status") in ("completed", "in_progress")]
+    pending = [item for item in todos if item.get("status") == "pending"]
+    request = (_session_scope.get(session_id) or [""])[-1]
+    evidence = collect_evidence(changed)
+    checks = list(_session_checks.get(session_id, []))
+
+    labels: Dict[str, str] = {}
+    questions: Dict[str, Dict[str, Any]] = {}
+    if criteria:
+        for index, item in enumerate(criteria, 1):
+            key = f"criterion_{index}"
+            labels[key] = item["content"]
+            questions[key] = {
+                "type": "noul",
+                "instructions": f"Do the code changes fully satisfy this acceptance criterion: {item['content']}",
+            }
+    elif request:
+        labels["criterion_1"] = request
+        questions["criterion_1"] = {
+            "type": "noul",
+            "instructions": f"Do the code changes fully satisfy the user's request: {_clip(request, 400)}",
+        }
+    if checks:
+        questions["checks_failing"] = {
+            "type": "noul",
+            "instructions": "Do the check outputs show a failing test, an error, or a lint or type problem that was not fixed afterwards?",
+        }
+    questions["claims_unverified"] = {
+        "type": "noul",
+        "instructions": "Does the final message claim work, results, or passing checks that the diff and check outputs do not show?",
+    }
+    state = {
+        "provenance": "request was typed by the user. acceptance_criteria and still_pending_todos come from the agent's own todo list. diff and check_outputs are evidence. final_message is what the agent is about to say.",
+        "request": {"source": "user", "text": _clip(request, 1_500)},
+        "acceptance_criteria": {"source": "agent todo list", "items": [{"id": key, "text": text} for key, text in labels.items()]},
+        "still_pending_todos": {"source": "agent todo list", "items": [_clip(item["content"], 200) for item in pending]},
+        "features": {"source": "project map", "items": evidence["features"]},
+        "diff": {"source": "git", "text": evidence["diff"], "truncated": evidence["truncated"]},
+        "check_outputs": {"source": "tool", "items": checks},
+        "final_message": {"source": "agent", "text": _clip(final_response, 3_000)},
+    }
+    started = time.monotonic()
+    answers: Dict[str, Optional[float]] = {}
+    error = ""
+    try:
+        ask = _ask
+        if ask is None:
+            from tools.typesafe_tool import ask_jev
+
+            ask = ask_jev
+        body = ask(state, questions, timeout=verify_timeout_seconds())
+        for key in questions:
+            value = ((body.get("answers") or {}).get(key) or {}).get("noul")
+            answers[key] = float(value) if isinstance(value, (int, float)) else None
+    except Exception as exc:
+        error = f"{exc.__class__.__name__}: {exc}"[:300]
+
+    findings: List[str] = []
+    unmet = [
+        (labels[key], answers.get(key))
+        for key in labels
+        if answers.get(key) is not None and answers[key] <= verify_fail_threshold()
+    ]
+    if unmet:
+        findings.append(
+            "Criteria rated unmet: "
+            + "; ".join(f'"{_clip(text, 120)}" (P(satisfied)={value:.2f})' for text, value in unmet)
+            + "."
+        )
+    if pending:
+        findings.append(f"Todo items still pending: {len(pending)}.")
+    checks_failing = answers.get("checks_failing")
+    if checks_failing is not None and checks_failing >= VERIFY_FLAG_THRESHOLD:
+        findings.append(f"Check outputs show a failure (P={checks_failing:.2f}).")
+    claims = answers.get("claims_unverified")
+    if claims is not None and claims >= VERIFY_FLAG_THRESHOLD:
+        findings.append(f"The final message claims results the evidence does not show (P={claims:.2f}).")
+    write_log(
+        {
+            "event": "verify",
+            "session_id": session_id,
+            "attempt": attempt,
+            "changed_paths": len(changed),
+            "criteria": len(labels),
+            "pending": len(pending),
+            "checks": len(checks),
+            "features": len(evidence["features"]),
+            "diff_chars": len(evidence["diff"]),
+            "answers": answers,
+            "findings": findings,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": error,
+        }
+    )
+    if not findings:
+        return None
+    return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=" ".join(findings))}
+
+
 def register(ctx: Any) -> None:
     global _settings_reader
     _settings_reader = ctx.get_config
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("pre_verify", on_pre_verify)
     logger.info("system-one-preflight registered (mode=%s, tool_guard=%s)", current_mode(), tool_guard_mode())

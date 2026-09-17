@@ -46,6 +46,9 @@ def harness(tmp_path, monkeypatch):
     monkeypatch.setattr(preflight, "_ask", jev)
     preflight._turn_memo.clear()
     preflight._session_scope.clear()
+    preflight._session_todos.clear()
+    preflight._session_checks.clear()
+    preflight._held_actions.clear()
 
     def records(event=None):
         path = tmp_path / "preflight.jsonl"
@@ -225,7 +228,7 @@ def test_register_wires_the_three_hooks_and_the_settings_reader(monkeypatch):
     ctx = PluginContext(manifest=manifest, manager=manager)  # type: ignore[arg-type]
     monkeypatch.setattr(ctx, "get_config", lambda key, default=None: {"mode": "jev"}.get(key, default))
     preflight.register(ctx)
-    assert set(manager._hooks) == {"pre_llm_call", "post_llm_call", "pre_tool_call"}
+    assert set(manager._hooks) == {"pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call", "pre_verify"}
     assert manager._hooks["pre_llm_call"] == [preflight.on_pre_llm_call]
     assert ("hook", "pre_llm_call") in manager.tracked
     assert preflight.current_mode() == "jev"
@@ -258,7 +261,7 @@ def test_feedback_mode_asks_both_questions_and_stays_quiet_when_jev_sees_no_issu
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="What time is it in Lisbon?", conversation_history=[])
     assert result is None
     questions = feedback["jev"].calls[0]["questions"]
-    assert set(questions) == {"missing_verification", "ambiguous"}
+    assert set(questions) == {"missing_verification", "ambiguous", "is_build"}
     [record] = feedback["records"]("preflight")
     assert record["arm"] == "feedback" and record["injected"] is False
     assert record["p_ambiguous"] == 0.1 and record["p_missing"] == 0.1
@@ -321,3 +324,116 @@ def test_feedback_guard_passes_in_scope_or_low_risk_actions_and_fails_open(feedb
     feedback["jev"].raise_exc = RuntimeError("down")
     assert preflight.on_pre_tool_call(tool_name="terminal", args={"command": "rm -rf /"}, session_id="s1") is None, "Jev unavailable: fail open, log only"
     assert feedback["records"]("tool_guard_hold") == []
+
+
+import subprocess
+
+
+@pytest.fixture
+def repo(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (root / "app.py").write_text("def greet():\n    return 'hi'\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "init")
+    (root / "app.py").write_text("def greet():\n    return 'hello world'\n")
+    (root / "new_module.py").write_text("print('new')\n")
+    (root / "demo.devproject").write_text(json.dumps({
+        "features": [{"title": "Greeting", "description": "Says hello to the user", "status": "in-progress", "files_touched": ["app.py"]}]
+    }))
+    return root
+
+
+TODOS_RESULT = json.dumps({"todos": [
+    {"id": "1", "content": "Greeting returns hello world", "status": "completed"},
+    {"id": "2", "content": "Errors are logged", "status": "in_progress"},
+    {"id": "3", "content": "Docs updated", "status": "pending"},
+]})
+
+
+def test_post_tool_call_remembers_todos_and_check_outputs(feedback):
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    assert [item["content"] for item in preflight._session_todos["s1"]] == ["Greeting returns hello world", "Errors are logged", "Docs updated"]
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "npm test"}, result="x" * 5000 + "\n1 failing", session_id="s1")
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "ls -la"}, result="files", session_id="s1")
+    checks = preflight._session_checks["s1"]
+    assert len(checks) == 1 and checks[0]["command"] == "npm test"
+    assert checks[0]["output"].endswith("1 failing") and len(checks[0]["output"]) <= preflight.MAX_CHECK_CHARS
+
+
+def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo):
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="1 failed, 3 passed", session_id="s1")
+    feedback["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.05, "checks_failing": 0.9, "claims_unverified": 0.1}
+    result = preflight.on_pre_verify(
+        session_id="s1", platform="api_server", model="m", coding=True, attempt=0,
+        final_response="Done, everything passes.",
+        changed_paths=[str(repo / "app.py"), str(repo / "new_module.py")],
+    )
+    assert result is not None and result["action"] == "continue"
+    message = result["message"]
+    assert "Errors are logged" in message and "0.05" in message
+    assert "Greeting returns hello world" not in message, "a satisfied criterion is not listed"
+    assert "still pending: 1" in message
+    assert "Check outputs show a failure" in message
+    call = feedback["jev"].calls[-1]
+    state = call["state"]
+    assert "+    return 'hello world'" in state["diff"]["text"]
+    assert "new file: new_module.py" in state["diff"]["text"]
+    assert state["features"]["items"][0]["title"] == "Greeting"
+    assert [item["text"] for item in state["acceptance_criteria"]["items"]] == ["Greeting returns hello world", "Errors are logged"]
+    assert state["still_pending_todos"]["items"] == ["Docs updated"]
+    assert state["check_outputs"]["items"][0]["command"] == "pytest -q"
+    assert state["final_message"]["text"] == "Done, everything passes."
+    assert set(call["questions"]) == {"criterion_1", "criterion_2", "checks_failing", "claims_unverified"}
+    assert call["timeout"] == preflight.VERIFY_TIMEOUT_SECONDS
+    [record] = feedback["records"]("verify")
+    assert record["criteria"] == 2 and record["pending"] == 1 and record["features"] == 1
+    assert len(record["findings"]) == 3
+
+
+def test_verify_judge_lets_a_satisfied_change_finish(feedback, repo):
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "Greeting returns hello world", "status": "completed"}]}), session_id="s1")
+    feedback["jev"].guard = {"criterion_1": 0.97, "claims_unverified": 0.05}
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    [record] = feedback["records"]("verify")
+    assert record["findings"] == []
+
+
+def test_verify_judge_uses_the_request_when_there_are_no_todos(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s2", turn_id="t1", user_message="Make greet return hello world", conversation_history=[])
+    feedback["jev"].guard = {"criterion_1": 0.92, "claims_unverified": 0.05}
+    assert preflight.on_pre_verify(session_id="s2", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    call = feedback["jev"].calls[-1]
+    assert "Make greet return hello world" in call["questions"]["criterion_1"]["instructions"]
+    assert call["state"]["acceptance_criteria"]["items"] == [{"id": "criterion_1", "text": "Make greet return hello world"}]
+
+
+def test_verify_judge_fails_open_and_respects_its_switches(feedback, repo):
+    feedback["jev"].raise_exc = RuntimeError("down")
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="x", changed_paths=[str(repo / "app.py")]) is None
+    [record] = feedback["records"]("verify")
+    assert "down" in record["error"]
+    feedback["jev"].raise_exc = None
+    calls_before = len(feedback["jev"].calls)
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="x", changed_paths=[]) is None
+    feedback["settings"]["verify_judge"] = "off"
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="x", changed_paths=[str(repo / "app.py")]) is None
+    assert len(feedback["jev"].calls) == calls_before
+
+
+def test_build_requests_get_the_criteria_nudge_until_todos_exist(feedback):
+    feedback["jev"].guard = {"is_build": 0.9}
+    result = preflight.on_pre_llm_call(session_id="s3", turn_id="t1", user_message="Add a --json flag to the CLI", conversation_history=[])
+    assert result == {"context": preflight.CRITERIA_NUDGE}
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s3")
+    assert preflight.on_pre_llm_call(session_id="s3", turn_id="t2", user_message="now the tests", conversation_history=[]) is None
+    feedback["jev"].guard = {"is_build": 0.1}
+    assert preflight.on_pre_llm_call(session_id="s4", turn_id="t1", user_message="explain the flag", conversation_history=[]) is None
