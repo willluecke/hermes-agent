@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Local time lookup
     "current_time",
+    # TypeSafe Jev typed decisions (gated on TYPESAFE_API_KEY via check_fn)
+    "typesafe_decide",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -279,6 +281,12 @@ TOOLSETS = {
     "current_time": {
         "description": "Query the local system date and time",
         "tools": ["current_time"],
+        "includes": []
+    },
+
+    "typesafe": {
+        "description": "TypeSafe Jev: typed classify/route/score/yes-no decisions about a piece of state",
+        "tools": ["typesafe_decide"],
         "includes": []
     },
 
