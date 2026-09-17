@@ -164,6 +164,9 @@ _turn_memo: Dict[str, Dict[str, Any]] = {}
 _session_scope: Dict[str, List[str]] = {}
 _session_todos: Dict[str, List[Dict[str, str]]] = {}
 _session_checks: Dict[str, List[Dict[str, str]]] = {}
+_session_commands: Dict[str, List[Dict[str, str]]] = {}
+_verify_memo: Dict[str, str] = {}
+MAX_COMMANDS_KEPT = 6
 _MEMO_LIMIT = 256
 
 
@@ -745,9 +748,16 @@ def on_post_tool_call(**kwargs: Any) -> None:
             _bound(_session_todos)
     elif tool_name == "terminal":
         command = str(args.get("command") or "")
+        entry = {"command": _clip(command, 300), "output": _tail(text, MAX_CHECK_CHARS)}
+        # Every command is evidence the judge may need (a script run, a curl,
+        # a file listing); the check subset is what "do the checks fail" asks about.
+        commands = _session_commands.setdefault(session_id, [])
+        commands.append(entry)
+        del commands[:-MAX_COMMANDS_KEPT]
+        _bound(_session_commands)
         if CHECK_COMMAND_RE.search(command):
             checks = _session_checks.setdefault(session_id, [])
-            checks.append({"command": _clip(command, 300), "output": _tail(text, MAX_CHECK_CHARS)})
+            checks.append(dict(entry))
             del checks[:-3]
             _bound(_session_checks)
     return None
@@ -866,6 +876,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     request = (_session_scope.get(session_id) or [""])[-1]
     evidence = collect_evidence(changed)
     checks = list(_session_checks.get(session_id, []))
+    commands = list(_session_commands.get(session_id, []))
 
     labels: Dict[str, str] = {}
     questions: Dict[str, Dict[str, Any]] = {}
@@ -899,6 +910,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         "still_pending_todos": {"source": "agent todo list", "items": [_clip(item["content"], 200) for item in pending]},
         "features": {"source": "project map", "items": evidence["features"]},
         "diff": {"source": "git", "text": evidence["diff"], "truncated": evidence["truncated"]},
+        "commands_run": {"source": "tool", "items": commands},
         "check_outputs": {"source": "tool", "items": checks},
         "final_message": {"source": "agent", "text": _clip(final_response, 3_000)},
     }
@@ -938,15 +950,26 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     claims = answers.get("claims_unverified")
     if claims is not None and claims >= VERIFY_FLAG_THRESHOLD:
         findings.append(f"The final message claims results the evidence does not show (P={claims:.2f}).")
+    # A nudge that changed nothing must not be repeated: if the findings and
+    # the evidence are identical to the previous attempt, the model has
+    # answered them as far as it will, so let the turn finish.
+    evidence_key = hashlib.sha256(
+        json.dumps({"findings": findings, "diff": evidence["diff"], "commands": commands}, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    repeated = attempt > 0 and _verify_memo.get(session_id) == evidence_key
+    _verify_memo[session_id] = evidence_key
+    _bound(_verify_memo)
     write_log(
         {
             "event": "verify",
             "session_id": session_id,
             "attempt": attempt,
+            "repeated": repeated,
             "changed_paths": len(changed),
             "criteria": len(labels),
             "pending": len(pending),
             "checks": len(checks),
+            "commands": len(commands),
             "features": len(evidence["features"]),
             "diff_chars": len(evidence["diff"]),
             "answers": answers,
@@ -955,7 +978,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "error": error,
         }
     )
-    if not findings:
+    if not findings or repeated:
         return None
     return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=" ".join(findings))}
 

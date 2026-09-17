@@ -48,6 +48,8 @@ def harness(tmp_path, monkeypatch):
     preflight._session_scope.clear()
     preflight._session_todos.clear()
     preflight._session_checks.clear()
+    preflight._session_commands.clear()
+    preflight._verify_memo.clear()
     preflight._held_actions.clear()
 
     def records(event=None):
@@ -437,3 +439,31 @@ def test_build_requests_get_the_criteria_nudge_until_todos_exist(feedback):
     assert preflight.on_pre_llm_call(session_id="s3", turn_id="t2", user_message="now the tests", conversation_history=[]) is None
     feedback["jev"].guard = {"is_build": 0.1}
     assert preflight.on_pre_llm_call(session_id="s4", turn_id="t1", user_message="explain the flag", conversation_history=[]) is None
+
+
+def test_every_command_is_evidence_and_checks_are_the_test_subset(feedback, repo):
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 hello.py"}, result="hello world", session_id="s1")
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s1")
+    feedback["jev"].guard = {"criterion_1": 0.9, "checks_failing": 0.05, "claims_unverified": 0.05}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make hello.py print hello world", conversation_history=[])
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Ran it, prints hello world.", changed_paths=[str(repo / "app.py")]) is None
+    state = feedback["jev"].calls[-1]["state"]
+    assert [item["command"] for item in state["commands_run"]["items"]] == ["python3 hello.py", "pytest -q"]
+    assert [item["command"] for item in state["check_outputs"]["items"]] == ["pytest -q"]
+    assert state["commands_run"]["items"][0]["output"] == "hello world"
+
+
+def test_an_unchanged_finding_is_not_nudged_twice(feedback, repo):
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
+    first = preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert first is not None and "claims results" in first["message"]
+    # Same findings, same diff, no new commands: the model is not going to change its mind.
+    second = preflight.on_pre_verify(session_id="s1", attempt=1, final_response="Done, really.", changed_paths=[str(repo / "app.py")])
+    assert second is None
+    records = feedback["records"]("verify")
+    assert [row["repeated"] for row in records] == [False, True]
+    # New evidence (a command ran) makes the judge look again.
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 app.py"}, result="hello world", session_id="s1")
+    third = preflight.on_pre_verify(session_id="s1", attempt=2, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert third is not None
