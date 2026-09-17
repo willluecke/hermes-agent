@@ -145,8 +145,15 @@ class TestSelectedTools:
             def __init__(self, *args, **kwargs):
                 pass
 
-            def add_tool(self, fn, name=None, description=None):
+            def add_tool(self, fn, name=None, description=None, annotations=None, **kwargs):
                 added.append(name)
+                annotations_seen[name] = annotations
+
+        annotations_seen: dict[str, object] = {}
+
+        class FakeToolAnnotations:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
 
         defs = [
             {
@@ -163,15 +170,29 @@ class TestSelectedTools:
         fake_mcp_server = types.ModuleType("mcp.server")
         fake_mcp_server.MCPServer = FakeMCPServer
         fake_mcp.server = fake_mcp_server
+        fake_mcp_types = types.ModuleType("mcp.types")
+        fake_mcp_types.ToolAnnotations = FakeToolAnnotations
+        fake_mcp.types = fake_mcp_types
         fake_model_tools = types.ModuleType("model_tools")
         fake_model_tools.get_tool_definitions = lambda quiet_mode=True: defs
         fake_model_tools.handle_function_call = lambda *a, **k: ""
         monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
         monkeypatch.setitem(sys.modules, "mcp.server", fake_mcp_server)
+        monkeypatch.setitem(sys.modules, "mcp.types", fake_mcp_types)
         monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
 
         m._build_server()
         assert added == ["typesafe_decide"]
+        hint = annotations_seen["typesafe_decide"]
+        assert isinstance(hint, FakeToolAnnotations)
+        assert hint.kwargs == {"read_only_hint": True, "open_world_hint": True}
+
+    def test_read_only_hints_cover_only_exposed_tools(self):
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, READ_ONLY_TOOLS, _tool_annotations
+        assert READ_ONLY_TOOLS <= set(EXPOSED_TOOLS)
+        assert "typesafe_decide" in READ_ONLY_TOOLS
+        assert _tool_annotations("opus_code_worker") is None
+        assert _tool_annotations("kanban_complete") is None
 
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):

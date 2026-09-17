@@ -178,6 +178,35 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 # widen it: unknown names are logged and ignored.
 ONLY_ENV = "HERMES_TOOLS_MCP_ONLY"
 
+# Tools that never change local state. MCP clients read the hint to skip
+# approvals; Claude Code's plan mode refuses any tool without it, which is
+# how the hermes-chat review lane can still ask Jev.
+READ_ONLY_TOOLS: frozenset[str] = frozenset(
+    {
+        "typesafe_decide",
+        "model_consult",
+        "web_search",
+        "web_extract",
+        "vision_analyze",
+        "skill_view",
+        "skills_list",
+        "kanban_show",
+        "kanban_list",
+    }
+)
+
+
+def _tool_annotations(name: str) -> Any:
+    """ToolAnnotations for read-only tools, None otherwise (or when the
+    installed SDK predates annotations)."""
+    if name not in READ_ONLY_TOOLS:
+        return None
+    try:
+        from mcp.types import ToolAnnotations
+    except ImportError:
+        return None
+    return ToolAnnotations(read_only_hint=True, open_world_hint=True)
+
 
 def selected_tools(env: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
     """EXPOSED_TOOLS, narrowed to the names in HERMES_TOOLS_MCP_ONLY when set."""
@@ -280,6 +309,7 @@ def _build_server() -> Any:
                 _make_handler(name, params_schema),
                 name=name,
                 description=description,
+                annotations=_tool_annotations(name),
             )
         except TypeError:
             # Older mcp SDK signature — fall back to decorator-style. The
