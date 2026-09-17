@@ -85,10 +85,72 @@ def _validate_questions(questions: Any) -> Dict[str, Dict[str, Any]]:
     return questions
 
 
+class JevError(RuntimeError):
+    """A TypeSafe call that produced no usable answer."""
+
+    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False, detail: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.retryable = retryable
+        self.detail = detail
+
+
+def ask_jev(
+    state: Any,
+    questions: Dict[str, Dict[str, Any]],
+    *,
+    model: str = DEFAULT_MODEL,
+    timeout: float = TIMEOUT_SECONDS,
+    api_key: str | None = None,
+) -> Dict[str, Any]:
+    """POST one System One request and return the decoded response body.
+
+    Shared by the ``typesafe_decide`` tool and the system-one-preflight
+    plugin. Raises :class:`JevError` for every failure so callers decide
+    how much a missing answer matters to them.
+    """
+    key = api_key or _env_value("TYPESAFE_API_KEY")
+    if not key:
+        raise JevError("TYPESAFE_API_KEY is not configured")
+    payload = {"state": state, "model": model, "questions": questions}
+    try:
+        response = httpx.post(
+            TYPESAFE_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        )
+    except httpx.HTTPError as exc:
+        raise JevError(
+            f"TypeSafe request failed: {exc.__class__.__name__}", retryable=True
+        ) from exc
+    if response.status_code != 200:
+        try:
+            detail = str(response.text or "")[:500]
+        except Exception:
+            detail = ""
+        meaning = _STATUS_MEANINGS.get(response.status_code, "unexpected status")
+        raise JevError(
+            f"TypeSafe returned HTTP {response.status_code}: {meaning}",
+            status=response.status_code,
+            retryable=response.status_code in (429, 529),
+            detail=detail,
+        )
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise JevError("TypeSafe returned a non-JSON body") from exc
+    if not isinstance(body, dict):
+        raise JevError("TypeSafe returned an unexpected body")
+    return body
+
+
 def typesafe_decide(args: Dict[str, Any]) -> str:
     """Ask Jev typed questions about ``state`` and return its typed answers."""
-    api_key = _env_value("TYPESAFE_API_KEY")
-    if not api_key:
+    if not _env_value("TYPESAFE_API_KEY"):
         return json.dumps({"error": "TYPESAFE_API_KEY is not configured"})
 
     state = args.get("state")
@@ -108,43 +170,13 @@ def typesafe_decide(args: Dict[str, Any]) -> str:
         return json.dumps({"error": str(exc)})
 
     model = str(args.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    payload = {"state": state, "model": model, "questions": questions}
     try:
-        response = httpx.post(
-            TYPESAFE_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=TIMEOUT_SECONDS,
-        )
-    except httpx.HTTPError as exc:
-        return json.dumps(
-            {"error": f"TypeSafe request failed: {exc.__class__.__name__}", "retryable": True}
-        )
-
-    if response.status_code != 200:
-        detail = ""
-        try:
-            detail = str(response.text or "")[:500]
-        except Exception:
-            detail = ""
-        meaning = _STATUS_MEANINGS.get(response.status_code, "unexpected status")
-        return json.dumps(
-            {
-                "error": f"TypeSafe returned HTTP {response.status_code}: {meaning}",
-                "detail": detail,
-                "retryable": response.status_code in (429, 529),
-            }
-        )
-
-    try:
-        body = response.json()
-    except ValueError:
-        return json.dumps({"error": "TypeSafe returned a non-JSON body"})
-    if not isinstance(body, dict):
-        return json.dumps({"error": "TypeSafe returned an unexpected body"})
+        body = ask_jev(state, questions, model=model)
+    except JevError as exc:
+        failure: Dict[str, Any] = {"error": str(exc), "retryable": exc.retryable}
+        if exc.detail:
+            failure["detail"] = exc.detail
+        return json.dumps(failure)
     return json.dumps(
         {
             "model": body.get("model", model),

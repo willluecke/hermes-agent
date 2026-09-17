@@ -1,0 +1,10 @@
+name: system-one-preflight
+version: "0.1.0"
+description: "Ask TypeSafe's Jev decision model one calibrated question per turn: does the active request need evidence the agent has not checked yet? Shadow mode logs the verdict beside what the model then did; jev mode inserts a fixed verification reminder above a threshold; always mode inserts it every turn; trial mode assigns each session to control, always, or jev for a three-arm comparison. Also shadow-classifies terminal and file-write calls (deletion, privilege change, external disclosure, shared-system change, within the user's established scope) without ever blocking."
+author: "Will Luecke"
+requires_env:
+  - TYPESAFE_API_KEY
+hooks:
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
