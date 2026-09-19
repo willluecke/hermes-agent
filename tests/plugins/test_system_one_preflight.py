@@ -1139,3 +1139,15 @@ def test_fidelity_reads_the_request_with_the_previous_answer_it_refers_to(fideli
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="now the tests", conversation_history=[{"role": "user", "content": "x"}])
     _register_criteria(C2)
     assert _fidelity_calls(fidelity)[-1]["state"]["previous_answer"]["text"] == "", "a turn with no previous answer carries none"
+
+
+def test_criteria_arrive_wrapped_by_the_mcp_bridge_on_the_claude_and_codex_lanes(fidelity):
+    """The MCP SDK wraps a tool's string result as {"result": "<json>"}; that is what both bridge lanes replay."""
+    fidelity["jev"].entails = {"2": 0.1}
+    _turn()
+    wrapped = json.dumps({"result": _criteria_result(C1, C2)})
+    assert preflight.parse_todos(wrapped) == [{"id": "1", "content": C1, "status": "in_progress"}, {"id": "2", "content": C2, "status": "in_progress"}]
+    assert preflight.parse_todos(json.dumps({"result": "not json"})) is None
+    assert preflight.on_post_tool_call(session_id="s1", tool_name="acceptance_criteria", args={}, result=wrapped, steerable=True) is not None
+    assert [item["content"] for item in preflight._session_todos["s1"]] == [C1, C2]
+    assert preflight._session_excluded["s1"] == ["2"]

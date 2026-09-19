@@ -149,7 +149,8 @@ async def test_post_tool_use_runs_the_real_criteria_fidelity_check_and_returns_i
     body = {
         "event": "PostToolUse", "tool_name": "mcp__hermes-tools__acceptance_criteria",
         "tool_input": {"criteria": ["The --json flag prints valid JSON", "The README gains a section on exporters"]},
-        "tool_response": [{"type": "text", "text": registered}], "tool_use_id": "toolu_3", "duration_ms": 5,
+        # Claude Code hands an MCP tool's result back as the SDK's {"result": "<json>"} wrapper.
+        "tool_response": [{"type": "text", "text": json.dumps({"result": registered})}], "tool_use_id": "toolu_3", "duration_ms": 5,
     }
     async with TestClient(TestServer(_app())) as cli:
         resp = await cli.post("/v1/hooks/claude", json=body, headers=_bearer(token))

@@ -1383,6 +1383,14 @@ def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
     except (TypeError, ValueError):
         return None
     items = payload.get("todos") if isinstance(payload, dict) else None
+    if items is None and isinstance(payload, dict) and isinstance(payload.get("result"), str):
+        # The MCP bridge (the Claude and Codex lanes) wraps a tool's string
+        # result as {"result": "<json>"}; the criteria are one level down.
+        try:
+            inner = json.loads(payload["result"])
+        except (TypeError, ValueError):
+            inner = None
+        items = inner.get("todos") if isinstance(inner, dict) else None
     if not isinstance(items, list):
         return None
     todos: List[Dict[str, str]] = []
