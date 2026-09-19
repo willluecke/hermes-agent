@@ -120,6 +120,15 @@ class TestSelectedTools:
         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
         assert "typesafe_decide" in EXPOSED_TOOLS
 
+    def test_acceptance_criteria_is_exposed_and_read_only(self):
+        # The stateless stand-in for `todo` on the Codex and Claude lanes: the
+        # verify judge's criteria channel. It changes no local state, so plan
+        # mode may call it too.
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, READ_ONLY_TOOLS
+        assert "acceptance_criteria" in EXPOSED_TOOLS
+        assert "acceptance_criteria" in READ_ONLY_TOOLS
+        assert "todo" not in EXPOSED_TOOLS, "the real todo tool still needs the live agent loop"
+
     def test_default_is_the_full_surface(self):
         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, selected_tools
         assert selected_tools({}) == EXPOSED_TOOLS

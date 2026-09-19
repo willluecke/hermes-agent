@@ -191,8 +191,9 @@ DEFAULT_TUNING_INTERVAL_SECONDS = 3600.0
 DEFAULT_TUNING_MIN_LABELS = 50
 CRITERIA_NUDGE = (
     "Preflight: this looks like a change to code or files. Before editing, write "
-    "the acceptance criteria for this change as todo items with the todo tool; "
-    "they will be checked against your diff and check output before you finish."
+    "the acceptance criteria for this change as single checkable statements, "
+    "with the todo tool or the acceptance_criteria tool; they will be checked "
+    "against your diff and check output before you finish."
 )
 VERIFY_TEMPLATE = (
     "Preflight judge (Jev, advisory) reviewed your diff and check output before "
@@ -1231,7 +1232,9 @@ def on_post_tool_call(**kwargs: Any) -> None:
             text = json.dumps(result, ensure_ascii=False, default=str)
         except Exception:
             text = str(result)
-    if tool_name == "todo":
+    if tool_name in ("todo", "acceptance_criteria"):
+        # `acceptance_criteria` is the bridge's stateless stand-in for the todo
+        # tool on the Codex and Claude lanes; it answers in the same shape.
         todos = parse_todos(text)
         if todos is not None:
             _session_todos[session_id] = todos

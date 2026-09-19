@@ -73,7 +73,7 @@ def test_registered_in_the_core_toolset_and_schema_is_typed():
     assert TYPESAFE_SCHEMA["name"] == "typesafe_decide"
     assert TYPESAFE_SCHEMA["parameters"]["required"] == ["state", "questions"]
     assert "typesafe_decide" in toolsets._HERMES_CORE_TOOLS
-    assert toolsets.TOOLSETS["typesafe"]["tools"] == ["typesafe_decide"]
+    assert toolsets.TOOLSETS["typesafe"]["tools"] == ["typesafe_decide", "acceptance_criteria"]
 
 
 def test_unavailable_without_a_key(no_api_key, monkeypatch):

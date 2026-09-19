@@ -687,3 +687,18 @@ def test_the_verify_judge_uses_the_tuned_claims_threshold(tuner, feedback, repo)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.6}
     result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
     assert result is not None and "claims results the evidence does not show (P=0.60)" in result["message"]
+
+
+def test_the_verify_judge_takes_criteria_from_the_acceptance_criteria_tool(feedback, repo):
+    """The Codex and Claude lanes cannot reach `todo`; the bridge's stateless stand-in answers in the same shape."""
+    registered = json.dumps({"todos": [
+        {"id": "1", "content": "Greeting returns hello world", "status": "in_progress"},
+        {"id": "2", "content": "Errors are logged", "status": "in_progress"},
+    ], "note": "2 acceptance criteria registered."})
+    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={"criteria": ["Greeting returns hello world", "Errors are logged"]}, result=registered, session_id="s1")
+    assert [item["content"] for item in preflight._session_todos["s1"]] == ["Greeting returns hello world", "Errors are logged"]
+    feedback["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.05, "claims_unverified": 0.1}
+    result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is not None and "Errors are logged" in result["message"] and "still pending" not in result["message"]
+    call = feedback["jev"].calls[-1]
+    assert [item["text"] for item in call["state"]["acceptance_criteria"]["items"]] == ["Greeting returns hello world", "Errors are logged"]
