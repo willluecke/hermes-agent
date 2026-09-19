@@ -621,6 +621,22 @@ def _neutralize_webbrowser(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_claude_config_dir(monkeypatch):
+    """Hide the live Claude config directory from every test.
+
+    ``claude_code_credentials_path()`` prefers CLAUDE_CONFIG_DIR over HOME, and
+    the gateway exports it for the Claude Code lane, so a suite run from inside
+    a Hermes Claude turn (or any shell with the variable set) wrote fixture
+    tokens into the live ``.credentials.json`` and logged Claude Max out twice
+    on 2026-09-19.  Unsetting it restores the HOME-based path the credential
+    tests monkeypatch; tests that need a directory still set it themselves, and
+    ``_refuse_live_credential_write_under_pytest`` refuses any write that is
+    not under the temp directory.
+    """
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_macos_keychain_creds(request, monkeypatch):
     """Default Anthropic credential resolution away from the real macOS Keychain."""
     if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):

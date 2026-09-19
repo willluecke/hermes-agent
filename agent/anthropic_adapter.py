@@ -1303,6 +1303,31 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
         return None
 
 
+def _refuse_live_credential_write_under_pytest(cred_path: Path) -> None:
+    """Never let a test process rewrite a real Claude credential file.
+
+    Tests isolate the path through HOME or CLAUDE_CONFIG_DIR, but one missed
+    override under pytest would replace the user's OAuth pair with fixture
+    tokens and log every Claude Code process out.  Under pytest the target
+    must live in the temp directory; anything else is a test-isolation bug.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    import tempfile
+
+    try:
+        tmp_root = Path(tempfile.gettempdir()).resolve()
+        target = cred_path.resolve()
+    except OSError:
+        return
+    if tmp_root == target or tmp_root in target.parents:
+        return
+    raise RuntimeError(
+        f"refusing to write Claude Code credentials at {cred_path} from a test; "
+        "isolate the path with CLAUDE_CONFIG_DIR or HOME"
+    )
+
+
 def _write_claude_code_credentials(
     access_token: str,
     refresh_token: str,
@@ -1318,6 +1343,7 @@ def _write_claude_code_credentials(
     in the stored scopes before it will use the token.
     """
     cred_path = claude_code_credentials_path()
+    _refuse_live_credential_write_under_pytest(cred_path)
     try:
         # Read existing file to preserve other fields
         existing = {}
