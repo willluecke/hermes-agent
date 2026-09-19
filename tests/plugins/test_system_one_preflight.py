@@ -47,6 +47,8 @@ def harness(tmp_path, monkeypatch):
         "mode": "shadow", "threshold": 0.7, "log_path": str(tmp_path / "preflight.jsonl"), "tool_guard": "shadow",
         # Self-tuning is off unless a test turns it on, and its state never comes from the real home.
         "tuning": "off", "tuning_state_path": str(tmp_path / "tuning.json"),
+        # Retained command output never lands in the real home; the gate never re-runs anything unless a test says so.
+        "ledger_dir": str(tmp_path / "evidence"), "controller_reruns": "off", "manifest_required": "off",
     }
     monkeypatch.setattr(preflight, "_settings_reader", lambda key, default=None: settings.get(key, default))
     jev = _FakeJev()
@@ -56,8 +58,8 @@ def harness(tmp_path, monkeypatch):
     preflight._turn_memo.clear()
     preflight._session_scope.clear()
     preflight._session_todos.clear()
-    preflight._session_checks.clear()
-    preflight._session_commands.clear()
+    preflight._session_ledger.clear()
+    preflight._session_manifest.clear()
     preflight._verify_memo.clear()
     preflight._held_actions.clear()
     preflight._session_excluded.clear()
@@ -451,14 +453,15 @@ TODOS_RESULT = json.dumps({"todos": [
 ]})
 
 
-def test_post_tool_call_remembers_todos_and_check_outputs(feedback):
+def test_post_tool_call_remembers_todos_and_ledger_rows(feedback):
     preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
     assert [item["content"] for item in preflight._session_todos["s1"]] == ["Greeting returns hello world", "Errors are logged", "Docs updated"]
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "npm test"}, result="x" * 5000 + "\n1 failing", session_id="s1")
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "ls -la"}, result="files", session_id="s1")
-    checks = preflight._session_checks["s1"]
-    assert len(checks) == 1 and checks[0]["command"] == "npm test"
-    assert checks[0]["output"].endswith("1 failing") and len(checks[0]["output"]) <= preflight.MAX_CHECK_CHARS
+    rows = preflight.ledger_state("s1")["rows"]
+    assert [(row["id"], row["command"], row["check"]) for row in rows] == [("c1", "npm test", True), ("c2", "ls -la", False)]
+    assert rows[0]["exit"] is None and rows[0]["status"] == "unknown", "text with no exit code stays unknown"
+    assert Path(rows[0]["file"]).read_text().endswith("1 failing") and rows[0]["chars"] == 5010
 
 
 def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo, emitted):
@@ -475,7 +478,7 @@ def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo, em
     assert "Errors are logged" in message and "0.05" in message
     assert "Greeting returns hello world" not in message, "a satisfied criterion is not listed"
     assert "still pending: 1" in message
-    assert "Check outputs show a failure" in message
+    assert "Failure excerpts show a failure" in message
     call = feedback["jev"].calls[-1]
     state = call["state"]
     assert "+    return 'hello world'" in state["diff"]["text"]
@@ -483,7 +486,10 @@ def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo, em
     assert state["features"]["items"][0]["title"] == "Greeting"
     assert [item["text"] for item in state["acceptance_criteria"]["items"]] == ["Greeting returns hello world", "Errors are logged"]
     assert state["still_pending_todos"]["items"] == ["Docs updated"]
-    assert state["check_outputs"]["items"][0]["command"] == "pytest -q"
+    assert state["evidence_ledger"]["items"] == [{"id": "c1", "command": "pytest -q", "exit": "unknown", "status": "fail", "kind": "pytest", "source": "agent", "counts": {"failed": 1, "passed": 3}, "failure_text": True}]
+    assert state["failure_excerpts"]["items"][0]["row"] == "c1" and "1 failed" in state["failure_excerpts"]["items"][0]["excerpt"]
+    assert state["result_manifest"] == {"source": "agent, checked by code", "registered": False, "items": []}
+    assert "commands_run" not in state and "check_outputs" not in state
     assert state["final_message"]["text"] == "Done, everything passes."
     assert set(call["questions"]) == {"criterion_1", "criterion_2", "checks_failing", "claims_unverified"}
     assert call["questions"]["criterion_2"]["criteria"] == preflight.CRITERION_CRITERIA, "nouls carry explicit boundaries"
@@ -491,12 +497,14 @@ def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo, em
     assert call["timeout"] == preflight.VERIFY_TIMEOUT_SECONDS
     [record] = feedback["records"]("verify")
     assert record["criteria"] == 2 and record["pending"] == 1 and record["features"] == 1
+    assert record["ledger"] == 1 and record["ledger_checks"] == 1 and record["manifest_registered"] is False and record["excerpts"] == 1
     [event] = emitted
     assert event["event"] == "judge.verdict" and event["stage"] == "verify" and event["attempt"] == 0
     assert event["decision"]["action"] == "nudge" and event["decision"]["criteria"] == 2 and event["decision"]["pending"] == 1
     assert event["answers"]["Errors are logged"] == 0.05 and event["answers"]["Greeting returns hello world"] == 0.95
     assert event["answers"]["claims_unverified"] == 0.1 and event["answers"]["checks_failing"] == 0.9
-    assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/2") and "Errors are logged" in event["text"]
+    assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/2 · manifest not registered · claims beyond 0.10 · checks failing 0.90 · ledger 1 rows · nudge")
+    assert "Errors are logged" in event["text"] and event["decision"]["ledger"] == 1 and event["decision"]["manifest_registered"] is False
     assert len(record["findings"]) == 3
 
 
@@ -540,16 +548,19 @@ def test_build_requests_get_the_criteria_nudge_until_todos_exist(feedback):
     assert preflight.on_pre_llm_call(session_id="s4", turn_id="t1", user_message="explain the flag", conversation_history=[]) is None
 
 
-def test_every_command_is_evidence_and_checks_are_the_test_subset(feedback, repo):
+def test_every_command_is_a_ledger_row_and_only_checks_count_as_checks(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make hello.py print hello world", conversation_history=[])
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 hello.py"}, result="hello world", session_id="s1")
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s1")
     feedback["jev"].guard = {"criterion_1": 0.9, "checks_failing": 0.05, "claims_unverified": 0.05}
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make hello.py print hello world", conversation_history=[])
     assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Ran it, prints hello world.", changed_paths=[str(repo / "app.py")]) is None
-    state = feedback["jev"].calls[-1]["state"]
-    assert [item["command"] for item in state["commands_run"]["items"]] == ["python3 hello.py", "pytest -q"]
-    assert [item["command"] for item in state["check_outputs"]["items"]] == ["pytest -q"]
-    assert state["commands_run"]["items"][0]["output"] == "hello world"
+    call = feedback["jev"].calls[-1]
+    state = call["state"]
+    assert [(item["id"], item["command"], item["status"]) for item in state["evidence_ledger"]["items"]] == [("c1", "python3 hello.py", "unknown"), ("c2", "pytest -q", "pass")]
+    assert state["evidence_ledger"]["dropped"] == 0 and state["failure_excerpts"]["items"] == []
+    assert "checks_failing" not in call["questions"], "no failing row, nothing to ask about"
+    record = feedback["records"]("verify")[-1]
+    assert record["ledger"] == 2 and record["ledger_checks"] == 1
 
 
 def test_an_unchanged_finding_is_not_nudged_twice(feedback, repo):
@@ -695,7 +706,7 @@ def test_the_verify_judge_uses_the_tuned_claims_threshold(tuner, feedback, repo)
     assert preflight.claims_flag_threshold() == 0.55
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.6}
     result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
-    assert result is not None and "claims results the evidence does not show (P=0.60)" in result["message"]
+    assert result is not None and "claims results beyond the manifest and the ledger (P=0.60)" in result["message"]
 
 
 def test_the_verify_judge_takes_criteria_from_the_acceptance_criteria_tool(feedback, repo):
@@ -1151,3 +1162,273 @@ def test_criteria_arrive_wrapped_by_the_mcp_bridge_on_the_claude_and_codex_lanes
     assert preflight.on_post_tool_call(session_id="s1", tool_name="acceptance_criteria", args={}, result=wrapped, steerable=True) is not None
     assert [item["content"] for item in preflight._session_todos["s1"]] == [C1, C2]
     assert preflight._session_excluded["s1"] == ["2"]
+
+
+# ---------------------------------------------------------------------------
+# Evidence ledger and result manifest
+# ---------------------------------------------------------------------------
+
+import subprocess as _subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+
+
+def _cmd(command, result, session="s1", **kwargs):
+    return preflight.on_post_tool_call(tool_name="terminal", args={"command": command}, result=result, session_id=session, **kwargs)
+
+
+def _manifest(items, session="s1", wrapped=False):
+    payload = json.dumps({"manifest": items, "note": "n"})
+    if wrapped:
+        payload = json.dumps({"result": payload})
+    return preflight.on_post_tool_call(tool_name="report_results", args={}, result=payload, session_id=session)
+
+
+def _item(claim, evidence, predicate="passed", expected=None, criterion="1", id="r1"):
+    return {"id": id, "criterion": criterion, "claim": claim, "evidence": evidence, "predicate": predicate, "expected": expected or {}}
+
+
+def _verify(session="s1", attempt=0, final="Done.", paths=None, coding=True, **kwargs):
+    return preflight.on_pre_verify(session_id=session, platform="api_server", model="m", coding=coding, attempt=attempt, final_response=final, changed_paths=paths or [], **kwargs)
+
+
+class _ManifestJev(_FeedbackJev):
+    """Answers the verify judge's per-assertion choices with one fixed read."""
+
+    def __init__(self, assertion=("supported", 0.9), **kwargs):
+        super().__init__(**kwargs)
+        self.assertion = assertion
+
+    def __call__(self, state, questions, timeout=None):
+        body = super().__call__(state, questions, timeout=timeout)
+        for key, question in questions.items():
+            if key.startswith("assertion"):
+                choice, p = self.assertion
+                keys = list(question["criteria"])
+                rest = round((1 - p) / max(1, len(keys) - 1), 4)
+                body["answers"][key] = {"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": {k: (p if k == choice else rest) for k in keys}}
+        return body
+
+
+def test_every_terminal_call_is_a_ledger_row_with_retained_output_and_a_workspace_digest(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd(f"cd {repo} && pytest -q", json.dumps({"output": "3 passed in 0.1s", "exit_code": 0}))
+    _cmd("python3 app.py", "hello world", cwd=str(repo))
+    rows = preflight.ledger_state("s1")["rows"]
+    assert [row["id"] for row in rows] == ["c1", "c2"]
+    assert rows[0]["exit"] == 0 and rows[0]["status"] == "pass" and rows[0]["counts"] == {"passed": 3} and rows[0]["check"] is True
+    assert rows[1]["exit"] is None and rows[1]["status"] == "unknown" and rows[1]["check"] is False and rows[1]["cwd"] == str(repo)
+    assert preflight.ledger_state("s1")["roots"] == [str(repo)], "the cd prefix and the hook's cwd both name the repository"
+    assert rows[0]["workspace"] and rows[0]["workspace"] == rows[1]["workspace"]
+    assert Path(rows[1]["file"]).read_text() == "hello world"
+    assert str(Path(rows[1]["file"])).startswith(feedback["settings"]["ledger_dir"])
+    # An edit moves the digest; the next command runs under the new one.
+    (repo / "app.py").write_text("def greet():\n    return 'changed'\n")
+    preflight.on_post_tool_call(tool_name="write_file", args={"path": str(repo / "app.py"), "content": "x"}, result="ok", session_id="s1")
+    _cmd("pytest -q", "3 passed", cwd=str(repo))
+    rows = preflight.ledger_state("s1")["rows"]
+    assert rows[2]["workspace"] != rows[0]["workspace"]
+    assert preflight.ledger_state("s1")["workspace"] == rows[2]["workspace"]
+
+
+def test_a_new_turn_keeps_the_previous_rows_under_p_ids_and_clears_the_manifest(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix", conversation_history=[])
+    _cmd("pytest -q", "3 passed", cwd=str(repo))
+    _manifest([_item("tests pass", ["c1"])])
+    assert preflight._session_manifest["s1"][0]["evidence"] == ["c1"]
+    old_file = preflight.ledger_state("s1")["rows"][0]["file"]
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="now docs", conversation_history=[])
+    state = preflight.ledger_state("s1")
+    assert state["rows"] == [] and [row["id"] for row in state["previous"]] == ["pc1"]
+    assert "s1" not in preflight._session_manifest
+    assert Path(old_file).exists(), "the previous turn's output stays for one more turn"
+    _cmd("ls", "x")
+    assert preflight.ledger_state("s1")["rows"][0]["id"] == "c1", "ids restart per turn"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="more", conversation_history=[])
+    assert not Path(old_file).exists()
+
+
+def test_report_results_is_captured_raw_and_through_the_bridge_wrapper_and_counted_by_the_drift_check(feedback):
+    _manifest([_item("a", ["c1"])])
+    assert [item["claim"] for item in preflight._session_manifest["s1"]] == ["a"]
+    _manifest([_item("b", ["c2"], predicate="count", expected={"passed": 2})], wrapped=True)
+    assert preflight._session_manifest["s1"][0]["claim"] == "b" and preflight._session_manifest["s1"][0]["expected"] == {"passed": 2}
+    assert feedback["records"]("manifest")[-1]["items"] == 1
+    assert preflight.drift_state("s1")["calls"][-1] == {"tool": "report_results", "summary": "results reported"}
+
+
+def test_a_build_turn_that_ran_checks_without_a_manifest_is_sent_back_by_rule_with_no_jev_call(feedback, repo, emitted):
+    feedback["settings"]["manifest_required"] = "on"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q", "3 passed", cwd=str(repo))
+    calls = len(feedback["jev"].calls)
+    result = _verify(final="Done, 3 passed.", paths=[str(repo / "app.py")])
+    assert result is not None and "No result manifest was registered although 1 check commands ran" in result["message"] and "(ledger rows c1)" in result["message"]
+    assert len(feedback["jev"].calls) == calls, "by rule: no Jev call"
+    [record] = feedback["records"]("verify")
+    assert record["rule"] == "no_manifest" and record["ledger"] == 1 and record["manifest_registered"] is False
+    event = emitted[-1]
+    assert event["stage"] == "verify" and "no result manifest on a build turn that ran 1 checks" in event["text"] and event["decision"]["rule"] == "no_manifest"
+    # The same answer again: repeated, the turn finishes.
+    assert _verify(attempt=1, paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["repeated"] is True
+    # A build turn that ran no checks needs no manifest.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="tweak", conversation_history=[])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    assert _verify(paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1].get("rule") is None
+    # Nor does a turn that is not a build.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="explain", conversation_history=[])
+    _cmd("pytest -q", "3 passed", cwd=str(repo))
+    assert _verify(paths=[str(repo / "app.py")], coding=False) is None
+    assert feedback["records"]("verify")[-1].get("rule") is None
+    # An empty manifest satisfies the rule: the answer claims no check result.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="fix", conversation_history=[])
+    _cmd("pytest -q", "3 passed", cwd=str(repo))
+    _manifest([])
+    assert _verify(paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["manifest_registered"] is True and feedback["records"]("verify")[-1].get("rule") is None
+
+
+def test_code_checks_each_manifest_claim_and_contradiction_and_missing_rows_are_findings(feedback, repo, emitted):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q", json.dumps({"output": "12 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
+    _cmd("pytest -q tests/x.py", json.dumps({"output": "1 failed, 3 passed in 0.3s", "exit_code": 1}), cwd=str(repo))
+    _manifest([
+        _item("plugin suite passes", ["c1"], id="r1"),
+        _item("12 passed", ["c1"], predicate="count", expected={"passed": 12}, id="r2"),
+        _item("x suite passes", ["c2"], id="r3"),
+        _item("lint clean", ["c7"], id="r4"),
+    ])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05, "checks_failing": 0.1}
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result is not None
+    assert 'contradicted by the evidence ledger: "x suite passes" (reported failure: c2)' in result["message"]
+    assert 'cite rows that are not in the ledger: "lint clean"' in result["message"] and "Rows this turn: c1, c2" in result["message"]
+    call = feedback["jev"].calls[-1]
+    state = call["state"]
+    assert state["evidence_ledger"]["items"][0] == {"id": "c1", "command": "pytest -q", "exit": 0, "status": "pass", "kind": "pytest", "source": "agent", "counts": {"passed": 12}, "fresh": True}
+    assert [(item["id"], item["code_verdict"]) for item in state["result_manifest"]["items"]] == [("r1", "supported"), ("r2", "supported"), ("r3", "contradicted"), ("r4", "missing")]
+    assert state["result_manifest"]["registered"] is True and state["evidence_ledger"]["workspace_known"] is True
+    assert state["failure_excerpts"]["items"][0]["row"] == "c2" and "1 failed" in state["failure_excerpts"]["items"][0]["excerpt"]
+    assert "built by code" in state["provenance"] and "decided by code" in state["provenance"]
+    # Jev gets one typed choice per claim code could not refute, plus the usual nouls.
+    assert set(call["questions"]) == {"criterion_1", "checks_failing", "claims_unverified", "assertion_r1", "assertion_r2"}
+    question = call["questions"]["assertion_r1"]
+    assert question["type"] == "choice" and set(question["criteria"]) == {"supported", "contradicted", "insufficient"}
+    assert "plugin suite passes" in question["instructions"] and "rows c1" in question["instructions"]
+    assert call["questions"]["claims_unverified"]["instructions"] == preflight.CLAIMS_QUESTION
+    assert call["questions"]["checks_failing"]["instructions"] == preflight.CHECKS_FAILING_QUESTION
+    [record] = feedback["records"]("verify")
+    assert record["manifest"] == {"supported": 2, "contradicted": 1, "stale": 0, "insufficient": 0, "missing": 1}
+    assert record["ledger"] == 2 and record["ledger_checks"] == 2 and record["manifest_registered"] is True and record["reruns"] == [] and record["workspace"]
+    assert [item["code"] for item in record["assertions"]] == ["supported", "supported", "contradicted", "missing"]
+    assert record["assertion_grouping"] == "none" and record["assertions_dropped"] == 0 and record["state_chars"] > 0
+    event = emitted[-1]
+    assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/1 · manifest 2 supported, 1 contradicted, 1 missing · claims beyond 0.05 · checks failing 0.10 · ledger 2 rows · nudge")
+    assert event["decision"]["manifest"]["contradicted"] == 1 and event["decision"]["ledger"] == 2 and event["decision"]["reruns"] == 0
+    assert set(event["answers"]) == {"fix greet", "claims_unverified", "checks_failing"}, "assertion reads stay out of the calibration answers"
+
+
+def test_a_check_that_ran_before_a_later_edit_is_stale_and_the_gate_reruns_it_itself(feedback, repo, emitted):
+    feedback["settings"]["controller_reruns"] = "on"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    command = f"{_sys.executable} -m pytest --version"
+    _cmd(command, "pytest 8.0.0", cwd=str(repo))
+    (repo / "app.py").write_text("def greet():\n    return 'edited after the check'\n")
+    _manifest([_item("pytest is available", ["c1"], predicate="exit_zero")])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    assert _verify(paths=[str(repo / "app.py")]) is None, "the gate's own run settled the claim"
+    [record] = feedback["records"]("verify")
+    [rerun] = record["reruns"]
+    assert rerun["row"] == "c1" and rerun["controller"] == "k2" and rerun["status"] == "pass" and rerun["timed_out"] is False
+    rows = preflight.ledger_state("s1")["rows"]
+    assert rows[-1]["id"] == "k2" and rows[-1]["source"] == "controller" and rows[-1]["exit"] == 0 and rows[-1]["for"] == "c1" and rows[-1]["fresh"] is True
+    assert record["manifest"]["supported"] == 1 and record["assertions"][0]["detail"] == "exit 0"
+    state = feedback["jev"].calls[-1]["state"]
+    assert [(item["id"], item["source"]) for item in state["evidence_ledger"]["items"]] == [("c1", "agent"), ("k2", "controller")]
+    assert "1 re-run by the gate" in emitted[-1]["text"] and emitted[-1]["decision"]["reruns"] == 1
+
+
+def test_a_stale_or_unknown_claim_the_gate_cannot_rerun_is_reported_honestly(feedback, repo):
+    feedback["settings"]["controller_reruns"] = "on"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("python3 app.py", json.dumps({"output": "hello", "exit_code": 0}), cwd=str(repo))
+    _cmd("curl -s http://x/health", "ok", cwd=str(repo))
+    (repo / "app.py").write_text("def greet():\n    return 'edited after the check'\n")
+    _manifest([
+        _item("app prints hello", ["c1"], predicate="exit_zero", id="r1"),
+        _item("service is healthy", ["c2"], predicate="ran", id="r2"),
+    ])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result is not None
+    assert 'rest on checks that ran before later edits and the gate could not re-run: "app prints hello" (ran before later edits: c1). Run them again and cite the new rows.' in result["message"]
+    record = feedback["records"]("verify")[-1]
+    assert record["reruns"] == [], "python3 app.py is not a check runner, so the gate never runs it"
+    assert [item["code"] for item in record["assertions"]] == ["stale", "supported"], "a ran claim is not about freshness"
+    # Insufficient is not a finding: a claim with unknown status is reported, not refuted.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix greet", conversation_history=[])
+    _cmd("python3 app.py", "hello", cwd=str(repo))
+    _manifest([_item("app prints hello", ["c1"], predicate="exit_zero")])
+    assert _verify(paths=[str(repo / "app.py")]) is None
+    record = feedback["records"]("verify")[-1]
+    assert record["manifest"]["insufficient"] == 1 and record["assertions"][0]["detail"] == "exit code unknown on this lane"
+
+
+def test_jev_can_still_refute_a_code_supported_claim_on_its_wording(feedback, repo, monkeypatch):
+    jev = _ManifestJev(assertion=("contradicted", 0.9))
+    monkeypatch.setattr(preflight, "_ask", jev)
+    feedback["jev"] = jev
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q tests/one.py", json.dumps({"output": "2 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
+    _manifest([_item("the whole suite passes", ["c1"])])
+    jev.guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result is not None
+    assert 'Jev reads the cited rows as contradicting the claim as worded: "the whole suite passes" (P(contradicted)=0.90)' in result["message"]
+    record = feedback["records"]("verify")[-1]
+    assert record["assertions"][0]["code"] == "supported" and record["assertions"][0]["jev"]["contradicted"] == 0.9
+    jev.assertion = ("supported", 0.9)
+    assert _verify(attempt=1, paths=[str(repo / "app.py")]) is None
+
+
+def test_assertion_questions_are_grouped_by_criterion_under_the_question_cap_and_never_dropped_silently(feedback, repo):
+    def criteria(n):
+        return json.dumps({"todos": [{"id": str(i), "content": f"criterion {i}", "status": "in_progress"} for i in range(1, n + 1)]})
+
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=criteria(20), session_id="s1")
+    _cmd("pytest -q", json.dumps({"output": "1 failed, 2 passed in 0.1s", "exit_code": 1}), cwd=str(repo))
+    _manifest([_item(f"claim {i}", ["c1"], predicate="ran", criterion=str(i % 3 + 1), id=f"r{i}") for i in range(16)])
+    feedback["jev"].guard = {**{f"criterion_{i}": 0.9 for i in range(1, 21)}, "claims_unverified": 0.05, "checks_failing": 0.1}
+    _verify(paths=[str(repo / "app.py")])
+    call = feedback["jev"].calls[-1]
+    assert len(call["questions"]) <= preflight.JEV_MAX_QUESTIONS
+    grouped = sorted(key for key in call["questions"] if key.startswith("assertions_"))
+    assert grouped == ["assertions_1", "assertions_2", "assertions_3"], "22 questions leave 10 slots: 16 claims become 3 groups"
+    assert "r0: claim 0 (rows c1)" in call["questions"]["assertions_1"]["instructions"]
+    record = feedback["records"]("verify")[-1]
+    assert record["assertion_grouping"] == "criterion" and record["assertions_dropped"] == 0
+    assert all(item["grouped"] for item in record["assertions"])
+    # 30 criteria fill the cap: nothing is asked about the claims, and the log says how many were dropped.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=criteria(30), session_id="s1")
+    _cmd("pytest -q", json.dumps({"output": "1 failed, 2 passed in 0.1s", "exit_code": 1}), cwd=str(repo))
+    _manifest([_item(f"claim {i}", ["c1"], predicate="ran", criterion=str(i % 3 + 1), id=f"r{i}") for i in range(16)])
+    feedback["jev"].guard = {**{f"criterion_{i}": 0.9 for i in range(1, 31)}, "claims_unverified": 0.05, "checks_failing": 0.1}
+    _verify(paths=[str(repo / "app.py")])
+    call = feedback["jev"].calls[-1]
+    assert len(call["questions"]) == preflight.JEV_MAX_QUESTIONS and not any(key.startswith("assertion") for key in call["questions"])
+    record = feedback["records"]("verify")[-1]
+    assert record["assertion_grouping"] == "truncated" and record["assertions_dropped"] == 16
+
+
+def test_a_change_to_tests_or_runner_config_is_flagged_for_the_human_not_as_a_finding(feedback, repo, emitted):
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_app.py").write_text("def test_x():\n    pass\n")
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    assert _verify(paths=[str(repo / "app.py"), str(repo / "tests" / "test_app.py")]) is None
+    record = feedback["records"]("verify")[-1]
+    assert record["machinery"] == ["tests/test_app.py"] and record["findings"] == []
+    assert "machinery changed (1)" in emitted[-1]["text"] and emitted[-1]["decision"]["machinery"] == ["tests/test_app.py"]

@@ -129,6 +129,13 @@ class TestSelectedTools:
         assert "acceptance_criteria" in READ_ONLY_TOOLS
         assert "todo" not in EXPOSED_TOOLS, "the real todo tool still needs the live agent loop"
 
+    def test_report_results_is_exposed_and_read_only(self):
+        """The result manifest for the verify judge: stateless, its record is the tool result."""
+        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, READ_ONLY_TOOLS
+
+        assert "report_results" in EXPOSED_TOOLS
+        assert "report_results" in READ_ONLY_TOOLS
+
     def test_default_is_the_full_surface(self):
         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, selected_tools
         assert selected_tools({}) == EXPOSED_TOOLS

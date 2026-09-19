@@ -74,16 +74,27 @@ lane. A status-only update of the same statements reuses the verdict. Jev
 failing leaves the list exactly as registered.
 
 The verify judge (``pre_verify``) turns Jev into a per-feature pass/fail gate
-on the model's own work. ``post_tool_call`` remembers the session's todo
-list (the model is nudged to write acceptance criteria there on build-type
-requests) and the last few test, lint or build outputs. When the model has
-edited files and is about to finish, the judge gathers the git diff of the
-changed paths, the matching RecCli ``.devproject`` features, those check
-outputs and the draft final message, asks Jev one yes/no question per
-criterion plus "do the checks show a failure" and "does the message claim
-results the evidence does not show", and keeps the model going with a
-findings note when something is confidently unmet. Bounded by
-``agent.max_verify_nudges``; Jev being unavailable fails open.
+on the model's own work, over evidence that code built. ``post_tool_call``
+keeps an evidence ledger for the turn (``evidence.py``): one row per
+terminal call with its exit code or ``unknown``, what the runner reported,
+a failure flag, a digest of the output and the workspace digest it ran
+under; the full output is retained on disk. It also keeps the session's
+criteria and the result manifest the model registers with
+``report_results``: each claim names the ledger rows it rests on and a
+predicate code compares exactly (supported, contradicted, stale, missing,
+insufficient). A cited check that ran before a later edit is stale by
+digest, and the gate re-runs plain check commands itself. When the model
+has edited files and is about to finish, the judge gathers the diff, the
+matching RecCli ``.devproject`` features, the ledger, code-selected failure
+excerpts, the manifest with its code verdicts and the draft final message;
+asks Jev one noul per criterion, "do the excerpts show a failure",
+"does the message claim results beyond the manifest and the ledger", and
+one typed choice per assertion code could not settle; and keeps the model
+going with a findings note when something is confidently unmet. A build
+turn that ran checks and registered no manifest is sent back by rule, with
+no Jev call. Bounded by ``agent.max_verify_nudges``; Jev being unavailable
+fails open. A diff that touches tests or runner configuration is flagged in
+the verdict for the human, never as a finding.
 """
 
 from __future__ import annotations
@@ -97,9 +108,29 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _load_evidence():
+    """The sibling ``evidence`` module: a relative import under the plugin loader, a file load elsewhere (tests)."""
+    try:
+        from . import evidence as module  # type: ignore[no-redef]
+
+        return module
+    except ImportError:
+        import importlib.util
+
+        path = Path(__file__).with_name("evidence.py")
+        spec = importlib.util.spec_from_file_location("system_one_preflight_evidence", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module
+
+
+evidence = _load_evidence()
 
 PLUGIN_ID = "system-one-preflight"
 MODES = ("off", "shadow", "feedback", "jev", "always", "trial")
@@ -222,13 +253,44 @@ CRITERIA_NUDGE = (
     "Preflight: this looks like a change to code or files. Before editing, write "
     "the acceptance criteria for this change as single checkable statements, "
     "with the todo tool or the acceptance_criteria tool; they will be checked "
-    "against your diff and check output before you finish."
+    "against your diff and the evidence ledger before you finish. Before your "
+    "final message, register the results you will state with report_results, "
+    "each citing the ledger rows (c1, c2, ...) of the commands that produced it."
 )
 VERIFY_TEMPLATE = (
-    "Preflight judge (Jev, advisory) reviewed your diff and check output before "
-    "you finish. {findings} Fix what is unmet and run the checks again, or say "
+    "Preflight judge (Jev, advisory) reviewed your diff, the evidence ledger and "
+    "your result manifest before you finish. {findings} Fix what is unmet and run "
+    "the checks again, update report_results with the new row ids, or say "
     "precisely why a criterion does not apply and cancel its todo, then finish."
 )
+MANIFEST_REQUIRED_FINDING = (
+    "No result manifest was registered although {n} check commands ran this turn "
+    "(ledger rows {ids}). Before finishing, call report_results with one item per "
+    "result your answer states: the claim as worded, the ledger row ids it rests on, "
+    "and the predicate (passed, count, exit_zero, contains or ran); an empty list "
+    "means the answer claims no check result."
+)
+CHECKS_FAILING_QUESTION = (
+    "Do the failure excerpts show a failing test, an error, or a lint or type "
+    "problem that no later row in the evidence ledger shows fixed?"
+)
+CLAIMS_QUESTION = (
+    "Does the final message claim work, results, or passing checks beyond what "
+    "the result manifest and the evidence ledger show?"
+)
+ASSERTION_QUESTION = (
+    "Do the cited evidence rows support this result claim as worded, at the "
+    "scope it states: {claim} (rows {rows})"
+)
+ASSERTION_GROUP_QUESTION = (
+    "Do the cited evidence rows support these result claims as worded, at the "
+    "scope each states: {claims}"
+)
+ASSERTION_CRITERIA = {
+    "supported": "The cited rows show what the claim states, at the scope the claim states (the same suites, files or commands).",
+    "contradicted": "A cited row shows the opposite of the claim, or the claim states a wider scope than the cited rows cover.",
+    "insufficient": "The cited rows neither show nor contradict the claim: status unknown, output missing, or the rows are about something else.",
+}
 # Explicit boundaries for the verify nouls. Jev reads literally, so the
 # distinction between "shown by the diff" and "claimed in the message" is
 # spelled out rather than implied.
@@ -237,8 +299,8 @@ CRITERION_CRITERIA = {
     "false": "The criterion is not shown by the diff, is only partly met, or is only claimed in the message.",
 }
 CLAIMS_CRITERIA = {
-    "true": "The message asserts a result, a passing check, or completed work that the diff and check outputs do not show.",
-    "false": "Every claim in the message is backed by the diff or a check output, or is explicitly marked as unverified.",
+    "true": "The message asserts a result, a passing check, or completed work that no manifest item marked supported, no ledger row and no part of the diff shows.",
+    "false": "Every result the message states is a manifest item code marked supported, is shown by the diff or a ledger row, or is explicitly marked as unverified.",
 }
 VERIFY_FAIL_THRESHOLD = 0.2
 VERIFY_FLAG_THRESHOLD = 0.8
@@ -247,13 +309,7 @@ BUILD_THRESHOLD = 0.7
 MAX_DIFF_CHARS = 60_000
 MAX_FILE_DIFF_CHARS = 20_000
 MAX_CHECK_CHARS = 2_000
-CHECK_COMMAND_RE = re.compile(
-    r"\b(pytest|npm (run )?(test|lint|build|typecheck)|pnpm (test|lint|build)|"
-    r"yarn (test|lint|build)|vitest|jest|mocha|go test|cargo (test|check|clippy)|"
-    r"make (test|check|lint)|node --test|tsc\b|eslint|ruff|mypy|flake8|"
-    r"black --check|prettier --check)",
-    re.IGNORECASE,
-)
+CHECK_COMMAND_RE = evidence.CHECK_COMMAND_RE
 GUARD_FEEDBACK_TEMPLATE = (
     "Preflight from Jev before running {tool}: P(destructive or far-reaching: "
     "{risk_name}) = {risk}; P(within what the user asked for) = {scope}. This "
@@ -269,10 +325,7 @@ GUARD_QUESTIONS: Dict[str, str] = {
     "within_scope": "Is this action within what the user asked for or authorized in the conversation so far?",
 }
 
-_FAILURE_RE = re.compile(
-    r"(traceback|\berror\b|\bfailed\b|exit code [1-9]|command not found|no such file|permission denied)",
-    re.IGNORECASE,
-)
+_FAILURE_RE = evidence.FAILURE_RE
 
 # Injectable seams for tests and for the register() wiring.
 _settings_reader: Callable[[str, Any], Any] = lambda key, default=None: default
@@ -281,8 +334,10 @@ _log_lock = threading.Lock()
 _turn_memo: Dict[str, Dict[str, Any]] = {}
 _session_scope: Dict[str, List[str]] = {}
 _session_todos: Dict[str, List[Dict[str, str]]] = {}
-_session_checks: Dict[str, List[Dict[str, str]]] = {}
-_session_commands: Dict[str, List[Dict[str, str]]] = {}
+# The evidence ledger per session (rows this turn, the previous turn's rows,
+# known repository roots, the latest workspace digest) and the result manifest.
+_session_ledger: Dict[str, Dict[str, Any]] = {}
+_session_manifest: Dict[str, List[Dict[str, Any]]] = {}
 _verify_memo: Dict[str, str] = {}
 _session_drift: Dict[str, Dict[str, Any]] = {}
 _pending_drift: Dict[str, Dict[str, str]] = {}
@@ -297,7 +352,6 @@ _session_fidelity: Dict[str, Dict[str, Any]] = {}
 _session_previous_answer: Dict[str, str] = {}
 _pending_fidelity: Dict[str, Dict[str, str]] = {}
 _pending_fidelity_note: Dict[str, str] = {}
-MAX_COMMANDS_KEPT = 6
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
 # acceptance criterion the recent calls serve; "none" at or above the
 # threshold steers the model back, at most DRIFT_MAX_STEERS times per turn.
@@ -332,6 +386,10 @@ DRIFT_NO_CRITERIA_TEMPLATE = (
 DEFAULT_FIDELITY_ENTAILMENT_THRESHOLD = 0.4
 DEFAULT_FIDELITY_COVERAGE_THRESHOLD = 0.6
 DEFAULT_FIDELITY_TIMEOUT_SECONDS = 3.0
+# Controller re-runs: a cited check that is stale or has unknown exit is run
+# again by the gate, one command at a time under these caps.
+DEFAULT_RERUN_TIMEOUT_SECONDS = 120.0
+DEFAULT_RERUN_BUDGET_SECONDS = 300.0
 # Wording chosen by live probe (2026-09-19): "does the request ask for what
 # this criterion states" read a turn's own legitimate criteria at 0.08-0.14
 # when the request was "implement the changes fully", because the request
@@ -577,6 +635,31 @@ def fidelity_timeout_seconds() -> float:
     except (TypeError, ValueError):
         return DEFAULT_FIDELITY_TIMEOUT_SECONDS
     return min(15.0, max(0.5, value))
+
+
+def manifest_required() -> bool:
+    """Whether a build turn that ran checks must register a result manifest before it may finish."""
+    return str(_setting("manifest_required", "on") or "on").strip().lower() != "off"
+
+
+def controller_reruns_enabled() -> bool:
+    return str(_setting("controller_reruns", "on") or "on").strip().lower() != "off"
+
+
+def rerun_timeout_seconds() -> float:
+    try:
+        value = float(_setting("rerun_timeout_seconds", DEFAULT_RERUN_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_RERUN_TIMEOUT_SECONDS
+    return min(600.0, max(5.0, value))
+
+
+def rerun_budget_seconds() -> float:
+    try:
+        value = float(_setting("rerun_budget_seconds", DEFAULT_RERUN_BUDGET_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_RERUN_BUDGET_SECONDS
+    return min(1_200.0, max(0.0, value))
 
 
 def verify_timeout_seconds() -> float:
@@ -1371,11 +1454,6 @@ def on_pre_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 # Verify judge: per-criterion pass/fail on the diff before the turn finishes
 # ---------------------------------------------------------------------------
 
-def _tail(text: str, limit: int) -> str:
-    text = text.strip()
-    return text if len(text) <= limit else "…" + text[-(limit - 1):]
-
-
 def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
     """The todo tool's result is JSON with a ``todos`` array; keep id/content/status."""
     try:
@@ -1411,6 +1489,149 @@ def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
 
 
 # ---------------------------------------------------------------------------
+# Evidence ledger: one code-built row per command, a workspace digest, the
+# result manifest. The judge reads these instead of raw output tails.
+# ---------------------------------------------------------------------------
+
+_MUTATING_FILE_TOOLS = ("write_file", "patch")
+# Jev takes at most this many questions in one call (tools.typesafe_tool
+# enforces it); the verify judge budgets its assertion questions under it.
+JEV_MAX_QUESTIONS = 32
+MAX_LEDGER_ROWS_FOR_JEV = 120
+
+
+def ledger_state(session_id: str) -> Dict[str, Any]:
+    state = _session_ledger.get(session_id)
+    if state is None:
+        state = {"rows": [], "previous": [], "roots": [], "seq": 0, "workspace": None, "turn": 0}
+        _session_ledger[session_id] = state
+        _bound(_session_ledger)
+    return state
+
+
+def ledger_dir(session_id: str) -> Path:
+    """Where a session's command outputs are retained, one file per row."""
+    configured = _setting("ledger_dir", "")
+    base = Path(str(configured)).expanduser() if configured else log_path().parent / "system-one-preflight-evidence"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "session")[:80] or "session"
+    return base / safe
+
+
+def reset_ledger(session_id: str) -> None:
+    """A new turn: this turn's rows become the previous turn's (ids p*), the older files go, the manifest clears."""
+    state = ledger_state(session_id)
+    for row in state["previous"]:
+        path = row.get("file")
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    previous: List[Dict[str, Any]] = []
+    for row in state["rows"][-evidence.MAX_PREVIOUS_ROWS:]:
+        item = dict(row)
+        item["id"] = "p" + str(row["id"])
+        item.pop("fresh", None)
+        previous.append(item)
+    state["previous"] = previous
+    state["rows"] = []
+    state["seq"] = 0
+    state["turn"] += 1
+    _session_manifest.pop(session_id, None)
+
+
+def _note_root(state: Dict[str, Any], path: str) -> Optional[str]:
+    root = evidence.git_root(path) if path else None
+    if root and root not in state["roots"]:
+        state["roots"].append(root)
+        del state["roots"][:-8]
+    return root
+
+
+def _refresh_workspace(state: Dict[str, Any]) -> Optional[str]:
+    digest = evidence.workspace_digest(state["roots"]) if state["roots"] else None
+    state["workspace"] = digest
+    return digest
+
+
+def record_command(session_id: str, command: str, result_text: str, *, cwd: str = "") -> Dict[str, Any]:
+    """One ledger row for a terminal call, with its output retained and the workspace digest it ran under."""
+    state = ledger_state(session_id)
+    prefix_dir = evidence.cd_prefix(command)
+    if prefix_dir:
+        candidate = prefix_dir if os.path.isabs(os.path.expanduser(prefix_dir)) or not cwd else os.path.join(cwd, prefix_dir)
+        _note_root(state, os.path.expanduser(candidate))
+    if cwd:
+        _note_root(state, cwd)
+    state["seq"] += 1
+    workspace = _refresh_workspace(state)
+    row, output = evidence.make_row(state["seq"], command, result_text, cwd=cwd, workspace=workspace)
+    row["file"] = evidence.retain_output(ledger_dir(session_id), f"{state['turn']}-{row['id']}", output)
+    state["rows"].append(row)
+    del state["rows"][:-evidence.MAX_ROWS]
+    return row
+
+
+def note_file_change(session_id: str, args: Dict[str, Any], *, cwd: str = "") -> Optional[str]:
+    """A file write: learn its repository and refresh the workspace digest."""
+    state = ledger_state(session_id)
+    for key in ("path", "file_path", "notebook_path"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            path = os.path.expanduser(value.strip())
+            if not os.path.isabs(path) and cwd:
+                path = os.path.join(cwd, path)
+            _note_root(state, path)
+            break
+    if cwd:
+        _note_root(state, cwd)
+    return _refresh_workspace(state)
+
+
+def _controller_rerun(session_id: str, ledger: Dict[str, Any], row: Dict[str, Any], final_digest: Optional[str], timeout: float) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Run one cited check again as the gate; returns (controller row, run record)."""
+    cwd = row.get("cwd") or (ledger["roots"][0] if ledger["roots"] else "")
+    run = evidence.run_check(row["command"], cwd, timeout)
+    ledger["seq"] += 1
+    result_text = json.dumps({"output": run["output"], "exit_code": run["exit_code"]}) if run["exit_code"] is not None else run["output"]
+    new_row, output = evidence.make_row(
+        ledger["seq"], row["command"], result_text, cwd=cwd, workspace=final_digest, source="controller", prefix="k",
+    )
+    if run["timed_out"]:
+        new_row["status"] = "unknown"
+        new_row["timed_out"] = True
+    new_row["file"] = evidence.retain_output(ledger_dir(session_id), f"{ledger['turn']}-{new_row['id']}", output)
+    new_row["fresh"] = True
+    new_row["for"] = row["id"]
+    ledger["rows"].append(new_row)
+    return new_row, {
+        "row": row["id"], "controller": new_row["id"], "status": new_row["status"],
+        "seconds": round(run["seconds"], 2), "timed_out": run["timed_out"],
+    }
+
+
+def _verify_key(findings: List[str], diff: str, rows: List[Dict[str, Any]], verdicts: Optional[List[Dict[str, Any]]]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "findings": findings,
+                "diff": diff,
+                "rows": [(row["id"], row["status"], row["digest"]) for row in rows],
+                "verdicts": [(item["id"], item["verdict"]) for item in verdicts] if verdicts is not None else None,
+            },
+            sort_keys=True, ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _manifest_summary(counts: Dict[str, int], registered: bool) -> str:
+    if not registered:
+        return "not registered"
+    parts = [f"{counts[name]} {name}" for name in evidence.VERDICTS if counts.get(name)]
+    return ", ".join(parts) if parts else "empty"
+
+
+# ---------------------------------------------------------------------------
 # Drift check: are the recent tool calls still serving the acceptance criteria?
 # ---------------------------------------------------------------------------
 
@@ -1425,6 +1646,7 @@ def reset_drift(session_id: str) -> None:
     _pending_fidelity.pop(session_id, None)
     _pending_fidelity_note.pop(session_id, None)
     _bound(_session_drift)
+    reset_ledger(session_id)
 
 
 def drift_state(session_id: str) -> Dict[str, Any]:
@@ -1440,6 +1662,8 @@ def _call_summary(tool_name: str, args: Dict[str, Any]) -> str:
         return _clip(str(args.get("command") or ""), 160)
     if tool_name in ("todo", "acceptance_criteria"):
         return "criteria updated"
+    if tool_name == "report_results":
+        return "results reported"
     for key in ("path", "file_path", "pattern", "query", "url", "command", "description"):
         value = args.get(key)
         if isinstance(value, str) and value.strip():
@@ -1690,8 +1914,12 @@ def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay
 
 
 def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
-    """Remember the session's todo list and its latest check outputs, then run the drift check.
+    """Record what the call produced, then run the fidelity and drift checks.
 
+    Every ``terminal`` call becomes a row in the turn's evidence ledger (built
+    by code from the result, output retained on disk); ``todo`` and
+    ``acceptance_criteria`` results become the criteria; ``report_results``
+    becomes the result manifest; file writes refresh the workspace digest.
     Returns ``{"message": ...}`` when the caller can put text in front of
     the model right now (``steerable=True``, the Claude hook endpoint);
     otherwise the steer waits for the next ``pre_tool_call`` to hold.
@@ -1711,6 +1939,7 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             text = json.dumps(result, ensure_ascii=False, default=str)
         except Exception:
             text = str(result)
+    cwd = str(kwargs.get("cwd") or args.get("workdir") or "")
     fidelity: Optional[Dict[str, str]] = None
     if tool_name in ("todo", "acceptance_criteria"):
         # `acceptance_criteria` is the bridge's stateless stand-in for the todo
@@ -1725,19 +1954,21 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
                 logger.debug("system-one-preflight: fidelity check failed", exc_info=True)
                 fidelity = None
     elif tool_name == "terminal":
-        command = str(args.get("command") or "")
-        entry = {"command": _clip(command, 300), "output": _tail(text, MAX_CHECK_CHARS)}
-        # Every command is evidence the judge may need (a script run, a curl,
-        # a file listing); the check subset is what "do the checks fail" asks about.
-        commands = _session_commands.setdefault(session_id, [])
-        commands.append(entry)
-        del commands[:-MAX_COMMANDS_KEPT]
-        _bound(_session_commands)
-        if CHECK_COMMAND_RE.search(command):
-            checks = _session_checks.setdefault(session_id, [])
-            checks.append(dict(entry))
-            del checks[:-3]
-            _bound(_session_checks)
+        try:
+            record_command(session_id, str(args.get("command") or ""), text, cwd=cwd)
+        except Exception:
+            logger.debug("system-one-preflight: ledger row not recorded", exc_info=True)
+    elif tool_name == "report_results":
+        manifest = evidence.parse_manifest(text)
+        if manifest is not None:
+            _session_manifest[session_id] = manifest
+            _bound(_session_manifest)
+            write_log({"event": "manifest", "session_id": session_id, "items": len(manifest), "replay": bool(kwargs.get("replay"))})
+    elif tool_name in _MUTATING_FILE_TOOLS:
+        try:
+            note_file_change(session_id, args, cwd=cwd)
+        except Exception:
+            logger.debug("system-one-preflight: workspace digest not refreshed", exc_info=True)
     try:
         # Replayed after the turn (the Codex lane, or a Claude turn without
         # the hook channel): counted for the record, never judged.
@@ -1893,7 +2124,7 @@ def collect_evidence(changed_paths: List[str]) -> Dict[str, Any]:
 
 
 def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
-    """Judge the finished change against its acceptance criteria before the turn ends."""
+    """Judge the finished change against its criteria, the evidence ledger and the result manifest."""
     if current_mode() == "off" or not verify_judge_enabled():
         return None
     session_id = str(kwargs.get("session_id") or "")
@@ -1907,9 +2138,105 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     criteria = [item for item in todos if item.get("status") in ("completed", "in_progress")]
     pending = [item for item in todos if item.get("status") == "pending"]
     request = (_session_scope.get(session_id) or [""])[-1]
-    evidence = collect_evidence(changed)
-    checks = list(_session_checks.get(session_id, []))
-    commands = list(_session_commands.get(session_id, []))
+    bundle = collect_evidence(changed)
+    started = time.monotonic()
+
+    # The ledger as it stands at the end of the turn, with freshness decided
+    # by the workspace digest, never by judgment.
+    ledger = ledger_state(session_id)
+    for path in changed[:40]:
+        _note_root(ledger, path)
+    final_digest = _refresh_workspace(ledger)
+    rows_this_turn = list(ledger["rows"])
+    rows_by_id: Dict[str, Dict[str, Any]] = {row["id"]: row for row in ledger["previous"]}
+    rows_by_id.update({row["id"]: row for row in rows_this_turn})
+    for row in rows_by_id.values():
+        row["fresh"] = (row["workspace"] == final_digest) if (row.get("workspace") and final_digest) else None
+    manifest = _session_manifest.get(session_id)
+    build = bool(drift_state(session_id).get("build")) or bool(kwargs.get("coding"))
+    checks_ran = [row for row in rows_this_turn if row.get("check")]
+    machinery = evidence.machinery_paths(changed, bundle["root"])
+
+    # By rule, no Jev call: a build turn that ran checks says which results it claims.
+    if manifest is None and manifest_required() and build and checks_ran:
+        finding = MANIFEST_REQUIRED_FINDING.format(n=len(checks_ran), ids=", ".join(row["id"] for row in checks_ran[-6:]))
+        findings = [finding]
+        key = _verify_key(findings, bundle["diff"], rows_this_turn, None)
+        repeated = attempt > 0 and _verify_memo.get(session_id) == key
+        _verify_memo[session_id] = key
+        _bound(_verify_memo)
+        write_log({
+            "event": "verify", "session_id": session_id, "attempt": attempt, "repeated": repeated, "rule": "no_manifest",
+            "changed_paths": len(changed), "criteria": len(criteria), "excluded": len(excluded), "pending": len(pending),
+            "ledger": len(rows_this_turn), "ledger_checks": len(checks_ran), "manifest_registered": False,
+            "manifest": evidence.manifest_counts([]), "reruns": [], "machinery": machinery, "workspace": final_digest,
+            "diff_chars": len(bundle["diff"]), "answers": {}, "findings": findings,
+            "latency_ms": int((time.monotonic() - started) * 1000), "error": "",
+        })
+        action = "repeated" if repeated else "nudge"
+        emit_verdict(
+            session_id, "verify",
+            f"Jev verify (attempt {attempt + 1}): no result manifest on a build turn that ran {len(checks_ran)} checks · "
+            f"ledger {len(rows_this_turn)} rows" + (f" · machinery changed ({len(machinery)})" if machinery else "") + f" · {action}",
+            answers={},
+            decision={
+                "action": action, "rule": "no_manifest", "findings": findings, "criteria": len(criteria), "excluded": len(excluded),
+                "pending": len(pending), "ledger": len(rows_this_turn), "manifest": evidence.manifest_counts([]),
+                "manifest_registered": False, "reruns": 0, "machinery": machinery, "assertions": [],
+            },
+            attempt=attempt,
+        )
+        if repeated:
+            return None
+        return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=finding)}
+
+    # Code decides each manifest item; the gate re-runs a stale or unknown check itself when it safely can.
+    verdicts: List[Dict[str, Any]] = []
+    reruns: List[Dict[str, Any]] = []
+    budget_left = rerun_budget_seconds()
+    for item in manifest or []:
+        verdict = evidence.check_assertion(item, rows_by_id, final_digest)
+        if verdict["verdict"] in ("stale", "insufficient") and controller_reruns_enabled():
+            replaced: Dict[str, str] = {}
+            for row_id in item.get("evidence") or []:
+                row = rows_by_id.get(row_id)
+                if row is None or row.get("source") == "controller":
+                    continue
+                needs = (verdict["verdict"] == "stale" and row.get("fresh") is False) or (
+                    verdict["verdict"] == "insufficient" and row.get("status") == "unknown"
+                )
+                cwd = row.get("cwd") or (ledger["roots"][0] if ledger["roots"] else "")
+                if not needs or not cwd or not evidence.rerunnable(row["command"]) or budget_left <= 0:
+                    continue
+                new_row, record = _controller_rerun(session_id, ledger, row, final_digest, min(rerun_timeout_seconds(), budget_left))
+                budget_left -= record["seconds"]
+                rows_by_id[new_row["id"]] = new_row
+                replaced[row_id] = new_row["id"]
+                reruns.append(record)
+            if replaced:
+                rerun_item = dict(item, evidence=[replaced.get(row_id, row_id) for row_id in item.get("evidence") or []])
+                verdict = evidence.check_assertion(rerun_item, rows_by_id, final_digest)
+                verdict["reran"] = replaced
+        verdicts.append({**item, **verdict})
+    workspace_after = _refresh_workspace(ledger) if reruns else final_digest
+    counts = evidence.manifest_counts(verdicts)
+
+    failing = [row for row in reversed(ledger["rows"]) if row.get("status") == "fail" or row.get("failure")][: evidence.MAX_EXCERPTS]
+    excerpts = [
+        {"row": row["id"], "command": row["command"], "status": row["status"], "excerpt": evidence.failure_excerpt(evidence.read_output(row.get("file")) or "")}
+        for row in failing
+    ]
+    cited_previous = sorted({row_id for item in manifest or [] for row_id in item.get("evidence") or [] if row_id.startswith("p") and row_id in rows_by_id})
+    ledger_items = [evidence.row_summary(rows_by_id[row_id]) for row_id in cited_previous]
+    ledger_items += [evidence.row_summary(row) for row in ledger["rows"][-MAX_LEDGER_ROWS_FOR_JEV:]]
+    dropped_rows = max(0, len(ledger["rows"]) - MAX_LEDGER_ROWS_FOR_JEV)
+    manifest_items = [
+        {
+            "id": item["id"], "criterion": item.get("criterion") or "", "claim": item["claim"], "evidence": item["evidence"],
+            "predicate": item["predicate"], "expected": item.get("expected") or {}, "code_verdict": item["verdict"], "detail": item["detail"],
+        }
+        for item in verdicts
+    ]
 
     labels: Dict[str, str] = {}
     questions: Dict[str, Dict[str, Any]] = {}
@@ -1919,7 +2246,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             labels[key] = item["content"]
             questions[key] = {
                 "type": "noul",
-                "instructions": f"Do the code changes fully satisfy this acceptance criterion: {item['content']}",
+                "instructions": f"Do the code changes, with the evidence ledger where a check is relevant, fully satisfy this acceptance criterion: {item['content']}",
                 "criteria": CRITERION_CRITERIA,
             }
     elif request:
@@ -1929,29 +2256,64 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "instructions": f"Do the code changes fully satisfy the user's request: {_clip(request, 400)}",
             "criteria": CRITERION_CRITERIA,
         }
-    if checks:
-        questions["checks_failing"] = {
-            "type": "noul",
-            "instructions": "Do the check outputs show a failing test, an error, or a lint or type problem that was not fixed afterwards?",
-        }
-    questions["claims_unverified"] = {
-        "type": "noul",
-        "instructions": "Does the final message claim work, results, or passing checks that the diff and check outputs do not show?",
-        "criteria": CLAIMS_CRITERIA,
-    }
+    if excerpts:
+        questions["checks_failing"] = {"type": "noul", "instructions": CHECKS_FAILING_QUESTION}
+    questions["claims_unverified"] = {"type": "noul", "instructions": CLAIMS_QUESTION, "criteria": CLAIMS_CRITERIA}
+    # One typed choice per assertion code could not settle against the claim's
+    # wording, batched under Jev's question cap; grouped by criterion when
+    # the manifest is too long, and never dropped silently.
+    judged = [item for item in verdicts if item["verdict"] in ("supported", "insufficient")]
+    remaining = max(0, JEV_MAX_QUESTIONS - len(questions))
+    grouping = "none"
+    assertion_keys: Dict[str, List[str]] = {}
+    dropped_assertions = 0
+    if len(judged) <= remaining:
+        for item in judged:
+            key = f"assertion_{item['id']}"
+            assertion_keys[key] = [item["id"]]
+            questions[key] = {
+                "type": "choice",
+                "instructions": ASSERTION_QUESTION.format(claim=item["claim"], rows=", ".join(item["evidence"]) or "none"),
+                "criteria": ASSERTION_CRITERIA,
+            }
+    else:
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for item in judged:
+            groups.setdefault(item.get("criterion") or "all", []).append(item)
+        grouping = "criterion" if len(groups) <= remaining else "truncated"
+        for group_key, members in list(groups.items())[:remaining]:
+            key = f"assertions_{re.sub(r'[^A-Za-z0-9]+', '_', group_key)[:40] or 'all'}"
+            assertion_keys[key] = [member["id"] for member in members]
+            questions[key] = {
+                "type": "choice",
+                "instructions": ASSERTION_GROUP_QUESTION.format(
+                    claims="; ".join(f"{member['id']}: {member['claim']} (rows {', '.join(member['evidence']) or 'none'})" for member in members)
+                ),
+                "criteria": ASSERTION_CRITERIA,
+            }
+        dropped_assertions = sum(len(members) for members in list(groups.values())[remaining:])
+
     state = {
-        "provenance": "request was typed by the user. acceptance_criteria and still_pending_todos come from the agent's own todo list. diff and check_outputs are evidence. final_message is what the agent is about to say.",
+        "provenance": (
+            "request was typed by the user. acceptance_criteria and still_pending_todos come from the agent's own list. "
+            "diff is from git. evidence_ledger was built by code from every command this turn (ids c*; controller re-runs "
+            "by the gate k*; the previous turn p*), with the runner's own summary where one was recognised and exit "
+            "'unknown' where the lane gives none. failure_excerpts were selected by code from the retained output. "
+            "result_manifest was written by the agent; its code_verdict was decided by code against the ledger. "
+            "final_message is what the agent is about to say."
+        ),
         "request": {"source": "user", "text": _clip(request, 1_500)},
         "acceptance_criteria": {"source": "agent todo list", "items": [{"id": key, "text": text} for key, text in labels.items()]},
         "still_pending_todos": {"source": "agent todo list", "items": [_clip(item["content"], 200) for item in pending]},
-        "features": {"source": "project map", "items": evidence["features"]},
-        "diff": {"source": "git", "text": evidence["diff"], "truncated": evidence["truncated"]},
-        "commands_run": {"source": "tool", "items": commands},
-        "check_outputs": {"source": "tool", "items": checks},
+        "features": {"source": "project map", "items": bundle["features"]},
+        "diff": {"source": "git", "text": bundle["diff"], "truncated": bundle["truncated"]},
+        "evidence_ledger": {"source": "tool, built by code", "items": ledger_items, "dropped": dropped_rows, "workspace_known": final_digest is not None},
+        "failure_excerpts": {"source": "tool, selected by code", "items": excerpts},
+        "result_manifest": {"source": "agent, checked by code", "registered": manifest is not None, "items": manifest_items},
         "final_message": {"source": "agent", "text": _clip(final_response, 3_000)},
     }
-    started = time.monotonic()
     answers: Dict[str, Optional[float]] = {}
+    assertion_answers: Dict[str, Dict[str, float]] = {}
     error = ""
     jev_model = ""
     try:
@@ -1962,13 +2324,38 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             ask = ask_jev
         body = ask(state, questions, timeout=verify_timeout_seconds())
         jev_model = str(body.get("model") or "")
+        raw = body.get("answers") or {}
         for key in questions:
-            value = ((body.get("answers") or {}).get(key) or {}).get("noul")
-            answers[key] = float(value) if isinstance(value, (int, float)) else None
+            if key in assertion_keys:
+                probabilities = (raw.get(key) or {}).get("probabilities") if isinstance(raw.get(key), dict) else None
+                assertion_answers[key] = {str(k): float(v) for k, v in (probabilities or {}).items() if isinstance(v, (int, float))}
+            else:
+                value = (raw.get(key) or {}).get("noul") if isinstance(raw.get(key), dict) else None
+                answers[key] = float(value) if isinstance(value, (int, float)) else None
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"[:300]
 
     findings: List[str] = []
+    contradicted = [item for item in verdicts if item["verdict"] == "contradicted"]
+    missing = [item for item in verdicts if item["verdict"] == "missing"]
+    stale = [item for item in verdicts if item["verdict"] == "stale"]
+    if contradicted:
+        findings.append(
+            "Result claims contradicted by the evidence ledger: "
+            + "; ".join(f'"{_clip(item["claim"], 100)}" ({item["detail"]})' for item in contradicted) + "."
+        )
+    if missing:
+        findings.append(
+            "Result claims cite rows that are not in the ledger: "
+            + "; ".join(f'"{_clip(item["claim"], 100)}" ({item["detail"]})' for item in missing)
+            + f". Rows this turn: {', '.join(row['id'] for row in rows_this_turn[-12:]) or 'none'}."
+        )
+    if stale:
+        findings.append(
+            "Result claims rest on checks that ran before later edits and the gate could not re-run: "
+            + "; ".join(f'"{_clip(item["claim"], 100)}" ({item["detail"]})' for item in stale)
+            + ". Run them again and cite the new rows."
+        )
     unmet = [
         (labels[key], answers.get(key))
         for key in labels
@@ -1993,19 +2380,34 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         findings.append(stale_fidelity["finding"])
     checks_failing = answers.get("checks_failing")
     if checks_failing is not None and checks_failing >= VERIFY_FLAG_THRESHOLD:
-        findings.append(f"Check outputs show a failure (P={checks_failing:.2f}).")
+        findings.append(f"Failure excerpts show a failure not fixed afterwards (P={checks_failing:.2f}).")
     claims = answers.get("claims_unverified")
     if claims is not None and claims >= claims_flag_threshold():
-        findings.append(f"The final message claims results the evidence does not show (P={claims:.2f}).")
+        findings.append(f"The final message claims results beyond the manifest and the ledger (P={claims:.2f}).")
+    # One record per manifest item, in manifest order, with Jev's read where one was asked.
+    assertion_records: List[Dict[str, Any]] = []
+    jev_contradicted: List[str] = []
+    key_by_item = {item_id: key for key, ids in assertion_keys.items() for item_id in ids}
+    for item in verdicts:
+        key = key_by_item.get(item["id"])
+        probabilities = (assertion_answers.get(key) or {}) if key else {}
+        assertion_records.append({
+            "id": item["id"], "claim": item["claim"], "code": item["verdict"], "detail": item["detail"],
+            "jev": probabilities, "grouped": bool(key and len(assertion_keys[key]) > 1),
+        })
+        p_contradicted = probabilities.get("contradicted")
+        if p_contradicted is not None and p_contradicted >= claims_flag_threshold():
+            jev_contradicted.append(f'"{_clip(item["claim"], 100)}" (P(contradicted)={p_contradicted:.2f})')
+    if jev_contradicted:
+        findings.append("Jev reads the cited rows as contradicting the claim as worded: " + "; ".join(jev_contradicted) + ".")
     # A nudge that changed nothing must not be repeated: if the findings and
     # the evidence are identical to the previous attempt, the model has
     # answered them as far as it will, so let the turn finish.
-    evidence_key = hashlib.sha256(
-        json.dumps({"findings": findings, "diff": evidence["diff"], "commands": commands}, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
-    repeated = attempt > 0 and _verify_memo.get(session_id) == evidence_key
-    _verify_memo[session_id] = evidence_key
+    key = _verify_key(findings, bundle["diff"], rows_this_turn, verdicts)
+    repeated = attempt > 0 and _verify_memo.get(session_id) == key
+    _verify_memo[session_id] = key
     _bound(_verify_memo)
+    latency_ms = int((time.monotonic() - started) * 1000)
     write_log(
         {
             "event": "verify",
@@ -2016,28 +2418,51 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "criteria": len(labels),
             "excluded": len(excluded),
             "pending": len(pending),
-            "checks": len(checks),
-            "commands": len(commands),
-            "features": len(evidence["features"]),
-            "diff_chars": len(evidence["diff"]),
+            "ledger": len(rows_this_turn),
+            "ledger_checks": len(checks_ran),
+            "ledger_dropped": dropped_rows,
+            "excerpts": len(excerpts),
+            "manifest_registered": manifest is not None,
+            "manifest": counts,
+            "reruns": reruns,
+            "workspace": final_digest,
+            "workspace_changed_by_rerun": bool(reruns) and workspace_after != final_digest,
+            "machinery": machinery,
+            "assertion_grouping": grouping,
+            "assertions_dropped": dropped_assertions,
+            "features": len(bundle["features"]),
+            "diff_chars": len(bundle["diff"]),
+            "state_chars": len(json.dumps(state, ensure_ascii=False)),
             "answers": answers,
+            "assertions": assertion_records,
             "findings": findings,
-            "latency_ms": int((time.monotonic() - started) * 1000),
+            "latency_ms": latency_ms,
             "error": error,
         }
     )
     action = "unavailable" if error else "finish" if not findings else "repeated" if repeated else "nudge"
     met = sum(1 for key in labels if answers.get(key) is not None and answers[key] > verify_fail_threshold())
+    text = (
+        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)} · "
+        f"manifest {_manifest_summary(counts, manifest is not None)} · "
+        f"claims beyond {_fmt(claims)} · checks failing {_fmt(checks_failing)} · ledger {len(rows_this_turn)} rows"
+        + (f" · {len(reruns)} re-run by the gate" if reruns else "")
+        + (f" · machinery changed ({len(machinery)})" if machinery else "")
+        + f" · {action}"
+        + (f" · {' '.join(findings)}" if findings and action == "nudge" else "")
+    )
     emit_verdict(
         session_id,
         "verify",
-        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)} · "
-        f"claims unverified {_fmt(claims)} · checks failing {_fmt(checks_failing)} · {action}"
-        + (f" · {' '.join(findings)}" if findings and action == 'nudge' else ""),
+        text,
         answers={**{labels[key]: answers.get(key) for key in labels}, "claims_unverified": claims, "checks_failing": checks_failing},
-        decision={"action": action, "findings": findings, "criteria": len(labels), "excluded": len(excluded), "pending": len(pending)},
+        decision={
+            "action": action, "findings": findings, "criteria": len(labels), "excluded": len(excluded), "pending": len(pending),
+            "ledger": len(rows_this_turn), "manifest": counts, "manifest_registered": manifest is not None,
+            "reruns": len(reruns), "machinery": machinery, "assertions": assertion_records,
+        },
         model=jev_model,
-        latency_ms=int((time.monotonic() - started) * 1000),
+        latency_ms=latency_ms,
         attempt=attempt,
     )
     if not findings or repeated:

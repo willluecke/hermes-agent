@@ -149,6 +149,9 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     # Stateless stand-in for `todo` on the Codex and Claude lanes: returns the
     # criteria in the todo result shape so the verify judge can use them.
     "acceptance_criteria",
+    # Its counterpart at the end of the turn: the result claims, each tied to
+    # evidence ledger rows, so code can check them before the verify judge.
+    "report_results",
     "opus_code_worker",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
@@ -188,6 +191,7 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset(
     {
         "typesafe_decide",
         "acceptance_criteria",
+        "report_results",
         "model_consult",
         "web_search",
         "web_extract",

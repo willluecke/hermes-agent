@@ -138,7 +138,7 @@ def test_a_pre_block_exits_2_with_the_message_on_stderr(gateway):
     assert path == "/v1/hooks/claude" and auth == "Bearer tok"
     assert body == {
         "event": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm -rf build", "description": "clean"},
-        "tool_response": None, "tool_use_id": "toolu_1", "claude_session_id": "9e86",
+        "tool_response": None, "tool_use_id": "toolu_1", "claude_session_id": "9e86", "cwd": "/tmp",
     }
 
 

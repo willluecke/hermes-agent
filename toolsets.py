@@ -73,6 +73,7 @@ _HERMES_CORE_TOOLS = [
     # TypeSafe Jev typed decisions (gated on TYPESAFE_API_KEY via check_fn)
     "typesafe_decide",
     "acceptance_criteria",
+    "report_results",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -287,7 +288,7 @@ TOOLSETS = {
 
     "typesafe": {
         "description": "TypeSafe Jev: typed classify/route/score/yes-no decisions about a piece of state",
-        "tools": ["typesafe_decide", "acceptance_criteria"],
+        "tools": ["typesafe_decide", "acceptance_criteria", "report_results"],
         "includes": []
     },
 

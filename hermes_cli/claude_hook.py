@@ -58,6 +58,9 @@ def build_request(payload):
         "tool_response": _clip(payload.get("tool_response")),
         "tool_use_id": str(payload.get("tool_use_id") or ""),
         "claude_session_id": str(payload.get("session_id") or ""),
+        # The working directory the call ran in: the evidence ledger keys its
+        # workspace digest and controller re-runs on it.
+        "cwd": str(payload.get("cwd") or ""),
     }
 
 

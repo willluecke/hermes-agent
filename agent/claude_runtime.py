@@ -462,6 +462,7 @@ def handle_claude_hook_event(binding: dict[str, Any], body: dict[str, Any]) -> d
     raw_name = str(body.get("tool_name") or "")
     tool_input = body.get("tool_input") if isinstance(body.get("tool_input"), dict) else {}
     call_id = str(body.get("tool_use_id") or "")
+    cwd = str(body.get("cwd") or "")
     session_id = str(binding.get("session_id") or "")
     turn_id = str(binding.get("turn_id") or "")
     try:
@@ -504,6 +505,7 @@ def handle_claude_hook_event(binding: dict[str, Any], body: dict[str, Any]) -> d
                 error_message=None,
                 middleware_trace=[],
                 steerable=True,
+                cwd=cwd,
             )
             for item in results or []:
                 message = item.get("message") if isinstance(item, dict) else None

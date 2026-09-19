@@ -48,6 +48,7 @@ PRE = {"event": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "rm
 POST = {
     "event": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "pytest -q", "description": "tests"},
     "tool_response": {"stdout": "1 failed, 3 passed", "stderr": "", "interrupted": False}, "tool_use_id": "toolu_2", "duration_ms": 25,
+    "cwd": "/work",
 }
 
 
@@ -103,6 +104,7 @@ async def test_post_tool_use_feeds_the_observers_live_and_returns_their_steer(bo
     assert first["tool_name"] == "terminal" and first["args"] == {"command": "pytest -q"} and first["result"] == "1 failed, 3 passed"
     assert first["steerable"] is True and first["duration_ms"] == 25 and first["tool_call_id"] == "toolu_2"
     assert first["session_id"] == "sess-a" and first["turn_id"] == "turn-1"
+    assert first["cwd"] == "/work", "the evidence ledger keys its workspace digest and re-runs on the call's directory"
     assert second["tool_name"] == "read_file" and "x" in second["result"]
     assert claude_hooks.live_calls(token) == 2, "the parity replay will know the observers already saw these"
 
@@ -161,3 +163,35 @@ async def test_post_tool_use_runs_the_real_criteria_fidelity_check_and_returns_i
     assert preflight._session_excluded["sess-a"] == ["2"]
     [record] = [json.loads(line) for line in (tmp_path / "preflight.jsonl").read_text().splitlines() if '"fidelity"' in line]
     assert record["excluded"] == ["2"] and record["steer"] is True and record["replay"] is False
+
+
+async def test_post_tool_use_feeds_the_real_evidence_ledger_with_the_calls_directory(bound, monkeypatch, tmp_path):
+    """A Bash call from a managed Claude process becomes a ledger row (exit unknown, cwd from the payload), and a report_results call becomes the manifest."""
+    token, _agent = bound
+    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "system-one-preflight" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("system_one_preflight_hook_endpoint_ledger_test", plugin_file)
+    preflight = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(preflight)
+    settings = {
+        "mode": "feedback", "log_path": str(tmp_path / "preflight.jsonl"), "tuning": "off", "tuning_state_path": str(tmp_path / "tuning.json"),
+        "drift_check": "off", "fidelity_check": "off", "ledger_dir": str(tmp_path / "evidence"),
+    }
+    monkeypatch.setattr(preflight, "_settings_reader", lambda key, default=None: settings.get(key, default))
+    preflight.reset_drift("sess-a")
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "post_tool_call")
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kwargs: [preflight.on_post_tool_call(**kwargs)])
+    manifest = json.dumps({"manifest": [{"id": "r1", "criterion": "1", "claim": "suite passes", "evidence": ["c1"], "predicate": "passed", "expected": {}}], "note": "1 result claim registered."})
+    async with TestClient(TestServer(_app())) as cli:
+        resp = await cli.post("/v1/hooks/claude", json={**POST, "cwd": str(tmp_path)}, headers=_bearer(token))
+        assert resp.status == 200 and await resp.json() == {}
+        resp = await cli.post("/v1/hooks/claude", json={
+            "event": "PostToolUse", "tool_name": "mcp__hermes-tools__report_results", "tool_input": {"results": [{"claim": "suite passes", "evidence": ["c1"]}]},
+            "tool_response": [{"type": "text", "text": json.dumps({"result": manifest})}], "tool_use_id": "toolu_4", "duration_ms": 5, "cwd": str(tmp_path),
+        }, headers=_bearer(token))
+        assert resp.status == 200
+    [row] = preflight.ledger_state("sess-a")["rows"]
+    assert row["id"] == "c1" and row["command"] == "pytest -q" and row["cwd"] == str(tmp_path)
+    assert row["exit"] is None and row["status"] == "fail" and row["counts"] == {"failed": 1, "passed": 3}, "no exit code on this lane; the runner's own summary decides"
+    assert Path(row["file"]).read_text() == "1 failed, 3 passed"
+    assert [item["claim"] for item in preflight._session_manifest["sess-a"]] == ["suite passes"]
