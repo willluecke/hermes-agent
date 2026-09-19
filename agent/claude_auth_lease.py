@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import os
 import time
 from typing import Any, Optional
 
@@ -106,6 +107,17 @@ def acquire_claude_auth_lease(
     cannot inspect.
     """
     minimum = max(0.0, float(min_validity_seconds))
+    # A long-lived token from `claude setup-token` is the native headless
+    # credential: the CLI reads it from the environment, nothing rotates, and
+    # the shared credential file is out of the loop entirely.
+    explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if explicit:
+        return ClaudeAuthLease(
+            available=True,
+            generation=claude_auth_generation(explicit),
+            expires_at_ms=0,
+            credentials_found=True,
+        )
     try:
         initial = read_claude_code_credentials()
     except Exception:

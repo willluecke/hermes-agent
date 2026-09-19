@@ -184,3 +184,21 @@ def test_lease_and_anthropic_pool_share_one_rotating_refresh(tmp_path, monkeypat
     assert pooled is not None
     assert pooled.access_token == "shared-access"
     assert pooled.refresh_token == "shared-refresh"
+
+
+def test_setup_token_env_is_a_lease_without_the_credential_file(monkeypatch, tmp_path):
+    """A `claude setup-token` value in the environment needs no file and no refresh."""
+    from agent import claude_auth_lease as lease_module
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))  # no credential file here
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-example-long-lived")
+    monkeypatch.setattr(
+        lease_module,
+        "refresh_anthropic_oauth_pure",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not refresh")),
+    )
+    lease = lease_module.acquire_claude_auth_lease(10 * 60 * 60)
+    assert lease.available is True
+    assert lease.refreshed is False
+    assert lease.generation == lease_module.claude_auth_generation("sk-ant-oat01-example-long-lived")
+    assert not (tmp_path / ".credentials.json").exists()
