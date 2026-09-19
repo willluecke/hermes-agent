@@ -1453,6 +1453,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    plugin_user_context: str = "",
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -1712,6 +1713,12 @@ def run_codex_app_server_turn(
             if handoff_entries
             else user_message
         )
+        if plugin_user_context:
+            # The pre_llm_call hook's note (the preflight judge, gateway
+            # notices) rides the turn input here as it rides the API copy
+            # of the user message on the default loop. It is not part of
+            # the durable dialogue entries, so it never replays.
+            turn_input = f"{turn_input}\n\n{plugin_user_context}"
         # Record what this thread is about to consume before the turn runs. A
         # turn that dies mid-flight still leaves a thread holding this input,
         # and re-seeding it from scratch next time would duplicate everything.

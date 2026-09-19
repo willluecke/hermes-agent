@@ -8460,14 +8460,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
-            elif event_type == "judge.verdict":
+            elif event_type in ("judge.verdict", "judge.outcome"):
                 # A typed judge (Jev) rated something about this turn: the
-                # budget before the model runs, or the finished change
-                # against its acceptance criteria. ``text`` is the fixed
+                # budget before the model runs, the finished change against
+                # its acceptance criteria, a threshold it retuned, or (as
+                # ``judge.outcome``) its read of how the previous turn went,
+                # taken from the user's follow-up. ``text`` is the fixed
                 # human summary; ``answers``/``decision`` are the numbers
                 # the calibration report joins to the user's outcome label.
                 event = {
-                    "event": "judge.verdict",
+                    "event": event_type,
                     "run_id": run_id,
                     "timestamp": ts,
                     "stage": str(kwargs.get("stage") or "judge"),

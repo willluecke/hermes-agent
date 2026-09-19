@@ -1897,6 +1897,43 @@ class TestRunToolEventIdentity:
         }
 
     @pytest.mark.asyncio
+    async def test_judge_outcome_is_a_durable_structured_run_event(self, adapter):
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb(
+                "judge.outcome",
+                "jev",
+                "Jev read of the previous turn from this follow-up: partly 0.86",
+                None,
+                stage="implicit",
+                answers={"worked": 0.05, "partly": 0.86, "failed": 0.05, "unrelated": 0.04},
+                decision={"outcome": "partly", "about": "previous_run", "p": 0.86},
+                model="jev-1.13.0",
+                latency_ms=300,
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=self._agent_factory(script)):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        events = [json.loads(line[len("data: "):]) for line in body.splitlines() if line.startswith("data: ")]
+        outcome = next(event for event in events if event.get("event") == "judge.outcome")
+        assert {k: v for k, v in outcome.items() if k not in {"run_seq", "emitted_at_ms", "timestamp"}} == {
+            "event": "judge.outcome",
+            "run_id": run_id,
+            "stage": "implicit",
+            "judge": "jev",
+            "text": "Jev read of the previous turn from this follow-up: partly 0.86",
+            "answers": {"worked": 0.05, "partly": 0.86, "failed": 0.05, "unrelated": 0.04},
+            "decision": {"outcome": "partly", "about": "previous_run", "p": 0.86},
+            "model": "jev-1.13.0",
+            "latency_ms": 300,
+        }
+
+    @pytest.mark.asyncio
     async def test_codex_first_event_timeout_keeps_thread_and_turn_ids(
         self, adapter
     ):

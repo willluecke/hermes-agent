@@ -167,6 +167,28 @@ PLAN_ASK = (
     "If the ambiguity is real, ask the user one focused clarifying question "
     "before acting. Otherwise proceed and state the assumption you made."
 )
+# Implicit outcome: the user's follow-up is the cheapest honest signal of how
+# the previous turn went. Judged as a choice with a rejection option, recorded
+# only above OUTCOME_MIN_P, and always overridden by an explicit user label.
+OUTCOME_QUESTION = (
+    "Judging only from the user's follow-up message, how did the assistant's "
+    "previous answer work out?"
+)
+OUTCOME_CRITERIA = {
+    "worked": "The follow-up moves on, thanks the assistant, or builds on the previous result without asking for a correction.",
+    "partly": "The follow-up accepts part of the previous result but asks for a fix, a missed piece, or a correction.",
+    "failed": "The follow-up says the previous result was wrong, broken, or not done, or repeats the same request.",
+    "unrelated": "The follow-up is a new topic or gives no signal about the previous result.",
+}
+OUTCOME_MIN_P = 0.6
+# Self-tuning: the sync store recommends thresholds from labelled turns; the
+# plugin applies them only within these bounds, only above a label count,
+# and only when the move is larger than noise. Every change is logged,
+# emitted into the turn, and reversible by deleting the state file.
+TUNE_BOUNDS = {"verify_fail_threshold": (0.1, 0.6), "claims_flag_threshold": (0.5, 0.95)}
+TUNE_MIN_DELTA = 0.02
+DEFAULT_TUNING_INTERVAL_SECONDS = 3600.0
+DEFAULT_TUNING_MIN_LABELS = 50
 CRITERIA_NUDGE = (
     "Preflight: this looks like a change to code or files. Before editing, write "
     "the acceptance criteria for this change as todo items with the todo tool; "
@@ -299,11 +321,90 @@ def criteria_nudge_enabled() -> bool:
 
 
 def verify_fail_threshold() -> float:
+    tuned = _tuned().get("verify_fail_threshold") if tuning_mode() == "auto" else None
+    if isinstance(tuned, (int, float)):
+        return min(1.0, max(0.0, float(tuned)))
     try:
         value = float(_setting("verify_fail_threshold", VERIFY_FAIL_THRESHOLD))
     except (TypeError, ValueError):
         return VERIFY_FAIL_THRESHOLD
     return min(1.0, max(0.0, value))
+
+
+def claims_flag_threshold() -> float:
+    """P(claims unverified) at or above which the verify judge sends the model back."""
+    tuned = _tuned().get("claims_flag_threshold") if tuning_mode() == "auto" else None
+    if isinstance(tuned, (int, float)):
+        return min(1.0, max(0.0, float(tuned)))
+    try:
+        value = float(_setting("claims_flag_threshold", VERIFY_FLAG_THRESHOLD))
+    except (TypeError, ValueError):
+        return VERIFY_FLAG_THRESHOLD
+    return min(1.0, max(0.0, value))
+
+
+def tuning_mode() -> str:
+    value = str(_setting("tuning", "auto") or "auto").strip().lower()
+    return value if value in ("auto", "off") else "auto"
+
+
+def tuning_interval_seconds() -> float:
+    try:
+        value = float(_setting("tuning_interval_seconds", DEFAULT_TUNING_INTERVAL_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_TUNING_INTERVAL_SECONDS
+    return min(86_400.0, max(60.0, value))
+
+
+def tuning_min_labels() -> int:
+    try:
+        value = int(_setting("tuning_min_labels", DEFAULT_TUNING_MIN_LABELS))
+    except (TypeError, ValueError):
+        return DEFAULT_TUNING_MIN_LABELS
+    return max(10, value)
+
+
+def sync_url() -> str:
+    configured = str(_setting("sync_url", "") or os.environ.get("HERMES_SYNC_URL") or "http://127.0.0.1:8643")
+    return configured.rstrip("/")
+
+
+def sync_key() -> str:
+    value = os.environ.get("HERMES_SYNC_KEY", "").strip()
+    if value:
+        return value
+    override = os.environ.get("HERMES_SYNC_KEY_FILE", "").strip()
+    path = Path(override) if override else Path.home() / ".hermes-api-key"
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def tuning_state_path() -> Path:
+    configured = _setting("tuning_state_path", "")
+    if configured:
+        return Path(str(configured)).expanduser()
+    return log_path().parent.parent / "system-one-preflight.tuning.json"
+
+
+_tuned_cache: Dict[str, Any] = {"mtime": None, "path": None, "data": {}}
+
+
+def _tuned() -> Dict[str, Any]:
+    """The self-tuned thresholds on disk, re-read only when the file changes."""
+    path = tuning_state_path()
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return {}
+    if _tuned_cache["mtime"] != stamp or _tuned_cache["path"] != str(path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        _tuned_cache.update(mtime=stamp, path=str(path), data=data if isinstance(data, dict) else {})
+    return _tuned_cache["data"]
 
 
 def verify_timeout_seconds() -> float:
@@ -592,6 +693,159 @@ def emit_verdict(
     return emit_turn_event(session_id, "judge.verdict", text=text, source="jev", **payload)
 
 
+def _previous_answer(history: List[Any]) -> str:
+    """The last assistant answer before the current user message, or empty."""
+    for message in reversed(history):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            text = _text_of(message.get("content")).strip()
+            if text:
+                return text
+    return ""
+
+
+def implicit_outcome(answers: Dict[str, Any]) -> Dict[str, Any]:
+    """Jev's read of the previous turn from the follow-up, or nothing usable."""
+    answer = answers.get("previous_outcome")
+    if not isinstance(answer, dict):
+        return {"outcome": None, "p": None, "probabilities": {}}
+    probabilities = answer.get("probabilities") if isinstance(answer.get("probabilities"), dict) else {}
+    choice = answer.get("choice") if isinstance(answer.get("choice"), str) else None
+    p = probabilities.get(choice) if choice else None
+    p = float(p) if isinstance(p, (int, float)) else None
+    usable = choice in ("worked", "partly", "failed") and p is not None and p >= OUTCOME_MIN_P
+    return {"outcome": choice if usable else None, "p": p, "probabilities": probabilities, "choice": choice}
+
+
+# ---------------------------------------------------------------------------
+# Self-tuning: labelled outcomes -> calibration -> bounded threshold moves
+# ---------------------------------------------------------------------------
+
+_tune_lock = threading.Lock()
+_last_tune_check = 0.0
+
+
+def _http_get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
+    import httpx
+
+    response = httpx.get(url, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    return body if isinstance(body, dict) else {}
+
+
+def _http_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: float) -> None:
+    import httpx
+
+    httpx.post(url, headers=headers, json=payload, timeout=timeout).raise_for_status()
+
+
+def fetch_calibration(days: int = 90) -> Dict[str, Any]:
+    return _http_get_json(
+        f"{sync_url()}/management/judge/calibration?days={int(days)}",
+        {"Authorization": f"Bearer {sync_key()}"},
+        3.0,
+    )
+
+
+def apply_recommendation(calibration: Dict[str, Any], current: Dict[str, float]) -> Dict[str, Dict[str, Any]]:
+    """The threshold moves the recommendation justifies: bounded, above the label floor, above noise."""
+    recommendation = calibration.get("recommendation") if isinstance(calibration.get("recommendation"), dict) else {}
+    changes: Dict[str, Dict[str, Any]] = {}
+    for key, (low, high) in TUNE_BOUNDS.items():
+        value = recommendation.get(key)
+        basis = recommendation.get(f"{key}_basis")
+        if not isinstance(value, (int, float)) or not isinstance(basis, (int, float)):
+            continue
+        if int(basis) < tuning_min_labels():
+            continue
+        new = round(min(high, max(low, float(value))), 3)
+        old = current.get(key)
+        if old is None or abs(new - float(old)) >= TUNE_MIN_DELTA:
+            changes[key] = {"from": old, "to": new, "basis": int(basis)}
+    return changes
+
+
+def _write_tuning_state(changes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    state = dict(_tuned())
+    now = time.time()
+    for key, change in changes.items():
+        state[key] = change["to"]
+    history = [item for item in (state.get("history") or []) if isinstance(item, dict)][-19:]
+    history.append({"at": now, "changes": changes})
+    state["history"] = history
+    state["at"] = now
+    path = tuning_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+    return state
+
+
+def run_tune(session_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
+    """One tuning pass: fetch calibration, apply justified moves, record everywhere."""
+    started = time.monotonic()
+    try:
+        calibration = fetch_calibration()
+    except Exception as exc:
+        write_log({"event": "tune", "session_id": session_id, "error": f"{exc.__class__.__name__}: {exc}"[:300]})
+        return None
+    current = {
+        "verify_fail_threshold": verify_fail_threshold(),
+        "claims_flag_threshold": claims_flag_threshold(),
+    }
+    changes = apply_recommendation(calibration, current)
+    recommendation = calibration.get("recommendation") if isinstance(calibration.get("recommendation"), dict) else {}
+    write_log(
+        {
+            "event": "tune",
+            "session_id": session_id,
+            "labelled": calibration.get("labelled"),
+            "recommendation": recommendation,
+            "current": current,
+            "changes": changes,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "error": "",
+        }
+    )
+    if not changes:
+        return {}
+    state = _write_tuning_state(changes)
+    summary = " · ".join(f"{key} {change['from']} → {change['to']}" for key, change in changes.items())
+    basis = max(change["basis"] for change in changes.values())
+    emit_verdict(
+        session_id,
+        "tune",
+        f"Jev tune on {basis} labelled turns: {summary}",
+        answers={key: change["to"] for key, change in changes.items()},
+        decision={"changes": changes, "basis": basis},
+    )
+    try:
+        _http_post_json(
+            f"{sync_url()}/management/judge/tuning",
+            {"Authorization": f"Bearer {sync_key()}"},
+            {"source": "system-one-preflight", "changes": changes, "thresholds": {k: state.get(k) for k in TUNE_BOUNDS}, "basis": basis},
+            3.0,
+        )
+    except Exception:
+        logger.debug("system-one-preflight: tuning record not posted", exc_info=True)
+    return changes
+
+
+def maybe_tune(session_id: str) -> bool:
+    """Start a tuning pass in the background at most once per interval."""
+    global _last_tune_check
+    if tuning_mode() != "auto":
+        return False
+    now = time.time()
+    with _tune_lock:
+        if now - _last_tune_check < tuning_interval_seconds():
+            return False
+        _last_tune_check = now
+    threading.Thread(target=run_tune, args=(session_id,), name="system-one-preflight-tune", daemon=True).start()
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
@@ -634,6 +888,11 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         questions["difficulty"] = {"type": "score", "instructions": DIFFICULTY_QUESTION, "criteria": DIFFICULTY_LEVELS}
         questions["checkable"] = {"type": "noul", "instructions": CHECKABLE_QUESTION, "criteria": CHECKABLE_CRITERIA}
         questions["kind"] = {"type": "choice", "instructions": "What kind of request is the active request?", "criteria": KIND_CRITERIA}
+    previous = _previous_answer(history if isinstance(history, list) else [])
+    if arm == "feedback" and previous:
+        state["previous_answer"] = {"source": "agent", "text": _clip(previous, 1_500)}
+        questions["previous_outcome"] = {"type": "choice", "instructions": OUTCOME_QUESTION, "criteria": OUTCOME_CRITERIA}
+    outcome: Dict[str, Any] = {"outcome": None, "p": None, "probabilities": {}}
     try:
         body = _ask_jev(state, questions)
         answers = body.get("answers") or {}
@@ -644,6 +903,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         p_hard = _level_mass(answers, "difficulty", (2, 3))
         p_checkable = _noul(answers, "checkable")
         kind = _choice(answers, "kind")
+        outcome = implicit_outcome(answers)
         if p_missing is None:
             error = "no noul in answer"
     except Exception as exc:
@@ -681,6 +941,8 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "p_checkable": p_checkable,
             "kind": kind,
             "k": plan["k"],
+            "implicit_outcome": outcome.get("outcome"),
+            "p_implicit": outcome.get("p"),
             "threshold": threshold(),
             "injected": injected,
             "latency_ms": latency_ms,
@@ -709,6 +971,26 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             model=jev_model,
             latency_ms=latency_ms,
         )
+        if "previous_outcome" in questions:
+            choice = outcome.get("choice") or "unknown"
+            try:
+                from hermes_cli.turn_events import emit_turn_event
+
+                emit_turn_event(
+                    session_id,
+                    "judge.outcome",
+                    text=f"Jev read of the previous turn from this follow-up: {choice} {_fmt(outcome.get('p'))}"
+                    + ("" if outcome.get("outcome") else " · not recorded"),
+                    source="jev",
+                    stage="implicit",
+                    answers=outcome.get("probabilities") or {},
+                    decision={"outcome": outcome.get("outcome"), "about": "previous_run", "p": outcome.get("p")},
+                    model=jev_model,
+                    latency_ms=latency_ms,
+                )
+            except Exception:
+                logger.debug("system-one-preflight: outcome event not emitted", exc_info=True)
+        maybe_tune(session_id)
     if turn_id:
         _turn_memo[memo_key] = {
             "injected": injected,
@@ -1161,7 +1443,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     if checks_failing is not None and checks_failing >= VERIFY_FLAG_THRESHOLD:
         findings.append(f"Check outputs show a failure (P={checks_failing:.2f}).")
     claims = answers.get("claims_unverified")
-    if claims is not None and claims >= VERIFY_FLAG_THRESHOLD:
+    if claims is not None and claims >= claims_flag_threshold():
         findings.append(f"The final message claims results the evidence does not show (P={claims:.2f}).")
     # A nudge that changed nothing must not be repeated: if the findings and
     # the evidence are identical to the previous attempt, the model has

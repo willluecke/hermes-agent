@@ -40,10 +40,16 @@ class _FakeJev:
 
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
-    settings = {"mode": "shadow", "threshold": 0.7, "log_path": str(tmp_path / "preflight.jsonl"), "tool_guard": "shadow"}
+    settings = {
+        "mode": "shadow", "threshold": 0.7, "log_path": str(tmp_path / "preflight.jsonl"), "tool_guard": "shadow",
+        # Self-tuning is off unless a test turns it on, and its state never comes from the real home.
+        "tuning": "off", "tuning_state_path": str(tmp_path / "tuning.json"),
+    }
     monkeypatch.setattr(preflight, "_settings_reader", lambda key, default=None: settings.get(key, default))
     jev = _FakeJev()
     monkeypatch.setattr(preflight, "_ask", jev)
+    preflight._last_tune_check = 0.0
+    preflight._tuned_cache.update(mtime=None, path=None, data={})
     preflight._turn_memo.clear()
     preflight._session_scope.clear()
     preflight._session_todos.clear()
@@ -237,17 +243,23 @@ def test_register_wires_the_three_hooks_and_the_settings_reader(monkeypatch):
 
 
 class _FeedbackJev(_FakeJev):
-    def __init__(self, p=0.1, ambiguous=0.1, hard=0.1, checkable=0.1, kind="answer", guard=None, raise_exc=None):
+    def __init__(self, p=0.1, ambiguous=0.1, hard=0.1, checkable=0.1, kind="answer", outcome=("worked", 0.9), guard=None, raise_exc=None):
         super().__init__(p=p, guard=guard, raise_exc=raise_exc)
         self.ambiguous = ambiguous
         self.hard = hard
         self.checkable = checkable
         self.kind = kind
+        self.outcome = outcome
 
     def __call__(self, state, questions, timeout=None):
         body = super().__call__(state, questions, timeout=timeout)
         if "ambiguous" in questions:
             body["answers"]["ambiguous"] = {"type": "noul", "noul": self.ambiguous}
+        if "previous_outcome" in questions:
+            choice, p = self.outcome
+            rest = round((1 - p) / 3, 4)
+            probabilities = {key: (p if key == choice else rest) for key in questions["previous_outcome"]["criteria"]}
+            body["answers"]["previous_outcome"] = {"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probabilities}
         if "difficulty" in questions:
             # Real score shape: per-level probabilities keyed by level number.
             easy = round(1 - self.hard, 4)
@@ -545,3 +557,133 @@ def test_an_unchanged_finding_is_not_nudged_twice(feedback, repo):
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 app.py"}, result="hello world", session_id="s1")
     third = preflight.on_pre_verify(session_id="s1", attempt=2, final_response="Done.", changed_paths=[str(repo / "app.py")])
     assert third is not None
+
+
+# ---------------------------------------------------------------------------
+# Closing the loop: implicit outcomes from the follow-up, and self-tuning
+# ---------------------------------------------------------------------------
+
+PRIOR = [
+    {"role": "user", "content": "Add the --json flag"},
+    {"role": "assistant", "content": "Added --json; the tests pass."},
+]
+
+
+def test_implicit_outcome_is_read_from_the_follow_up_and_emitted(feedback, emitted):
+    feedback["jev"].outcome = ("partly", 0.86)
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="It prints, but the output is not valid JSON.", conversation_history=PRIOR)
+    call = feedback["jev"].calls[0]
+    question = call["questions"]["previous_outcome"]
+    assert question["type"] == "choice" and set(question["criteria"]) == {"worked", "partly", "failed", "unrelated"}
+    assert call["state"]["previous_answer"] == {"source": "agent", "text": "Added --json; the tests pass."}
+    record = feedback["records"]("preflight")[-1]
+    assert record["implicit_outcome"] == "partly" and record["p_implicit"] == 0.86
+    outcome_events = [event for event in emitted if event["event"] == "judge.outcome"]
+    assert len(outcome_events) == 1
+    event = outcome_events[0]
+    assert event["stage"] == "implicit" and event["judge"] == "jev"
+    assert event["decision"] == {"outcome": "partly", "about": "previous_run", "p": 0.86}
+    assert event["answers"]["partly"] == 0.86 and "partly 0.86" in event["text"]
+
+    # Unrelated, or below the bar: still asked and emitted with the numbers, but not recorded.
+    feedback["jev"].outcome = ("unrelated", 0.9)
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="Different topic now.", conversation_history=PRIOR)
+    assert feedback["records"]("preflight")[-1]["implicit_outcome"] is None
+    assert emitted[-1]["event"] == "judge.outcome" and emitted[-1]["decision"]["outcome"] is None and "not recorded" in emitted[-1]["text"]
+    feedback["jev"].outcome = ("failed", 0.5)
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="hmm", conversation_history=PRIOR)
+    assert feedback["records"]("preflight")[-1]["implicit_outcome"] is None and feedback["records"]("preflight")[-1]["p_implicit"] == 0.5
+
+    # No previous answer to judge: the question is not asked and nothing is emitted.
+    before = len(emitted)
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="first message", conversation_history=[])
+    assert "previous_outcome" not in feedback["jev"].calls[-1]["questions"]
+    assert [event["event"] for event in emitted[before:]] == ["judge.verdict"]
+
+
+@pytest.fixture
+def tuner(feedback, monkeypatch, tmp_path):
+    feedback["settings"]["tuning"] = "auto"
+    feedback["settings"]["tuning_min_labels"] = 20
+    calls = {"get": [], "post": []}
+    calibration = {
+        "labelled": 40,
+        "recommendation": {
+            "verify_fail_threshold": 0.35, "verify_fail_threshold_basis": 30,
+            "claims_flag_threshold": 0.7, "claims_flag_threshold_basis": 12,
+        },
+    }
+    monkeypatch.setattr(preflight, "_http_get_json", lambda url, headers, timeout: (calls["get"].append(url), calibration)[1])
+    monkeypatch.setattr(preflight, "_http_post_json", lambda url, headers, payload, timeout: calls["post"].append((url, payload)))
+    return {"calls": calls, "calibration": calibration, "state": tmp_path / "tuning.json"}
+
+
+def test_tuning_applies_justified_moves_and_records_them_everywhere(tuner, feedback, emitted):
+    assert preflight.verify_fail_threshold() == 0.2 and preflight.claims_flag_threshold() == 0.8
+    changes = preflight.run_tune("s1")
+    # The criterion threshold has 30 labels behind it (floor 20) and moves; the claims one has 12 and does not.
+    assert changes == {"verify_fail_threshold": {"from": 0.2, "to": 0.35, "basis": 30}}
+    assert preflight.verify_fail_threshold() == 0.35 and preflight.claims_flag_threshold() == 0.8
+    state = json.loads(tuner["state"].read_text())
+    assert state["verify_fail_threshold"] == 0.35 and len(state["history"]) == 1
+    [record] = feedback["records"]("tune")
+    assert record["changes"]["verify_fail_threshold"]["to"] == 0.35 and record["error"] == "" and record["labelled"] == 40
+    event = emitted[-1]
+    assert event["event"] == "judge.verdict" and event["stage"] == "tune"
+    assert "verify_fail_threshold 0.2 → 0.35" in event["text"] and "30 labelled turns" in event["text"]
+    assert tuner["calls"]["get"][0].endswith("/management/judge/calibration?days=90")
+    url, payload = tuner["calls"]["post"][0]
+    assert url.endswith("/management/judge/tuning") and payload["changes"] == changes and payload["basis"] == 30
+    assert payload["thresholds"] == {"verify_fail_threshold": 0.35, "claims_flag_threshold": None}
+    # A second pass with the same recommendation moves nothing and writes nothing.
+    assert preflight.run_tune("s1") == {}
+    assert len(json.loads(tuner["state"].read_text())["history"]) == 1
+
+
+def test_tuning_clamps_to_bounds_and_respects_off_and_outages(tuner, feedback, monkeypatch):
+    tuner["calibration"]["recommendation"] = {
+        "verify_fail_threshold": 0.9, "verify_fail_threshold_basis": 100,
+        "claims_flag_threshold": 0.3, "claims_flag_threshold_basis": 100,
+    }
+    changes = preflight.run_tune("s1")
+    assert changes["verify_fail_threshold"]["to"] == 0.6 and changes["claims_flag_threshold"]["to"] == 0.5
+    assert preflight.claims_flag_threshold() == 0.5
+    feedback["settings"]["tuning"] = "off"
+    assert preflight.verify_fail_threshold() == 0.2 and preflight.claims_flag_threshold() == 0.8, "off ignores the tuned state without deleting it"
+    assert preflight.maybe_tune("s1") is False
+    feedback["settings"]["tuning"] = "auto"
+    assert preflight.verify_fail_threshold() == 0.6, "auto picks the tuned state up again"
+
+    def down(url, headers, timeout):
+        raise RuntimeError("sync down")
+
+    monkeypatch.setattr(preflight, "_http_get_json", down)
+    assert preflight.run_tune("s1") is None
+    assert feedback["records"]("tune")[-1]["error"].startswith("RuntimeError")
+    assert preflight.verify_fail_threshold() == 0.6, "an outage changes nothing"
+
+
+def test_maybe_tune_starts_one_background_pass_per_interval(tuner, monkeypatch):
+    started = []
+
+    class _Thread:
+        def __init__(self, target=None, args=(), name="", daemon=True):
+            self.args = args
+            self.name = name
+
+        def start(self):
+            started.append((self.name, self.args))
+
+    monkeypatch.setattr(preflight.threading, "Thread", _Thread)
+    assert preflight.maybe_tune("s1") is True
+    assert preflight.maybe_tune("s1") is False, "within the interval nothing starts"
+    assert started == [("system-one-preflight-tune", ("s1",))]
+
+
+def test_the_verify_judge_uses_the_tuned_claims_threshold(tuner, feedback, repo):
+    tuner["calibration"]["recommendation"] = {"claims_flag_threshold": 0.55, "claims_flag_threshold_basis": 60}
+    preflight.run_tune("s1")
+    assert preflight.claims_flag_threshold() == 0.55
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.6}
+    result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is not None and "claims results the evidence does not show (P=0.60)" in result["message"]

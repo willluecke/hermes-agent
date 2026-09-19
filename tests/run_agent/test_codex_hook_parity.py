@@ -32,6 +32,8 @@ def hooks(monkeypatch):
 
     def invoke_hook(name, **kwargs):
         seen.setdefault(name, []).append(kwargs)
+        if name == "pre_llm_call":
+            return [{"context": "Preflight from Jev: budget k=1."}]
         return []
 
     def continue_message(**kwargs):
@@ -88,7 +90,9 @@ def test_codex_turn_emits_tool_hooks_runs_the_verify_gate_and_continues_once(hoo
         result = agent.run_conversation("add the feature")
 
     assert len(inputs) == 2, "the verify gate sent exactly one follow-up turn"
-    assert inputs[1] == "Fix criterion 2, then finish."
+    assert inputs[0].startswith("add the feature"), "the user's message leads the turn input"
+    assert inputs[0].endswith("\n\nPreflight from Jev: budget k=1."), "the pre_llm_call note reaches the codex turn input"
+    assert inputs[1] == "Fix criterion 2, then finish.", "a verify nudge carries no preflight note"
     assert result["final_response"] == "Fixed criterion 2 and re-ran the tests."
     assert result["completed"] is True
     assert result["api_calls"] == 2
