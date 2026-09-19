@@ -101,9 +101,12 @@ REPORT_RESULTS_SCHEMA = {
         "exactly: passed (every cited row reports a pass), count (the rows' counts equal "
         "expected, e.g. {passed: 98, failed: 0}), exit_zero, contains (expected.text is in "
         "the retained output), or ran. Cite the row of the command that produced the "
-        "result; a row that ran before your last edit is stale and the gate re-runs it. "
-        "Call once before your final message; call again to replace the list. An empty "
-        "list means the answer claims no check result."
+        "result. Every passed, count or exit_zero claim is re-run by the gate itself before "
+        "it counts, so cite plain check commands (pytest, npm test, node --test, tsc, eslint, "
+        "ruff and the like; no wrapper scripts, no '|| echo', output filters are stripped); "
+        "a claim the gate cannot re-run is reported as unverified. Call once before your "
+        "final message; call again to replace the list. An empty list means the answer "
+        "claims no check result."
     ),
     "parameters": {
         "type": "object",

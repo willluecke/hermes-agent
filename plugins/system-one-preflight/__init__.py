@@ -1588,15 +1588,22 @@ def note_file_change(session_id: str, args: Dict[str, Any], *, cwd: str = "") ->
     return _refresh_workspace(state)
 
 
+# The gate's runner, a seam so tests can answer for it.
+_run_check: Callable[..., Dict[str, Any]] = evidence.run_check
+
+
 def _controller_rerun(session_id: str, ledger: Dict[str, Any], row: Dict[str, Any], final_digest: Optional[str], timeout: float) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Run one cited check again as the gate; returns (controller row, run record)."""
+    """Run one cited check again as the gate, filters stripped; returns (controller row, run record)."""
     cwd = row.get("cwd") or (ledger["roots"][0] if ledger["roots"] else "")
-    run = evidence.run_check(row["command"], cwd, timeout)
+    bare = evidence.strip_filters(row["command"])
+    run = _run_check(bare, cwd, timeout)
     ledger["seq"] += 1
     result_text = json.dumps({"output": run["output"], "exit_code": run["exit_code"]}) if run["exit_code"] is not None else run["output"]
     new_row, output = evidence.make_row(
-        ledger["seq"], row["command"], result_text, cwd=cwd, workspace=final_digest, source="controller", prefix="k",
+        ledger["seq"], bare, result_text, cwd=cwd, workspace=final_digest, source="controller", prefix="k",
     )
+    if bare != row["command"]:
+        new_row["filtered_from"] = row["command"]
     if run["timed_out"]:
         new_row["status"] = "unknown"
         new_row["timed_out"] = True
@@ -1606,17 +1613,38 @@ def _controller_rerun(session_id: str, ledger: Dict[str, Any], row: Dict[str, An
     ledger["rows"].append(new_row)
     return new_row, {
         "row": row["id"], "controller": new_row["id"], "status": new_row["status"],
-        "seconds": round(run["seconds"], 2), "timed_out": run["timed_out"],
+        "seconds": round(run["seconds"], 2), "timed_out": run["timed_out"], "command": bare,
     }
 
 
+def _count_regression(ledger: Dict[str, Any], row: Dict[str, Any], new_row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fewer tests in the gate's run than in the earliest run of the same bare command: this turn first, else the previous turn."""
+    after = evidence.tests_run(new_row)
+    if after is None:
+        return None
+    bare = evidence.strip_filters(row["command"])
+    for candidate in list(ledger["rows"]) + list(ledger["previous"]):
+        if candidate.get("source") == "controller" or evidence.strip_filters(candidate["command"]) != bare:
+            continue
+        before = evidence.tests_run(candidate)
+        if before is None:
+            continue
+        if after < before:
+            return {"command": bare, "before": before, "after": after, "baseline": candidate["id"], "controller": new_row["id"]}
+        return None
+    return None
+
+
 def _verify_key(findings: List[str], diff: str, rows: List[Dict[str, Any]], verdicts: Optional[List[Dict[str, Any]]]) -> str:
+    # Controller rows get a new id on every attempt, so findings that name
+    # them are normalised before hashing; otherwise no re-run turn could ever
+    # read as repeated.
     return hashlib.sha256(
         json.dumps(
             {
-                "findings": findings,
+                "findings": [re.sub(r"\bk\d+\b", "k*", finding) for finding in findings],
                 "diff": diff,
-                "rows": [(row["id"], row["status"], row["digest"]) for row in rows],
+                "rows": [(row["id"], row["status"], row["digest"]) for row in rows if row.get("source") != "controller"],
                 "verdicts": [(item["id"], item["verdict"]) for item in verdicts] if verdicts is not None else None,
             },
             sort_keys=True, ensure_ascii=False,
@@ -2190,34 +2218,60 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             return None
         return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=finding)}
 
-    # Code decides each manifest item; the gate re-runs a stale or unknown check itself when it safely can.
+    # Code decides each manifest item. A decisive claim (passed, count,
+    # exit_zero) is supported only by a row the gate produced itself: every
+    # cited agent row on the whitelist is re-run, filters stripped, whatever
+    # its freshness, within the budget. A claim the gate could not re-run is
+    # insufficient with the reason. contains and ran keep the agent's row and
+    # carry basis "agent" so the judge and the reader know.
     verdicts: List[Dict[str, Any]] = []
     reruns: List[Dict[str, Any]] = []
+    regressions: List[Dict[str, Any]] = []
     budget_left = rerun_budget_seconds()
+    reran_rows: Dict[str, str] = {}  # agent row id -> controller row id, one gate run per cited row
     for item in manifest or []:
-        verdict = evidence.check_assertion(item, rows_by_id, final_digest)
-        if verdict["verdict"] in ("stale", "insufficient") and controller_reruns_enabled():
-            replaced: Dict[str, str] = {}
+        predicate = str(item.get("predicate") or "passed")
+        replaced: Dict[str, str] = {}
+        skipped: List[str] = []
+        if predicate in evidence.DECISIVE and not controller_reruns_enabled():
+            skipped.append("controller re-runs are off")
+        elif predicate in evidence.DECISIVE:
             for row_id in item.get("evidence") or []:
                 row = rows_by_id.get(row_id)
                 if row is None or row.get("source") == "controller":
                     continue
-                needs = (verdict["verdict"] == "stale" and row.get("fresh") is False) or (
-                    verdict["verdict"] == "insufficient" and row.get("status") == "unknown"
-                )
+                if row_id in reran_rows:
+                    replaced[row_id] = reran_rows[row_id]
+                    continue
                 cwd = row.get("cwd") or (ledger["roots"][0] if ledger["roots"] else "")
-                if not needs or not cwd or not evidence.rerunnable(row["command"]) or budget_left <= 0:
+                if not cwd:
+                    skipped.append(f"{row_id}: working directory unknown")
+                    continue
+                if not evidence.rerunnable(row["command"]):
+                    skipped.append(f"{row_id}: not a plain check runner")
+                    continue
+                if budget_left <= 0:
+                    skipped.append(f"{row_id}: re-run budget exhausted")
                     continue
                 new_row, record = _controller_rerun(session_id, ledger, row, final_digest, min(rerun_timeout_seconds(), budget_left))
                 budget_left -= record["seconds"]
                 rows_by_id[new_row["id"]] = new_row
                 replaced[row_id] = new_row["id"]
+                reran_rows[row_id] = new_row["id"]
                 reruns.append(record)
-            if replaced:
-                rerun_item = dict(item, evidence=[replaced.get(row_id, row_id) for row_id in item.get("evidence") or []])
-                verdict = evidence.check_assertion(rerun_item, rows_by_id, final_digest)
-                verdict["reran"] = replaced
+                regression = _count_regression(ledger, row, new_row)
+                if regression:
+                    regressions.append(regression)
+        check_item = dict(item, evidence=[replaced.get(row_id, row_id) for row_id in item.get("evidence") or []]) if replaced else item
+        verdict = evidence.check_assertion(check_item, rows_by_id, final_digest)
+        if replaced:
+            verdict["reran"] = replaced
+        if predicate in evidence.DECISIVE and verdict["verdict"] == "supported" and verdict.get("basis") != "gate":
+            verdict = {**verdict, "verdict": "insufficient", "detail": "supported only by the agent's own row; the gate could not re-run it (" + "; ".join(skipped) + ")"}
+        elif skipped and verdict["verdict"] in ("insufficient", "stale"):
+            verdict = {**verdict, "detail": verdict["detail"] + " (not re-run by the gate: " + "; ".join(skipped) + ")"}
         verdicts.append({**item, **verdict})
+    weakening = evidence.weakening_signals(bundle["root"], changed)
     workspace_after = _refresh_workspace(ledger) if reruns else final_digest
     counts = evidence.manifest_counts(verdicts)
 
@@ -2234,6 +2288,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         {
             "id": item["id"], "criterion": item.get("criterion") or "", "claim": item["claim"], "evidence": item["evidence"],
             "predicate": item["predicate"], "expected": item.get("expected") or {}, "code_verdict": item["verdict"], "detail": item["detail"],
+            "basis": item.get("basis", "agent"),
         }
         for item in verdicts
     ]
@@ -2299,8 +2354,9 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "diff is from git. evidence_ledger was built by code from every command this turn (ids c*; controller re-runs "
             "by the gate k*; the previous turn p*), with the runner's own summary where one was recognised and exit "
             "'unknown' where the lane gives none. failure_excerpts were selected by code from the retained output. "
-            "result_manifest was written by the agent; its code_verdict was decided by code against the ledger. "
-            "final_message is what the agent is about to say."
+            "result_manifest was written by the agent; its code_verdict was decided by code against the ledger. A passed, count "
+            "or exit_zero claim is supported only when the gate re-ran the check itself (basis gate, rows k*); contains and ran "
+            "rest on the agent's own rows (basis agent). final_message is what the agent is about to say."
         ),
         "request": {"source": "user", "text": _clip(request, 1_500)},
         "acceptance_criteria": {"source": "agent todo list", "items": [{"id": key, "text": text} for key, text in labels.items()]},
@@ -2356,6 +2412,18 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             + "; ".join(f'"{_clip(item["claim"], 100)}" ({item["detail"]})' for item in stale)
             + ". Run them again and cite the new rows."
         )
+    if regressions:
+        findings.append(
+            "Fewer tests ran than before the change: "
+            + "; ".join(f"{_clip(item['command'], 80)} went from {item['before']} to {item['after']} (rows {item['baseline']} then {item['controller']})" for item in regressions)
+            + ". Restore the tests or state why in the answer."
+        )
+    if weakening["removed"] or weakening["skips"]:
+        findings.append(
+            f"Verification machinery weakened: {weakening['removed']} assertion or test lines removed and {weakening['skips']} skip markers added in "
+            + ", ".join(entry["path"] for entry in weakening["files"])
+            + ". Restore them or state why in the answer."
+        )
     unmet = [
         (labels[key], answers.get(key))
         for key in labels
@@ -2392,7 +2460,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         key = key_by_item.get(item["id"])
         probabilities = (assertion_answers.get(key) or {}) if key else {}
         assertion_records.append({
-            "id": item["id"], "claim": item["claim"], "code": item["verdict"], "detail": item["detail"],
+            "id": item["id"], "claim": item["claim"], "code": item["verdict"], "detail": item["detail"], "basis": item.get("basis", "agent"),
             "jev": probabilities, "grouped": bool(key and len(assertion_keys[key]) > 1),
         })
         p_contradicted = probabilities.get("contradicted")
@@ -2428,6 +2496,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "workspace": final_digest,
             "workspace_changed_by_rerun": bool(reruns) and workspace_after != final_digest,
             "machinery": machinery,
+            "weakening": weakening,
+            "regressions": regressions,
             "assertion_grouping": grouping,
             "assertions_dropped": dropped_assertions,
             "features": len(bundle["features"]),
@@ -2448,6 +2518,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         f"claims beyond {_fmt(claims)} · checks failing {_fmt(checks_failing)} · ledger {len(rows_this_turn)} rows"
         + (f" · {len(reruns)} re-run by the gate" if reruns else "")
         + (f" · machinery changed ({len(machinery)})" if machinery else "")
+        + (" · tests weakened" if regressions or weakening["removed"] or weakening["skips"] else "")
         + f" · {action}"
         + (f" · {' '.join(findings)}" if findings and action == "nudge" else "")
     )
@@ -2459,7 +2530,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         decision={
             "action": action, "findings": findings, "criteria": len(labels), "excluded": len(excluded), "pending": len(pending),
             "ledger": len(rows_this_turn), "manifest": counts, "manifest_registered": manifest is not None,
-            "reruns": len(reruns), "machinery": machinery, "assertions": assertion_records,
+            "reruns": len(reruns), "machinery": machinery, "weakening": weakening, "regressions": regressions,
+            "assertions": assertion_records,
         },
         model=jev_model,
         latency_ms=latency_ms,

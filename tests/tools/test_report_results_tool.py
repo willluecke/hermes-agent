@@ -62,4 +62,4 @@ def test_bounds_on_items_claim_length_and_evidence():
     schema = module.REPORT_RESULTS_SCHEMA["parameters"]["properties"]["results"]["items"]
     assert schema["properties"]["predicate"]["enum"] == list(module.PREDICATES)
     assert schema["required"] == ["claim", "evidence"]
-    assert "stale" in module.REPORT_RESULTS_SCHEMA["description"]
+    assert "re-run by the gate" in module.REPORT_RESULTS_SCHEMA["description"] and "wrapper scripts" in module.REPORT_RESULTS_SCHEMA["description"]

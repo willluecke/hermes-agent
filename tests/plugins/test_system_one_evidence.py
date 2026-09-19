@@ -257,8 +257,9 @@ def test_check_assertion_supported_contradicted_missing_and_insufficient(tmp_pat
     assert check()["verdict"] == "supported"
     assert check(evidence=["c3"])["verdict"] == "contradicted"
     assert check(evidence=["c2", "c3"])["verdict"] == "contradicted"
-    assert check(evidence=["c4"])["verdict"] == "insufficient"
+    assert check(evidence=["c4"])["verdict"] == "insufficient" and "not a check runner" in check(evidence=["c4"])["detail"]
     assert check(evidence=["c9"])["verdict"] == "missing" and "c9" in check(evidence=["c9"])["detail"]
+    assert check()["basis"] == "agent", "every verdict says whose row it rests on"
     assert check(evidence=[])["verdict"] == "insufficient"
     assert check(predicate="bogus")["verdict"] == "insufficient"
     assert check(predicate="ran", evidence=["c4"])["verdict"] == "supported"
@@ -358,3 +359,68 @@ def test_run_check_captures_output_exit_and_timeouts(tmp_path):
     run = evidence.run_check(f"{sys.executable} -c \"import time; time.sleep(5)\"", str(tmp_path), 0.3)
     assert run["timed_out"] is True and run["exit_code"] is None
     assert os.environ.get("HERMES_CONTROLLER_RERUN") is None, "the marker is set for the child only"
+
+
+def test_a_passed_claim_needs_a_runner_shaped_recognised_row(tmp_path):
+    """Astra's risk, demonstrated on the first ledger: all four of these cleared a passed claim."""
+    rows = {}
+    for n, (cmd, out) in enumerate([
+        ("echo '100 passed in 0.1s'", "100 passed in 0.1s"),
+        ("bash run_tests.sh", "all good"),
+        ("pytest -q >/dev/null 2>&1; echo '12 passed in 0.1s'", "12 passed in 0.1s"),
+        ("pytest -q | grep -v failed", "..\n2 passed in 0.1s"),
+        ("pytest -q", ""),
+    ], 1):
+        row, _ = evidence.make_row(n, cmd, json.dumps({"output": out, "exit_code": 0}), workspace="w")
+        rows[row["id"]] = row
+    verdict = lambda rid: evidence.check_assertion({"predicate": "passed", "evidence": [rid]}, rows, "w")
+    assert verdict("c1")["verdict"] == "insufficient" and "not a check runner" in verdict("c1")["detail"], "an echo"
+    assert verdict("c2")["verdict"] == "insufficient" and "not a check runner" in verdict("c2")["detail"], "a wrapper script"
+    assert verdict("c5")["verdict"] == "insufficient" and "no runner summary recognised" in verdict("c5")["detail"], "a silent runner with exit 0"
+    # The two runner-shaped forgeries still pass the row check; the gate's own re-run is what refuses them (plugin tests).
+    assert verdict("c3")["verdict"] == "supported" and verdict("c3")["basis"] == "agent"
+    assert verdict("c4")["verdict"] == "supported" and verdict("c4")["basis"] == "agent"
+    assert evidence.rerunnable("pytest -q >/dev/null 2>&1; echo '12 passed in 0.1s'") is False
+    gate, _ = evidence.make_row(9, "pytest -q", json.dumps({"output": PYTEST_OK, "exit_code": 0}), workspace="w", source="controller", prefix="k")
+    rows["k9"] = gate
+    assert evidence.check_assertion({"predicate": "passed", "evidence": ["k9"]}, rows, "w")["basis"] == "gate"
+    assert evidence.check_assertion({"predicate": "passed", "evidence": ["k9", "c3"]}, rows, "w")["basis"] == "agent", "one agent row makes the basis agent"
+
+
+def test_strip_filters_drops_trailing_filters_only():
+    assert evidence.strip_filters("pytest -q | grep -v failed") == "pytest -q"
+    assert evidence.strip_filters("pytest -q 2>&1 | tail -20") == "pytest -q 2>&1"
+    assert evidence.strip_filters("cd /app && npm test | tail -5 | grep -c ok") == "cd /app && npm test"
+    assert evidence.strip_filters("pytest -q || echo failed") == "pytest -q || echo failed", "a double pipe is not a filter pipe"
+    assert evidence.strip_filters("pytest -q | tee out.txt") == "pytest -q | tee out.txt", "tee is not a filter; left alone (and not re-runnable)"
+    assert evidence.strip_filters("pytest -q") == "pytest -q"
+    assert evidence.strip_filters("") == ""
+
+
+def test_tests_run_counts_only_test_runners():
+    row, _ = evidence.make_row(1, "pytest -q", PYTEST_FAIL, workspace="w")
+    assert evidence.tests_run(row) == 4
+    row, _ = evidence.make_row(2, "npm test", NODE_OK, workspace="w")
+    assert evidence.tests_run(row) == 4
+    row, _ = evidence.make_row(3, "npx vitest run", VITEST_FAIL, workspace="w")
+    assert evidence.tests_run(row) == 2
+    row, _ = evidence.make_row(4, "npx tsc --noEmit", TSC_FAIL, workspace="w")
+    assert evidence.tests_run(row) is None, "tsc counts errors, not tests"
+    row, _ = evidence.make_row(5, "pytest -q", "", workspace="w")
+    assert evidence.tests_run(row) is None
+
+
+def test_weakening_signals_read_removed_assertions_and_added_skips_in_existing_test_files(repo):
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_app.py").write_text("import pytest\n\n\ndef test_a():\n    assert 1 == 1\n\n\ndef test_b():\n    assert 2 == 2\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "tests"], check=True, capture_output=True)
+    (tests / "test_app.py").write_text("import pytest\n\n\n@pytest.mark.skip\ndef test_a():\n    pass\n")
+    (tests / "test_new.py").write_text("def test_c():\n    pass\n")
+    (repo / "app.py").write_text("print('changed')\n")
+    found = evidence.weakening_signals(str(repo), [str(tests / "test_app.py"), str(tests / "test_new.py"), str(repo / "app.py")])
+    assert found["files"] == [{"path": "tests/test_app.py", "removed": 3, "skips": 1}], "two asserts and one def test_ removed, one skip added; the new file and app.py do not count"
+    assert found["removed"] == 3 and found["skips"] == 1
+    assert evidence.weakening_signals(None, [str(tests / "test_app.py")]) == {"files": [], "removed": 0, "skips": 0}
+    assert evidence.weakening_signals(str(repo), [str(repo / "app.py")]) == {"files": [], "removed": 0, "skips": 0}

@@ -51,6 +51,9 @@ MAX_COMMAND_CHARS = 300
 STATUSES = ("pass", "fail", "unknown")
 VERDICTS = ("supported", "contradicted", "stale", "insufficient", "missing")
 PREDICATES = ("passed", "count", "exit_zero", "contains", "ran")
+# A decisive claim is one the gate must back with its own run: the agent's
+# row is advisory, because a command can print the summary that clears it.
+DECISIVE = ("passed", "count", "exit_zero")
 
 CHECK_COMMAND_RE = re.compile(
     r"\b(pytest|npm (run )?(test|lint|build|typecheck)|pnpm (test|lint|build)|"
@@ -505,13 +508,24 @@ def parse_manifest(text: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def check_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str]) -> Dict[str, Any]:
-    """Compare one manifest item with its cited rows: ``{"verdict", "detail", "rows"}``.
+    """Compare one manifest item with its cited rows: ``{"verdict", "detail", "rows", "basis"}``.
 
     Missing rows and stale rows are decided before the predicate, because
     no comparison against evidence that is absent or superseded means
     anything. ``insufficient`` is the honest answer when the row's status
-    is unknown; it is never treated as a contradiction.
+    is unknown; it is never treated as a contradiction. A ``passed`` or
+    ``count`` claim needs rows that are runner-shaped commands with a
+    recognised runner summary: an exit-zero ``echo`` or wrapper script is
+    insufficient, never supported. ``basis`` is ``gate`` when every cited
+    row was produced by the gate's own re-run, else ``agent``.
     """
+    verdict = _decide_assertion(item, rows, final_digest)
+    ids = [row_id for row_id in verdict.get("rows") or [] if row_id in rows]
+    verdict["basis"] = "gate" if ids and all(rows[row_id].get("source") == "controller" for row_id in ids) else "agent"
+    return verdict
+
+
+def _decide_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str]) -> Dict[str, Any]:
     ids = list(item.get("evidence") or [])
     predicate = str(item.get("predicate") or "passed")
     if predicate not in PREDICATES:
@@ -528,12 +542,19 @@ def check_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final
             return {"verdict": "stale", "detail": f"ran before later edits: {', '.join(stale)}", "rows": ids}
     if predicate == "ran":
         return {"verdict": "supported", "detail": "rows exist", "rows": ids}
+    if predicate in ("passed", "count"):
+        not_checks = [row["id"] for row in cited if not row.get("check")]
+        if not_checks:
+            return {"verdict": "insufficient", "detail": f"not a check runner: {', '.join(not_checks)}", "rows": ids}
     if predicate == "passed":
         statuses = {row["id"]: row["status"] for row in cited}
         if any(status == "fail" for status in statuses.values()):
             failed = [row_id for row_id, status in statuses.items() if status == "fail"]
             return {"verdict": "contradicted", "detail": f"reported failure: {', '.join(failed)}", "rows": ids}
         if all(status == "pass" for status in statuses.values()):
+            unrecognized = [row["id"] for row in cited if not row.get("recognized")]
+            if unrecognized:
+                return {"verdict": "insufficient", "detail": f"no runner summary recognised: {', '.join(unrecognized)}", "rows": ids}
             return {"verdict": "supported", "detail": "every cited row reports a pass", "rows": ids}
         unknown = [row_id for row_id, status in statuses.items() if status == "unknown"]
         return {"verdict": "insufficient", "detail": f"status unknown: {', '.join(unknown)}", "rows": ids}
@@ -600,6 +621,93 @@ _SAFE_SEGMENT_RE = re.compile(
     r")$"
 )
 _UNSAFE_RE = re.compile(r"`|\$\(|(?<![2&])>(?!&1|/dev/null)|<<")
+
+
+_PIPE_SPLIT_RE = re.compile(r"\s*(?<!\|)\|(?!\|)\s*")
+_FILTER_SEGMENT_RE = re.compile(
+    r"^(?:(?:tail|head)\s+(?:-n\s*)?-?\d+|grep\s+(?:-[a-zA-Z]+\s+)*(?:\"[^\"]*\"|'[^']*'|\S+)|wc\s+-[lwc]|sort|uniq)$"
+)
+
+
+def strip_filters(command: str) -> str:
+    """The command without trailing output filters, so a re-run sees the whole summary.
+
+    ``pytest -q | grep -v failed`` becomes ``pytest -q``. A pipe into anything
+    that is not a plain filter is left alone (and is not re-runnable anyway).
+    """
+    command = (command or "").strip()
+    parts = _PIPE_SPLIT_RE.split(command)
+    if len(parts) < 2:
+        return command
+    if all(_FILTER_SEGMENT_RE.match(part.strip()) for part in parts[1:]):
+        return parts[0].strip()
+    return command
+
+
+def tests_run(row: Dict[str, Any]) -> Optional[int]:
+    """How many tests a recognised test-runner row reports having run, or None."""
+    if not row.get("recognized") or row.get("kind") not in ("pytest", "node-test", "jest"):
+        return None
+    counts = row.get("counts") or {}
+    if row.get("kind") == "node-test" and isinstance(counts.get("tests"), int):
+        return int(counts["tests"])
+    keys = ("passed", "failed", "errors", "skipped", "xfailed", "xpassed")
+    if not any(key in counts for key in keys):
+        return None
+    return sum(int(counts.get(key, 0)) for key in keys)
+
+
+_TEST_FILE_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*\.py$|_test\.py$|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)conftest\.py$|_test\.go$",
+    re.IGNORECASE,
+)
+_REMOVED_TEST_LINE_RE = re.compile(
+    r"^-\s*(?:assert\b|self\.assert\w*\(|def test_|async def test_|it\(|test\(|expect\(|assert_eq!|assert!|t\.Errorf|t\.Fatal)"
+)
+_ADDED_SKIP_RE = re.compile(
+    r"^\+.*(?:pytest\.mark\.skip|pytest\.mark\.xfail|@unittest\.skip|pytest\.skip\(|\.skip\(|\.only\(|\bxit\(|\bxdescribe\(|\bxtest\(|\btest\.skip|\bit\.skip|\bdescribe\.skip|t\.Skip\(|#\[ignore\])"
+)
+
+
+def _git_ok(root: str, args: List[str]) -> bool:
+    try:
+        return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, timeout=5.0, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def weakening_signals(root: Optional[str], changed_paths: List[str]) -> Dict[str, Any]:
+    """Removed assertion or test lines, and added skip markers, in test files that existed at HEAD.
+
+    Deterministic and coarse: it catches a deleted assertion and a skipped
+    test, not a loosened expected value. The count is the net loss of
+    assertion or test lines, so a moved test does not count. New test files
+    are never counted, because adding tests is the normal case.
+    """
+    result: Dict[str, Any] = {"files": [], "removed": 0, "skips": 0}
+    if not root:
+        return result
+    for path in changed_paths[:40]:
+        if not os.path.abspath(path).startswith(root + os.sep):
+            continue
+        rel = os.path.relpath(path, root)
+        if not _TEST_FILE_RE.search(rel.replace(os.sep, "/")):
+            continue
+        if not _git_ok(root, ["cat-file", "-e", f"HEAD:{rel}"]):
+            continue
+        diff = _git(root, ["diff", "HEAD", "--", rel]) or ""
+        lines = diff.splitlines()
+        # Net loss: a line the diff algorithm removes and re-adds (a moved
+        # test) is not a weakening, so added assertion lines cancel removed ones.
+        gone = sum(1 for line in lines if line.startswith("-") and not line.startswith("---") and _REMOVED_TEST_LINE_RE.match(line))
+        back = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++") and _REMOVED_TEST_LINE_RE.match("-" + line[1:]))
+        removed = max(0, gone - back)
+        skips = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++") and _ADDED_SKIP_RE.match(line))
+        if removed or skips:
+            result["files"].append({"path": rel, "removed": removed, "skips": skips})
+            result["removed"] += removed
+            result["skips"] += skips
+    return result
 
 
 def rerunnable(command: str) -> bool:

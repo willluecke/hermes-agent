@@ -48,8 +48,13 @@ def harness(tmp_path, monkeypatch):
         # Self-tuning is off unless a test turns it on, and its state never comes from the real home.
         "tuning": "off", "tuning_state_path": str(tmp_path / "tuning.json"),
         # Retained command output never lands in the real home; the gate never re-runs anything unless a test says so.
-        "ledger_dir": str(tmp_path / "evidence"), "controller_reruns": "off", "manifest_required": "off",
+        "ledger_dir": str(tmp_path / "evidence"), "controller_reruns": "on", "manifest_required": "off",
     }
+    # The gate's runner answers from a table of bare command -> (output, exit); a test that wants the real runner sets it back.
+    runner = {}
+    monkeypatch.setattr(preflight, "_run_check", lambda command, cwd, timeout: {
+        "output": runner.get(command, ("", 0))[0], "exit_code": runner.get(command, ("", 0))[1], "timed_out": False, "seconds": 0.01,
+    })
     monkeypatch.setattr(preflight, "_settings_reader", lambda key, default=None: settings.get(key, default))
     jev = _FakeJev()
     monkeypatch.setattr(preflight, "_ask", jev)
@@ -75,7 +80,7 @@ def harness(tmp_path, monkeypatch):
         rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         return [row for row in rows if event is None or row["event"] == event]
 
-    return {"settings": settings, "jev": jev, "records": records}
+    return {"settings": settings, "jev": jev, "records": records, "runner": runner}
 
 
 HISTORY = [
@@ -1299,17 +1304,21 @@ def test_code_checks_each_manifest_claim_and_contradiction_and_missing_rows_are_
         _item("x suite passes", ["c2"], id="r3"),
         _item("lint clean", ["c7"], id="r4"),
     ])
+    feedback["runner"]["pytest -q"] = ("12 passed in 0.3s", 0)
+    feedback["runner"]["pytest -q tests/x.py"] = ("1 failed, 3 passed in 0.3s", 1)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05, "checks_failing": 0.1}
     result = _verify(paths=[str(repo / "app.py")])
     assert result is not None
-    assert 'contradicted by the evidence ledger: "x suite passes" (reported failure: c2)' in result["message"]
+    assert 'contradicted by the evidence ledger: "x suite passes" (reported failure: k4)' in result["message"], "the gate's own run is what contradicts"
     assert 'cite rows that are not in the ledger: "lint clean"' in result["message"] and "Rows this turn: c1, c2" in result["message"]
     call = feedback["jev"].calls[-1]
     state = call["state"]
     assert state["evidence_ledger"]["items"][0] == {"id": "c1", "command": "pytest -q", "exit": 0, "status": "pass", "kind": "pytest", "source": "agent", "counts": {"passed": 12}, "fresh": True}
-    assert [(item["id"], item["code_verdict"]) for item in state["result_manifest"]["items"]] == [("r1", "supported"), ("r2", "supported"), ("r3", "contradicted"), ("r4", "missing")]
+    assert [(item["id"], item["code_verdict"], item["basis"]) for item in state["result_manifest"]["items"]] == [("r1", "supported", "gate"), ("r2", "supported", "gate"), ("r3", "contradicted", "gate"), ("r4", "missing", "agent")]
+    assert [(item["id"], item["source"]) for item in state["evidence_ledger"]["items"]] == [("c1", "agent"), ("c2", "agent"), ("k3", "controller"), ("k4", "controller")]
     assert state["result_manifest"]["registered"] is True and state["evidence_ledger"]["workspace_known"] is True
-    assert state["failure_excerpts"]["items"][0]["row"] == "c2" and "1 failed" in state["failure_excerpts"]["items"][0]["excerpt"]
+    assert [item["row"] for item in state["failure_excerpts"]["items"]] == ["k4", "c2"], "the gate's own failing run comes first"
+    assert all("1 failed" in item["excerpt"] for item in state["failure_excerpts"]["items"])
     assert "built by code" in state["provenance"] and "decided by code" in state["provenance"]
     # Jev gets one typed choice per claim code could not refute, plus the usual nouls.
     assert set(call["questions"]) == {"criterion_1", "checks_failing", "claims_unverified", "assertion_r1", "assertion_r2"}
@@ -1320,17 +1329,19 @@ def test_code_checks_each_manifest_claim_and_contradiction_and_missing_rows_are_
     assert call["questions"]["checks_failing"]["instructions"] == preflight.CHECKS_FAILING_QUESTION
     [record] = feedback["records"]("verify")
     assert record["manifest"] == {"supported": 2, "contradicted": 1, "stale": 0, "insufficient": 0, "missing": 1}
-    assert record["ledger"] == 2 and record["ledger_checks"] == 2 and record["manifest_registered"] is True and record["reruns"] == [] and record["workspace"]
+    assert record["ledger"] == 2 and record["ledger_checks"] == 2 and record["manifest_registered"] is True and record["workspace"]
+    assert [(r["row"], r["controller"], r["status"]) for r in record["reruns"]] == [("c1", "k3", "pass"), ("c2", "k4", "fail")], "one gate run per cited row, two claims share c1's"
+    assert record["regressions"] == [] and record["weakening"] == {"files": [], "removed": 0, "skips": 0}
     assert [item["code"] for item in record["assertions"]] == ["supported", "supported", "contradicted", "missing"]
     assert record["assertion_grouping"] == "none" and record["assertions_dropped"] == 0 and record["state_chars"] > 0
     event = emitted[-1]
-    assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/1 · manifest 2 supported, 1 contradicted, 1 missing · claims beyond 0.05 · checks failing 0.10 · ledger 2 rows · nudge")
-    assert event["decision"]["manifest"]["contradicted"] == 1 and event["decision"]["ledger"] == 2 and event["decision"]["reruns"] == 0
+    assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/1 · manifest 2 supported, 1 contradicted, 1 missing · claims beyond 0.05 · checks failing 0.10 · ledger 2 rows · 2 re-run by the gate · nudge")
+    assert event["decision"]["manifest"]["contradicted"] == 1 and event["decision"]["ledger"] == 2 and event["decision"]["reruns"] == 2
     assert set(event["answers"]) == {"fix greet", "claims_unverified", "checks_failing"}, "assertion reads stay out of the calibration answers"
 
 
-def test_a_check_that_ran_before_a_later_edit_is_stale_and_the_gate_reruns_it_itself(feedback, repo, emitted):
-    feedback["settings"]["controller_reruns"] = "on"
+def test_a_check_that_ran_before_a_later_edit_is_stale_and_the_gate_reruns_it_itself(feedback, repo, emitted, monkeypatch):
+    monkeypatch.setattr(preflight, "_run_check", preflight.evidence.run_check)  # the real subprocess this once
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     command = f"{_sys.executable} -m pytest --version"
     _cmd(command, "pytest 8.0.0", cwd=str(repo))
@@ -1362,17 +1373,17 @@ def test_a_stale_or_unknown_claim_the_gate_cannot_rerun_is_reported_honestly(fee
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     result = _verify(paths=[str(repo / "app.py")])
     assert result is not None
-    assert 'rest on checks that ran before later edits and the gate could not re-run: "app prints hello" (ran before later edits: c1). Run them again and cite the new rows.' in result["message"]
+    assert 'rest on checks that ran before later edits and the gate could not re-run: "app prints hello" (ran before later edits: c1 (not re-run by the gate: c1: not a plain check runner)). Run them again and cite the new rows.' in result["message"]
     record = feedback["records"]("verify")[-1]
     assert record["reruns"] == [], "python3 app.py is not a check runner, so the gate never runs it"
-    assert [item["code"] for item in record["assertions"]] == ["stale", "supported"], "a ran claim is not about freshness"
+    assert [(item["code"], item["basis"]) for item in record["assertions"]] == [("stale", "agent"), ("supported", "agent")], "a ran claim is not about freshness and rests on the agent's row"
     # Insufficient is not a finding: a claim with unknown status is reported, not refuted.
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix greet", conversation_history=[])
     _cmd("python3 app.py", "hello", cwd=str(repo))
     _manifest([_item("app prints hello", ["c1"], predicate="exit_zero")])
     assert _verify(paths=[str(repo / "app.py")]) is None
     record = feedback["records"]("verify")[-1]
-    assert record["manifest"]["insufficient"] == 1 and record["assertions"][0]["detail"] == "exit code unknown on this lane"
+    assert record["manifest"]["insufficient"] == 1 and record["assertions"][0]["detail"].startswith("exit code unknown on this lane (not re-run by the gate: c1: not a plain check runner)")
 
 
 def test_jev_can_still_refute_a_code_supported_claim_on_its_wording(feedback, repo, monkeypatch):
@@ -1382,6 +1393,7 @@ def test_jev_can_still_refute_a_code_supported_claim_on_its_wording(feedback, re
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     _cmd("pytest -q tests/one.py", json.dumps({"output": "2 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
     _manifest([_item("the whole suite passes", ["c1"])])
+    feedback["runner"]["pytest -q tests/one.py"] = ("2 passed in 0.1s", 0)
     jev.guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     result = _verify(paths=[str(repo / "app.py")])
     assert result is not None
@@ -1432,3 +1444,93 @@ def test_a_change_to_tests_or_runner_config_is_flagged_for_the_human_not_as_a_fi
     record = feedback["records"]("verify")[-1]
     assert record["machinery"] == ["tests/test_app.py"] and record["findings"] == []
     assert "machinery changed (1)" in emitted[-1]["text"] and emitted[-1]["decision"]["machinery"] == ["tests/test_app.py"]
+
+
+def test_a_decisive_claim_is_supported_only_by_the_gates_own_run(feedback, repo, emitted):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q", json.dumps({"output": "12 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
+    _cmd("pytest -q >/dev/null 2>&1; echo '12 passed in 0.1s'", json.dumps({"output": "12 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
+    _cmd("bash run_tests.sh", json.dumps({"output": "all good", "exit_code": 0}), cwd=str(repo))
+    _manifest([
+        _item("suite passes", ["c1"], id="r1"),
+        _item("suite passes (forged)", ["c2"], id="r2"),
+        _item("wrapper passes", ["c3"], predicate="exit_zero", id="r3"),
+        _item("the run happened", ["c2"], predicate="ran", id="r4"),
+    ])
+    feedback["runner"]["pytest -q"] = ("12 passed in 0.3s", 0)
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    assert _verify(paths=[str(repo / "app.py")]) is None, "insufficient is reported, never a finding"
+    record = feedback["records"]("verify")[-1]
+    verdicts = {item["id"]: (item["code"], item["basis"], item["detail"]) for item in record["assertions"]}
+    assert verdicts["r1"] == ("supported", "gate", "every cited row reports a pass"), "a fresh agent row is still re-run; only the gate's row clears it"
+    assert verdicts["r2"][0] == "insufficient" and "could not re-run it (c2: not a plain check runner)" in verdicts["r2"][2], "the forged runner row clears nothing"
+    assert verdicts["r3"][0] == "insufficient" and "c3: not a plain check runner" in verdicts["r3"][2], "a wrapper's exit 0 clears nothing"
+    assert verdicts["r4"] == ("supported", "agent", "rows exist"), "ran keeps the agent's row and says so"
+    assert [(r["row"], r["controller"]) for r in record["reruns"]] == [("c1", "k4")]
+    assert record["manifest"] == {"supported": 2, "contradicted": 0, "stale": 0, "insufficient": 2, "missing": 0}
+    # With the gate's runner off, no decisive claim can be supported at all.
+    feedback["settings"]["controller_reruns"] = "off"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q", json.dumps({"output": "12 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
+    _manifest([_item("suite passes", ["c1"])])
+    assert _verify(paths=[str(repo / "app.py")]) is None
+    record = feedback["records"]("verify")[-1]
+    assert record["assertions"][0]["code"] == "insufficient" and "controller re-runs are off" in record["assertions"][0]["detail"]
+
+
+def test_the_gate_strips_output_filters_and_keeps_the_original_command(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q | grep -v failed", json.dumps({"output": "..\n2 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
+    _manifest([_item("suite passes", ["c1"])])
+    feedback["runner"]["pytest -q"] = ("F..\n1 failed, 2 passed in 0.1s", 1)
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result is not None and 'contradicted by the evidence ledger: "suite passes" (reported failure: k2)' in result["message"]
+    row = preflight.ledger_state("s1")["rows"][-1]
+    assert row["id"] == "k2" and row["command"] == "pytest -q" and row["filtered_from"] == "pytest -q | grep -v failed" and row["status"] == "fail"
+    assert feedback["records"]("verify")[-1]["reruns"][0]["command"] == "pytest -q"
+
+
+def test_fewer_tests_than_the_earliest_run_is_a_finding_once_and_the_memo_survives_re_runs(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q", json.dumps({"output": "5 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
+    (repo / "app.py").write_text("def greet():\n    return 'edited'\n")
+    _cmd("pytest -q | tail -1", json.dumps({"output": "3 passed in 0.2s", "exit_code": 0}), cwd=str(repo))
+    _manifest([_item("suite passes", ["c2"])])
+    feedback["runner"]["pytest -q"] = ("3 passed in 0.2s", 0)
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result is not None and "Fewer tests ran than before the change: pytest -q went from 5 to 3 (rows c1 then k3). Restore the tests or state why in the answer." in result["message"]
+    record = feedback["records"]("verify")[-1]
+    assert record["regressions"] == [{"command": "pytest -q", "before": 5, "after": 3, "baseline": "c1", "controller": "k3"}]
+    # The same answer again: the gate runs again (a new k row), but the memo ignores controller rows and the turn finishes.
+    assert _verify(attempt=1, paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["repeated"] is True
+    # A run in the previous turn is the baseline when this turn ran nothing before its edits.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="more", conversation_history=[])
+    _manifest([_item("suite passes", ["pc1"])])
+    feedback["runner"]["pytest -q"] = ("2 passed in 0.2s", 0)
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result is not None and "went from 5 to 2 (rows pc1 then k1)" in result["message"]
+
+
+def test_removed_assertions_or_added_skips_in_existing_tests_are_a_finding_once(feedback, repo, emitted):
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_app.py").write_text("def test_a():\n    assert 1 == 1\n\n\ndef test_b():\n    assert 2 == 2\n")
+    _subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    _subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "tests"], check=True, capture_output=True)
+    (repo / "app.py").write_text("def greet():\n    return 'changed'\n")
+    (tests / "test_app.py").write_text("import pytest\n\n\n@pytest.mark.skip\ndef test_a():\n    pass\n")
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    paths = [str(repo / "app.py"), str(tests / "test_app.py")]
+    result = _verify(paths=paths)
+    assert result is not None
+    assert "Verification machinery weakened: 3 assertion or test lines removed and 1 skip markers added in tests/test_app.py. Restore them or state why in the answer." in result["message"]
+    record = feedback["records"]("verify")[-1]
+    assert record["weakening"] == {"files": [{"path": "tests/test_app.py", "removed": 3, "skips": 1}], "removed": 3, "skips": 1}
+    assert record["machinery"] == ["tests/test_app.py"]
+    assert "· tests weakened ·" in emitted[-1]["text"] and emitted[-1]["decision"]["weakening"]["removed"] == 3
+    assert _verify(attempt=1, paths=paths) is None, "once: the same finding on the same evidence lets the turn finish"
+    assert feedback["records"]("verify")[-1]["repeated"] is True
