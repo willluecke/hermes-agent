@@ -2697,6 +2697,10 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
+            # Managed Claude Code processes report each tool call here through
+            # their own command hooks; authenticated by a per-session token,
+            # not the API key (hermes_cli.claude_hooks).
+            ("POST", "/v1/hooks/claude", self._handle_claude_hook),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
@@ -9733,6 +9737,40 @@ class APIServerAdapter(BasePlatformAdapter):
             **({"request_id": request_id} if request_id else {}),
         })
 
+    async def _handle_claude_hook(self, request: "web.Request") -> "web.Response":
+        """POST /v1/hooks/claude — a managed Claude Code process reports one tool call.
+
+        The hook script (``hermes_cli/claude_hook.py``) posts every
+        ``PreToolUse`` and ``PostToolUse`` payload with the token the runtime
+        bound for its session. The plugin tool hooks run in a worker thread
+        (a judge call may take a second) and their directive comes back as
+        ``{"action": "block", "message"}`` / ``{"action": "pass"}`` for a
+        pre event or ``{"message"}`` / ``{}`` for a post event. An unknown
+        or retired token is refused; any dispatch failure lets the call
+        proceed.
+        """
+        from hermes_cli.claude_hooks import resolve_hook_token
+
+        header = request.headers.get("Authorization", "")
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        binding = resolve_hook_token(token) if token else None
+        if binding is None:
+            return web.json_response(
+                _openai_error("Unknown hook token", code="hook_token_unknown"), status=401
+            )
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        event = str(body.get("event") or "")
+        try:
+            from agent.claude_runtime import handle_claude_hook_event
+
+            answer = await asyncio.to_thread(handle_claude_hook_event, binding, body)
+        except Exception:
+            logger.debug("[api_server] claude hook dispatch failed", exc_info=True)
+            answer = {"action": "pass"} if event == "PreToolUse" else {}
+        return web.json_response(answer if isinstance(answer, dict) else {})
+
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
         auth_err = self._check_auth(request)
@@ -10090,6 +10128,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 return False
 
             self._mark_connected()
+            try:
+                # Managed Claude Code processes started from now on get the
+                # live tool-call hook channel (hermes_cli.claude_hooks).
+                from hermes_cli.claude_hooks import hook_endpoint_for, set_hook_endpoint
+
+                set_hook_endpoint(hook_endpoint_for(self._host, self._port))
+            except Exception:
+                logger.debug("[%s] claude hook endpoint not published", self.name, exc_info=True)
             logger.info(
                 "[%s] API server listening on http://%s:%d (model: %s)",
                 self.name, self._host, self._port, self._model_name,
@@ -10112,6 +10158,12 @@ class APIServerAdapter(BasePlatformAdapter):
         and turns the whole gateway into a zombie
         (OSError: [Errno 24] Too many open files, #37011).
         """
+        try:
+            from hermes_cli.claude_hooks import set_hook_endpoint
+
+            set_hook_endpoint(None)
+        except Exception:
+            pass
         self._mark_disconnected()
         if self._response_store is not None:
             try:

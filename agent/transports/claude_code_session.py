@@ -436,6 +436,7 @@ def claude_code_args(
     read_only: bool = False,
     no_tools: bool = False,
     debug_file: Optional[str] = None,
+    settings_json: Optional[str] = None,
 ) -> list[str]:
     read_only = read_only or no_tools
     repo_root = str(Path(__file__).resolve().parents[2])
@@ -491,6 +492,11 @@ def claude_code_args(
         args.extend(["--add-dir", directory])
     if debug_file:
         args.extend(["--debug-file", debug_file])
+    if settings_json and not read_only:
+        # Hermes' own Claude Code hooks (hermes_cli.claude_hooks): the live
+        # tool-call channel for the plugin hooks. Safe mode disables hooks,
+        # so a read-only session gets none.
+        args.extend(["--settings", settings_json])
     return args
 
 
@@ -521,8 +527,15 @@ class ClaudeCodeSession:
         absolute_timeout: float = DEFAULT_ABSOLUTE_TIMEOUT,
         resident_first_event_timeout: Optional[float] = DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT,
         startup_first_event_timeout: Optional[float] = DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT,
+        extra_env: Optional[dict[str, str]] = None,
+        settings_json: Optional[str] = None,
     ) -> None:
         self.cwd = cwd
+        # The gateway's hook endpoint and per-session token ride the process
+        # environment so Claude Code's command hooks can reach it; the
+        # settings document wires those hooks (see hermes_cli.claude_hooks).
+        self.extra_env = {str(k): str(v) for k, v in (extra_env or {}).items()}
+        self.settings_json = settings_json
         self.model = model
         self.session_id = str(session_id or uuid4())
         self.resume = bool(resume and session_id)
@@ -682,10 +695,12 @@ class ClaudeCodeSession:
             read_only=self.read_only,
             no_tools=self.no_tools,
             debug_file=self._next_debug_file(),
+            settings_json=self.settings_json,
         )
         # This route must use the signed-in Max subscription. An ambient key
         # would silently turn it into metered API usage.
         env = claude_subscription_env()
+        env.update(self.extra_env)
         process = subprocess.Popen(
             [binary, *args],
             cwd=self.cwd,

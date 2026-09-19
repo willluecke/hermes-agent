@@ -1033,6 +1033,8 @@ def _codex_hook_parity(
                     error_type=None,
                     error_message=None,
                     middleware_trace=[],
+                    # Replayed after the turn: no steer can reach the model.
+                    replay=True,
                 )
             except Exception:
                 logger.debug("codex post_tool_call parity failed", exc_info=True)

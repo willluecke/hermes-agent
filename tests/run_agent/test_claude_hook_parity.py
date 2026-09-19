@@ -149,3 +149,60 @@ def test_claude_turn_binds_the_turn_emitter_so_a_hook_can_reach_the_run_stream(h
     assert turn_events.turn_emitter(agent.session_id) is agent.tool_progress_callback
     assert turn_events.emit_turn_event(agent.session_id, "judge.verdict", text="x", stage="budget") is True
     assert events[-1] == ("judge.verdict", {"stage": "budget"})
+
+
+def test_claude_replay_marks_its_calls_so_observers_know_no_steer_can_land(hooks, monkeypatch):
+    def fake_run_turn(self, prompt):
+        _tool_use(self, "c1", "Bash", {"command": "ls"})
+        _tool_result(self, "c1", "app.py")
+        return ClaudeCodeTurnResult(final_text="ok", session_id="sess-1", tool_iterations=1, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    agent = _agent()
+    agent.run_conversation("list files")
+    [call] = hooks["post_tool_call"]
+    assert call["tool_name"] == "terminal" and call["replay"] is True
+    assert not hasattr(agent, "_claude_hook_token"), "no endpoint published: no hook channel"
+    assert agent._claude_code_session.extra_env == {} and agent._claude_code_session.settings_json is None
+
+
+def test_claude_turn_gets_the_live_hook_channel_and_skips_the_replay_once_it_delivered(hooks, monkeypatch, tmp_path):
+    from hermes_cli import claude_hooks
+
+    claude_hooks._bindings.clear()
+    claude_hooks.set_hook_endpoint("http://127.0.0.1:8642/v1/hooks/claude")
+    changed = tmp_path / "app.py"
+    changed.write_text("print('x')\n")
+    prompts = []
+
+    def fake_run_turn(self, prompt):
+        prompts.append(prompt)
+        # The process's own hooks reported the call live through the gateway.
+        claude_hooks.note_live_call(self.extra_env["HERMES_HOOK_TOKEN"])
+        _tool_use(self, f"c{len(prompts)}", "Edit", {"file_path": str(changed), "old_string": "x", "new_string": "y"})
+        _tool_result(self, f"c{len(prompts)}", "The file has been updated.")
+        return ClaudeCodeTurnResult(final_text="Done.", session_id="sess-1", tool_iterations=1, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    try:
+        agent = _agent()
+        agent.run_conversation("edit the file")
+        session = agent._claude_code_session
+        token = session.extra_env["HERMES_HOOK_TOKEN"]
+        assert token == agent._claude_hook_token
+        assert session.extra_env["HERMES_HOOK_URL"] == "http://127.0.0.1:8642/v1/hooks/claude"
+        settings = json.loads(session.settings_json)
+        assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse"}
+        assert "claude_hook.py" in settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+        binding = claude_hooks.resolve_hook_token(token)
+        assert binding["agent"] is agent and binding["session_id"] == agent.session_id
+        assert hooks["post_tool_call"] == [], "delivered live: the replay does not fire the observers again"
+        assert len(prompts) == 2, "the verify gate still ran and continued once"
+        assert hooks["pre_verify"][0]["changed_paths"] == [str(changed.resolve())], "the verify gate still knows the changed file"
+        # A new turn on the same agent rebinds the same token and starts the live count over.
+        agent.run_conversation("and again")
+        assert agent._claude_hook_token == token
+        assert claude_hooks.live_calls(token) == 2, "one per turn of this fake, reset at each turn start"
+    finally:
+        claude_hooks.set_hook_endpoint(None)
+        claude_hooks._bindings.clear()

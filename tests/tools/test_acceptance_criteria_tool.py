@@ -39,3 +39,18 @@ def test_refuses_empty_or_malformed_input():
     assert "error" in json.loads(module.acceptance_criteria({"criteria": []}))
     assert "error" in json.loads(module.acceptance_criteria({"criteria": ["", None]}))
     assert "error" in json.loads(module.acceptance_criteria({}))
+
+
+def test_records_a_status_per_item_so_progress_can_be_marked():
+    result = json.loads(module.acceptance_criteria({"criteria": [
+        {"content": "Flag parses", "status": "completed"},
+        {"content": "Tests pass", "status": "PENDING"},
+        {"content": "Docs updated", "status": "bogus"},
+        "Changelog entry",
+    ]}))
+    assert [(item["content"], item["status"]) for item in result["todos"]] == [
+        ("Flag parses", "completed"), ("Tests pass", "pending"), ("Docs updated", "in_progress"), ("Changelog entry", "in_progress"),
+    ]
+    schema = module.ACCEPTANCE_CRITERIA_SCHEMA["parameters"]["properties"]["criteria"]["items"]
+    assert schema["anyOf"][1]["properties"]["status"]["enum"] == ["pending", "in_progress", "completed"]
+    assert "status" in module.ACCEPTANCE_CRITERIA_SCHEMA["description"]

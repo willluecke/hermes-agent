@@ -1203,3 +1203,35 @@ def test_next_debug_file_is_bounded_and_can_be_disabled(tmp_path, monkeypatch):
     assert not stale.exists() and fresh.exists()
     monkeypatch.setenv("HERMES_CLAUDE_CODE_DEBUG", "0")
     assert session._next_debug_file() is None
+
+
+def test_hook_settings_reach_the_cli_except_in_read_only():
+    args = claude_code_args(model="claude-fable-5", session_id="sid", settings_json='{"hooks":{}}')
+    assert args[args.index("--settings") + 1] == '{"hooks":{}}'
+    assert "--settings" not in claude_code_args(model="claude-fable-5", session_id="sid", settings_json='{"hooks":{}}', read_only=True), "safe mode has no hooks"
+    assert "--settings" not in claude_code_args(model="claude-fable-5", session_id="sid")
+
+
+def test_hook_environment_and_settings_reach_the_spawned_process(monkeypatch):
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_DEBUG", "0")
+    session = ClaudeCodeSession(
+        cwd="/tmp", model="claude-fable-5",
+        extra_env={"HERMES_HOOK_URL": "http://127.0.0.1:8642/v1/hooks/claude", "HERMES_HOOK_TOKEN": "tok"},
+        settings_json='{"hooks":{}}',
+    )
+    fake = SimpleNamespace(pid=7, stdin=io.StringIO(), stdout=io.StringIO(""), stderr=io.StringIO(""), poll=lambda: None)
+    with patch(
+        "agent.transports.claude_code_session.find_claude_binary", return_value="/usr/bin/claude",
+    ), patch(
+        "agent.transports.claude_code_session.claude_subscription_auth_available", return_value=True,
+    ), patch(
+        "agent.transports.claude_code_session._current_claude_auth_generation", return_value="gen",
+    ), patch(
+        "agent.transports.claude_code_session.subprocess.Popen", return_value=fake,
+    ) as popen:
+        session._start_process()
+    argv = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
+    assert argv[argv.index("--settings") + 1] == '{"hooks":{}}'
+    assert env["HERMES_HOOK_URL"] == "http://127.0.0.1:8642/v1/hooks/claude" and env["HERMES_HOOK_TOKEN"] == "tok"
+    assert "ANTHROPIC_API_KEY" not in env

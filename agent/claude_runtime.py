@@ -424,6 +424,133 @@ def _claude_file_change_path(agent: Any, value: str) -> Optional[Path]:
         return None
 
 
+def _hook_result_text(value: Any) -> str:
+    """The text of a Claude Code hook's ``tool_response`` in the shape the observer hooks read."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        text = _content_text(value)
+        return text if text else json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, dict):
+        if "stdout" in value or "stderr" in value:
+            parts = [str(value.get("stdout") or ""), str(value.get("stderr") or "")]
+            return "\n".join(part for part in parts if part).strip()
+        content = value.get("content")
+        if isinstance(content, (str, list)):
+            return _hook_result_text(content)
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
+
+
+def handle_claude_hook_event(binding: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch one Claude Code hook payload to the plugin tool hooks.
+
+    Called by the gateway's ``/v1/hooks/claude`` endpoint (see
+    :mod:`hermes_cli.claude_hooks`) with the token's binding and the hook
+    script's request body. ``PreToolUse`` runs ``pre_tool_call``: a block
+    directive returns ``{"action": "block", "message"}``, anything else
+    ``{"action": "pass"}`` (an ``approve`` directive is not escalated on
+    this lane; it passes). ``PostToolUse`` runs ``post_tool_call`` with
+    ``steerable=True`` and returns the first hook result's ``message`` as
+    ``{"message"}``, else ``{}``. Tool names, arguments and results are
+    projected onto the Hermes shapes the hooks know, as the parity replay
+    does. Never raises.
+    """
+    event = str(body.get("event") or "")
+    raw_name = str(body.get("tool_name") or "")
+    tool_input = body.get("tool_input") if isinstance(body.get("tool_input"), dict) else {}
+    call_id = str(body.get("tool_use_id") or "")
+    session_id = str(binding.get("session_id") or "")
+    turn_id = str(binding.get("turn_id") or "")
+    try:
+        if event == "PreToolUse":
+            name, args, _result, _changed = _claude_hermes_call(raw_name, dict(tool_input), "")
+            from hermes_cli.plugins import get_pre_tool_call_directive
+
+            directive, message = get_pre_tool_call_directive(
+                name, args, session_id=session_id, tool_call_id=call_id, turn_id=turn_id
+            )
+            if directive == "block" and message:
+                return {"action": "block", "message": str(message)}
+            return {"action": "pass"}
+        if event == "PostToolUse":
+            from hermes_cli import claude_hooks
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            claude_hooks.note_live_call(str(binding.get("token") or ""))
+            result = redact_sensitive_text(_hook_result_text(body.get("tool_response")), force=True)
+            name, args, result, _changed = _claude_hermes_call(raw_name, dict(tool_input), result)
+            if not has_hook("post_tool_call"):
+                return {}
+            try:
+                duration_ms = int(body.get("duration_ms") or 0)
+            except (TypeError, ValueError):
+                duration_ms = 0
+            results = invoke_hook(
+                "post_tool_call",
+                tool_name=name,
+                args=args,
+                result=result,
+                task_id="",
+                session_id=session_id,
+                tool_call_id=call_id,
+                turn_id=turn_id,
+                api_request_id="",
+                duration_ms=duration_ms,
+                status="ok",
+                error_type=None,
+                error_message=None,
+                middleware_trace=[],
+                steerable=True,
+            )
+            for item in results or []:
+                message = item.get("message") if isinstance(item, dict) else None
+                if isinstance(message, str) and message.strip():
+                    return {"message": message.strip()}
+            return {}
+    except Exception:
+        logger.debug("Claude hook dispatch failed", exc_info=True)
+    return {"action": "pass"} if event == "PreToolUse" else {}
+
+
+def _claude_hook_binding(agent: Any, *, read_only: bool) -> tuple[Optional[str], dict[str, str], Optional[str]]:
+    """(token, process environment, settings JSON) for the live hook channel, or (None, {}, None).
+
+    The token is created once per agent and rebound every turn so a resident
+    process, whose environment was fixed at spawn, keeps resolving to the
+    agent currently serving the session. Read-only sessions run in safe
+    mode, which disables hooks, so they get none. Never raises.
+    """
+    try:
+        from hermes_cli import claude_hooks
+
+        url = claude_hooks.hook_endpoint()
+        if not url or read_only:
+            return None, {}, None
+        token = str(getattr(agent, "_claude_hook_token", "") or "") or claude_hooks.new_hook_token()
+        agent._claude_hook_token = token
+        claude_hooks.bind_hook_token(token, session_id=getattr(agent, "session_id", "") or "", agent=agent)
+        claude_hooks.reset_live_calls(token)
+        settings = json.dumps(claude_hooks.hook_settings(), separators=(",", ":"))
+        return token, claude_hooks.hook_environment(token, url), settings
+    except Exception:
+        logger.debug("Claude hook binding failed", exc_info=True)
+        return None, {}, None
+
+
+def _live_hook_calls(hook_token: Optional[str]) -> int:
+    if not hook_token:
+        return 0
+    try:
+        from hermes_cli import claude_hooks
+
+        return claude_hooks.live_calls(hook_token)
+    except Exception:
+        return 0
+
+
 def _claude_hook_parity(
     agent: Any,
     session: Any,
@@ -432,6 +559,7 @@ def _claude_hook_parity(
     calls: list[tuple[str, str, dict[str, Any], str, str]],
     original_user_message: Any,
     effective_task_id: str,
+    hook_token: Optional[str] = None,
 ) -> int:
     """Give a Claude turn the observer hooks and the verify gate of the default loop.
 
@@ -457,6 +585,10 @@ def _claude_hook_parity(
         nonlocal replayed
         pending = list(calls[replayed:])
         replayed = len(calls)
+        # When the process's own hooks delivered the calls live through the
+        # gateway (hermes_cli.claude_hooks), the observers already saw them;
+        # only the changed paths are still needed here for the verify gate.
+        live = _live_hook_calls(hook_token) > 0
         for raw_name, _name, args, result, call_id in pending:
             name, hermes_args, hermes_result, changed_path = _claude_hermes_call(
                 raw_name, args if isinstance(args, dict) else {}, result
@@ -465,7 +597,7 @@ def _claude_hook_parity(
                 path = _claude_file_change_path(agent, changed_path)
                 if path is not None:
                     changed.add(str(path))
-            if not has_hook("post_tool_call"):
+            if live or not has_hook("post_tool_call"):
                 continue
             try:
                 invoke_hook(
@@ -483,6 +615,7 @@ def _claude_hook_parity(
                     error_type=None,
                     error_message=None,
                     middleware_trace=[],
+                    replay=True,
                 )
             except Exception:
                 logger.debug("Claude post_tool_call parity failed", exc_info=True)
@@ -757,6 +890,7 @@ def run_claude_code_turn(
             calls.append((raw_name, name, args, result, call_id))
 
         bridge = make_claude_code_event_bridge(agent, record=_record)
+        hook_token, hook_env, hook_settings = _claude_hook_binding(agent, read_only=read_only)
         if session is None:
             session = ClaudeCodeSession(
                 cwd=cwd,
@@ -771,6 +905,8 @@ def run_claude_code_turn(
                 on_watchdog_timeout=_watchdog_timeout,
                 resident_first_event_timeout=resident_first_event_timeout,
                 startup_first_event_timeout=startup_first_event_timeout,
+                extra_env=hook_env,
+                settings_json=hook_settings,
             )
             session.history_fingerprint = prior_fingerprint
             agent._claude_code_session = session
@@ -813,7 +949,8 @@ def run_claude_code_turn(
     follow_ups = 0
     try:
         follow_ups = _claude_hook_parity(
-            agent, session, turn, messages, calls, original_user_message, effective_task_id
+            agent, session, turn, messages, calls, original_user_message, effective_task_id,
+            hook_token=hook_token,
         )
     except Exception:
         logger.debug("Claude hook parity failed", exc_info=True)

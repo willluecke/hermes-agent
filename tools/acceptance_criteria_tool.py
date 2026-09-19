@@ -10,6 +10,10 @@ stateless equivalent: it takes the criteria, returns them in the todo
 tool's JSON shape, and the runtime's hook parity replays that result to the
 ``system-one-preflight`` plugin, which stores it exactly as it stores a todo
 list. Nothing is written anywhere; the record is the tool result itself.
+
+Items may carry a status (``pending``, ``in_progress``, ``completed``) so the
+model can record progress by calling again with the same statements; the
+plugin's drift check steers toward the earliest criterion still open.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from tools.registry import registry
 
 MAX_ITEMS = 12
 MAX_CHARS = 400
+STATUSES = ("pending", "in_progress", "completed")
 
 
 def acceptance_criteria(args: Dict[str, Any]) -> str:
@@ -29,10 +34,17 @@ def acceptance_criteria(args: Dict[str, Any]) -> str:
         return json.dumps({"error": "criteria must be a non-empty list of single checkable statements"})
     items: List[Dict[str, str]] = []
     for value in raw:
-        text = str(value or "").strip() if not isinstance(value, dict) else str(value.get("content") or "").strip()
+        status = "in_progress"
+        if isinstance(value, dict):
+            text = str(value.get("content") or "").strip()
+            wanted = str(value.get("status") or "").strip().lower()
+            if wanted in STATUSES:
+                status = wanted
+        else:
+            text = str(value or "").strip()
         if not text:
             continue
-        items.append({"id": str(len(items) + 1), "content": text[:MAX_CHARS], "status": "in_progress"})
+        items.append({"id": str(len(items) + 1), "content": text[:MAX_CHARS], "status": status})
         if len(items) >= MAX_ITEMS:
             break
     if not items:
@@ -57,15 +69,30 @@ ACCEPTANCE_CRITERIA_SCHEMA = {
         "work (for example 'The --json flag prints valid JSON that jq can parse'). "
         "A typed judge checks every criterion against the diff and the check "
         "output before the turn finishes and sends the work back when one is "
-        "unmet. Call it once, before the first edit; call again to replace the list."
+        "unmet. Call it once, before the first edit; call again to replace the list. "
+        "To record progress, call again with objects {content, status} where status is "
+        "pending, in_progress or completed; a drift check steers toward the earliest "
+        "criterion still open."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "criteria": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Single checkable statements, one per criterion, at most 12.",
+                "items": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string", "enum": list(STATUSES)},
+                            },
+                            "required": ["content"],
+                        },
+                    ]
+                },
+                "description": "Single checkable statements, one per criterion, at most 12; or {content, status} objects to record progress.",
             }
         },
         "required": ["criteria"],

@@ -702,3 +702,194 @@ def test_the_verify_judge_takes_criteria_from_the_acceptance_criteria_tool(feedb
     assert result is not None and "Errors are logged" in result["message"] and "still pending" not in result["message"]
     call = feedback["jev"].calls[-1]
     assert [item["text"] for item in call["state"]["acceptance_criteria"]["items"]] == ["Greeting returns hello world", "Errors are logged"]
+
+
+# ---------------------------------------------------------------------------
+# Drift check
+# ---------------------------------------------------------------------------
+
+class _DriftJev(_FeedbackJev):
+    """Answers the drift check's choice question with a fixed pick and probability."""
+
+    def __init__(self, serving=("none", 0.8), **kwargs):
+        super().__init__(**kwargs)
+        self.serving = serving
+
+    def __call__(self, state, questions, timeout=None):
+        body = super().__call__(state, questions, timeout=timeout)
+        if "serving" in questions:
+            choice, p = self.serving
+            keys = list(questions["serving"]["criteria"])
+            rest = round((1 - p) / max(1, len(keys) - 1), 4)
+            body["answers"]["serving"] = {
+                "type": "choice", "choice": choice, "confidence": 0.9,
+                "probabilities": {key: (p if key == choice else rest) for key in keys},
+            }
+        return body
+
+
+@pytest.fixture
+def drift(feedback, monkeypatch):
+    jev = _DriftJev(kind="build")
+    monkeypatch.setattr(preflight, "_ask", jev)
+    feedback["jev"] = jev
+    feedback["settings"]["drift_every"] = 3
+    preflight._session_drift.clear()
+    preflight._pending_drift.clear()
+    return feedback
+
+
+CRITERIA_RESULT = json.dumps({"todos": [
+    {"id": "1", "content": "The --json flag prints valid JSON", "status": "in_progress"},
+    {"id": "2", "content": "Existing tests still pass", "status": "in_progress"},
+]})
+
+
+def _turn(session="s1", turn="t1", text="Add a --json flag to the exporter"):
+    preflight.on_pre_llm_call(session_id=session, turn_id=turn, user_message=text, conversation_history=[])
+
+
+def _register(session="s1"):
+    preflight.on_post_tool_call(session_id=session, tool_name="acceptance_criteria", args={}, result=CRITERIA_RESULT)
+
+
+def _reads(n, session="s1", start=0, **kwargs):
+    return [
+        preflight.on_post_tool_call(session_id=session, tool_name="read_file", args={"path": f"src/{i}.py"}, result="...", **kwargs)
+        for i in range(start, start + n)
+    ]
+
+
+def _serving_calls(harness):
+    return [call for call in harness["jev"].calls if "serving" in call["questions"]]
+
+
+def test_drift_check_judges_every_window_and_holds_the_next_call_with_the_steer(drift, emitted):
+    _register()
+    _turn()
+    assert _reads(2) == [None, None]
+    assert _serving_calls(drift) == [], "nothing is asked before the window fills"
+    assert _reads(1, start=2) == [None], "without a steerable caller the steer waits for the next tool call"
+    [call] = _serving_calls(drift)
+    question = call["questions"]["serving"]
+    assert question["type"] == "choice"
+    assert list(question["criteria"]) == ["c1", "c2", "none"]
+    assert question["criteria"]["none"] == preflight.DRIFT_NONE_TEXT
+    state = call["state"]
+    assert state["request"]["text"] == "Add a --json flag to the exporter"
+    assert [item["key"] for item in state["acceptance_criteria"]["items"]] == ["c1", "c2"]
+    assert [item["summary"] for item in state["recent_tool_calls"]["items"]] == ["src/0.py", "src/1.py", "src/2.py"]
+    assert state["calls_this_turn"] == 3
+    held = preflight.on_pre_tool_call(tool_name="read_file", args={"path": "src/3.py"}, session_id="s1", turn_id="t1", tool_call_id="c9")
+    assert held is not None and held["action"] == "block"
+    assert "served none of your acceptance criteria" in held["message"] and "0.80" in held["message"]
+    assert "The --json flag prints valid JSON" in held["message"], "the steer names the earliest open criterion"
+    assert preflight.on_pre_tool_call(tool_name="read_file", args={"path": "src/3.py"}, session_id="s1") is None, "held once"
+    [record] = drift["records"]("drift")
+    assert record["rule"] == "jev" and record["calls"] == 3 and record["window"] == 3 and record["criteria"] == 2
+    assert record["chosen"] == "none" and record["p_none"] == 0.8 and record["steer"] is True and record["target"] == "1"
+    [hold] = drift["records"]("drift_hold")
+    assert hold["tool"] == "read_file"
+    verdicts = [event for event in emitted if event.get("stage") == "drift"]
+    [event] = verdicts
+    assert event["event"] == "judge.verdict" and event["attempt"] == 1
+    assert event["text"] == "Jev drift (after 3 calls): serving none · none 0.80 · steer"
+    assert event["decision"]["steer"] is True and event["decision"]["target"] == "1"
+    assert event["answers"]["The --json flag prints valid JSON"] == 0.1
+
+
+def test_drift_check_hands_the_steer_to_a_caller_that_can_deliver_it(drift):
+    _register()
+    _turn()
+    results = _reads(3, steerable=True)
+    assert results[:2] == [None, None]
+    assert results[2] == {"message": preflight.DRIFT_TEMPLATE.format(n=3, p=0.8, target="The --json flag prints valid JSON")}
+    assert preflight._pending_drift == {}, "delivered steers never wait for a hold"
+    assert preflight.on_pre_tool_call(tool_name="read_file", args={"path": "x"}, session_id="s1") is None
+
+
+def test_drift_check_stays_quiet_when_the_calls_serve_a_criterion(drift, emitted):
+    drift["jev"].serving = ("c2", 0.9)
+    _register()
+    _turn()
+    assert _reads(3) == [None, None, None]
+    assert preflight._pending_drift == {}
+    [record] = drift["records"]("drift")
+    assert record["chosen"] == "c2" and record["steer"] is False and record["drifting"] is False
+    [event] = [event for event in emitted if event.get("stage") == "drift"]
+    assert event["text"] == "Jev drift (after 3 calls): serving criterion 2 · none 0.05 · on track"
+
+
+def test_drift_check_steers_a_build_turn_to_register_criteria_by_rule(drift, emitted):
+    _turn()
+    assert _reads(3) == [None, None, None]
+    assert _serving_calls(drift) == [], "no rubric, no Jev question"
+    pending = preflight._pending_drift["s1"]
+    assert "no acceptance criteria are registered" in pending["message"]
+    [record] = drift["records"]("drift")
+    assert record["rule"] == "no_criteria" and record["calls"] == 3 and record["steer"] is True
+    [event] = [event for event in emitted if event.get("stage") == "drift"]
+    assert event["text"] == "Jev drift (after 3 calls): no acceptance criteria on a build turn · steer"
+    preflight._pending_drift.clear()
+    assert _reads(3) == [None, None, None]
+    assert preflight._pending_drift == {} and len(drift["records"]("drift")) == 1, "the rule fires once per turn"
+
+
+def test_drift_check_leaves_a_non_build_turn_without_criteria_alone(drift):
+    drift["jev"].kind = "answer"
+    _turn(text="What does the exporter do?")
+    assert _reads(3) == [None, None, None]
+    assert preflight._pending_drift == {} and drift["records"]("drift") == []
+
+
+def test_drift_check_fails_open_and_respects_its_switch_and_replay(drift):
+    _register()
+    _turn()
+    drift["jev"].raise_exc = RuntimeError("jev down")
+    assert _reads(3) == [None, None, None]
+    [record] = drift["records"]("drift")
+    assert record["error"].startswith("RuntimeError") and record["steer"] is False
+    assert preflight._pending_drift == {}
+    drift["jev"].raise_exc = None
+    drift["settings"]["drift_check"] = "off"
+    assert _reads(3) == [None, None, None]
+    assert len(_serving_calls(drift)) == 1, "switched off: nothing asked"
+    drift["settings"]["drift_check"] = "on"
+    _turn(turn="t2")
+    assert _reads(3, replay=True) == [None, None, None]
+    assert len(_serving_calls(drift)) == 1, "a replayed call is counted, never judged"
+    assert preflight.drift_state("s1")["total"] == 3
+
+
+def test_drift_steers_are_bounded_per_turn_and_a_new_turn_resets_the_window(drift):
+    drift["settings"]["drift_max_steers"] = 1
+    _register()
+    _turn()
+    _reads(3)
+    assert preflight._pending_drift["s1"]["message"]
+    preflight._pending_drift.clear()
+    _reads(3)
+    assert preflight._pending_drift == {}, "the steer budget is spent"
+    assert drift["records"]("drift")[-1]["drifting"] is True and drift["records"]("drift")[-1]["steer"] is False
+    _reads(2)
+    _turn(turn="t2")
+    _reads(1)
+    assert len(_serving_calls(drift)) == 2, "the new turn started a fresh window"
+    assert preflight.drift_state("s1")["total"] == 1
+
+
+def test_an_undelivered_drift_steer_becomes_a_verify_finding(drift, repo):
+    _register()
+    _turn()
+    _reads(3)
+    assert preflight._pending_drift["s1"]
+    drift["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.9, "claims_unverified": 0.1}
+    result = preflight.on_pre_verify(
+        session_id="s1", platform="api_server", model="m", coding=True, attempt=0,
+        final_response="Done.", changed_paths=[str(repo / "app.py")],
+    )
+    assert result is not None and result["action"] == "continue"
+    assert "The drift check found the last 3 tool calls served none of the acceptance criteria (P(none)=0.80)." in result["message"]
+    assert preflight._pending_drift == {}
+    [record] = drift["records"]("verify")
+    assert len(record["findings"]) == 1

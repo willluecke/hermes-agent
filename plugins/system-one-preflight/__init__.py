@@ -44,6 +44,18 @@ a daemon thread, so it adds no latency.
 Jev is bounded by ``timeout_seconds``; a slow or failed call is logged and
 the turn proceeds without advice (the always arm still inserts its reminder).
 
+The drift check (``post_tool_call``) keeps a turn on its own acceptance
+criteria. Every ``drift_every`` tool calls it asks Jev one choice question:
+which criterion are the recent calls working toward, with "none" as an
+option. When "none" clears ``drift_threshold`` the model is steered back to
+the earliest criterion still open. On the default loop the steer holds the
+next tool call (``pre_tool_call`` returns a block carrying it); on the Claude
+lane the gateway's hook endpoint delivers it right after the call that
+triggered it (``steerable=True``), and a steer nobody delivered becomes a
+verify finding. A build-kind turn that reaches the window with no criteria
+registered is steered once, by rule, to register them. Replayed calls
+(``replay=True``, the Codex lane after the fact) are counted but never judged.
+
 The verify judge (``pre_verify``) turns Jev into a per-feature pass/fail gate
 on the model's own work. ``post_tool_call`` remembers the session's todo
 list (the model is nudged to write acceptance criteria there on build-type
@@ -255,7 +267,35 @@ _session_todos: Dict[str, List[Dict[str, str]]] = {}
 _session_checks: Dict[str, List[Dict[str, str]]] = {}
 _session_commands: Dict[str, List[Dict[str, str]]] = {}
 _verify_memo: Dict[str, str] = {}
+_session_drift: Dict[str, Dict[str, Any]] = {}
+_pending_drift: Dict[str, Dict[str, str]] = {}
 MAX_COMMANDS_KEPT = 6
+# Drift check: every DRIFT_EVERY tool calls, one choice question asks which
+# acceptance criterion the recent calls serve; "none" at or above the
+# threshold steers the model back, at most DRIFT_MAX_STEERS times per turn.
+DEFAULT_DRIFT_EVERY = 10
+DEFAULT_DRIFT_THRESHOLD = 0.6
+DEFAULT_DRIFT_MAX_STEERS = 2
+MAX_DRIFT_CALLS_KEPT = 20
+DRIFT_NONE = "none"
+DRIFT_NONE_TEXT = (
+    "None of them: the recent calls explore, read, run or change things that "
+    "no listed criterion needs"
+)
+DRIFT_QUESTION = "Which acceptance criterion are the recent tool calls working toward?"
+DRIFT_TEMPLATE = (
+    "Drift check from Jev, a fast typed judge whose read is advisory: the last "
+    "{n} tool calls served none of your acceptance criteria (P(none) = {p:.2f}). "
+    "Return to the earliest criterion still open: \"{target}\". If it is already "
+    "done, update the list with the acceptance_criteria tool (or todo) so the "
+    "check can follow your progress, then continue."
+)
+DRIFT_NO_CRITERIA_TEMPLATE = (
+    "Drift check: {n} tool calls into a build request and no acceptance criteria "
+    "are registered. Register them now with the acceptance_criteria tool (or "
+    "todo), one checkable statement each in the order the request asked for, "
+    "then continue with the first."
+)
 _MEMO_LIMIT = 256
 
 
@@ -406,6 +446,34 @@ def _tuned() -> Dict[str, Any]:
             data = {}
         _tuned_cache.update(mtime=stamp, path=str(path), data=data if isinstance(data, dict) else {})
     return _tuned_cache["data"]
+
+
+def drift_check_enabled() -> bool:
+    return str(_setting("drift_check", "on") or "on").strip().lower() != "off"
+
+
+def drift_every() -> int:
+    try:
+        value = int(_setting("drift_every", DEFAULT_DRIFT_EVERY))
+    except (TypeError, ValueError):
+        return DEFAULT_DRIFT_EVERY
+    return min(50, max(3, value))
+
+
+def drift_threshold() -> float:
+    try:
+        value = float(_setting("drift_threshold", DEFAULT_DRIFT_THRESHOLD))
+    except (TypeError, ValueError):
+        return DEFAULT_DRIFT_THRESHOLD
+    return min(0.95, max(0.3, value))
+
+
+def drift_max_steers() -> int:
+    try:
+        value = int(_setting("drift_max_steers", DEFAULT_DRIFT_MAX_STEERS))
+    except (TypeError, ValueError):
+        return DEFAULT_DRIFT_MAX_STEERS
+    return min(10, max(0, value))
 
 
 def verify_timeout_seconds() -> float:
@@ -869,6 +937,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     history = kwargs.get("conversation_history") or []
     user_message = kwargs.get("user_message")
     remember_scope(session_id, user_message, history if isinstance(history, list) else [])
+    reset_drift(session_id)
     arm = resolve_arm(mode, session_id)
     state = build_state(user_message, history if isinstance(history, list) else [])
     started = time.monotonic()
@@ -912,6 +981,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     latency_ms = int((time.monotonic() - started) * 1000)
     context: Optional[str] = None
     plan = budget(p_hard, p_checkable)
+    drift_state(session_id)["build"] = bool(p_build is not None and p_build >= BUILD_THRESHOLD) or kind == "build"
     if arm == "feedback":
         context = budget_context(p_ambiguous, p_hard, p_checkable, plan)
         if (
@@ -1135,7 +1205,16 @@ def _run_guard(tool_name: str, args: Dict[str, Any], session_id: str, turn_id: s
 def on_pre_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Shadow: classify off the critical path. Feedback: hold a risky,
     out-of-scope action once with a note the model answers by asking the user."""
-    if current_mode() == "off" or tool_guard_mode() == "off":
+    if current_mode() == "off":
+        return None
+    session_id = str(kwargs.get("session_id") or "")
+    pending = _pending_drift.pop(session_id, None)
+    if pending:
+        # The drift steer nobody could deliver mid-turn: hold this call once
+        # and hand the model the steer as the tool result.
+        write_log({"event": "drift_hold", "session_id": session_id, "tool": str(kwargs.get("tool_name") or "")})
+        return {"action": "block", "message": pending["message"]}
+    if tool_guard_mode() == "off":
         return None
     tool_name = str(kwargs.get("tool_name") or "")
     if tool_name not in GUARD_TOOLS:
@@ -1215,8 +1294,153 @@ def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
     return todos
 
 
-def on_post_tool_call(**kwargs: Any) -> None:
-    """Remember the session's todo list and its latest check outputs."""
+# ---------------------------------------------------------------------------
+# Drift check: are the recent tool calls still serving the acceptance criteria?
+# ---------------------------------------------------------------------------
+
+def reset_drift(session_id: str) -> None:
+    """A new turn: forget the previous turn's calls, checks and steers."""
+    _session_drift[session_id] = {
+        "calls": [], "total": 0, "since_check": 0, "checks": 0, "steers": 0,
+        "build": False, "criteria_nudged": False,
+    }
+    _pending_drift.pop(session_id, None)
+    _bound(_session_drift)
+
+
+def drift_state(session_id: str) -> Dict[str, Any]:
+    state = _session_drift.get(session_id)
+    if state is None:
+        reset_drift(session_id)
+        state = _session_drift[session_id]
+    return state
+
+
+def _call_summary(tool_name: str, args: Dict[str, Any]) -> str:
+    if tool_name == "terminal":
+        return _clip(str(args.get("command") or ""), 160)
+    if tool_name in ("todo", "acceptance_criteria"):
+        return "criteria updated"
+    for key in ("path", "file_path", "pattern", "query", "url", "command", "description"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return _clip(value.strip(), 120)
+    return ""
+
+
+def _first_open_criterion(todos: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    for item in todos:
+        if item.get("status") != "completed":
+            return item
+    return None
+
+
+def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay: bool = False) -> Optional[Dict[str, str]]:
+    """Count one tool call; every ``drift_every`` calls, judge whether the window served a criterion.
+
+    Returns the steer (``message`` for the model, ``finding`` for the verify
+    judge) when the model should be sent back, else None. A replayed call
+    (after the turn, no steer can land) is counted and never judged. The
+    Jev call is bounded by ``timeout_seconds`` and any failure reads as
+    "on track".
+    """
+    state = drift_state(session_id)
+    state["calls"].append({"tool": tool_name, "summary": _call_summary(tool_name, args)})
+    del state["calls"][:-MAX_DRIFT_CALLS_KEPT]
+    state["total"] += 1
+    if replay:
+        return None
+    state["since_check"] += 1
+    window = drift_every()
+    if not drift_check_enabled() or state["since_check"] < window:
+        return None
+    state["since_check"] = 0
+    state["checks"] += 1
+    todos = list(_session_todos.get(session_id, []))
+    if not todos:
+        # No rubric to drift from. A build turn this deep with no criteria is
+        # the drift the criteria nudge exists to prevent: steer once, by rule.
+        if not state["build"] or state["criteria_nudged"] or not criteria_nudge_enabled():
+            return None
+        state["criteria_nudged"] = True
+        write_log({
+            "event": "drift", "session_id": session_id, "rule": "no_criteria",
+            "calls": state["total"], "window": window, "criteria": 0, "steer": True,
+        })
+        emit_verdict(
+            session_id, "drift",
+            f"Jev drift (after {state['total']} calls): no acceptance criteria on a build turn · steer",
+            answers={}, decision={"rule": "no_criteria", "steer": True, "calls": state["total"]},
+            attempt=state["checks"],
+        )
+        return {
+            "message": DRIFT_NO_CRITERIA_TEMPLATE.format(n=state["total"]),
+            "finding": f"No acceptance criteria were registered after {state['total']} tool calls.",
+        }
+    request = (_session_scope.get(session_id) or [""])[-1]
+    keys = {f"c{item['id']}": item for item in todos}
+    options = {key: _clip(item["content"], 300) for key, item in keys.items()}
+    options[DRIFT_NONE] = DRIFT_NONE_TEXT
+    jev_state = {
+        "provenance": "request was typed by the user. acceptance_criteria come from the agent's own list, in order. recent_tool_calls are what the agent just did, oldest first.",
+        "request": {"source": "user", "text": _clip(request, 1_200)},
+        "acceptance_criteria": {"source": "agent", "items": [{"key": key, "text": _clip(item["content"], 300), "status": item.get("status")} for key, item in keys.items()]},
+        "recent_tool_calls": {"source": "tool", "items": list(state["calls"][-window:])},
+        "calls_this_turn": state["total"],
+    }
+    started = time.monotonic()
+    p_none: Optional[float] = None
+    chosen: Optional[str] = None
+    probabilities: Dict[str, float] = {}
+    jev_model = ""
+    error = ""
+    try:
+        body = _ask_jev(jev_state, {"serving": {"type": "choice", "instructions": DRIFT_QUESTION, "criteria": options}})
+        answer = (body.get("answers") or {}).get("serving") or {}
+        jev_model = str(body.get("model") or "")
+        probabilities = {str(k): float(v) for k, v in (answer.get("probabilities") or {}).items() if isinstance(v, (int, float))}
+        p_none = probabilities.get(DRIFT_NONE)
+        chosen = str(answer.get("choice") or "") or None
+        if p_none is None:
+            error = "no probabilities in answer"
+    except Exception as exc:
+        error = f"{exc.__class__.__name__}: {exc}"[:300]
+    latency_ms = int((time.monotonic() - started) * 1000)
+    drifting = bool(not error and p_none is not None and p_none >= drift_threshold())
+    steer = drifting and state["steers"] < drift_max_steers()
+    target = _first_open_criterion(todos)
+    write_log({
+        "event": "drift", "session_id": session_id, "rule": "jev", "calls": state["total"],
+        "window": window, "criteria": len(todos), "chosen": chosen, "p_none": p_none,
+        "probabilities": probabilities, "threshold": drift_threshold(), "drifting": drifting,
+        "steer": steer, "target": target["id"] if target else None,
+        "latency_ms": latency_ms, "error": error,
+    })
+    label = "none" if chosen == DRIFT_NONE else (f"criterion {chosen[1:]}" if chosen and chosen in keys else "unknown")
+    action = "unavailable" if error else "steer" if steer else "drifting, steer budget spent" if drifting else "on track"
+    emit_verdict(
+        session_id, "drift",
+        f"Jev drift (after {state['total']} calls): serving {label} · none {_fmt(p_none)} · {action}",
+        answers={"serving": chosen, "none": p_none, **{keys[k]["content"]: v for k, v in probabilities.items() if k in keys}},
+        decision={"steer": steer, "drifting": drifting, "calls": state["total"], "window": window, "threshold": drift_threshold(), "target": target["id"] if target else None},
+        model=jev_model, latency_ms=latency_ms, attempt=state["checks"],
+    )
+    if not steer:
+        return None
+    state["steers"] += 1
+    return {
+        "message": DRIFT_TEMPLATE.format(n=window, p=p_none, target=_clip(target["content"], 200) if target else "the first criterion"),
+        "finding": f"The drift check found the last {window} tool calls served none of the acceptance criteria (P(none)={p_none:.2f}).",
+    }
+
+
+def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
+    """Remember the session's todo list and its latest check outputs, then run the drift check.
+
+    Returns ``{"message": ...}`` when the caller can put text in front of
+    the model right now (``steerable=True``, the Claude hook endpoint);
+    otherwise the steer waits for the next ``pre_tool_call`` to hold.
+    """
     if current_mode() == "off":
         return None
     session_id = str(kwargs.get("session_id") or "")
@@ -1253,6 +1477,19 @@ def on_post_tool_call(**kwargs: Any) -> None:
             checks.append(dict(entry))
             del checks[:-3]
             _bound(_session_checks)
+    try:
+        # Replayed after the turn (the Codex lane, or a Claude turn without
+        # the hook channel): counted for the record, never judged.
+        steer = check_drift(session_id, tool_name, dict(args), replay=bool(kwargs.get("replay")))
+    except Exception:
+        logger.debug("system-one-preflight: drift check failed", exc_info=True)
+        return None
+    if steer is None:
+        return None
+    if kwargs.get("steerable"):
+        return {"message": steer["message"]}
+    _pending_drift[session_id] = steer
+    _bound(_pending_drift)
     return None
 
 
@@ -1442,6 +1679,11 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         )
     if pending:
         findings.append(f"Todo items still pending: {len(pending)}.")
+    stale_drift = _pending_drift.pop(session_id, None)
+    if stale_drift and stale_drift.get("finding"):
+        # A steer the loop never delivered (the model made no further tool
+        # call) still reaches the model here, once, as a verify finding.
+        findings.append(stale_drift["finding"])
     checks_failing = answers.get("checks_failing")
     if checks_failing is not None and checks_failing >= VERIFY_FLAG_THRESHOLD:
         findings.append(f"Check outputs show a failure (P={checks_failing:.2f}).")
