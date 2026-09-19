@@ -154,8 +154,10 @@ PLAN_CANDIDATES = (
     "This looks hard and checkable, so before choosing an approach produce "
     "{k} independent candidate solutions (parallel subagents where available), "
     "then select with the typesafe_decide tool: one noul question per candidate "
-    "per acceptance criterion, keep the highest total, and never pick among "
-    "your own candidates by reasoning alone."
+    "per acceptance criterion, keep the candidate whose weakest criterion scores "
+    "highest (a sum only counts criteria, and a candidate that fails one "
+    "mandatory criterion is out), and never pick among your own candidates by "
+    "reasoning alone."
 )
 PLAN_CRITERIA_ONLY = (
     "This looks hard but not objectively checkable, so write the acceptance "
@@ -712,6 +714,10 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "injected": injected,
             "p_missing": p_missing,
             "p_ambiguous": p_ambiguous,
+            "p_hard": p_hard,
+            "p_checkable": p_checkable,
+            "kind": kind,
+            "k": plan["k"],
             "arm": arm,
             "context": context,
         }
@@ -756,6 +762,10 @@ def on_post_llm_call(**kwargs: Any) -> None:
             "arm": memo.get("arm"),
             "p_missing": memo.get("p_missing"),
             "p_ambiguous": memo.get("p_ambiguous"),
+            "p_hard": memo.get("p_hard"),
+            "p_checkable": memo.get("p_checkable"),
+            "kind": memo.get("kind"),
+            "k": memo.get("k"),
             "injected": memo.get("injected"),
             "tool_calls": tool_calls,
             "tools": sorted(set(tools)),
