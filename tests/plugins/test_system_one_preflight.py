@@ -72,6 +72,7 @@ def harness(tmp_path, monkeypatch):
     preflight._session_previous_answer.clear()
     preflight._pending_fidelity.clear()
     preflight._pending_fidelity_note.clear()
+    preflight._session_budget.clear()
 
     def records(event=None):
         path = tmp_path / "preflight.jsonl"
@@ -330,7 +331,7 @@ def test_feedback_mode_asks_the_budget_questions_and_stays_quiet_when_jev_sees_n
     # The budget is visible in the turn even when no note goes to the model.
     [event] = emitted
     assert event["event"] == "judge.verdict" and event["stage"] == "budget" and event["judge"] == "jev"
-    assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False}
+    assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False, "note_reason": "", "baseline_n": 0}
     assert event["answers"]["hard"] == pytest.approx(0.1) and event["answers"]["kind"] == "answer"
     assert event["model"] == "jev-1.13.0" and "k=1" in event["text"]
 
@@ -360,7 +361,7 @@ def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedba
     [record] = feedback["records"]("preflight")
     assert record["k"] == 3 and record["kind"] == "build" and record["p_hard"] == pytest.approx(0.8)
     [event] = emitted
-    assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True}
+    assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True, "note_reason": "candidates", "baseline_n": 0}
     # Hard but not checkable: criteria first, one candidate, no finish loop.
     feedback["jev"].checkable = 0.2
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[])
@@ -369,9 +370,11 @@ def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedba
     assert emitted[-1]["decision"]["plan"] == "criteria_only" and emitted[-1]["decision"]["finish_loop"] is False
 
 
-def test_feedback_mode_feeds_back_when_jev_is_unsure_but_no_longer_on_missing_evidence_alone(feedback):
-    feedback["jev"].ambiguous = 0.5  # unsure band
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) is not None
+def test_feedback_mode_no_longer_feeds_back_on_the_unsure_band_or_on_missing_evidence_alone(feedback):
+    feedback["jev"].ambiguous = 0.5  # the unsure band used to trigger the note; it made the note a constant
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) is None
+    feedback["jev"].ambiguous = 0.7
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1b", user_message="x", conversation_history=[]) is not None, "above the threshold, in the first turns"
     feedback["jev"].ambiguous = 0.05
     feedback["jev"].p = 0.9  # evidence missing: averaged 0.81 over real turns, so it no longer triggers on its own
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="x", conversation_history=[]) is None
@@ -1534,3 +1537,104 @@ def test_removed_assertions_or_added_skips_in_existing_tests_are_a_finding_once(
     assert "· tests weakened ·" in emitted[-1]["text"] and emitted[-1]["decision"]["weakening"]["removed"] == 3
     assert _verify(attempt=1, paths=paths) is None, "once: the same finding on the same evidence lets the turn finish"
     assert feedback["records"]("verify")[-1]["repeated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Noise rules: follow-up requests and the session baseline
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "continue", "Continue.", "proceed", "proceed as recommended", "okay, go ahead", "yes please", "Yes, do it.",
+    "implement the changes fully", "implement the recommendation", "go for it", "sounds good, proceed", "ok continue then",
+    "proceed with the implementation", "finish it", "lgtm",
+])
+def test_continuation_requests_are_matched_by_the_fixed_list(text):
+    assert preflight.continuation_request(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    "", "Fix the plugin", "continue with the tests only", "what happened?", "proceed to delete the database",
+    "implement the changes to the sidebar", "do you recommend the closing design items?", "x" * 81,
+])
+def test_instructions_and_questions_are_not_continuations(text):
+    assert preflight.continuation_request(text) is False
+
+
+def test_fidelity_on_a_follow_up_judges_the_proposed_work_and_records_a_low_read_without_steering(fidelity, emitted):
+    fidelity["jev"].coverage = 0.2
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="proceed as recommended", conversation_history=[
+        {"role": "user", "content": "Should we add a --json flag?"},
+        {"role": "assistant", "content": "Yes: add the flag, keep text output unchanged, and cover it with a test."},
+    ])
+    assert _register_criteria(C1, C2) is None, "no steer on a follow-up"
+    call = _fidelity_calls(fidelity)[-1]
+    assert call["questions"]["coverage"]["instructions"] == preflight.FIDELITY_COVERAGE_QUESTION_CONTINUATION
+    assert "follow-up" in call["state"]["provenance"] and call["state"]["previous_answer"]["text"].startswith("Yes: add the flag")
+    record = fidelity["records"]("fidelity")[-1]
+    assert record["coverage_low"] is True and record["steer"] is False and record["continuation"] is True and record["suppressed"] == "continuation"
+    event = [e for e in emitted if e.get("stage") == "fidelity"][-1]
+    assert event["text"].endswith("coverage 0.20 · coverage low on a follow-up, not steered") and event["decision"]["suppressed"] == "continuation"
+    assert preflight._pending_fidelity_note == {} and preflight._pending_fidelity == {}
+    # A replayed lane leaves no verify finding behind either.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="continue", conversation_history=[])
+    assert _register_criteria(C1, C3, replay=True) is None
+    assert preflight._pending_fidelity == {}
+    # An exclusion is still delivered on a follow-up: it is about a criterion, not about the request's wording.
+    fidelity["jev"].entails = {"2": 0.1}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="go ahead", conversation_history=[])
+    assert _register_criteria(C1, C2) is None, "the default loop puts the note in the tool result, not the hook's return"
+    note = preflight._pending_fidelity_note.pop("s1")
+    assert "will not be judged" in note and "may not cover" not in note
+    assert preflight._session_excluded["s1"] == ["2"]
+    # A real instruction still steers.
+    fidelity["jev"].entails = {}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="Add a --json flag to the exporter", conversation_history=[])
+    assert _register_criteria(C1, C3) is None
+    note = preflight._pending_fidelity_note.pop("s1")
+    assert "may not cover everything the request asks for (P(cover) = 0.20)" in note
+    assert fidelity["records"]("fidelity")[-1]["continuation"] is False
+
+
+def test_the_budget_note_is_sent_for_the_first_turns_then_only_when_the_read_stands_out(feedback, emitted):
+    feedback["jev"].ambiguous = 0.64
+    for turn in ("t1", "t2", "t3"):
+        assert preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="x", conversation_history=[]) is not None
+        assert feedback["records"]("preflight")[-1]["note_reason"] == "first_turns"
+    record = feedback["records"]("preflight")[-1]
+    assert record["baseline_n"] == 2 and record["baseline_ambiguous"] == pytest.approx(0.64)
+    # The fourth turn reads like the session's usual: withheld, and the row says so.
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="x", conversation_history=[]) is None
+    record = feedback["records"]("preflight")[-1]
+    assert record["injected"] is False and record["note_reason"] == "" and record["baseline_n"] == 3
+    assert emitted[-1]["stage"] == "budget" and emitted[-1]["text"].endswith("· note withheld") and emitted[-1]["decision"]["note_reason"] == ""
+    # A read that stands out is sent, with the reason.
+    feedback["jev"].ambiguous = 0.85
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="x", conversation_history=[])
+    assert result is not None and "clarifying question" in result["context"]
+    assert feedback["records"]("preflight")[-1]["note_reason"] == "ambiguous_above_baseline"
+    assert emitted[-1]["text"].endswith("· note sent")
+    # Difficulty works the same way for the criteria-first plan.
+    feedback["jev"].ambiguous = 0.1
+    feedback["jev"].hard = 0.8
+    feedback["jev"].checkable = 0.2
+    reasons = []
+    for turn in range(6, 14):
+        preflight.on_pre_llm_call(session_id="s1", turn_id=f"t{turn}", user_message="x", conversation_history=[])
+        reasons.append(feedback["records"]("preflight")[-1]["note_reason"])
+    assert reasons[0] == "hard_above_baseline", "the first hard turn stands out from an easy session"
+    assert reasons[-1] == "" and feedback["records"]("preflight")[-1]["injected"] is False, "hard on every recent turn is the session's usual"
+    assert feedback["records"]("preflight")[-1]["baseline_hard"] == pytest.approx(0.8)
+    feedback["jev"].hard = 0.99
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t20", user_message="x", conversation_history=[])
+    assert result is not None and "write the acceptance criteria first" in result["context"]
+    assert feedback["records"]("preflight")[-1]["note_reason"] == "hard_above_baseline"
+    # Candidates are always worth saying.
+    feedback["jev"].hard = 0.8
+    feedback["jev"].checkable = 0.9
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t21", user_message="x", conversation_history=[])
+    assert result is not None and "3 independent candidate solutions" in result["context"]
+    assert feedback["records"]("preflight")[-1]["note_reason"] == "candidates"
+    # A new session starts its own baseline.
+    feedback["jev"].checkable = 0.2
+    assert preflight.on_pre_llm_call(session_id="s2", turn_id="t1", user_message="x", conversation_history=[]) is not None
+    assert feedback["records"]("preflight")[-1]["note_reason"] == "first_turns" and feedback["records"]("preflight")[-1]["baseline_n"] == 0

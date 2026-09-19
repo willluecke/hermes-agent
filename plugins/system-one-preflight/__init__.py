@@ -352,6 +352,9 @@ _session_fidelity: Dict[str, Dict[str, Any]] = {}
 _session_previous_answer: Dict[str, str] = {}
 _pending_fidelity: Dict[str, Dict[str, str]] = {}
 _pending_fidelity_note: Dict[str, str] = {}
+# Running means of the budget reads per session, so a turn's note is sent
+# when its read stands out from the session's usual, not on every turn.
+_session_budget: Dict[str, Dict[str, Any]] = {}
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
 # acceptance criterion the recent calls serve; "none" at or above the
 # threshold steers the model back, at most DRIFT_MAX_STEERS times per turn.
@@ -414,6 +417,38 @@ FIDELITY_COVERAGE_CRITERIA = {
     "true": "Every deliverable, constraint and ordering the user asked for has a criterion that would fail if it were missing.",
     "false": "Something the user asked for has no criterion, so the work could meet every criterion and still not do what was asked.",
 }
+FIDELITY_COVERAGE_QUESTION_CONTINUATION = (
+    "The user's request is a follow-up that accepts or resumes the work the "
+    "previous answer proposed. Taken together, do these acceptance criteria "
+    "cover that proposed work, read with the earlier instructions?"
+)
+# A follow-up that accepts or resumes the previous answer's proposed work
+# carries no instruction of its own. Judged against the bare request, the
+# coverage read sat between 0.22 and 0.60 on eleven such turns in one
+# conversation on 2026-09-19 and steered six times without changing a
+# criterion. So the request is matched here, in code, against a fixed list;
+# a match switches the coverage question to the proposed work and turns the
+# steer into a logged read.
+_CONTINUATION_PREFIX = r"(?:(?:ok|okay|yes|yep|yeah|sure|great|good|fine|please|alright|right|cool|perfect)[,.!\s]*)*"
+_CONTINUATION_CORE = (
+    r"yes|yep|yeah|ok|okay|sure|continue|proceed|go ahead|go on|carry on|keep going|do it|do that|do so|do both|make it so|ship it|build it|"
+    r"proceed as recommended|proceed with (?:it|that|them|the (?:implementation|plan|changes?|build|fix|recommendation))|"
+    r"continue as planned|as recommended|sounds good|looks good|lgtm|go for it|let'?s do it|let'?s go|next|resume|"
+    r"finish(?: it| that| the (?:work|implementation|job))?|"
+    r"implement (?:it|that|them|the changes?|the recommendation|the plan|as recommended|your recommendation)"
+)
+_CONTINUATION_SUFFIX = r"(?:[,.\s]*(?:please|then|now|fully|as recommended|as planned|with that|thanks|thank you|and finish))*"
+CONTINUATION_RE = re.compile(
+    rf"^{_CONTINUATION_PREFIX}(?:{_CONTINUATION_CORE})(?:[,.!\s]+(?:{_CONTINUATION_CORE}))*{_CONTINUATION_SUFFIX}[.!\s]*$",
+    re.IGNORECASE,
+)
+MAX_CONTINUATION_CHARS = 80
+# The budget note goes out when the read is unusual for the session, not on
+# every turn: 24 of 24 turns in one conversation got it on 2026-09-19 with
+# ambiguity averaging 0.64, which made it a constant rather than a signal.
+BASELINE_TURNS = 3
+BASELINE_MARGIN = 0.15
+BASELINE_WINDOW = 6
 FIDELITY_EXCLUDED_TEMPLATE = (
     "Criteria check from Jev, a fast typed judge whose read is advisory: {n} of "
     "your acceptance criteria do not follow from what the user asked and will "
@@ -897,15 +932,22 @@ def budget_context(
     p_hard: Optional[float],
     p_checkable: Optional[float],
     plan: Dict[str, Any],
+    reason: Optional[str] = None,
 ) -> Optional[str]:
     """The feedback note built from the budget, or None when there is nothing to say.
 
     The old trigger, "would an answer depend on evidence not yet checked",
     averaged 0.81 over 189 real turns and so carried almost no information.
-    The note now goes in when the budget calls for candidates or criteria, or
-    when the ambiguity read clears its threshold or sits in the unsure band.
+    The note goes in when the budget calls for candidates or criteria, or
+    when the ambiguity read clears its threshold, and only for a ``reason``
+    from :func:`budget_note_reason`: candidates always, otherwise the first
+    turns of a session or a read that stands out from the session's mean.
     """
-    ask = (p_ambiguous is not None and p_ambiguous >= ambiguity_threshold()) or _unsure(p_ambiguous)
+    if reason is None:
+        reason = "unconditional"
+    if not reason:
+        return None
+    ask = p_ambiguous is not None and p_ambiguous >= ambiguity_threshold()
     parts: List[str] = []
     if plan.get("plan") == "candidates":
         parts.append(PLAN_CANDIDATES.format(k=plan.get("k", CANDIDATES_WHEN_HARD)))
@@ -918,6 +960,58 @@ def budget_context(
     return BUDGET_TEMPLATE.format(
         hard=_fmt(p_hard), checkable=_fmt(p_checkable), ambiguous=_fmt(p_ambiguous), plan=" ".join(parts)
     )
+
+
+def continuation_request(text: str) -> bool:
+    """Whether the request only accepts or resumes the previous answer's proposed work."""
+    text = " ".join((text or "").split())
+    return bool(text) and len(text) <= MAX_CONTINUATION_CHARS and bool(CONTINUATION_RE.match(text))
+
+
+def session_baseline(session_id: str) -> Dict[str, Any]:
+    """``n`` turns seen and the mean ambiguity and difficulty over the last ``BASELINE_WINDOW`` of them."""
+    stats = _session_budget.get(session_id)
+    if not stats:
+        return {"n": 0, "ambiguous": None, "hard": None}
+    means = {}
+    for key in ("ambiguous", "hard"):
+        values = [value for value in stats[key] if value is not None]
+        means[key] = sum(values) / len(values) if values else None
+    return {"n": stats["n"], **means}
+
+
+def budget_note_reason(session_id: str, p_ambiguous: Optional[float], p_hard: Optional[float], plan: Dict[str, Any]) -> str:
+    """Why the note goes out this turn, or an empty string to withhold it.
+
+    Candidates always: k above one is rare and actionable. Otherwise the note
+    needs something to say (ambiguity at or above its threshold, or a
+    criteria-first plan) and a reason it is worth saying now: the session's
+    first turns, before there is a baseline, or a read at least
+    ``BASELINE_MARGIN`` above the session's mean over its last ``BASELINE_WINDOW`` turns.
+    """
+    if plan.get("plan") == "candidates":
+        return "candidates"
+    ask = p_ambiguous is not None and p_ambiguous >= ambiguity_threshold()
+    criteria = plan.get("plan") == "criteria_only"
+    if not ask and not criteria:
+        return ""
+    stats = session_baseline(session_id)
+    if stats["n"] < BASELINE_TURNS:
+        return "first_turns"
+    if ask and stats["ambiguous"] is not None and p_ambiguous >= stats["ambiguous"] + BASELINE_MARGIN:
+        return "ambiguous_above_baseline"
+    if criteria and p_hard is not None and stats["hard"] is not None and p_hard >= stats["hard"] + BASELINE_MARGIN:
+        return "hard_above_baseline"
+    return ""
+
+
+def update_baseline(session_id: str, p_ambiguous: Optional[float], p_hard: Optional[float]) -> None:
+    stats = _session_budget.setdefault(session_id, {"n": 0, "ambiguous": [], "hard": []})
+    for key, value in (("ambiguous", p_ambiguous), ("hard", p_hard)):
+        stats[key].append(value)
+        del stats[key][:-BASELINE_WINDOW]
+    stats["n"] += 1
+    _bound(_session_budget)
 
 
 def emit_verdict(
@@ -1173,8 +1267,12 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     context: Optional[str] = None
     plan = budget(p_hard, p_checkable)
     drift_state(session_id)["build"] = bool(p_build is not None and p_build >= BUILD_THRESHOLD) or kind == "build"
+    note_reason = ""
+    baseline = session_baseline(session_id)
     if arm == "feedback":
-        context = budget_context(p_ambiguous, p_hard, p_checkable, plan)
+        note_reason = budget_note_reason(session_id, p_ambiguous, p_hard, plan)
+        context = budget_context(p_ambiguous, p_hard, p_checkable, plan, note_reason)
+        update_baseline(session_id, p_ambiguous, p_hard)
         if (
             criteria_nudge_enabled()
             and verify_judge_enabled()
@@ -1207,6 +1305,10 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "p_implicit": outcome.get("p"),
             "threshold": threshold(),
             "injected": injected,
+            "note_reason": note_reason,
+            "baseline_n": baseline["n"],
+            "baseline_ambiguous": baseline["ambiguous"],
+            "baseline_hard": baseline["hard"],
             "latency_ms": latency_ms,
             "state_chars": len(json.dumps(state, ensure_ascii=False)),
             "evidence_items": len(state["evidence"]["items"]),
@@ -1220,7 +1322,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "budget",
             f"Jev budget: hard {_fmt(p_hard)} · checkable {_fmt(p_checkable)} · kind {kind or 'unknown'} · "
             f"ambiguous {_fmt(p_ambiguous)} · build {_fmt(p_build)} · k={plan['k']}"
-            + (" · note sent" if injected else ""),
+            + (" · note sent" if injected else " · note withheld"),
             answers={
                 "hard": p_hard,
                 "checkable": p_checkable,
@@ -1229,7 +1331,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
                 "build": p_build,
                 "missing": p_missing,
             },
-            decision={"k": plan["k"], "finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected},
+            decision={"k": plan["k"], "finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected, "note_reason": note_reason, "baseline_n": baseline["n"]},
             model=jev_model,
             latency_ms=latency_ms,
         )
@@ -1754,9 +1856,15 @@ def check_fidelity(session_id: str, todos: List[Dict[str, str]], *, replay: bool
             "instructions": FIDELITY_ENTAILMENT_QUESTION.format(criterion=_clip(item["content"], 300)),
             "criteria": FIDELITY_ENTAILMENT_CRITERIA,
         }
-    questions["coverage"] = {"type": "noul", "instructions": FIDELITY_COVERAGE_QUESTION, "criteria": FIDELITY_COVERAGE_CRITERIA}
+    continuation = continuation_request(request)
+    questions["coverage"] = {
+        "type": "noul",
+        "instructions": FIDELITY_COVERAGE_QUESTION_CONTINUATION if continuation else FIDELITY_COVERAGE_QUESTION,
+        "criteria": FIDELITY_COVERAGE_CRITERIA,
+    }
     jev_state = {
-        "provenance": "request and earlier_instructions were typed by the user. previous_answer was written by the agent in the turn before and the request may refer to it. acceptance_criteria were written by the agent now and are what is being judged.",
+        "provenance": "request and earlier_instructions were typed by the user. previous_answer was written by the agent in the turn before and the request may refer to it. acceptance_criteria were written by the agent now and are what is being judged."
+        + (" The request is a follow-up that accepts or resumes the work the previous answer proposed." if continuation else ""),
         "request": {"source": "user", "text": _clip(request, 1_500)},
         "earlier_instructions": {"source": "user", "items": scope[:-1][-3:]},
         "previous_answer": {"source": "agent, previous turn", "text": _session_previous_answer.get(session_id, "")},
@@ -1789,7 +1897,9 @@ def check_fidelity(session_id: str, todos: List[Dict[str, str]], *, replay: bool
         if entailment.get(item["id"]) is not None and entailment[item["id"]] < fidelity_entailment_threshold()
     ]
     coverage_low = bool(not error and p_cover is not None and p_cover < fidelity_coverage_threshold())
-    steer = coverage_low and not state["coverage_steered"]
+    # On a follow-up the low read is recorded and shown, never delivered.
+    steer = coverage_low and not state["coverage_steered"] and not continuation
+    suppressed = "continuation" if coverage_low and continuation else ""
     if steer:
         state["coverage_steered"] = True
     if not error:
@@ -1802,6 +1912,7 @@ def check_fidelity(session_id: str, todos: List[Dict[str, str]], *, replay: bool
         "entailment": entailment, "p_coverage": p_cover, "excluded": excluded,
         "entailment_threshold": fidelity_entailment_threshold(), "coverage_threshold": fidelity_coverage_threshold(),
         "coverage_low": coverage_low, "steer": steer, "replay": replay,
+        "continuation": continuation, "suppressed": suppressed,
         "latency_ms": latency_ms, "error": error,
     })
     if error:
@@ -1812,6 +1923,8 @@ def check_fidelity(session_id: str, todos: List[Dict[str, str]], *, replay: bool
             parts.append(f"{len(excluded)} excluded")
         if steer:
             parts.append("steer")
+        elif suppressed:
+            parts.append("coverage low on a follow-up, not steered")
         elif coverage_low:
             parts.append("coverage low, already steered")
         action = " · ".join(parts) or "on track"
@@ -1821,7 +1934,7 @@ def check_fidelity(session_id: str, todos: List[Dict[str, str]], *, replay: bool
         f"coverage {_fmt(p_cover)} · {action}",
         answers={**{labels[cid]: value for cid, value in entailment.items()}, "coverage": p_cover},
         decision={
-            "excluded": excluded, "steer": steer, "coverage_low": coverage_low,
+            "excluded": excluded, "steer": steer, "coverage_low": coverage_low, "continuation": continuation, "suppressed": suppressed,
             "entailment_threshold": fidelity_entailment_threshold(), "coverage_threshold": fidelity_coverage_threshold(),
         },
         model=jev_model, latency_ms=latency_ms, attempt=state["fidelity_checks"],
