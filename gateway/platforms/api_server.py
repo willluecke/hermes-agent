@@ -8460,6 +8460,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
+            elif event_type == "judge.verdict":
+                # A typed judge (Jev) rated something about this turn: the
+                # budget before the model runs, or the finished change
+                # against its acceptance criteria. ``text`` is the fixed
+                # human summary; ``answers``/``decision`` are the numbers
+                # the calibration report joins to the user's outcome label.
+                event = {
+                    "event": "judge.verdict",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "stage": str(kwargs.get("stage") or "judge"),
+                    "judge": str(tool_name or "jev"),
+                    "text": redact_sensitive_text(str(preview or ""), force=True),
+                }
+                for key in ("answers", "decision", "model", "latency_ms", "attempt"):
+                    value = kwargs.get(key)
+                    if value is not None:
+                        event[key] = value
+                _push(event)
             elif event_type == "runtime.first_event_timeout":
                 event = {
                     "event": "runtime.first_event_timeout",

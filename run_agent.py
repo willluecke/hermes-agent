@@ -9037,6 +9037,7 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
+        plugin_user_context: str = "",
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.claude_runtime.run_claude_code_turn``."""
         from agent.claude_runtime import run_claude_code_turn
@@ -9048,6 +9049,7 @@ class AIAgent:
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=should_review_memory,
+            plugin_user_context=plugin_user_context,
         )
 
 def main(

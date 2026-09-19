@@ -1244,6 +1244,16 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
+        # Hooks only get kwargs. Bind this run's progress callback under the
+        # session id first so a hook can put an event on the run stream.
+        from hermes_cli.turn_events import bind_turn_emitter
+
+        bind_turn_emitter(
+            agent.session_id, getattr(agent, "tool_progress_callback", None)
+        )
+    except Exception:
+        logger.debug("turn emitter binding failed", exc_info=True)
+    try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",

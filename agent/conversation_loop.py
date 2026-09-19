@@ -1964,6 +1964,7 @@ def run_conversation(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
+            plugin_user_context=_plugin_user_context,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )

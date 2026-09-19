@@ -237,15 +237,43 @@ def test_register_wires_the_three_hooks_and_the_settings_reader(monkeypatch):
 
 
 class _FeedbackJev(_FakeJev):
-    def __init__(self, p=0.1, ambiguous=0.1, guard=None, raise_exc=None):
+    def __init__(self, p=0.1, ambiguous=0.1, hard=0.1, checkable=0.1, kind="answer", guard=None, raise_exc=None):
         super().__init__(p=p, guard=guard, raise_exc=raise_exc)
         self.ambiguous = ambiguous
+        self.hard = hard
+        self.checkable = checkable
+        self.kind = kind
 
     def __call__(self, state, questions, timeout=None):
         body = super().__call__(state, questions, timeout=timeout)
         if "ambiguous" in questions:
             body["answers"]["ambiguous"] = {"type": "noul", "noul": self.ambiguous}
+        if "difficulty" in questions:
+            # Real score shape: per-level probabilities keyed by level number.
+            easy = round(1 - self.hard, 4)
+            body["answers"]["difficulty"] = {
+                "type": "score", "score": 1 + 2 * self.hard, "confidence": 0.9,
+                "probabilities": {"0": round(easy / 2, 4), "1": round(easy / 2, 4), "2": round(self.hard * 0.7, 4), "3": round(self.hard * 0.3, 4)},
+                "legend": {str(i): level for i, level in enumerate(preflight.DIFFICULTY_LEVELS)},
+            }
+        if "checkable" in questions:
+            body["answers"]["checkable"] = {"type": "noul", "noul": self.checkable}
+        if "kind" in questions:
+            body["answers"]["kind"] = {"type": "choice", "choice": self.kind, "confidence": 0.9, "probabilities": {self.kind: 0.9}}
+        body["model"] = "jev-1.13.0"
         return body
+
+
+@pytest.fixture
+def emitted(monkeypatch):
+    """Bind a run-stream emitter for session s1 and collect what the plugin sends."""
+    from hermes_cli import turn_events
+
+    events = []
+    turn_events._emitters.clear()
+    turn_events.bind_turn_emitter("s1", lambda event_type, tool_name=None, preview=None, args=None, **kwargs: events.append({"event": event_type, "judge": tool_name, "text": preview, **kwargs}))
+    yield events
+    turn_events._emitters.clear()
 
 
 @pytest.fixture
@@ -259,14 +287,24 @@ def feedback(harness, monkeypatch):
     return harness
 
 
-def test_feedback_mode_asks_both_questions_and_stays_quiet_when_jev_sees_no_issue(feedback):
+def test_feedback_mode_asks_the_budget_questions_and_stays_quiet_when_jev_sees_no_issue(feedback, emitted):
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="What time is it in Lisbon?", conversation_history=[])
     assert result is None
     questions = feedback["jev"].calls[0]["questions"]
-    assert set(questions) == {"missing_verification", "ambiguous", "is_build"}
+    assert set(questions) == {"missing_verification", "ambiguous", "is_build", "difficulty", "checkable", "kind"}
+    assert questions["difficulty"]["type"] == "score" and questions["difficulty"]["criteria"] == preflight.DIFFICULTY_LEVELS
+    assert questions["checkable"]["type"] == "noul" and set(questions["checkable"]["criteria"]) == {"true", "false"}
+    assert questions["kind"]["type"] == "choice" and "build" in questions["kind"]["criteria"]
     [record] = feedback["records"]("preflight")
     assert record["arm"] == "feedback" and record["injected"] is False
     assert record["p_ambiguous"] == 0.1 and record["p_missing"] == 0.1
+    assert record["p_hard"] == pytest.approx(0.1) and record["p_checkable"] == 0.1 and record["kind"] == "answer" and record["k"] == 1
+    # The budget is visible in the turn even when no note goes to the model.
+    [event] = emitted
+    assert event["event"] == "judge.verdict" and event["stage"] == "budget" and event["judge"] == "jev"
+    assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False}
+    assert event["answers"]["hard"] == pytest.approx(0.1) and event["answers"]["kind"] == "answer"
+    assert event["model"] == "jev-1.13.0" and "k=1" in event["text"]
 
 
 def test_feedback_mode_feeds_the_numbers_back_when_the_request_is_ambiguous(feedback):
@@ -274,23 +312,55 @@ def test_feedback_mode_feeds_the_numbers_back_when_the_request_is_ambiguous(feed
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix it", conversation_history=[])
     assert result is not None
     note = result["context"]
-    assert "advisory" in note and "0.82" in note and "0.10" in note
+    assert "advisory" in note and "ambiguous enough to ask first) = 0.82" in note
     assert "ask the user one focused clarifying question" in note
     assert preflight.REMINDER not in note
     [record] = feedback["records"]("preflight")
     assert record["injected"] is True and record["p_ambiguous"] == 0.82
 
 
-def test_feedback_mode_feeds_back_when_jev_is_unsure_or_evidence_is_missing(feedback):
+def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedback, emitted):
+    feedback["jev"].hard = 0.8
+    feedback["jev"].checkable = 0.9
+    feedback["jev"].kind = "build"
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make the importer idempotent", conversation_history=[])
+    note = result["context"]
+    assert "P(hard or very hard) = 0.80" in note and "P(objectively checkable) = 0.90" in note
+    assert "3 independent candidate solutions" in note and "typesafe_decide" in note
+    assert "never pick among your own candidates by reasoning alone" in note
+    assert "clarifying question" not in note
+    [record] = feedback["records"]("preflight")
+    assert record["k"] == 3 and record["kind"] == "build" and record["p_hard"] == pytest.approx(0.8)
+    [event] = emitted
+    assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True}
+    # Hard but not checkable: criteria first, one candidate, no finish loop.
+    feedback["jev"].checkable = 0.2
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[])
+    assert "write the acceptance criteria first" in result["context"]
+    assert feedback["records"]("preflight")[-1]["k"] == 1
+    assert emitted[-1]["decision"]["plan"] == "criteria_only" and emitted[-1]["decision"]["finish_loop"] is False
+
+
+def test_feedback_mode_feeds_back_when_jev_is_unsure_but_no_longer_on_missing_evidence_alone(feedback):
     feedback["jev"].ambiguous = 0.5  # unsure band
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) is not None
     feedback["jev"].ambiguous = 0.05
-    feedback["jev"].p = 0.9  # evidence missing
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="x", conversation_history=[]) is not None
+    feedback["jev"].p = 0.9  # evidence missing: averaged 0.81 over real turns, so it no longer triggers on its own
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="x", conversation_history=[]) is None
+    assert feedback["records"]("preflight")[-1]["p_missing"] == 0.9, "still asked and logged for the trial arms"
     feedback["jev"].p = 0.05
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="x", conversation_history=[]) is None
     feedback["jev"].raise_exc = RuntimeError("down")
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="x", conversation_history=[]) is None, "no answer, no note"
+
+
+def test_budget_reads_level_mass_not_the_weighted_score():
+    answers = {"difficulty": {"type": "score", "score": 1.9, "probabilities": {"0": 0.05, "1": 0.45, "2": 0.45, "3": 0.05}}}
+    assert preflight._level_mass(answers, "difficulty", (2, 3)) == pytest.approx(0.5)
+    assert preflight._level_mass({"difficulty": {"type": "noul", "noul": 0.9}}, "difficulty", (2, 3)) is None
+    assert preflight.budget(0.5, 0.7) == {"k": 3, "finish_loop": True, "plan": "candidates"}
+    assert preflight.budget(0.49, 0.99) == {"k": 1, "finish_loop": True, "plan": "direct"}
+    assert preflight.budget(None, None) == {"k": 1, "finish_loop": True, "plan": "direct"}
 
 
 def test_feedback_mode_repeats_the_same_note_within_a_turn(feedback):
@@ -370,7 +440,7 @@ def test_post_tool_call_remembers_todos_and_check_outputs(feedback):
     assert checks[0]["output"].endswith("1 failing") and len(checks[0]["output"]) <= preflight.MAX_CHECK_CHARS
 
 
-def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo):
+def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo, emitted):
     preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="1 failed, 3 passed", session_id="s1")
     feedback["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.05, "checks_failing": 0.9, "claims_unverified": 0.1}
@@ -395,9 +465,17 @@ def test_verify_judge_keeps_the_model_going_on_unmet_criteria(feedback, repo):
     assert state["check_outputs"]["items"][0]["command"] == "pytest -q"
     assert state["final_message"]["text"] == "Done, everything passes."
     assert set(call["questions"]) == {"criterion_1", "criterion_2", "checks_failing", "claims_unverified"}
+    assert call["questions"]["criterion_2"]["criteria"] == preflight.CRITERION_CRITERIA, "nouls carry explicit boundaries"
+    assert call["questions"]["claims_unverified"]["criteria"] == preflight.CLAIMS_CRITERIA
     assert call["timeout"] == preflight.VERIFY_TIMEOUT_SECONDS
     [record] = feedback["records"]("verify")
     assert record["criteria"] == 2 and record["pending"] == 1 and record["features"] == 1
+    [event] = emitted
+    assert event["event"] == "judge.verdict" and event["stage"] == "verify" and event["attempt"] == 0
+    assert event["decision"]["action"] == "nudge" and event["decision"]["criteria"] == 2 and event["decision"]["pending"] == 1
+    assert event["answers"]["Errors are logged"] == 0.05 and event["answers"]["Greeting returns hello world"] == 0.95
+    assert event["answers"]["claims_unverified"] == 0.1 and event["answers"]["checks_failing"] == 0.9
+    assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/2") and "Errors are logged" in event["text"]
     assert len(record["findings"]) == 3
 
 

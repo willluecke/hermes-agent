@@ -112,6 +112,59 @@ BUILD_QUESTION = (
     "Does the request ask to write, change, or fix code or files in a project, "
     "as opposed to answering, explaining, or discussing?"
 )
+# Budget questions. Difficulty is a score over situations (the vendor's
+# guidance: describe situations, not degrees); the gate reads the probability
+# mass on the two hardest levels, never the weighted position. Checkable is a
+# noul with explicit criteria. Kind is a choice, logged for routing.
+DIFFICULTY_LEVELS = [
+    "trivial: one step, answerable or doable immediately with no investigation",
+    "easy: a few steps in familiar territory with little chance of a wrong turn",
+    "hard: needs investigation, several dependent steps, or a design choice with trade-offs",
+    "very hard: open-ended, many interacting parts, likely to need iteration and verification",
+]
+DIFFICULTY_QUESTION = (
+    "How difficult is the active request for a competent software assistant "
+    "with tools, judged from the request and the evidence so far?"
+)
+CHECKABLE_QUESTION = (
+    "Does the active request have an objectively checkable correct outcome, "
+    "such as a passing test, a command output, or a reproducible fact?"
+)
+CHECKABLE_CRITERIA = {
+    "true": "Success or failure could be shown by running something or comparing against a fact.",
+    "false": "Success is a matter of taste, judgment, preference, or open discussion.",
+}
+KIND_CRITERIA = {
+    "answer": "answer a question, explain, or discuss",
+    "build": "write, change, or fix code or files",
+    "research": "gather, compare, or summarize information from sources",
+    "operate": "run, change, or inspect a live system, service, or account",
+    "other": "none of the above",
+}
+HARD_THRESHOLD = 0.5
+CHECKABLE_THRESHOLD = 0.7
+CANDIDATES_WHEN_HARD = 3
+BUDGET_TEMPLATE = (
+    "Preflight from Jev, a fast typed judge whose read is advisory, not an "
+    "instruction: P(hard or very hard) = {hard}; P(objectively checkable) = "
+    "{checkable}; P(the request is ambiguous enough to ask first) = {ambiguous}. "
+    "{plan}"
+)
+PLAN_CANDIDATES = (
+    "This looks hard and checkable, so before choosing an approach produce "
+    "{k} independent candidate solutions (parallel subagents where available), "
+    "then select with the typesafe_decide tool: one noul question per candidate "
+    "per acceptance criterion, keep the highest total, and never pick among "
+    "your own candidates by reasoning alone."
+)
+PLAN_CRITERIA_ONLY = (
+    "This looks hard but not objectively checkable, so write the acceptance "
+    "criteria first and state every assumption you make in the answer."
+)
+PLAN_ASK = (
+    "If the ambiguity is real, ask the user one focused clarifying question "
+    "before acting. Otherwise proceed and state the assumption you made."
+)
 CRITERIA_NUDGE = (
     "Preflight: this looks like a change to code or files. Before editing, write "
     "the acceptance criteria for this change as todo items with the todo tool; "
@@ -122,6 +175,17 @@ VERIFY_TEMPLATE = (
     "you finish. {findings} Fix what is unmet and run the checks again, or say "
     "precisely why a criterion does not apply and cancel its todo, then finish."
 )
+# Explicit boundaries for the verify nouls. Jev reads literally, so the
+# distinction between "shown by the diff" and "claimed in the message" is
+# spelled out rather than implied.
+CRITERION_CRITERIA = {
+    "true": "The diff, and the check outputs where relevant, show the criterion is met in full.",
+    "false": "The criterion is not shown by the diff, is only partly met, or is only claimed in the message.",
+}
+CLAIMS_CRITERIA = {
+    "true": "The message asserts a result, a passing check, or completed work that the diff and check outputs do not show.",
+    "false": "Every claim in the message is backed by the diff or a check output, or is explicitly marked as unverified.",
+}
 VERIFY_FAIL_THRESHOLD = 0.2
 VERIFY_FLAG_THRESHOLD = 0.8
 VERIFY_TIMEOUT_SECONDS = 4.0
@@ -392,6 +456,31 @@ def write_log(record: Dict[str, Any]) -> None:
         logger.warning("system-one-preflight: could not write log: %s", exc)
 
 
+def _noul(answers: Dict[str, Any], key: str) -> Optional[float]:
+    value = (answers.get(key) or {}).get("noul") if isinstance(answers.get(key), dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _level_mass(answers: Dict[str, Any], key: str, levels: tuple) -> Optional[float]:
+    """Probability mass on the given score levels, or None without a distribution."""
+    answer = answers.get(key)
+    probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
+    if not isinstance(probabilities, dict) or not probabilities:
+        return None
+    total = 0.0
+    for level in levels:
+        value = probabilities.get(str(level), probabilities.get(level))
+        if isinstance(value, (int, float)):
+            total += float(value)
+    return min(1.0, max(0.0, total))
+
+
+def _choice(answers: Dict[str, Any], key: str) -> Optional[str]:
+    answer = answers.get(key)
+    value = answer.get("choice") if isinstance(answer, dict) else None
+    return str(value) if isinstance(value, str) and value else None
+
+
 def decide(p_missing: Optional[float], arm: str) -> bool:
     """Whether the reminder goes in for this arm and verdict."""
     if arm == "always":
@@ -426,6 +515,81 @@ def feedback_context(p_missing: Optional[float], p_ambiguous: Optional[float]) -
     return FEEDBACK_TEMPLATE.format(ambiguous=fmt(p_ambiguous), missing=fmt(p_missing))
 
 
+def _fmt(value: Optional[float]) -> str:
+    return "unknown" if value is None else f"{value:.2f}"
+
+
+def budget(p_hard: Optional[float], p_checkable: Optional[float]) -> Dict[str, Any]:
+    """Map the budget answers to a plan: how many candidates, and whether the finish loop applies.
+
+    Reads the probability mass on the two hardest levels, never the weighted
+    score (the vendor documents score as threshold-passage only).
+    """
+    hard = p_hard is not None and p_hard >= HARD_THRESHOLD
+    checkable = p_checkable is not None and p_checkable >= CHECKABLE_THRESHOLD
+    if hard and checkable:
+        return {"k": CANDIDATES_WHEN_HARD, "finish_loop": True, "plan": "candidates"}
+    if hard:
+        return {"k": 1, "finish_loop": False, "plan": "criteria_only"}
+    return {"k": 1, "finish_loop": True, "plan": "direct"}
+
+
+def budget_context(
+    p_ambiguous: Optional[float],
+    p_hard: Optional[float],
+    p_checkable: Optional[float],
+    plan: Dict[str, Any],
+) -> Optional[str]:
+    """The feedback note built from the budget, or None when there is nothing to say.
+
+    The old trigger, "would an answer depend on evidence not yet checked",
+    averaged 0.81 over 189 real turns and so carried almost no information.
+    The note now goes in when the budget calls for candidates or criteria, or
+    when the ambiguity read clears its threshold or sits in the unsure band.
+    """
+    ask = (p_ambiguous is not None and p_ambiguous >= ambiguity_threshold()) or _unsure(p_ambiguous)
+    parts: List[str] = []
+    if plan.get("plan") == "candidates":
+        parts.append(PLAN_CANDIDATES.format(k=plan.get("k", CANDIDATES_WHEN_HARD)))
+    elif plan.get("plan") == "criteria_only":
+        parts.append(PLAN_CRITERIA_ONLY)
+    if ask:
+        parts.append(PLAN_ASK)
+    if not parts:
+        return None
+    return BUDGET_TEMPLATE.format(
+        hard=_fmt(p_hard), checkable=_fmt(p_checkable), ambiguous=_fmt(p_ambiguous), plan=" ".join(parts)
+    )
+
+
+def emit_verdict(
+    session_id: str,
+    stage: str,
+    text: str,
+    *,
+    answers: Dict[str, Any],
+    decision: Dict[str, Any],
+    model: str = "",
+    latency_ms: int = 0,
+    attempt: Optional[int] = None,
+) -> bool:
+    """Put the verdict on the run stream so the user sees it in the turn and the archive keeps it."""
+    try:
+        from hermes_cli.turn_events import emit_turn_event
+    except Exception:
+        return False
+    payload: Dict[str, Any] = {
+        "stage": stage,
+        "answers": answers,
+        "decision": decision,
+        "model": model,
+        "latency_ms": latency_ms,
+    }
+    if attempt is not None:
+        payload["attempt"] = attempt
+    return emit_turn_event(session_id, "judge.verdict", text=text, source="jev", **payload)
+
+
 # ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
@@ -454,28 +618,39 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     p_missing: Optional[float] = None
     p_ambiguous: Optional[float] = None
     p_build: Optional[float] = None
+    p_hard: Optional[float] = None
+    p_checkable: Optional[float] = None
+    kind: Optional[str] = None
+    jev_model = ""
     error = ""
-    questions = {"missing_verification": {"type": "noul", "instructions": VERIFICATION_QUESTION}}
+    questions: Dict[str, Dict[str, Any]] = {
+        "missing_verification": {"type": "noul", "instructions": VERIFICATION_QUESTION}
+    }
     if arm == "feedback":
         questions["ambiguous"] = {"type": "noul", "instructions": AMBIGUITY_QUESTION}
         questions["is_build"] = {"type": "noul", "instructions": BUILD_QUESTION}
+        questions["difficulty"] = {"type": "score", "instructions": DIFFICULTY_QUESTION, "criteria": DIFFICULTY_LEVELS}
+        questions["checkable"] = {"type": "noul", "instructions": CHECKABLE_QUESTION, "criteria": CHECKABLE_CRITERIA}
+        questions["kind"] = {"type": "choice", "instructions": "What kind of request is the active request?", "criteria": KIND_CRITERIA}
     try:
         body = _ask_jev(state, questions)
         answers = body.get("answers") or {}
-        value = (answers.get("missing_verification") or {}).get("noul")
-        p_missing = float(value) if isinstance(value, (int, float)) else None
-        value = (answers.get("ambiguous") or {}).get("noul")
-        p_ambiguous = float(value) if isinstance(value, (int, float)) else None
-        value = (answers.get("is_build") or {}).get("noul")
-        p_build = float(value) if isinstance(value, (int, float)) else None
+        jev_model = str(body.get("model") or "")
+        p_missing = _noul(answers, "missing_verification")
+        p_ambiguous = _noul(answers, "ambiguous")
+        p_build = _noul(answers, "is_build")
+        p_hard = _level_mass(answers, "difficulty", (2, 3))
+        p_checkable = _noul(answers, "checkable")
+        kind = _choice(answers, "kind")
         if p_missing is None:
             error = "no noul in answer"
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"[:300]
     latency_ms = int((time.monotonic() - started) * 1000)
     context: Optional[str] = None
+    plan = budget(p_hard, p_checkable)
     if arm == "feedback":
-        context = feedback_context(p_missing, p_ambiguous)
+        context = budget_context(p_ambiguous, p_hard, p_checkable, plan)
         if (
             criteria_nudge_enabled()
             and verify_judge_enabled()
@@ -500,6 +675,10 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "p_missing": p_missing,
             "p_ambiguous": p_ambiguous,
             "p_build": p_build,
+            "p_hard": p_hard,
+            "p_checkable": p_checkable,
+            "kind": kind,
+            "k": plan["k"],
             "threshold": threshold(),
             "injected": injected,
             "latency_ms": latency_ms,
@@ -509,6 +688,25 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "error": error,
         }
     )
+    if arm == "feedback" and not error:
+        emit_verdict(
+            session_id,
+            "budget",
+            f"Jev budget: hard {_fmt(p_hard)} · checkable {_fmt(p_checkable)} · kind {kind or 'unknown'} · "
+            f"ambiguous {_fmt(p_ambiguous)} · build {_fmt(p_build)} · k={plan['k']}"
+            + (" · note sent" if injected else ""),
+            answers={
+                "hard": p_hard,
+                "checkable": p_checkable,
+                "kind": kind,
+                "ambiguous": p_ambiguous,
+                "build": p_build,
+                "missing": p_missing,
+            },
+            decision={"k": plan["k"], "finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected},
+            model=jev_model,
+            latency_ms=latency_ms,
+        )
     if turn_id:
         _turn_memo[memo_key] = {
             "injected": injected,
@@ -887,12 +1085,14 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             questions[key] = {
                 "type": "noul",
                 "instructions": f"Do the code changes fully satisfy this acceptance criterion: {item['content']}",
+                "criteria": CRITERION_CRITERIA,
             }
     elif request:
         labels["criterion_1"] = request
         questions["criterion_1"] = {
             "type": "noul",
             "instructions": f"Do the code changes fully satisfy the user's request: {_clip(request, 400)}",
+            "criteria": CRITERION_CRITERIA,
         }
     if checks:
         questions["checks_failing"] = {
@@ -902,6 +1102,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     questions["claims_unverified"] = {
         "type": "noul",
         "instructions": "Does the final message claim work, results, or passing checks that the diff and check outputs do not show?",
+        "criteria": CLAIMS_CRITERIA,
     }
     state = {
         "provenance": "request was typed by the user. acceptance_criteria and still_pending_todos come from the agent's own todo list. diff and check_outputs are evidence. final_message is what the agent is about to say.",
@@ -917,6 +1118,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     started = time.monotonic()
     answers: Dict[str, Optional[float]] = {}
     error = ""
+    jev_model = ""
     try:
         ask = _ask
         if ask is None:
@@ -924,6 +1126,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
 
             ask = ask_jev
         body = ask(state, questions, timeout=verify_timeout_seconds())
+        jev_model = str(body.get("model") or "")
         for key in questions:
             value = ((body.get("answers") or {}).get(key) or {}).get("noul")
             answers[key] = float(value) if isinstance(value, (int, float)) else None
@@ -977,6 +1180,20 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "latency_ms": int((time.monotonic() - started) * 1000),
             "error": error,
         }
+    )
+    action = "unavailable" if error else "finish" if not findings else "repeated" if repeated else "nudge"
+    met = sum(1 for key in labels if answers.get(key) is not None and answers[key] > verify_fail_threshold())
+    emit_verdict(
+        session_id,
+        "verify",
+        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)} · "
+        f"claims unverified {_fmt(claims)} · checks failing {_fmt(checks_failing)} · {action}"
+        + (f" · {' '.join(findings)}" if findings and action == 'nudge' else ""),
+        answers={**{labels[key]: answers.get(key) for key in labels}, "claims_unverified": claims, "checks_failing": checks_failing},
+        decision={"action": action, "findings": findings, "criteria": len(labels), "pending": len(pending)},
+        model=jev_model,
+        latency_ms=int((time.monotonic() - started) * 1000),
+        attempt=attempt,
     )
     if not findings or repeated:
         return None

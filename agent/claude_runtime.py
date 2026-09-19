@@ -178,9 +178,17 @@ def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) ->
     )
 
 
-def make_claude_code_event_bridge(agent: Any) -> Callable[[dict[str, Any]], None]:
-    """Project Claude Code stream-json records onto Hermes run events."""
-    started: dict[str, tuple[str, dict[str, Any], float]] = {}
+def make_claude_code_event_bridge(
+    agent: Any,
+    record: Optional[Callable[[str, str, dict[str, Any], str, str], None]] = None,
+) -> Callable[[dict[str, Any]], None]:
+    """Project Claude Code stream-json records onto Hermes run events.
+
+    ``record(raw_name, name, args, result, call_id)`` is told about every
+    completed tool call so the turn can replay them through the observer
+    hooks afterwards (see :func:`_claude_hook_parity`).
+    """
+    started: dict[str, tuple[str, dict[str, Any], float, str]] = {}
     pending_text: list[str] = []
 
     def _emit_commentary() -> None:
@@ -205,7 +213,7 @@ def make_claude_code_event_bridge(agent: Any) -> Callable[[dict[str, Any]], None
         raw_name = str(block.get("name") or "tool")
         name = _tool_name(raw_name)
         args = block.get("input") if isinstance(block.get("input"), dict) else {}
-        started[call_id] = (name, args, time.monotonic())
+        started[call_id] = (name, args, time.monotonic(), raw_name)
         progress = getattr(agent, "tool_progress_callback", None)
         if progress:
             progress(
@@ -222,12 +230,17 @@ def make_claude_code_event_bridge(agent: Any) -> Callable[[dict[str, Any]], None
     def _tool_completed(block: dict[str, Any]) -> None:
         call_id = str(block.get("tool_use_id") or "")
         prior = started.pop(call_id, None)
-        name, args, started_at = prior or ("tool", {}, time.monotonic())
+        name, args, started_at, raw_name = prior or ("tool", {}, time.monotonic(), "tool")
         result = _content_text(block.get("content"))
         if not result and isinstance(block.get("content"), str):
             result = str(block.get("content"))
         result = redact_sensitive_text(result, force=True)
         is_error = bool(block.get("is_error"))
+        if record is not None:
+            try:
+                record(raw_name, name, args, result, call_id)
+            except Exception:
+                logger.debug("Claude tool record failed", exc_info=True)
         progress = getattr(agent, "tool_progress_callback", None)
         if progress:
             progress(
@@ -351,6 +364,223 @@ def _materialize_images(
     return attached, referenced
 
 
+_CLAUDE_HERMES_TOOL_NAMES = {
+    "Bash": "terminal",
+    "Edit": "patch",
+    "MultiEdit": "patch",
+    "NotebookEdit": "patch",
+    "Write": "write_file",
+    "TodoWrite": "todo",
+    "Read": "read_file",
+    "Grep": "search_files",
+    "Glob": "search_files",
+}
+_CLAUDE_FILE_CHANGE_TOOLS = ("Edit", "MultiEdit", "NotebookEdit", "Write")
+
+
+def _claude_hermes_call(
+    raw_name: str, args: dict[str, Any], result: str
+) -> tuple[str, dict[str, Any], str, Optional[str]]:
+    """(hermes_name, args, result, changed_path) for one completed Claude Code call.
+
+    The observer hooks and the verify judge know Hermes tool names and the
+    todo tool's JSON result, so Claude Code's own tools are projected onto
+    those shapes, the same way codex calls are.
+    """
+    name = _CLAUDE_HERMES_TOOL_NAMES.get(raw_name)
+    if name is None:
+        name = raw_name.split("__")[-1] if raw_name.startswith("mcp__") else (raw_name or "tool")
+    changed = None
+    if raw_name in _CLAUDE_FILE_CHANGE_TOOLS:
+        value = args.get("file_path") or args.get("notebook_path")
+        changed = str(value) if isinstance(value, str) and value.strip() else None
+    if raw_name == "TodoWrite":
+        todos = args.get("todos") if isinstance(args.get("todos"), list) else []
+        result = json.dumps(
+            {
+                "todos": [
+                    {
+                        "id": str(index + 1),
+                        "content": str(item.get("content") or ""),
+                        "status": str(item.get("status") or "pending"),
+                    }
+                    for index, item in enumerate(todos)
+                    if isinstance(item, dict)
+                ]
+            }
+        )
+    elif raw_name == "Bash":
+        args = {"command": str(args.get("command") or "")}
+    return name, args, result, changed
+
+
+def _claude_file_change_path(agent: Any, value: str) -> Optional[Path]:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(getattr(agent, "session_cwd", None) or Path.cwd()) / candidate
+    try:
+        return candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _claude_hook_parity(
+    agent: Any,
+    session: Any,
+    turn: Any,
+    messages: list[dict[str, Any]],
+    calls: list[tuple[str, str, dict[str, Any], str, str]],
+    original_user_message: Any,
+    effective_task_id: str,
+) -> int:
+    """Give a Claude turn the observer hooks and the verify gate of the default loop.
+
+    Claude Code executes tools inside its own process, so ``post_tool_call``,
+    ``post_llm_call`` and ``pre_verify`` never fire on this path unless they
+    are replayed from the calls the event bridge saw. The verify gate may
+    keep the turn going: a ``continue`` directive is sent to the same Claude
+    session as one more turn, the attempted answer stays in the transcript
+    as an interim message, and the turn object is updated to the follow-up's
+    outcome. Bounded by ``agent.max_verify_nudges``. Returns the number of
+    follow-up turns run. Mirrors ``agent.codex_runtime._codex_hook_parity``.
+    """
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+
+    session_id = getattr(agent, "session_id", "") or ""
+    turn_id = getattr(agent, "_current_turn_id", "") or ""
+    platform = getattr(agent, "platform", "") or ""
+    model = getattr(agent, "model", "") or ""
+    changed: set[str] = set()
+    replayed = 0
+
+    def emit_tool_hooks() -> None:
+        nonlocal replayed
+        pending = list(calls[replayed:])
+        replayed = len(calls)
+        for raw_name, _name, args, result, call_id in pending:
+            name, hermes_args, hermes_result, changed_path = _claude_hermes_call(
+                raw_name, args if isinstance(args, dict) else {}, result
+            )
+            if changed_path:
+                path = _claude_file_change_path(agent, changed_path)
+                if path is not None:
+                    changed.add(str(path))
+            if not has_hook("post_tool_call"):
+                continue
+            try:
+                invoke_hook(
+                    "post_tool_call",
+                    tool_name=name,
+                    args=hermes_args,
+                    result=hermes_result,
+                    task_id=effective_task_id or "",
+                    session_id=session_id,
+                    tool_call_id=call_id,
+                    turn_id=turn_id,
+                    api_request_id="",
+                    duration_ms=0,
+                    status="ok",
+                    error_type=None,
+                    error_message=None,
+                    middleware_trace=[],
+                )
+            except Exception:
+                logger.debug("Claude post_tool_call parity failed", exc_info=True)
+
+    emit_tool_hooks()
+
+    follow_ups = 0
+    try:
+        from agent.verify_hooks import max_verify_nudges
+
+        limit = int(max_verify_nudges())
+    except Exception:
+        limit = 0
+    attempt = int(getattr(agent, "_pre_verify_nudges", 0) or 0)
+    while (
+        changed
+        and attempt < limit
+        and session is not None
+        and isinstance(turn.final_text, str)
+        and turn.final_text.strip()
+        and not turn.interrupted
+        and turn.error is None
+        and has_hook("pre_verify")
+    ):
+        from hermes_cli.plugins import get_pre_verify_continue_message
+
+        nudge = get_pre_verify_continue_message(
+            session_id=session_id,
+            platform=platform,
+            model=model,
+            coding=True,
+            attempt=attempt,
+            final_response=turn.final_text,
+            changed_paths=sorted(changed),
+        )
+        if not nudge:
+            break
+        attempt += 1
+        agent._pre_verify_nudges = attempt
+        from agent.message_metadata import append_message
+
+        # The attempted answer stays visible as commentary and in the
+        # transcript; the nudge is synthetic and stripped from the durable
+        # transcript, exactly as the default loop does.
+        emit = getattr(agent, "_emit_interim_assistant_message", None)
+        if emit:
+            try:
+                emit({"role": "assistant", "content": turn.final_text})
+            except Exception:
+                logger.debug("Claude interim answer callback failed", exc_info=True)
+        append_message(messages, {"role": "assistant", "content": turn.final_text})
+        append_message(
+            messages, {"role": "user", "content": nudge, "_pre_verify_synthetic": True}
+        )
+        try:
+            follow = session.run_turn(nudge)
+        except Exception:
+            logger.warning("Claude pre_verify follow-up turn failed", exc_info=True)
+            break
+        follow_ups += 1
+        emit_tool_hooks()
+        turn.final_text = follow.final_text
+        turn.tool_iterations = int(turn.tool_iterations or 0) + int(follow.tool_iterations or 0)
+        for key, value in (follow.usage or {}).items():
+            if isinstance(value, (int, float)):
+                turn.usage[key] = turn.usage.get(key, 0) + value
+        turn.interrupted = bool(turn.interrupted or follow.interrupted)
+        turn.error = follow.error
+        turn.error_code = follow.error_code
+        turn.should_retire = bool(turn.should_retire or follow.should_retire)
+        turn.session_confirmed = bool(turn.session_confirmed or follow.session_confirmed)
+        turn.watchdog_retries = int(turn.watchdog_retries or 0) + int(follow.watchdog_retries or 0)
+        if follow.session_id:
+            turn.session_id = follow.session_id
+
+    if (
+        has_hook("post_llm_call")
+        and isinstance(turn.final_text, str)
+        and turn.final_text.strip()
+        and not turn.interrupted
+    ):
+        try:
+            invoke_hook(
+                "post_llm_call",
+                session_id=session_id,
+                task_id=effective_task_id or "",
+                turn_id=turn_id,
+                user_message=original_user_message,
+                assistant_response=turn.final_text,
+                conversation_history=list(messages),
+                model=model,
+                platform=platform,
+            )
+        except Exception:
+            logger.debug("Claude post_llm_call parity failed", exc_info=True)
+    return follow_ups
+
+
 def run_claude_code_turn(
     agent: Any,
     *,
@@ -359,9 +589,10 @@ def run_claude_code_turn(
     messages: list[dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    plugin_user_context: str = "",
 ) -> dict[str, Any]:
     """Run one Claude subscription turn and return the standard agent result."""
-    del effective_task_id, should_review_memory
+    del should_review_memory
     from agent.deadline import resolve_timeout
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.claude_code_session import (
@@ -455,6 +686,11 @@ def run_claude_code_turn(
             else claude_history_handoff(prior_messages, prompt_text)
         )
         sections = [prompt]
+        if plugin_user_context:
+            # The pre_llm_call hook's note (the preflight judge, gateway
+            # notices) rides the user message here as it does on the default
+            # loop, where it is stamped on the API copy of the message.
+            sections.append(plugin_user_context)
         if attached_images:
             sections.append(
                 "Attached images are available at:\n"
@@ -515,6 +751,12 @@ def run_claude_code_turn(
                         exc_info=True,
                     )
 
+        calls: list[tuple[str, str, dict[str, Any], str, str]] = []
+
+        def _record(raw_name: str, name: str, args: dict[str, Any], result: str, call_id: str) -> None:
+            calls.append((raw_name, name, args, result, call_id))
+
+        bridge = make_claude_code_event_bridge(agent, record=_record)
         if session is None:
             session = ClaudeCodeSession(
                 cwd=cwd,
@@ -524,7 +766,7 @@ def run_claude_code_turn(
                 effort=effort,
                 system_prompt=runtime_contract,
                 read_only=read_only,
-                on_event=make_claude_code_event_bridge(agent),
+                on_event=bridge,
                 on_session_id=_remember_confirmed_session,
                 on_watchdog_timeout=_watchdog_timeout,
                 resident_first_event_timeout=resident_first_event_timeout,
@@ -535,7 +777,7 @@ def run_claude_code_turn(
         else:
             # Event callbacks are per outer turn even though the native process
             # is per conversation. Rebind them before sending the next message.
-            session.on_event = make_claude_code_event_bridge(agent)
+            session.on_event = bridge
             session.on_session_id = _remember_confirmed_session
             session.on_watchdog_timeout = _watchdog_timeout
             session.resident_first_event_timeout = resident_first_event_timeout
@@ -565,6 +807,16 @@ def run_claude_code_turn(
             **({"error_code": error_code} if error_code else {}),
             "agent_persisted": True,
         }
+
+    # Hook parity with the default loop (observer hooks + the pre_verify
+    # gate), which may extend this turn with bounded follow-up turns.
+    follow_ups = 0
+    try:
+        follow_ups = _claude_hook_parity(
+            agent, session, turn, messages, calls, original_user_message, effective_task_id
+        )
+    except Exception:
+        logger.debug("Claude hook parity failed", exc_info=True)
 
     transcript_persisted = getattr(agent, "_session_db", None) is None
     if turn.final_text:
@@ -621,7 +873,7 @@ def run_claude_code_turn(
     return {
         "final_response": turn.final_text,
         "messages": messages,
-        "api_calls": 1,
+        "api_calls": 1 + follow_ups,
         "completed": not turn.interrupted and turn.error is None and bool(turn.final_text),
         "partial": turn.interrupted or turn.error is not None or not bool(turn.final_text),
         "interrupted": user_interrupted,

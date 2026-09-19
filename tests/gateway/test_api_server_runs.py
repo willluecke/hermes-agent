@@ -1848,6 +1848,55 @@ class TestRunToolEventIdentity:
         }
 
     @pytest.mark.asyncio
+    async def test_judge_verdict_is_a_durable_structured_run_event(self, adapter):
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb(
+                "judge.verdict",
+                "jev",
+                "Jev verify (attempt 1): criteria met 1/2 · nudge",
+                None,
+                stage="verify",
+                answers={"Greeting returns hello": 0.95, "Errors are logged": 0.05},
+                decision={"action": "nudge", "findings": ["Criteria rated unmet: ..."]},
+                model="jev-1.13.0",
+                latency_ms=412,
+                attempt=0,
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+
+        events = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        verdict = next(event for event in events if event.get("event") == "judge.verdict")
+        assert {k: v for k, v in verdict.items() if k not in {"run_seq", "emitted_at_ms", "timestamp"}} == {
+            "event": "judge.verdict",
+            "run_id": run_id,
+            "stage": "verify",
+            "judge": "jev",
+            "text": "Jev verify (attempt 1): criteria met 1/2 · nudge",
+            "answers": {"Greeting returns hello": 0.95, "Errors are logged": 0.05},
+            "decision": {"action": "nudge", "findings": ["Criteria rated unmet: ..."]},
+            "model": "jev-1.13.0",
+            "latency_ms": 412,
+            "attempt": 0,
+        }
+
+    @pytest.mark.asyncio
     async def test_codex_first_event_timeout_keeps_thread_and_turn_ids(
         self, adapter
     ):
