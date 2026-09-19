@@ -33,6 +33,9 @@ class _FakeJev:
         for key in questions:
             if key == "missing_verification":
                 answers[key] = {"type": "noul", "noul": self.p}
+            elif key.startswith("entails_") or key == "coverage":
+                # The fidelity check: criteria are entailed and cover the request unless a test says otherwise.
+                answers[key] = {"type": "noul", "noul": self.guard.get(key, 0.9)}
             else:
                 answers[key] = {"type": "noul", "noul": self.guard.get(key, 0.1)}
         return {"model": "jev-latest", "answers": answers, "usage": {"input_tokens": 100, "output_tokens": 0}}
@@ -57,6 +60,11 @@ def harness(tmp_path, monkeypatch):
     preflight._session_commands.clear()
     preflight._verify_memo.clear()
     preflight._held_actions.clear()
+    preflight._session_excluded.clear()
+    preflight._session_fidelity.clear()
+    preflight._session_previous_answer.clear()
+    preflight._pending_fidelity.clear()
+    preflight._pending_fidelity_note.clear()
 
     def records(event=None):
         path = tmp_path / "preflight.jsonl"
@@ -230,13 +238,14 @@ class _MinimalManager:
         return object()
 
 
-def test_register_wires_the_three_hooks_and_the_settings_reader(monkeypatch):
+def test_register_wires_the_hooks_and_the_settings_reader(monkeypatch):
     manifest = PluginManifest(name="system-one-preflight", version="0.1.0", description="test")
     manager = _MinimalManager()
     ctx = PluginContext(manifest=manifest, manager=manager)  # type: ignore[arg-type]
     monkeypatch.setattr(ctx, "get_config", lambda key, default=None: {"mode": "jev"}.get(key, default))
     preflight.register(ctx)
-    assert set(manager._hooks) == {"pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call", "pre_verify"}
+    assert set(manager._hooks) == {"pre_llm_call", "post_llm_call", "pre_tool_call", "post_tool_call", "transform_tool_result", "pre_verify"}
+    assert manager._hooks["transform_tool_result"] == [preflight.on_transform_tool_result]
     assert manager._hooks["pre_llm_call"] == [preflight.on_pre_llm_call]
     assert ("hook", "pre_llm_call") in manager.tracked
     assert preflight.current_mode() == "jev"
@@ -893,3 +902,240 @@ def test_an_undelivered_drift_steer_becomes_a_verify_finding(drift, repo):
     assert preflight._pending_drift == {}
     [record] = drift["records"]("verify")
     assert len(record["findings"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Criteria fidelity check
+# ---------------------------------------------------------------------------
+
+class _FidelityJev(_DriftJev):
+    """Answers the fidelity check's entailment nouls from a map by criterion id, and coverage from one value."""
+
+    def __init__(self, entails=None, coverage=0.9, **kwargs):
+        super().__init__(**kwargs)
+        self.entails = dict(entails or {})
+        self.coverage = coverage
+
+    def __call__(self, state, questions, timeout=None):
+        body = super().__call__(state, questions, timeout=timeout)
+        for key in questions:
+            if key.startswith("entails_"):
+                body["answers"][key] = {"type": "noul", "noul": self.entails.get(key[len("entails_"):], 0.9)}
+        if "coverage" in questions:
+            body["answers"]["coverage"] = {"type": "noul", "noul": self.coverage}
+        return body
+
+
+@pytest.fixture
+def fidelity(drift, monkeypatch):
+    jev = _FidelityJev(kind="build", serving=("c1", 0.9))
+    monkeypatch.setattr(preflight, "_ask", jev)
+    drift["jev"] = jev
+    preflight._session_excluded.clear()
+    preflight._session_fidelity.clear()
+    preflight._pending_fidelity.clear()
+    preflight._pending_fidelity_note.clear()
+    return drift
+
+
+C1, C2, C3 = "The --json flag prints valid JSON", "The README gains a section on exporters", "Existing tests still pass"
+
+
+def _criteria_result(*contents, status="in_progress"):
+    return json.dumps({"todos": [{"id": str(i + 1), "content": text, "status": status} for i, text in enumerate(contents)], "note": "registered"})
+
+
+def _register_criteria(*contents, session="s1", tool="acceptance_criteria", **kwargs):
+    return preflight.on_post_tool_call(session_id=session, tool_name=tool, args={"criteria": list(contents)}, result=_criteria_result(*contents), **kwargs)
+
+
+def _fidelity_calls(harness):
+    return [call for call in harness["jev"].calls if "coverage" in call["questions"]]
+
+
+def test_fidelity_check_asks_one_noul_per_criterion_plus_coverage_at_registration(fidelity, emitted):
+    _turn()
+    assert _register_criteria(C1, C2, C3) is None, "all entailed, full coverage: nothing to tell the model"
+    [call] = _fidelity_calls(fidelity)
+    assert list(call["questions"]) == ["entails_1", "entails_2", "entails_3", "coverage"]
+    assert {question["type"] for question in call["questions"].values()} == {"noul"}
+    assert C2 in call["questions"]["entails_2"]["instructions"]
+    assert call["questions"]["entails_1"]["criteria"] == preflight.FIDELITY_ENTAILMENT_CRITERIA
+    assert call["questions"]["coverage"]["criteria"] == preflight.FIDELITY_COVERAGE_CRITERIA
+    assert call["timeout"] == preflight.DEFAULT_FIDELITY_TIMEOUT_SECONDS
+    state = call["state"]
+    assert state["request"] == {"source": "user", "text": "Add a --json flag to the exporter"}
+    assert state["earlier_instructions"] == {"source": "user", "items": []}
+    assert state["previous_answer"] == {"source": "agent, previous turn", "text": ""}
+    assert "previous_answer" in state["provenance"]
+    assert [item["id"] for item in state["acceptance_criteria"]["items"]] == ["1", "2", "3"]
+    assert state["acceptance_criteria"]["source"] == "agent"
+    [record] = fidelity["records"]("fidelity")
+    assert record["criteria"] == 3 and record["excluded"] == [] and record["p_coverage"] == 0.9
+    assert record["entailment"] == {"1": 0.9, "2": 0.9, "3": 0.9}
+    assert record["entailment_threshold"] == 0.4 and record["coverage_threshold"] == 0.6
+    assert record["steer"] is False and record["coverage_low"] is False and record["replay"] is False
+    [event] = [event for event in emitted if event.get("stage") == "fidelity"]
+    assert event["event"] == "judge.verdict" and event["attempt"] == 1
+    assert event["text"] == "Jev fidelity: 3 criteria · entailed 3/3 · coverage 0.90 · on track"
+    assert event["answers"][C1] == 0.9 and event["answers"]["coverage"] == 0.9
+    assert event["decision"]["excluded"] == [] and event["decision"]["steer"] is False
+    assert preflight._session_excluded["s1"] == [] and preflight._pending_fidelity_note == {}
+    assert preflight.on_transform_tool_result(tool_name="acceptance_criteria", session_id="s1", result=_criteria_result(C1, C2, C3), args={}) is None
+
+
+def test_fidelity_excludes_an_unentailed_criterion_from_judging_and_names_it_in_the_tool_result(fidelity, repo, emitted):
+    fidelity["jev"].entails = {"2": 0.1}
+    _turn()
+    assert _register_criteria(C1, C2, C3) is None, "the default loop puts the note in the result, not in the hook return"
+    assert preflight._session_excluded["s1"] == ["2"]
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "3"]
+    assert [item["id"] for item in preflight._session_todos["s1"]] == ["1", "2", "3"], "the registered list itself is untouched"
+    transformed = preflight.on_transform_tool_result(tool_name="acceptance_criteria", session_id="s1", result=_criteria_result(C1, C2, C3), args={})
+    payload = json.loads(transformed)
+    assert [item["id"] for item in payload["todos"]] == ["1", "2", "3"]
+    assert "do not follow from what the user asked and will not be judged" in payload["preflight"]
+    assert f'"{C2}" (P(entailed)=0.10)' in payload["preflight"]
+    assert C1 not in payload["preflight"]
+    assert preflight.on_transform_tool_result(tool_name="acceptance_criteria", session_id="s1", result="{}", args={}) is None, "delivered once"
+    [event] = [event for event in emitted if event.get("stage") == "fidelity"]
+    assert event["text"] == "Jev fidelity: 3 criteria · entailed 2/3 · coverage 0.90 · 1 excluded"
+    assert event["decision"]["excluded"] == ["2"]
+    # The verify judge and the drift check never see the excluded criterion.
+    fidelity["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.9, "claims_unverified": 0.1}
+    result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is None
+    verify_call = fidelity["jev"].calls[-1]
+    assert [item["text"] for item in verify_call["state"]["acceptance_criteria"]["items"]] == [C1, C3]
+    [record] = fidelity["records"]("verify")
+    assert record["criteria"] == 2 and record["excluded"] == 1
+    _reads(3)
+    [serving] = _serving_calls(fidelity)
+    assert list(serving["questions"]["serving"]["criteria"]) == ["c1", "c3", "none"]
+
+
+def test_fidelity_steers_once_per_turn_when_the_criteria_do_not_cover_the_request(fidelity, emitted):
+    fidelity["jev"].coverage = 0.2
+    _turn()
+    assert _register_criteria(C1, steerable=True) == {"message": preflight.FIDELITY_COVERAGE_TEMPLATE.format(p=0.2)}
+    assert preflight._pending_fidelity_note == {} and preflight._pending_fidelity == {}, "delivered live: nothing waits"
+    [record] = fidelity["records"]("fidelity")
+    assert record["coverage_low"] is True and record["steer"] is True
+    assert [event["text"] for event in emitted if event.get("stage") == "fidelity"] == ["Jev fidelity: 1 criteria · entailed 1/1 · coverage 0.20 · steer"]
+    assert _register_criteria(C1, C3, steerable=True) is None, "a second list in the same turn is judged but not steered again"
+    assert fidelity["records"]("fidelity")[-1]["steer"] is False and fidelity["records"]("fidelity")[-1]["coverage_low"] is True
+    assert [event["attempt"] for event in emitted if event.get("stage") == "fidelity"] == [1, 2]
+    assert emitted[-1]["text"].endswith("coverage 0.20 · coverage low, already steered")
+    _turn(turn="t2")
+    assert _register_criteria(C1, C2, steerable=True) == {"message": preflight.FIDELITY_COVERAGE_TEMPLATE.format(p=0.2)}, "a new turn may be steered again"
+
+
+def test_fidelity_thresholds_are_settings_with_the_documented_starting_values(fidelity):
+    assert preflight.fidelity_entailment_threshold() == 0.4 and preflight.fidelity_coverage_threshold() == 0.6
+    fidelity["jev"].entails = {"2": 0.5}
+    fidelity["jev"].coverage = 0.5
+    _turn()
+    _register_criteria(C1, C2)
+    record = fidelity["records"]("fidelity")[-1]
+    assert record["excluded"] == [] and record["coverage_low"] is True, "0.5 clears entailment at 0.4 and misses coverage at 0.6"
+    fidelity["settings"]["fidelity_entailment_threshold"] = 0.7
+    fidelity["settings"]["fidelity_coverage_threshold"] = 0.3
+    _turn(turn="t2")
+    _register_criteria(C1, C2, C3)
+    record = fidelity["records"]("fidelity")[-1]
+    assert record["excluded"] == ["2"] and record["coverage_low"] is False
+    assert record["entailment_threshold"] == 0.7 and record["coverage_threshold"] == 0.3
+    assert preflight._session_excluded["s1"] == ["2"]
+
+
+def test_fidelity_fails_open_and_respects_its_switch(fidelity, emitted):
+    fidelity["jev"].entails = {"2": 0.1}
+    fidelity["jev"].coverage = 0.1
+    fidelity["jev"].raise_exc = RuntimeError("jev down")
+    _turn()
+    assert _register_criteria(C1, C2, steerable=True) is None
+    assert [item["id"] for item in preflight._session_todos["s1"]] == ["1", "2"], "the list is registered exactly as written"
+    assert preflight._session_excluded.get("s1") in (None, []) and preflight._pending_fidelity_note == {} and preflight._pending_fidelity == {}
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "2"]
+    [record] = fidelity["records"]("fidelity")
+    assert record["error"].startswith("RuntimeError") and record["excluded"] == [] and record["steer"] is False
+    [event] = [event for event in emitted if event.get("stage") == "fidelity"]
+    assert event["text"] == "Jev fidelity: 2 criteria · entailed 2/2 · coverage unknown · unavailable"
+    fidelity["jev"].raise_exc = None
+    fidelity["settings"]["fidelity_check"] = "off"
+    assert _register_criteria(C1, C2, C3, steerable=True) is None
+    assert len(_fidelity_calls(fidelity)) == 1, "switched off: nothing asked"
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "2", "3"]
+
+
+def test_fidelity_on_a_replayed_lane_applies_the_exclusions_and_makes_the_coverage_steer_a_verify_finding(fidelity, repo):
+    fidelity["jev"].entails = {"2": 0.1}
+    fidelity["jev"].coverage = 0.2
+    _turn()
+    assert _register_criteria(C1, C2, C3, replay=True) is None
+    assert preflight._pending_fidelity_note == {}, "no result to write into after the turn"
+    assert preflight._pending_fidelity["s1"]["finding"] == "The criteria check found the acceptance criteria may not cover the request (P(cover)=0.20)."
+    assert preflight._session_excluded["s1"] == ["2"]
+    assert fidelity["records"]("fidelity")[-1]["replay"] is True
+    fidelity["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.9, "claims_unverified": 0.1}
+    result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is not None and result["action"] == "continue"
+    assert "may not cover the request (P(cover)=0.20)" in result["message"]
+    assert [item["text"] for item in fidelity["jev"].calls[-1]["state"]["acceptance_criteria"]["items"]] == [C1, C3]
+    assert preflight._pending_fidelity == {}
+    [record] = fidelity["records"]("verify")
+    assert record["findings"] == ["The criteria check found the acceptance criteria may not cover the request (P(cover)=0.20)."]
+
+
+def test_fidelity_reuses_the_verdict_for_a_status_only_update_and_rejudges_a_changed_list(fidelity):
+    fidelity["jev"].entails = {"2": 0.1}
+    _turn()
+    _register_criteria(C1, C2)
+    assert len(_fidelity_calls(fidelity)) == 1 and preflight._session_excluded["s1"] == ["2"]
+    preflight._pending_fidelity_note.clear()
+    preflight.on_post_tool_call(session_id="s1", tool_name="acceptance_criteria", args={}, result=_criteria_result(C1, C2, status="completed"))
+    assert len(_fidelity_calls(fidelity)) == 1, "the same statements are not asked about twice"
+    assert preflight._session_excluded["s1"] == ["2"] and preflight._pending_fidelity_note == {}
+    assert [item["status"] for item in preflight._session_todos["s1"]] == ["completed", "completed"]
+    fidelity["jev"].entails = {}
+    _register_criteria(C1, C3)
+    assert len(_fidelity_calls(fidelity)) == 2 and preflight._session_excluded["s1"] == []
+
+
+def test_fidelity_judges_the_todo_tool_on_the_default_loop_too(fidelity):
+    fidelity["jev"].entails = {"1": 0.05}
+    _turn()
+    assert _register_criteria(C2, C1, tool="todo") is None
+    [call] = _fidelity_calls(fidelity)
+    assert [item["text"] for item in call["state"]["acceptance_criteria"]["items"]] == [C2, C1]
+    assert preflight._session_excluded["s1"] == ["1"]
+    transformed = preflight.on_transform_tool_result(tool_name="todo", session_id="s1", result="not json at all", args={})
+    assert transformed.startswith("not json at all\n\n") and C2 in transformed
+    assert preflight.on_transform_tool_result(tool_name="read_file", session_id="s1", result="x", args={}) is None
+
+
+def test_fidelity_is_skipped_when_the_plugin_never_saw_the_request(fidelity):
+    fidelity["jev"].entails = {"1": 0.05, "2": 0.05}
+    assert _register_criteria(C1, C2) is None, "no turn yet: nothing to judge against"
+    assert _fidelity_calls(fidelity) == [] and preflight._session_excluded.get("s1") is None
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "2"]
+    [record] = fidelity["records"]("fidelity")
+    assert record["skipped"] == "no_request" and record["criteria"] == 2
+
+
+def test_fidelity_reads_the_request_with_the_previous_answer_it_refers_to(fidelity):
+    """"Implement the changes" names nothing by itself: the answer it refers to is part of the state."""
+    history = [
+        {"role": "user", "content": "Is there anything you think should be updated?"},
+        {"role": "assistant", "content": "Yes: the one change worth making is the criteria fidelity check."},
+    ]
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="implement the changes fully", conversation_history=history)
+    _register_criteria(C1)
+    [call] = _fidelity_calls(fidelity)
+    assert call["state"]["request"]["text"] == "implement the changes fully"
+    assert call["state"]["earlier_instructions"]["items"] == ["Is there anything you think should be updated?"]
+    assert call["state"]["previous_answer"] == {"source": "agent, previous turn", "text": "Yes: the one change worth making is the criteria fidelity check."}
+    assert "previous answer the request refers to" in call["questions"]["entails_1"]["instructions"]
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="now the tests", conversation_history=[{"role": "user", "content": "x"}])
+    _register_criteria(C2)
+    assert _fidelity_calls(fidelity)[-1]["state"]["previous_answer"]["text"] == "", "a turn with no previous answer carries none"

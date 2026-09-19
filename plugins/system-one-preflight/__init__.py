@@ -56,6 +56,23 @@ verify finding. A build-kind turn that reaches the window with no criteria
 registered is steered once, by rule, to register them. Replayed calls
 (``replay=True``, the Codex lane after the fact) are counted but never judged.
 
+The criteria fidelity check (also ``post_tool_call``, on ``todo`` and
+``acceptance_criteria`` results) judges the rubric itself. The criteria are
+the one option list in the loop the model writes rather than code builds,
+and the drift and verify calls take them as given. On each new list one
+batched call asks a noul per criterion, is it part of the work the user
+asked for, and one for the set, does it cover that work, both read with the
+earlier instructions and the previous answer the request may refer to (a
+request like "implement the changes" cannot be judged without it). A
+criterion under
+``fidelity_entailment_threshold`` is excluded from judging and named to the
+model; coverage under ``fidelity_coverage_threshold`` steers the model once
+per turn to add what is missing. The note reaches the model inside the
+tool's own result on the default loop (``transform_tool_result``), through
+the hook endpoint on the Claude lane, and as a verify finding on the Codex
+lane. A status-only update of the same statements reuses the verdict. Jev
+failing leaves the list exactly as registered.
+
 The verify judge (``pre_verify``) turns Jev into a per-feature pass/fail gate
 on the model's own work. ``post_tool_call`` remembers the session's todo
 list (the model is nudged to write acceptance criteria there on build-type
@@ -269,6 +286,17 @@ _session_commands: Dict[str, List[Dict[str, str]]] = {}
 _verify_memo: Dict[str, str] = {}
 _session_drift: Dict[str, Dict[str, Any]] = {}
 _pending_drift: Dict[str, Dict[str, str]] = {}
+# Fidelity: criterion ids Jev excluded per session, the last judged list so a
+# status-only update is not re-asked, a coverage finding waiting for the
+# verify judge (replayed lanes), and a note waiting for the tool result
+# (default loop).
+_session_excluded: Dict[str, List[str]] = {}
+_session_fidelity: Dict[str, Dict[str, Any]] = {}
+# The previous assistant answer, kept per session because a request like
+# "implement the changes" refers to it and cannot be judged without it.
+_session_previous_answer: Dict[str, str] = {}
+_pending_fidelity: Dict[str, Dict[str, str]] = {}
+_pending_fidelity_note: Dict[str, str] = {}
 MAX_COMMANDS_KEPT = 6
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
 # acceptance criterion the recent calls serve; "none" at or above the
@@ -295,6 +323,51 @@ DRIFT_NO_CRITERIA_TEMPLATE = (
     "are registered. Register them now with the acceptance_criteria tool (or "
     "todo), one checkable statement each in the order the request asked for, "
     "then continue with the first."
+)
+# Criteria fidelity check: the acceptance criteria are the one option list in
+# the loop the model writes rather than code builds. At registration Jev is
+# asked, per criterion, whether the request entails it, and once whether the
+# set covers the request. Both thresholds are settings; these are the
+# starting values, unjustified until outcome labels say otherwise.
+DEFAULT_FIDELITY_ENTAILMENT_THRESHOLD = 0.4
+DEFAULT_FIDELITY_COVERAGE_THRESHOLD = 0.6
+DEFAULT_FIDELITY_TIMEOUT_SECONDS = 3.0
+# Wording chosen by live probe (2026-09-19): "does the request ask for what
+# this criterion states" read a turn's own legitimate criteria at 0.08-0.14
+# when the request was "implement the changes fully", because the request
+# refers to the previous answer; with that answer in the state and the
+# wording below, the same criteria read 0.81-0.91, a planted fake 0.02, and
+# on a plain request an unasked README criterion 0.20.
+FIDELITY_ENTAILMENT_QUESTION = (
+    "Is this acceptance criterion part of the work the user asked for, read "
+    "together with the earlier instructions and the previous answer the "
+    "request refers to: {criterion}"
+)
+FIDELITY_ENTAILMENT_CRITERIA = {
+    "true": "The criterion checks part of the requested work, a step needed to deliver it, or a constraint the user stated.",
+    "false": "The criterion checks work the user did not ask for and that is not needed to deliver what was asked.",
+}
+FIDELITY_COVERAGE_QUESTION = (
+    "Taken together, do these acceptance criteria cover everything the user "
+    "asked for, read with the earlier instructions and the previous answer "
+    "the request refers to?"
+)
+FIDELITY_COVERAGE_CRITERIA = {
+    "true": "Every deliverable, constraint and ordering the user asked for has a criterion that would fail if it were missing.",
+    "false": "Something the user asked for has no criterion, so the work could meet every criterion and still not do what was asked.",
+}
+FIDELITY_EXCLUDED_TEMPLATE = (
+    "Criteria check from Jev, a fast typed judge whose read is advisory: {n} of "
+    "your acceptance criteria do not follow from what the user asked and will "
+    "not be judged: {items}. Replace each with a criterion the request entails, "
+    "or leave it out."
+)
+FIDELITY_COVERAGE_TEMPLATE = (
+    "Criteria check from Jev, a fast typed judge whose read is advisory: your "
+    "acceptance criteria may not cover everything the request asks for "
+    "(P(cover) = {p:.2f}). Add one checkable criterion for each deliverable, "
+    "constraint or ordering in the request that has none, with the "
+    "acceptance_criteria tool (or todo), then continue."
 )
 _MEMO_LIMIT = 256
 
@@ -474,6 +547,36 @@ def drift_max_steers() -> int:
     except (TypeError, ValueError):
         return DEFAULT_DRIFT_MAX_STEERS
     return min(10, max(0, value))
+
+
+def fidelity_check_enabled() -> bool:
+    return str(_setting("fidelity_check", "on") or "on").strip().lower() != "off"
+
+
+def fidelity_entailment_threshold() -> float:
+    """P(the request entails the criterion) below which it is not judged."""
+    try:
+        value = float(_setting("fidelity_entailment_threshold", DEFAULT_FIDELITY_ENTAILMENT_THRESHOLD))
+    except (TypeError, ValueError):
+        return DEFAULT_FIDELITY_ENTAILMENT_THRESHOLD
+    return min(0.95, max(0.0, value))
+
+
+def fidelity_coverage_threshold() -> float:
+    """P(the criteria cover the request) below which the model is steered to add more."""
+    try:
+        value = float(_setting("fidelity_coverage_threshold", DEFAULT_FIDELITY_COVERAGE_THRESHOLD))
+    except (TypeError, ValueError):
+        return DEFAULT_FIDELITY_COVERAGE_THRESHOLD
+    return min(0.95, max(0.0, value))
+
+
+def fidelity_timeout_seconds() -> float:
+    try:
+        value = float(_setting("fidelity_timeout_seconds", DEFAULT_FIDELITY_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_FIDELITY_TIMEOUT_SECONDS
+    return min(15.0, max(0.5, value))
 
 
 def verify_timeout_seconds() -> float:
@@ -959,6 +1062,11 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         questions["checkable"] = {"type": "noul", "instructions": CHECKABLE_QUESTION, "criteria": CHECKABLE_CRITERIA}
         questions["kind"] = {"type": "choice", "instructions": "What kind of request is the active request?", "criteria": KIND_CRITERIA}
     previous = _previous_answer(history if isinstance(history, list) else [])
+    if previous:
+        _session_previous_answer[session_id] = _clip(previous, 1_500)
+    else:
+        _session_previous_answer.pop(session_id, None)
+    _bound(_session_previous_answer)
     if arm == "feedback" and previous:
         state["previous_answer"] = {"source": "agent", "text": _clip(previous, 1_500)}
         questions["previous_outcome"] = {"type": "choice", "instructions": OUTCOME_QUESTION, "criteria": OUTCOME_CRITERIA}
@@ -1303,8 +1411,11 @@ def reset_drift(session_id: str) -> None:
     _session_drift[session_id] = {
         "calls": [], "total": 0, "since_check": 0, "checks": 0, "steers": 0,
         "build": False, "criteria_nudged": False,
+        "fidelity_checks": 0, "coverage_steered": False,
     }
     _pending_drift.pop(session_id, None)
+    _pending_fidelity.pop(session_id, None)
+    _pending_fidelity_note.pop(session_id, None)
     _bound(_session_drift)
 
 
@@ -1335,6 +1446,142 @@ def _first_open_criterion(todos: List[Dict[str, str]]) -> Optional[Dict[str, str
     return None
 
 
+def active_criteria(session_id: str) -> List[Dict[str, str]]:
+    """The session's criteria minus the ones the fidelity check excluded."""
+    excluded = set(_session_excluded.get(session_id) or [])
+    return [item for item in _session_todos.get(session_id, []) if item.get("id") not in excluded]
+
+
+def _criteria_key(todos: List[Dict[str, str]]) -> str:
+    return hashlib.sha256(json.dumps([item["content"] for item in todos], ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def check_fidelity(session_id: str, todos: List[Dict[str, str]], *, replay: bool = False) -> Optional[Dict[str, str]]:
+    """Judge a freshly registered criteria list against the request.
+
+    One batched call: a noul per criterion (does the request entail it) and
+    one for the set (does it cover the request). Criteria below the
+    entailment threshold are excluded from the verify and drift rubrics and
+    named to the model; coverage below its threshold steers the model once
+    per turn to add what is missing. Returns ``{"message", "finding"}`` when
+    the model should be told something, else None. A status-only update of
+    the same statements reuses the last verdict. Any failure fails open with
+    the list exactly as registered.
+    """
+    if not fidelity_check_enabled() or not todos:
+        _session_excluded.pop(session_id, None)
+        return None
+    key = _criteria_key(todos)
+    memo = _session_fidelity.get(session_id)
+    if memo and memo.get("key") == key:
+        _session_excluded[session_id] = list(memo.get("excluded") or [])
+        return None
+    scope = list(_session_scope.get(session_id) or [])
+    request = scope[-1] if scope else ""
+    if not request:
+        # Nothing to judge the list against (this lane never told the plugin
+        # the request): leave it as registered rather than exclude it all.
+        write_log({"event": "fidelity", "session_id": session_id, "criteria": len(todos), "skipped": "no_request", "replay": replay})
+        _session_excluded.pop(session_id, None)
+        return None
+    state = drift_state(session_id)
+    state["fidelity_checks"] += 1
+    labels = {item["id"]: item["content"] for item in todos}
+    questions: Dict[str, Dict[str, Any]] = {}
+    for item in todos:
+        questions[f"entails_{item['id']}"] = {
+            "type": "noul",
+            "instructions": FIDELITY_ENTAILMENT_QUESTION.format(criterion=_clip(item["content"], 300)),
+            "criteria": FIDELITY_ENTAILMENT_CRITERIA,
+        }
+    questions["coverage"] = {"type": "noul", "instructions": FIDELITY_COVERAGE_QUESTION, "criteria": FIDELITY_COVERAGE_CRITERIA}
+    jev_state = {
+        "provenance": "request and earlier_instructions were typed by the user. previous_answer was written by the agent in the turn before and the request may refer to it. acceptance_criteria were written by the agent now and are what is being judged.",
+        "request": {"source": "user", "text": _clip(request, 1_500)},
+        "earlier_instructions": {"source": "user", "items": scope[:-1][-3:]},
+        "previous_answer": {"source": "agent, previous turn", "text": _session_previous_answer.get(session_id, "")},
+        "acceptance_criteria": {"source": "agent", "items": [{"id": item["id"], "text": _clip(item["content"], 300)} for item in todos]},
+    }
+    started = time.monotonic()
+    entailment: Dict[str, Optional[float]] = {}
+    p_cover: Optional[float] = None
+    jev_model = ""
+    error = ""
+    try:
+        ask = _ask
+        if ask is None:
+            from tools.typesafe_tool import ask_jev
+
+            ask = ask_jev
+        body = ask(jev_state, questions, timeout=fidelity_timeout_seconds())
+        answers = body.get("answers") or {}
+        jev_model = str(body.get("model") or "")
+        for item in todos:
+            entailment[item["id"]] = _noul(answers, f"entails_{item['id']}")
+        p_cover = _noul(answers, "coverage")
+        if p_cover is None and all(value is None for value in entailment.values()):
+            error = "no noul in answer"
+    except Exception as exc:
+        error = f"{exc.__class__.__name__}: {exc}"[:300]
+    latency_ms = int((time.monotonic() - started) * 1000)
+    excluded = [] if error else [
+        item["id"] for item in todos
+        if entailment.get(item["id"]) is not None and entailment[item["id"]] < fidelity_entailment_threshold()
+    ]
+    coverage_low = bool(not error and p_cover is not None and p_cover < fidelity_coverage_threshold())
+    steer = coverage_low and not state["coverage_steered"]
+    if steer:
+        state["coverage_steered"] = True
+    if not error:
+        _session_excluded[session_id] = excluded
+        _session_fidelity[session_id] = {"key": key, "excluded": excluded, "p_coverage": p_cover}
+        _bound(_session_excluded)
+        _bound(_session_fidelity)
+    write_log({
+        "event": "fidelity", "session_id": session_id, "criteria": len(todos),
+        "entailment": entailment, "p_coverage": p_cover, "excluded": excluded,
+        "entailment_threshold": fidelity_entailment_threshold(), "coverage_threshold": fidelity_coverage_threshold(),
+        "coverage_low": coverage_low, "steer": steer, "replay": replay,
+        "latency_ms": latency_ms, "error": error,
+    })
+    if error:
+        action = "unavailable"
+    else:
+        parts: List[str] = []
+        if excluded:
+            parts.append(f"{len(excluded)} excluded")
+        if steer:
+            parts.append("steer")
+        elif coverage_low:
+            parts.append("coverage low, already steered")
+        action = " · ".join(parts) or "on track"
+    emit_verdict(
+        session_id, "fidelity",
+        f"Jev fidelity: {len(todos)} criteria · entailed {len(todos) - len(excluded)}/{len(todos)} · "
+        f"coverage {_fmt(p_cover)} · {action}",
+        answers={**{labels[cid]: value for cid, value in entailment.items()}, "coverage": p_cover},
+        decision={
+            "excluded": excluded, "steer": steer, "coverage_low": coverage_low,
+            "entailment_threshold": fidelity_entailment_threshold(), "coverage_threshold": fidelity_coverage_threshold(),
+        },
+        model=jev_model, latency_ms=latency_ms, attempt=state["fidelity_checks"],
+    )
+    messages: List[str] = []
+    if excluded:
+        messages.append(FIDELITY_EXCLUDED_TEMPLATE.format(
+            n=len(excluded),
+            items="; ".join(f'"{_clip(labels[cid], 120)}" (P(entailed)={entailment[cid]:.2f})' for cid in excluded),
+        ))
+    if steer:
+        messages.append(FIDELITY_COVERAGE_TEMPLATE.format(p=p_cover))
+    if not messages:
+        return None
+    return {
+        "message": "\n\n".join(messages),
+        "finding": f"The criteria check found the acceptance criteria may not cover the request (P(cover)={p_cover:.2f})." if steer else "",
+    }
+
+
 def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay: bool = False) -> Optional[Dict[str, str]]:
     """Count one tool call; every ``drift_every`` calls, judge whether the window served a criterion.
 
@@ -1356,7 +1603,7 @@ def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay
         return None
     state["since_check"] = 0
     state["checks"] += 1
-    todos = list(_session_todos.get(session_id, []))
+    todos = active_criteria(session_id)
     if not todos:
         # No rubric to drift from. A build turn this deep with no criteria is
         # the drift the criteria nudge exists to prevent: steer once, by rule.
@@ -1456,6 +1703,7 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             text = json.dumps(result, ensure_ascii=False, default=str)
         except Exception:
             text = str(result)
+    fidelity: Optional[Dict[str, str]] = None
     if tool_name in ("todo", "acceptance_criteria"):
         # `acceptance_criteria` is the bridge's stateless stand-in for the todo
         # tool on the Codex and Claude lanes; it answers in the same shape.
@@ -1463,6 +1711,11 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         if todos is not None:
             _session_todos[session_id] = todos
             _bound(_session_todos)
+            try:
+                fidelity = check_fidelity(session_id, todos, replay=bool(kwargs.get("replay")))
+            except Exception:
+                logger.debug("system-one-preflight: fidelity check failed", exc_info=True)
+                fidelity = None
     elif tool_name == "terminal":
         command = str(args.get("command") or "")
         entry = {"command": _clip(command, 300), "output": _tail(text, MAX_CHECK_CHARS)}
@@ -1483,14 +1736,55 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         steer = check_drift(session_id, tool_name, dict(args), replay=bool(kwargs.get("replay")))
     except Exception:
         logger.debug("system-one-preflight: drift check failed", exc_info=True)
-        return None
-    if steer is None:
+        steer = None
+    if fidelity is None and steer is None:
         return None
     if kwargs.get("steerable"):
-        return {"message": steer["message"]}
-    _pending_drift[session_id] = steer
-    _bound(_pending_drift)
+        return {"message": "\n\n".join(item["message"] for item in (fidelity, steer) if item)}
+    if fidelity is not None:
+        if kwargs.get("replay"):
+            # No result to write into and no next call to hold: the coverage
+            # finding waits for the verify judge, the exclusions already apply.
+            if fidelity.get("finding"):
+                _pending_fidelity[session_id] = fidelity
+                _bound(_pending_fidelity)
+        else:
+            # The default loop: the note goes into this call's own result
+            # (transform_tool_result runs right after this hook).
+            _pending_fidelity_note[session_id] = fidelity["message"]
+            _bound(_pending_fidelity_note)
+    if steer is not None:
+        _pending_drift[session_id] = steer
+        _bound(_pending_drift)
     return None
+
+
+def on_transform_tool_result(**kwargs: Any) -> Optional[str]:
+    """Put the fidelity note into the criteria tool's own result on the default loop.
+
+    ``post_tool_call`` is observational there, so the note it produced waits
+    for this hook, same session and same tool, and is added to the JSON the
+    model reads (a ``preflight`` field) or appended when the result is not
+    JSON. The Claude lane got the note back from the hook endpoint and the
+    Codex lane is replayed after the turn, so neither reaches this.
+    """
+    if current_mode() == "off":
+        return None
+    if str(kwargs.get("tool_name") or "") not in ("todo", "acceptance_criteria"):
+        return None
+    session_id = str(kwargs.get("session_id") or "")
+    note = _pending_fidelity_note.pop(session_id, None)
+    result = kwargs.get("result")
+    if not note or not isinstance(result, str):
+        return None
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        payload["preflight"] = note
+        return json.dumps(payload, ensure_ascii=False)
+    return f"{result}\n\n{note}"
 
 
 def _git(root: str, args: List[str]) -> Optional[str]:
@@ -1600,7 +1894,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         return None
     attempt = int(kwargs.get("attempt") or 0)
     final_response = str(kwargs.get("final_response") or "")
-    todos = list(_session_todos.get(session_id, []))
+    todos = active_criteria(session_id)
+    excluded = list(_session_excluded.get(session_id) or [])
     criteria = [item for item in todos if item.get("status") in ("completed", "in_progress")]
     pending = [item for item in todos if item.get("status") == "pending"]
     request = (_session_scope.get(session_id) or [""])[-1]
@@ -1684,6 +1979,10 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         # A steer the loop never delivered (the model made no further tool
         # call) still reaches the model here, once, as a verify finding.
         findings.append(stale_drift["finding"])
+    stale_fidelity = _pending_fidelity.pop(session_id, None)
+    if stale_fidelity and stale_fidelity.get("finding"):
+        # The coverage steer a replayed lane could not deliver mid-turn.
+        findings.append(stale_fidelity["finding"])
     checks_failing = answers.get("checks_failing")
     if checks_failing is not None and checks_failing >= VERIFY_FLAG_THRESHOLD:
         findings.append(f"Check outputs show a failure (P={checks_failing:.2f}).")
@@ -1707,6 +2006,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "repeated": repeated,
             "changed_paths": len(changed),
             "criteria": len(labels),
+            "excluded": len(excluded),
             "pending": len(pending),
             "checks": len(checks),
             "commands": len(commands),
@@ -1727,7 +2027,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         f"claims unverified {_fmt(claims)} · checks failing {_fmt(checks_failing)} · {action}"
         + (f" · {' '.join(findings)}" if findings and action == 'nudge' else ""),
         answers={**{labels[key]: answers.get(key) for key in labels}, "claims_unverified": claims, "checks_failing": checks_failing},
-        decision={"action": action, "findings": findings, "criteria": len(labels), "pending": len(pending)},
+        decision={"action": action, "findings": findings, "criteria": len(labels), "excluded": len(excluded), "pending": len(pending)},
         model=jev_model,
         latency_ms=int((time.monotonic() - started) * 1000),
         attempt=attempt,
@@ -1744,5 +2044,6 @@ def register(ctx: Any) -> None:
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("transform_tool_result", on_transform_tool_result)
     ctx.register_hook("pre_verify", on_pre_verify)
     logger.info("system-one-preflight registered (mode=%s, tool_guard=%s)", current_mode(), tool_guard_mode())

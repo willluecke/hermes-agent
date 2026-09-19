@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
+from pathlib import Path
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -115,3 +119,44 @@ async def test_a_dispatch_failure_lets_the_call_proceed(bound, monkeypatch):
     async with TestClient(TestServer(_app())) as cli:
         assert await (await cli.post("/v1/hooks/claude", json=PRE, headers=_bearer(token))).json() == {"action": "pass"}
         assert await (await cli.post("/v1/hooks/claude", json=POST, headers=_bearer(token))).json() == {}
+
+
+async def test_post_tool_use_runs_the_real_criteria_fidelity_check_and_returns_its_note(bound, monkeypatch, tmp_path):
+    """A criteria registration from a managed Claude process reaches the preflight plugin under its Hermes name, and the plugin's note rides the hook response back to the model."""
+    token, _agent = bound
+    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "system-one-preflight" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("system_one_preflight_hook_endpoint_test", plugin_file)
+    preflight = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(preflight)
+    settings = {"mode": "feedback", "log_path": str(tmp_path / "preflight.jsonl"), "tuning": "off", "tuning_state_path": str(tmp_path / "tuning.json"), "drift_check": "off"}
+    monkeypatch.setattr(preflight, "_settings_reader", lambda key, default=None: settings.get(key, default))
+
+    def jev(state, questions, timeout=None):
+        answers = {key: {"type": "noul", "noul": 0.1 if key == "entails_2" else 0.9} for key in questions}
+        answers["coverage"] = {"type": "noul", "noul": 0.2}
+        return {"model": "jev-1.13.0", "answers": answers}
+
+    monkeypatch.setattr(preflight, "_ask", jev)
+    preflight._session_scope["sess-a"] = ["Add a --json flag to the exporter"]
+    preflight.reset_drift("sess-a")
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "post_tool_call")
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kwargs: [preflight.on_post_tool_call(**kwargs)])
+    registered = json.dumps({"todos": [
+        {"id": "1", "content": "The --json flag prints valid JSON", "status": "in_progress"},
+        {"id": "2", "content": "The README gains a section on exporters", "status": "in_progress"},
+    ], "note": "2 acceptance criteria registered."})
+    body = {
+        "event": "PostToolUse", "tool_name": "mcp__hermes-tools__acceptance_criteria",
+        "tool_input": {"criteria": ["The --json flag prints valid JSON", "The README gains a section on exporters"]},
+        "tool_response": [{"type": "text", "text": registered}], "tool_use_id": "toolu_3", "duration_ms": 5,
+    }
+    async with TestClient(TestServer(_app())) as cli:
+        resp = await cli.post("/v1/hooks/claude", json=body, headers=_bearer(token))
+        assert resp.status == 200
+        message = (await resp.json())["message"]
+    assert "The README gains a section on exporters" in message and "will not be judged" in message
+    assert "may not cover everything the request asks for (P(cover) = 0.20)" in message
+    assert preflight._session_excluded["sess-a"] == ["2"]
+    [record] = [json.loads(line) for line in (tmp_path / "preflight.jsonl").read_text().splitlines() if '"fidelity"' in line]
+    assert record["excluded"] == ["2"] and record["steer"] is True and record["replay"] is False
