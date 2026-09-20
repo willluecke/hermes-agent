@@ -88,12 +88,20 @@ has edited files and is about to finish, the judge gathers the diff, the
 matching RecCli ``.devproject`` features, the ledger, code-selected failure
 excerpts, the manifest with its code verdicts and the draft final message;
 asks Jev one noul per criterion, "do the excerpts show a failure",
-"does the message claim results beyond the manifest and the ledger", and
-one typed choice per assertion code could not settle; and keeps the model
-going with a findings note when something is confidently unmet. A build
-turn that ran checks and registered no manifest is sent back by rule, with
-no Jev call. Bounded by ``agent.max_verify_nudges``; Jev being unavailable
-fails open. A diff that touches tests or runner configuration is flagged in
+"does the message claim results beyond the manifest and the ledger" (logged,
+never a finding on its own), one noul per sentence of the draft final
+message ("is this claim supported by the evidence shown"), and one typed
+choice per assertion code could not settle; and keeps the model going with a
+findings note when something is confidently unmet, quoting each unsupported
+sentence so the model knows what to prove or drop. A build turn that ran
+checks and registered no manifest is sent back by rule, with no Jev call.
+The gate sends a turn back at most ``verify_max_send_backs`` times (default
+1; ``agent.max_verify_nudges`` is the loop's outer bound) and only when the
+evidence (diff, paths, commands with outputs) changed since the last
+attempt; otherwise the answer ships and the verdict carries
+``ship_flagged`` with the quoted sentences. ``verify_send_back: off`` is the
+flag-only shape: one verdict per code turn, never a nudge. Jev being
+unavailable fails open. A diff that touches tests or runner configuration is flagged in
 the verdict for the human, never as a finding.
 """
 
@@ -278,6 +286,27 @@ CLAIMS_QUESTION = (
     "Does the final message claim work, results, or passing checks beyond what "
     "the result manifest and the evidence ledger show?"
 )
+# One noul per sentence of the draft final message, so a finding can quote
+# the sentence it is about. The whole-message claims_unverified noul is still
+# asked and logged, but it no longer sends the model back on its own: a
+# finding the model has to guess at is why send-backs repeated.
+CLAIM_QUESTION = (
+    "Is this claim from the agent's final message supported by the evidence "
+    "shown (the diff, the commands and their outputs)? Claim: {claim}"
+)
+CLAIM_CRITERIA = {
+    "true": "The diff or a command output shows it.",
+    "false": "Nothing shown supports it, or it describes something not run.",
+}
+CLAIM_FINDING = (
+    'Unsupported by the evidence: "{claim}". Prove it with a command, or drop '
+    "or downgrade the sentence."
+)
+CLAIM_FLAG_THRESHOLD = 0.25
+CLAIM_SENTENCE_CAP = 12
+CLAIM_SENTENCE_MIN_WORDS = 6
+CLAIM_SENTENCE_CHARS = 300
+DEFAULT_VERIFY_MAX_SEND_BACKS = 1
 ASSERTION_QUESTION = (
     "Do the cited evidence rows support this result claim as worded, at the "
     "scope it states: {claim} (rows {rows})"
@@ -483,8 +512,19 @@ def _setting(key: str, default: Any) -> Any:
     return default if value is None else value
 
 
+def _switch(key: str, default: str) -> str:
+    """A text setting that may arrive as a YAML boolean: bare ``off`` parses as
+    false and bare ``on`` as true, and ``str(False or default)`` would read
+    ``off`` as the default."""
+    value = _setting(key, default)
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = str(value).strip().lower() if value is not None else ""
+    return text or default
+
+
 def current_mode() -> str:
-    mode = str(_setting("mode", "shadow") or "shadow").strip().lower()
+    mode = _switch("mode", "shadow")
     return mode if mode in MODES else "shadow"
 
 
@@ -505,7 +545,7 @@ def timeout_seconds() -> float:
 
 
 def tool_guard_mode() -> str:
-    mode = str(_setting("tool_guard", "shadow") or "shadow").strip().lower()
+    mode = _switch("tool_guard", "shadow")
     return mode if mode in ("off", "shadow", "feedback") else "shadow"
 
 
@@ -517,14 +557,30 @@ def ambiguity_threshold() -> float:
     return min(1.0, max(0.0, value))
 
 
+def _on(key: str) -> bool:
+    return _switch(key, "on") not in ("off", "false", "0", "no")
+
+
 def verify_judge_enabled() -> bool:
-    value = str(_setting("verify_judge", "on") or "on").strip().lower()
-    return value not in ("off", "false", "0", "no")
+    return _on("verify_judge")
+
+
+def verify_send_back_enabled() -> bool:
+    """Off is the flag-only shape: the judge runs once, emits its verdict and never nudges."""
+    return _on("verify_send_back")
+
+
+def verify_max_send_backs() -> int:
+    """Send-backs per turn from this gate, whatever ``agent.max_verify_nudges`` allows."""
+    try:
+        value = int(_setting("verify_max_send_backs", DEFAULT_VERIFY_MAX_SEND_BACKS))
+    except (TypeError, ValueError):
+        return DEFAULT_VERIFY_MAX_SEND_BACKS
+    return min(10, max(0, value))
 
 
 def criteria_nudge_enabled() -> bool:
-    value = str(_setting("criteria_nudge", "on") or "on").strip().lower()
-    return value not in ("off", "false", "0", "no")
+    return _on("criteria_nudge")
 
 
 def verify_fail_threshold() -> float:
@@ -551,7 +607,7 @@ def claims_flag_threshold() -> float:
 
 
 def tuning_mode() -> str:
-    value = str(_setting("tuning", "auto") or "auto").strip().lower()
+    value = _switch("tuning", "auto")
     return value if value in ("auto", "off") else "auto"
 
 
@@ -615,7 +671,7 @@ def _tuned() -> Dict[str, Any]:
 
 
 def drift_check_enabled() -> bool:
-    return str(_setting("drift_check", "on") or "on").strip().lower() != "off"
+    return _on("drift_check")
 
 
 def drift_every() -> int:
@@ -643,7 +699,7 @@ def drift_max_steers() -> int:
 
 
 def fidelity_check_enabled() -> bool:
-    return str(_setting("fidelity_check", "on") or "on").strip().lower() != "off"
+    return _on("fidelity_check")
 
 
 def fidelity_entailment_threshold() -> float:
@@ -674,11 +730,11 @@ def fidelity_timeout_seconds() -> float:
 
 def manifest_required() -> bool:
     """Whether a build turn that ran checks must register a result manifest before it may finish."""
-    return str(_setting("manifest_required", "on") or "on").strip().lower() != "off"
+    return _on("manifest_required")
 
 
 def controller_reruns_enabled() -> bool:
-    return str(_setting("controller_reruns", "on") or "on").strip().lower() != "off"
+    return _on("controller_reruns")
 
 
 def rerun_timeout_seconds() -> float:
@@ -1726,21 +1782,54 @@ def _count_regression(ledger: Dict[str, Any], row: Dict[str, Any], new_row: Dict
     return None
 
 
-def _verify_key(findings: List[str], diff: str, rows: List[Dict[str, Any]], verdicts: Optional[List[Dict[str, Any]]]) -> str:
-    # Controller rows get a new id on every attempt, so findings that name
-    # them are normalised before hashing; otherwise no re-run turn could ever
-    # read as repeated.
+def _verify_key(diff: str, changed: List[str], rows: List[Dict[str, Any]]) -> str:
+    """What the model can change between attempts: the diff, the paths and the
+    commands it ran with their outputs. The draft message and the findings are
+    left out on purpose; a reworded answer over the same evidence is the same
+    attempt, and the gate's own re-runs (controller rows) are not the model's."""
     return hashlib.sha256(
         json.dumps(
             {
-                "findings": [re.sub(r"\bk\d+\b", "k*", finding) for finding in findings],
                 "diff": diff,
-                "rows": [(row["id"], row["status"], row["digest"]) for row in rows if row.get("source") != "controller"],
-                "verdicts": [(item["id"], item["verdict"]) for item in verdicts] if verdicts is not None else None,
+                "paths": sorted(changed),
+                "rows": [(row["command"], row["status"], row["digest"]) for row in rows if row.get("source") != "controller"],
             },
             sort_keys=True, ensure_ascii=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+_FENCE_RE = re.compile(r"```.*?```", re.S)
+_LINE_LEAD_RE = re.compile(r"^[\s>*#\-•]+|^\d+[.)]\s+")
+
+
+def claim_sentences(text: str) -> List[str]:
+    """The sentences of a draft final message worth a claim question: code
+    blocks dropped, list markers stripped, anything under
+    ``CLAIM_SENTENCE_MIN_WORDS`` words skipped, the first ``CLAIM_SENTENCE_CAP`` kept."""
+    out: List[str] = []
+    for piece in _SENTENCE_SPLIT_RE.split(_FENCE_RE.sub(" ", text or "")):
+        sentence = " ".join(_LINE_LEAD_RE.sub("", piece).split())
+        if len(sentence.split()) < CLAIM_SENTENCE_MIN_WORDS:
+            continue
+        out.append(sentence[:CLAIM_SENTENCE_CHARS])
+        if len(out) >= CLAIM_SENTENCE_CAP:
+            break
+    return out
+
+
+def _send_back(findings: List[str], repeated: bool, attempt: int) -> Tuple[bool, str]:
+    """Whether this attempt goes back to the model, and if not, why it ships."""
+    if not findings:
+        return False, ""
+    if repeated:
+        return False, "same evidence as the previous attempt"
+    if not verify_send_back_enabled():
+        return False, "verify_send_back is off"
+    if attempt >= verify_max_send_backs():
+        return False, f"send-back cap of {verify_max_send_backs()} reached"
+    return True, ""
 
 
 def _manifest_summary(counts: Dict[str, int], registered: bool) -> str:
@@ -2291,32 +2380,34 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     if manifest is None and manifest_required() and build and checks_ran:
         finding = MANIFEST_REQUIRED_FINDING.format(n=len(checks_ran), ids=", ".join(row["id"] for row in checks_ran[-6:]))
         findings = [finding]
-        key = _verify_key(findings, bundle["diff"], rows_this_turn, None)
+        key = _verify_key(bundle["diff"], changed, rows_this_turn)
         repeated = attempt > 0 and _verify_memo.get(session_id) == key
         _verify_memo[session_id] = key
         _bound(_verify_memo)
+        send_back, ship_reason = _send_back(findings, repeated, attempt)
+        action = "nudge" if send_back else "ship_flagged"
         write_log({
             "event": "verify", "session_id": session_id, "attempt": attempt, "repeated": repeated, "rule": "no_manifest",
             "changed_paths": len(changed), "criteria": len(criteria), "excluded": len(excluded), "pending": len(pending),
             "ledger": len(rows_this_turn), "ledger_checks": len(checks_ran), "manifest_registered": False,
             "manifest": evidence.manifest_counts([]), "reruns": [], "machinery": machinery, "workspace": final_digest,
-            "diff_chars": len(bundle["diff"]), "answers": {}, "findings": findings,
+            "diff_chars": len(bundle["diff"]), "answers": {}, "findings": findings, "action": action, "ship_reason": ship_reason,
             "latency_ms": int((time.monotonic() - started) * 1000), "error": "",
         })
-        action = "repeated" if repeated else "nudge"
         emit_verdict(
             session_id, "verify",
             f"Jev verify (attempt {attempt + 1}): no result manifest on a build turn that ran {len(checks_ran)} checks · "
-            f"ledger {len(rows_this_turn)} rows" + (f" · machinery changed ({len(machinery)})" if machinery else "") + f" · {action}",
+            f"ledger {len(rows_this_turn)} rows" + (f" · machinery changed ({len(machinery)})" if machinery else "") + f" · {action}"
+            + (f" ({ship_reason})" if ship_reason else "") + f" · {finding}",
             answers={},
             decision={
                 "action": action, "rule": "no_manifest", "findings": findings, "criteria": len(criteria), "excluded": len(excluded),
                 "pending": len(pending), "ledger": len(rows_this_turn), "manifest": evidence.manifest_counts([]),
-                "manifest_registered": False, "reruns": 0, "machinery": machinery, "assertions": [],
+                "manifest_registered": False, "reruns": 0, "machinery": machinery, "assertions": [], "ship_reason": ship_reason,
             },
             attempt=attempt,
         )
-        if repeated:
+        if not send_back:
             return None
         return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=finding)}
 
@@ -2416,6 +2507,12 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     if excerpts:
         questions["checks_failing"] = {"type": "noul", "instructions": CHECKS_FAILING_QUESTION}
     questions["claims_unverified"] = {"type": "noul", "instructions": CLAIMS_QUESTION, "criteria": CLAIMS_CRITERIA}
+    sentences = claim_sentences(final_response)[: max(0, JEV_MAX_QUESTIONS - len(questions))]
+    claim_keys: Dict[str, str] = {}
+    for index, sentence in enumerate(sentences, 1):
+        key = f"claim_{index}"
+        claim_keys[key] = sentence
+        questions[key] = {"type": "noul", "instructions": CLAIM_QUESTION.format(claim=sentence), "criteria": CLAIM_CRITERIA}
     # One typed choice per assertion code could not settle against the claim's
     # wording, batched under Jev's question cap; grouped by criterion when
     # the manifest is too long, and never dropped silently.
@@ -2552,8 +2649,12 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     if checks_failing is not None and checks_failing >= VERIFY_FLAG_THRESHOLD:
         findings.append(f"Failure excerpts show a failure not fixed afterwards (P={checks_failing:.2f}).")
     claims = answers.get("claims_unverified")
-    if claims is not None and claims >= claims_flag_threshold():
-        findings.append(f"The final message claims results beyond the manifest and the ledger (P={claims:.2f}).")
+    flagged = [
+        (claim_keys[key], answers[key]) for key in claim_keys
+        if answers.get(key) is not None and answers[key] <= CLAIM_FLAG_THRESHOLD
+    ]
+    for sentence, _value in flagged:
+        findings.append(CLAIM_FINDING.format(claim=sentence))
     # One record per manifest item, in manifest order, with Jev's read where one was asked.
     assertion_records: List[Dict[str, Any]] = []
     jev_contradicted: List[str] = []
@@ -2570,13 +2671,16 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             jev_contradicted.append(f'"{_clip(item["claim"], 100)}" (P(contradicted)={p_contradicted:.2f})')
     if jev_contradicted:
         findings.append("Jev reads the cited rows as contradicting the claim as worded: " + "; ".join(jev_contradicted) + ".")
-    # A nudge that changed nothing must not be repeated: if the findings and
-    # the evidence are identical to the previous attempt, the model has
-    # answered them as far as it will, so let the turn finish.
-    key = _verify_key(findings, bundle["diff"], rows_this_turn, verdicts)
+    # A nudge that changed nothing must not be repeated: if the evidence (the
+    # diff, the paths and the commands with their outputs) is identical to the
+    # previous attempt, rewording the answer is not a new attempt, so the
+    # turn ships with its flags.
+    key = _verify_key(bundle["diff"], changed, rows_this_turn)
     repeated = attempt > 0 and _verify_memo.get(session_id) == key
     _verify_memo[session_id] = key
     _bound(_verify_memo)
+    send_back, ship_reason = _send_back(findings, repeated, attempt)
+    action = "unavailable" if error else "finish" if not findings else "nudge" if send_back else "ship_flagged"
     latency_ms = int((time.monotonic() - started) * 1000)
     write_log(
         {
@@ -2607,12 +2711,14 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "state_chars": len(json.dumps(state, ensure_ascii=False)),
             "answers": answers,
             "assertions": assertion_records,
+            "claims": {"sentences": len(claim_keys), "flagged": [sentence for sentence, _value in flagged]},
             "findings": findings,
+            "action": action,
+            "ship_reason": ship_reason,
             "latency_ms": latency_ms,
             "error": error,
         }
     )
-    action = "unavailable" if error else "finish" if not findings else "repeated" if repeated else "nudge"
     met = sum(1 for key in labels if answers.get(key) is not None and answers[key] > verify_fail_threshold())
     text = (
         f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)} · "
@@ -2622,7 +2728,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         + (f" · machinery changed ({len(machinery)})" if machinery else "")
         + (" · tests weakened" if regressions or weakening["removed"] or weakening["skips"] else "")
         + f" · {action}"
-        + (f" · {' '.join(findings)}" if findings and action == "nudge" else "")
+        + (f" ({ship_reason})" if ship_reason else "")
+        + (f" · {' '.join(findings)}" if findings and action in ("nudge", "ship_flagged") else "")
     )
     emit_verdict(
         session_id,
@@ -2633,13 +2740,14 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "action": action, "findings": findings, "criteria": len(labels), "excluded": len(excluded), "pending": len(pending),
             "ledger": len(rows_this_turn), "manifest": counts, "manifest_registered": manifest is not None,
             "reruns": len(reruns), "machinery": machinery, "weakening": weakening, "regressions": regressions,
-            "assertions": assertion_records,
+            "assertions": assertion_records, "flagged_sentences": [sentence for sentence, _value in flagged],
+            "ship_reason": ship_reason,
         },
         model=jev_model,
         latency_ms=latency_ms,
         attempt=attempt,
     )
-    if not findings or repeated:
+    if not send_back:
         return None
     return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=" ".join(findings))}
 

@@ -572,19 +572,148 @@ def test_every_command_is_a_ledger_row_and_only_checks_count_as_checks(feedback,
 
 
 def test_an_unchanged_finding_is_not_nudged_twice(feedback, repo):
-    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9}
+    feedback["settings"]["verify_max_send_backs"] = 3
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9, "claim_1": 0.05}
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
-    first = preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
-    assert first is not None and "claims results" in first["message"]
-    # Same findings, same diff, no new commands: the model is not going to change its mind.
-    second = preflight.on_pre_verify(session_id="s1", attempt=1, final_response="Done, really.", changed_paths=[str(repo / "app.py")])
+    draft = "Done. The full test suite passes on every module now."
+    first = preflight.on_pre_verify(session_id="s1", attempt=0, final_response=draft, changed_paths=[str(repo / "app.py")])
+    assert first is not None and 'Unsupported by the evidence: "The full test suite passes on every module now."' in first["message"]
+    # Same diff, no new commands: a reworded answer is the same attempt, so it ships flagged.
+    second = preflight.on_pre_verify(session_id="s1", attempt=1, final_response="Really done. Every module's tests pass in the full suite.", changed_paths=[str(repo / "app.py")])
     assert second is None
     records = feedback["records"]("verify")
     assert [row["repeated"] for row in records] == [False, True]
+    assert records[1]["action"] == "ship_flagged" and records[1]["ship_reason"] == "same evidence as the previous attempt"
     # New evidence (a command ran) makes the judge look again.
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 app.py"}, result="hello world", session_id="s1")
-    third = preflight.on_pre_verify(session_id="s1", attempt=2, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    third = preflight.on_pre_verify(session_id="s1", attempt=2, final_response=draft, changed_paths=[str(repo / "app.py")])
     assert third is not None
+
+
+# ---------------------------------------------------------------------------
+# Tightened loop: claim-specific findings, one send-back, ship with flags
+# ---------------------------------------------------------------------------
+
+def test_claim_sentences_drop_code_and_short_lines_and_cap_at_twelve():
+    text = "Done.\n\n```\nthis code block has many words in it but is not a claim\n```\n- The exporter now writes JSON when --json is passed.\n1. All 14 tests pass on the new module! Short one.\n" + " ".join(f"Sentence number {i} has more than six words in it." for i in range(20))
+    sentences = preflight.claim_sentences(text)
+    assert sentences[0] == "The exporter now writes JSON when --json is passed."
+    assert sentences[1] == "All 14 tests pass on the new module!"
+    assert len(sentences) == preflight.CLAIM_SENTENCE_CAP
+    assert not any("code block" in s or s == "Short one." for s in sentences)
+    assert preflight.claim_sentences("") == [] and preflight.claim_sentences("Done, everything passes.") == []
+
+
+def test_the_judge_quotes_only_the_unsupported_sentence_and_sends_back_once(feedback, repo, emitted):
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 app.py"}, result="hello world", session_id="s1")
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9, "claim_1": 0.95, "claim_2": 0.05}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make greet say hello world", conversation_history=[])
+    draft = "Running app.py now prints hello world as requested. The whole test suite also passes without any failures."
+    first = preflight.on_pre_verify(session_id="s1", attempt=0, final_response=draft, changed_paths=[str(repo / "app.py")])
+    assert first is not None and first["action"] == "continue"
+    call = feedback["jev"].calls[-1]
+    assert call["questions"]["claim_1"]["instructions"].endswith("Claim: Running app.py now prints hello world as requested.")
+    assert call["questions"]["claim_2"]["criteria"] == preflight.CLAIM_CRITERIA
+    assert "claims_unverified" in call["questions"], "the whole-message noul is still asked"
+    message = first["message"]
+    assert 'Unsupported by the evidence: "The whole test suite also passes without any failures."' in message
+    assert "prints hello world" not in message, "a supported sentence is not quoted"
+    assert "claims results beyond" not in message, "claims_unverified alone is no longer a finding"
+    [record] = feedback["records"]("verify")
+    assert record["claims"] == {"sentences": 2, "flagged": ["The whole test suite also passes without any failures."]}
+    assert record["answers"]["claims_unverified"] == 0.9 and record["action"] == "nudge"
+    # The second attempt over the same evidence ships, flagged, whatever the model wrote.
+    feedback["jev"].guard["claim_3"] = 0.95
+    second = preflight.on_pre_verify(session_id="s1", attempt=1, final_response=draft + " Also the lint step is clean across the repo.", changed_paths=[str(repo / "app.py")])
+    assert second is None
+    verdicts = [event for event in emitted if event["stage"] == "verify"]
+    assert [event["decision"]["action"] for event in verdicts] == ["nudge", "ship_flagged"]
+    assert verdicts[1]["decision"]["flagged_sentences"] == ["The whole test suite also passes without any failures."]
+    assert 'ship_flagged (same evidence as the previous attempt) · Unsupported by the evidence: "The whole test suite' in verdicts[1]["text"]
+
+
+def test_the_cap_ships_the_second_attempt_even_with_new_evidence(feedback, repo, emitted):
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
+    draft = "The integration tests pass against the live database now."
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response=draft, changed_paths=[str(repo / "app.py")]) is not None
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s1")
+    assert preflight.on_pre_verify(session_id="s1", attempt=1, final_response=draft, changed_paths=[str(repo / "app.py")]) is None
+    records = feedback["records"]("verify")
+    assert [row["repeated"] for row in records] == [False, False]
+    assert records[1]["action"] == "ship_flagged" and records[1]["ship_reason"] == "send-back cap of 1 reached"
+    assert [event["decision"]["action"] for event in emitted if event["stage"] == "verify"] == ["nudge", "ship_flagged"]
+    # The cap is a setting; a clean second attempt finishes rather than ships flagged.
+    feedback["settings"]["verify_max_send_backs"] = 2
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.9}
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q -x"}, result="3 passed", session_id="s1")
+    assert preflight.on_pre_verify(session_id="s1", attempt=1, final_response=draft, changed_paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["action"] == "finish"
+
+
+def test_flag_only_mode_emits_the_verdict_and_never_nudges(feedback, repo, emitted):
+    feedback["settings"]["verify_send_back"] = "off"
+    feedback["jev"].guard = {"criterion_1": 0.05, "claim_1": 0.05}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
+    draft = "Everything is wired up and the deploy succeeded on staging."
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response=draft, changed_paths=[str(repo / "app.py")]) is None
+    [record] = feedback["records"]("verify")
+    assert record["action"] == "ship_flagged" and record["ship_reason"] == "verify_send_back is off" and len(record["findings"]) == 2
+    [event] = [event for event in emitted if event["stage"] == "verify"]
+    assert event["decision"]["action"] == "ship_flagged" and event["decision"]["flagged_sentences"] == [draft]
+    # The manifest rule honours the same switch.
+    feedback["settings"]["manifest_required"] = "on"
+    preflight._session_todos.clear()
+    preflight.on_pre_llm_call(session_id="s3", turn_id="t1", user_message="build the exporter", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s3")
+    assert preflight.on_pre_verify(session_id="s3", attempt=0, coding=True, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["rule"] == "no_manifest" and feedback["records"]("verify")[-1]["action"] == "ship_flagged"
+
+
+def test_the_manifest_rule_sends_back_once_then_ships(feedback, repo):
+    feedback["settings"]["manifest_required"] = "on"
+    preflight.on_pre_llm_call(session_id="s3", turn_id="t1", user_message="build the exporter", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s3")
+    first = preflight.on_pre_verify(session_id="s3", attempt=0, coding=True, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert first is not None and "No result manifest" in first["message"]
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q tests/"}, result="4 passed", session_id="s3")
+    assert preflight.on_pre_verify(session_id="s3", attempt=1, coding=True, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    records = feedback["records"]("verify")
+    assert [row["action"] for row in records] == ["nudge", "ship_flagged"] and records[1]["ship_reason"] == "send-back cap of 1 reached"
+
+
+@pytest.mark.parametrize("raw, enabled", [(False, False), ("off", False), ("OFF", False), (True, True), ("on", True), (None, True), ("", True)])
+def test_yaml_booleans_and_strings_both_switch_the_gates(harness, raw, enabled):
+    for key in ("verify_judge", "verify_send_back", "criteria_nudge", "drift_check", "fidelity_check", "manifest_required", "controller_reruns"):
+        harness["settings"][key] = raw
+    assert preflight.verify_judge_enabled() is enabled
+    assert preflight.verify_send_back_enabled() is enabled
+    assert preflight.criteria_nudge_enabled() is enabled
+    assert preflight.drift_check_enabled() is enabled
+    assert preflight.fidelity_check_enabled() is enabled
+    assert preflight.manifest_required() is enabled
+    assert preflight.controller_reruns_enabled() is enabled
+
+
+def test_yaml_off_switches_the_mode_the_guard_and_tuning(harness):
+    harness["settings"].update({"mode": False, "tool_guard": False, "tuning": False})
+    assert preflight.current_mode() == "off" and preflight.tool_guard_mode() == "off" and preflight.tuning_mode() == "off"
+    harness["settings"].update({"mode": True, "tool_guard": True, "tuning": True})
+    assert preflight.current_mode() == "shadow" and preflight.tool_guard_mode() == "shadow" and preflight.tuning_mode() == "auto"
+
+
+def test_the_runtimes_shared_consumer_sees_one_send_back_then_a_ship(feedback, repo, monkeypatch):
+    """Both replay lanes ask get_pre_verify_continue_message with the attempt they are on."""
+    from hermes_cli import plugins as plugin_api
+
+    monkeypatch.setattr(plugin_api, "invoke_hook", lambda name, **kwargs: [preflight.on_pre_verify(**kwargs)])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
+    draft = "The nightly job now finishes under the five minute budget."
+    nudge = plugin_api.get_pre_verify_continue_message(session_id="s1", coding=True, attempt=0, final_response=draft, changed_paths=[str(repo / "app.py")])
+    assert nudge and 'Unsupported by the evidence: "The nightly job now finishes under the five minute budget."' in nudge
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 app.py"}, result="hello world", session_id="s1")
+    assert plugin_api.get_pre_verify_continue_message(session_id="s1", coding=True, attempt=1, final_response=draft, changed_paths=[str(repo / "app.py")]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +843,10 @@ def test_the_verify_judge_uses_the_tuned_claims_threshold(tuner, feedback, repo)
     assert preflight.claims_flag_threshold() == 0.55
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.6}
     result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
-    assert result is not None and "claims results beyond the manifest and the ledger (P=0.60)" in result["message"]
+    # The whole-message noul is asked and logged above the tuned threshold, but it no longer sends the model back on its own.
+    assert result is None
+    [record] = feedback["records"]("verify")
+    assert record["answers"]["claims_unverified"] == 0.6 and record["action"] == "finish" and record["findings"] == []
 
 
 def test_the_verify_judge_takes_criteria_from_the_acceptance_criteria_tool(feedback, repo):
