@@ -78,11 +78,17 @@ _NO_FALLTHROUGH_STATUSES = {400, 422}
 
 
 def _env_value(name: str) -> str:
-    """Resolve ``name`` through Hermes' config/.env layer, then process env."""
-    try:
-        from hermes_cli.config import get_env_value
+    """Resolve ``name`` from ``~/.hermes/.env`` first, then the process env.
 
-        value = get_env_value(name)
+    A deliberate edit to .env (a new provider order, a rotated key) must beat
+    the copy of the old value that the gateway, and every CLI and MCP server
+    it spawned, inherited when they started. Reading the process environment
+    first made such an edit wait for a gateway restart.
+    """
+    try:
+        from hermes_cli.config import get_env_value_prefer_dotenv
+
+        value = get_env_value_prefer_dotenv(name)
     except Exception:
         value = None
     if not value:

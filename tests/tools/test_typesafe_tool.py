@@ -311,3 +311,30 @@ def test_callers_can_pin_providers_regardless_of_env(monkeypatch):
     body = ask_jev("x", QUESTIONS, providers=["openrouter"])
     assert calls[0]["url"] == OPENROUTER_DECISIONS_URL
     assert body["provider"] == "openrouter"
+
+
+# ---------------------------------------------------------------------------
+# The chain is read from ~/.hermes/.env before the process environment, so a
+# deliberate edit lands on the next call instead of after a gateway restart.
+# ---------------------------------------------------------------------------
+
+
+def test_a_dotenv_edit_beats_the_value_the_process_inherited(monkeypatch, tmp_path):
+    from hermes_cli import config
+
+    (tmp_path / ".env").write_text("TYPESAFE_PROVIDER=openrouter,typesafe\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TYPESAFE_PROVIDER", "typesafe,openrouter")
+    config.invalidate_env_cache()
+    assert typesafe_tool._env_value("TYPESAFE_PROVIDER") == "openrouter,typesafe"
+    assert provider_chain() == ("openrouter", "typesafe")
+
+
+def test_the_process_environment_still_answers_when_dotenv_is_silent(monkeypatch, tmp_path):
+    from hermes_cli import config
+
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TYPESAFE_PROVIDER", "openrouter")
+    config.invalidate_env_cache()
+    assert provider_chain() == ("openrouter",)
