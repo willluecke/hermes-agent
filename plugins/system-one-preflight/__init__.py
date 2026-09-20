@@ -15,10 +15,13 @@ nothing retrieved from a tool can become an instruction through this path.
 Modes (``plugins.entries.system-one-preflight.settings.mode``):
 
 * ``shadow`` (default) — ask Jev, log the verdict, inject nothing.
-* ``feedback`` — ask Jev about ambiguity and missing evidence; when either
-               is high or Jev is unsure, feed the numbers back to the model
-               in a fixed advisory note so it can ask one clarifying
-               question or verify first. Nothing is enforced.
+* ``feedback`` — ask Jev the budget questions; feed the numbers back to the
+               model in a fixed advisory note only when P(ambiguous) clears
+               ``ambiguity_threshold``, when the budget plan is candidates or
+               criteria-first, or as the build criteria nudge. Nothing is
+               enforced. The injection rate over the last
+               ``INJECTION_WINDOW`` feedback turns is logged with every
+               verdict so a note that has become a constant is visible.
 * ``jev``    — inject the reminder when P(missing verification) >= threshold.
 * ``always`` — inject the reminder every turn (the always-remind control).
 * ``trial``  — assign each session, by hash, to control / always / jev and
@@ -144,7 +147,6 @@ PLUGIN_ID = "system-one-preflight"
 MODES = ("off", "shadow", "feedback", "jev", "always", "trial")
 TRIAL_ARMS = ("control", "always", "jev")
 AMBIGUITY_THRESHOLD = 0.6
-UNSURE_BAND = (0.35, 0.65)
 GUARD_RISK_THRESHOLD = 0.8
 GUARD_SCOPE_THRESHOLD = 0.4
 DEFAULT_THRESHOLD = 0.7
@@ -167,14 +169,6 @@ AMBIGUITY_QUESTION = (
     "Is the request ambiguous or underspecified enough that a competent "
     "assistant should ask the user one clarifying question before acting, "
     "rather than guess at what they meant?"
-)
-FEEDBACK_TEMPLATE = (
-    "Preflight from Jev, a fast typed judge whose read is advisory, not an "
-    "instruction: P(the request is ambiguous enough to ask first) = {ambiguous}; "
-    "P(an answer would depend on evidence you have not checked) = {missing}. "
-    "If the ambiguity is real, ask the user one focused clarifying question "
-    "before acting. If evidence is missing, verify it before depending on it. "
-    "Otherwise proceed and state the assumption you made."
 )
 BUILD_QUESTION = (
     "Does the request ask to write, change, or fix code or files in a project, "
@@ -383,7 +377,7 @@ _pending_fidelity: Dict[str, Dict[str, str]] = {}
 _pending_fidelity_note: Dict[str, str] = {}
 # Running means of the budget reads per session, so a turn's note is sent
 # when its read stands out from the session's usual, not on every turn.
-_session_budget: Dict[str, Dict[str, Any]] = {}
+_injection_window: List[bool] = []
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
 # acceptance criterion the recent calls serve; "none" at or above the
 # threshold steers the model back, at most DRIFT_MAX_STEERS times per turn.
@@ -472,12 +466,11 @@ CONTINUATION_RE = re.compile(
     re.IGNORECASE,
 )
 MAX_CONTINUATION_CHARS = 80
-# The budget note goes out when the read is unusual for the session, not on
-# every turn: 24 of 24 turns in one conversation got it on 2026-09-19 with
-# ambiguity averaging 0.64, which made it a constant rather than a signal.
-BASELINE_TURNS = 3
-BASELINE_MARGIN = 0.15
-BASELINE_WINDOW = 6
+# The note went into 276 of 314 turns before 2026-09-18 and 166 of 199 after
+# the session-baseline rule, most of those as the build criteria nudge. The
+# trigger is now the thresholds alone; the rate over the last INJECTION_WINDOW
+# feedback turns is logged so a note that is still a constant shows up as one.
+INJECTION_WINDOW = 50
 FIDELITY_EXCLUDED_TEMPLATE = (
     "Criteria check from Jev, a fast typed judge whose read is advisory: {n} of "
     "your acceptance criteria do not follow from what the user asked and will "
@@ -939,31 +932,6 @@ def decide(p_missing: Optional[float], arm: str) -> bool:
     return False
 
 
-def _unsure(value: Optional[float]) -> bool:
-    return value is not None and UNSURE_BAND[0] <= value <= UNSURE_BAND[1]
-
-
-def feedback_context(p_missing: Optional[float], p_ambiguous: Optional[float]) -> Optional[str]:
-    """The advisory note for feedback mode, or None when Jev sees no issue.
-
-    Fed back when either signal clears its threshold or sits in the unsure
-    band, so the model gets Jev's read exactly when a clarifying question or
-    a check is most likely to pay off. Numbers only; the wording is fixed.
-    """
-    if p_missing is None and p_ambiguous is None:
-        return None
-    worth_it = (
-        (p_ambiguous is not None and p_ambiguous >= ambiguity_threshold())
-        or (p_missing is not None and p_missing >= threshold())
-        or _unsure(p_ambiguous)
-        or _unsure(p_missing)
-    )
-    if not worth_it:
-        return None
-    fmt = lambda value: "unknown" if value is None else f"{value:.2f}"
-    return FEEDBACK_TEMPLATE.format(ambiguous=fmt(p_ambiguous), missing=fmt(p_missing))
-
-
 def _fmt(value: Optional[float]) -> str:
     return "unknown" if value is None else f"{value:.2f}"
 
@@ -995,9 +963,8 @@ def budget_context(
     The old trigger, "would an answer depend on evidence not yet checked",
     averaged 0.81 over 189 real turns and so carried almost no information.
     The note goes in when the budget calls for candidates or criteria, or
-    when the ambiguity read clears its threshold, and only for a ``reason``
-    from :func:`budget_note_reason`: candidates always, otherwise the first
-    turns of a session or a read that stands out from the session's mean.
+    when the ambiguity read clears its threshold: the ``reason`` from
+    :func:`budget_note_reason`.
     """
     if reason is None:
         reason = "unconditional"
@@ -1024,50 +991,28 @@ def continuation_request(text: str) -> bool:
     return bool(text) and len(text) <= MAX_CONTINUATION_CHARS and bool(CONTINUATION_RE.match(text))
 
 
-def session_baseline(session_id: str) -> Dict[str, Any]:
-    """``n`` turns seen and the mean ambiguity and difficulty over the last ``BASELINE_WINDOW`` of them."""
-    stats = _session_budget.get(session_id)
-    if not stats:
-        return {"n": 0, "ambiguous": None, "hard": None}
-    means = {}
-    for key in ("ambiguous", "hard"):
-        values = [value for value in stats[key] if value is not None]
-        means[key] = sum(values) / len(values) if values else None
-    return {"n": stats["n"], **means}
-
-
-def budget_note_reason(session_id: str, p_ambiguous: Optional[float], p_hard: Optional[float], plan: Dict[str, Any]) -> str:
+def budget_note_reason(p_ambiguous: Optional[float], plan: Dict[str, Any]) -> str:
     """Why the note goes out this turn, or an empty string to withhold it.
 
-    Candidates always: k above one is rare and actionable. Otherwise the note
-    needs something to say (ambiguity at or above its threshold, or a
-    criteria-first plan) and a reason it is worth saying now: the session's
-    first turns, before there is a baseline, or a read at least
-    ``BASELINE_MARGIN`` above the session's mean over its last ``BASELINE_WINDOW`` turns.
+    Candidates and the criteria-first plan are rare and actionable; ambiguity
+    at or above ``ambiguity_threshold`` is what a clarifying question answers.
+    Nothing else sends it: not the session's first turns, not a read that
+    stands out from the session's mean, and not the unsure band.
     """
     if plan.get("plan") == "candidates":
         return "candidates"
-    ask = p_ambiguous is not None and p_ambiguous >= ambiguity_threshold()
-    criteria = plan.get("plan") == "criteria_only"
-    if not ask and not criteria:
-        return ""
-    stats = session_baseline(session_id)
-    if stats["n"] < BASELINE_TURNS:
-        return "first_turns"
-    if ask and stats["ambiguous"] is not None and p_ambiguous >= stats["ambiguous"] + BASELINE_MARGIN:
-        return "ambiguous_above_baseline"
-    if criteria and p_hard is not None and stats["hard"] is not None and p_hard >= stats["hard"] + BASELINE_MARGIN:
-        return "hard_above_baseline"
+    if plan.get("plan") == "criteria_only":
+        return "criteria_only"
+    if p_ambiguous is not None and p_ambiguous >= ambiguity_threshold():
+        return "ambiguous"
     return ""
 
 
-def update_baseline(session_id: str, p_ambiguous: Optional[float], p_hard: Optional[float]) -> None:
-    stats = _session_budget.setdefault(session_id, {"n": 0, "ambiguous": [], "hard": []})
-    for key, value in (("ambiguous", p_ambiguous), ("hard", p_hard)):
-        stats[key].append(value)
-        del stats[key][:-BASELINE_WINDOW]
-    stats["n"] += 1
-    _bound(_session_budget)
+def record_injection(injected: bool) -> Dict[str, int]:
+    """Count this feedback turn and return the rate over the last ``INJECTION_WINDOW``."""
+    _injection_window.append(bool(injected))
+    del _injection_window[:-INJECTION_WINDOW]
+    return {"n": len(_injection_window), "injected": sum(1 for value in _injection_window if value)}
 
 
 def emit_verdict(
@@ -1324,11 +1269,10 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     plan = budget(p_hard, p_checkable)
     drift_state(session_id)["build"] = bool(p_build is not None and p_build >= BUILD_THRESHOLD) or kind == "build"
     note_reason = ""
-    baseline = session_baseline(session_id)
+    injection_rate: Dict[str, int] = {}
     if arm == "feedback":
-        note_reason = budget_note_reason(session_id, p_ambiguous, p_hard, plan)
+        note_reason = budget_note_reason(p_ambiguous, plan)
         context = budget_context(p_ambiguous, p_hard, p_checkable, plan, note_reason)
-        update_baseline(session_id, p_ambiguous, p_hard)
         if (
             criteria_nudge_enabled()
             and verify_judge_enabled()
@@ -1337,7 +1281,9 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             and not _session_todos.get(session_id)
         ):
             context = f"{context}\n\n{CRITERIA_NUDGE}" if context else CRITERIA_NUDGE
+            note_reason = note_reason or "criteria_nudge"
         injected = context is not None
+        injection_rate = record_injection(injected)
     else:
         injected = decide(p_missing, arm)
         context = REMINDER if injected else None
@@ -1362,9 +1308,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "threshold": threshold(),
             "injected": injected,
             "note_reason": note_reason,
-            "baseline_n": baseline["n"],
-            "baseline_ambiguous": baseline["ambiguous"],
-            "baseline_hard": baseline["hard"],
+            "injection_rate": injection_rate,
             "latency_ms": latency_ms,
             "state_chars": len(json.dumps(state, ensure_ascii=False)),
             "evidence_items": len(state["evidence"]["items"]),
@@ -1378,7 +1322,9 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "budget",
             f"Jev budget: hard {_fmt(p_hard)} · checkable {_fmt(p_checkable)} · kind {kind or 'unknown'} · "
             f"ambiguous {_fmt(p_ambiguous)} · build {_fmt(p_build)} · k={plan['k']}"
-            + (" · note sent" if injected else " · note withheld"),
+            + (" · note sent" if injected else " · note withheld")
+            + (f" ({note_reason})" if injected and note_reason else "")
+            + f" · {injection_rate['injected']} of last {injection_rate['n']} sent",
             answers={
                 "hard": p_hard,
                 "checkable": p_checkable,
@@ -1387,7 +1333,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
                 "build": p_build,
                 "missing": p_missing,
             },
-            decision={"k": plan["k"], "finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected, "note_reason": note_reason, "baseline_n": baseline["n"]},
+            decision={"k": plan["k"], "finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected, "note_reason": note_reason, "injection_rate": injection_rate},
             model=jev_model,
             latency_ms=latency_ms,
         )

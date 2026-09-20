@@ -72,7 +72,7 @@ def harness(tmp_path, monkeypatch):
     preflight._session_previous_answer.clear()
     preflight._pending_fidelity.clear()
     preflight._pending_fidelity_note.clear()
-    preflight._session_budget.clear()
+    preflight._injection_window.clear()
 
     def records(event=None):
         path = tmp_path / "preflight.jsonl"
@@ -331,7 +331,8 @@ def test_feedback_mode_asks_the_budget_questions_and_stays_quiet_when_jev_sees_n
     # The budget is visible in the turn even when no note goes to the model.
     [event] = emitted
     assert event["event"] == "judge.verdict" and event["stage"] == "budget" and event["judge"] == "jev"
-    assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False, "note_reason": "", "baseline_n": 0}
+    assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False, "note_reason": "", "injection_rate": {"n": 1, "injected": 0}}
+    assert event["text"].endswith("· note withheld · 0 of last 1 sent")
     assert event["answers"]["hard"] == pytest.approx(0.1) and event["answers"]["kind"] == "answer"
     assert event["model"] == "jev-1.13.0" and "k=1" in event["text"]
 
@@ -361,7 +362,8 @@ def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedba
     [record] = feedback["records"]("preflight")
     assert record["k"] == 3 and record["kind"] == "build" and record["p_hard"] == pytest.approx(0.8)
     [event] = emitted
-    assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True, "note_reason": "candidates", "baseline_n": 0}
+    assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True, "note_reason": "candidates", "injection_rate": {"n": 1, "injected": 1}}
+    assert event["text"].endswith("· note sent (candidates) · 1 of last 1 sent")
     # Hard but not checkable: criteria first, one candidate, no finish loop.
     feedback["jev"].checkable = 0.2
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[])
@@ -1765,46 +1767,39 @@ def test_fidelity_on_a_follow_up_judges_the_proposed_work_and_records_a_low_read
     assert fidelity["records"]("fidelity")[-1]["continuation"] is False
 
 
-def test_the_budget_note_is_sent_for_the_first_turns_then_only_when_the_read_stands_out(feedback, emitted):
+def test_the_budget_note_follows_the_thresholds_alone_and_reports_its_rate(feedback, emitted):
+    # Ambiguity at or above the threshold sends the note on every such turn: no first-turns
+    # allowance, no session baseline, no unsure band.
     feedback["jev"].ambiguous = 0.64
-    for turn in ("t1", "t2", "t3"):
+    for turn in ("t1", "t2", "t3", "t4"):
         assert preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="x", conversation_history=[]) is not None
-        assert feedback["records"]("preflight")[-1]["note_reason"] == "first_turns"
+        assert feedback["records"]("preflight")[-1]["note_reason"] == "ambiguous"
+    assert emitted[-1]["text"].endswith("· note sent (ambiguous) · 4 of last 4 sent")
+    # Below it, nothing else sends it, however the session has been reading.
+    feedback["jev"].ambiguous = 0.55
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="x", conversation_history=[]) is None
     record = feedback["records"]("preflight")[-1]
-    assert record["baseline_n"] == 2 and record["baseline_ambiguous"] == pytest.approx(0.64)
-    # The fourth turn reads like the session's usual: withheld, and the row says so.
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="x", conversation_history=[]) is None
-    record = feedback["records"]("preflight")[-1]
-    assert record["injected"] is False and record["note_reason"] == "" and record["baseline_n"] == 3
-    assert emitted[-1]["stage"] == "budget" and emitted[-1]["text"].endswith("· note withheld") and emitted[-1]["decision"]["note_reason"] == ""
-    # A read that stands out is sent, with the reason.
-    feedback["jev"].ambiguous = 0.85
-    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="x", conversation_history=[])
-    assert result is not None and "clarifying question" in result["context"]
-    assert feedback["records"]("preflight")[-1]["note_reason"] == "ambiguous_above_baseline"
-    assert emitted[-1]["text"].endswith("· note sent")
-    # Difficulty works the same way for the criteria-first plan.
+    assert record["injected"] is False and record["note_reason"] == "" and record["injection_rate"] == {"n": 5, "injected": 4}
+    assert "baseline_n" not in record
+    assert emitted[-1]["stage"] == "budget" and emitted[-1]["text"].endswith("· note withheld · 4 of last 5 sent")
+    # The criteria-first plan sends it on every hard turn, not only the first that stands out.
     feedback["jev"].ambiguous = 0.1
     feedback["jev"].hard = 0.8
     feedback["jev"].checkable = 0.2
-    reasons = []
-    for turn in range(6, 14):
-        preflight.on_pre_llm_call(session_id="s1", turn_id=f"t{turn}", user_message="x", conversation_history=[])
-        reasons.append(feedback["records"]("preflight")[-1]["note_reason"])
-    assert reasons[0] == "hard_above_baseline", "the first hard turn stands out from an easy session"
-    assert reasons[-1] == "" and feedback["records"]("preflight")[-1]["injected"] is False, "hard on every recent turn is the session's usual"
-    assert feedback["records"]("preflight")[-1]["baseline_hard"] == pytest.approx(0.8)
-    feedback["jev"].hard = 0.99
-    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t20", user_message="x", conversation_history=[])
-    assert result is not None and "write the acceptance criteria first" in result["context"]
-    assert feedback["records"]("preflight")[-1]["note_reason"] == "hard_above_baseline"
-    # Candidates are always worth saying.
-    feedback["jev"].hard = 0.8
-    feedback["jev"].checkable = 0.9
-    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t21", user_message="x", conversation_history=[])
-    assert result is not None and "3 independent candidate solutions" in result["context"]
-    assert feedback["records"]("preflight")[-1]["note_reason"] == "candidates"
-    # A new session starts its own baseline.
-    feedback["jev"].checkable = 0.2
-    assert preflight.on_pre_llm_call(session_id="s2", turn_id="t1", user_message="x", conversation_history=[]) is not None
-    assert feedback["records"]("preflight")[-1]["note_reason"] == "first_turns" and feedback["records"]("preflight")[-1]["baseline_n"] == 0
+    for turn in range(6, 10):
+        result = preflight.on_pre_llm_call(session_id="s1", turn_id=f"t{turn}", user_message="x", conversation_history=[])
+        assert result is not None and "write the acceptance criteria first" in result["context"]
+        assert feedback["records"]("preflight")[-1]["note_reason"] == "criteria_only"
+    # The build criteria nudge counts as an injection with its own reason.
+    feedback["jev"].hard = 0.1
+    feedback["jev"].kind = "build"
+    feedback["jev"].guard = {"is_build": 0.9}
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t10", user_message="build it", conversation_history=[])
+    assert result is not None and "acceptance criteria" in result["context"]
+    assert feedback["records"]("preflight")[-1]["note_reason"] == "criteria_nudge"
+    # The rate window is process-wide and bounded.
+    feedback["jev"].kind = "answer"
+    feedback["jev"].guard = {}
+    for turn in range(11, 11 + preflight.INJECTION_WINDOW):
+        preflight.on_pre_llm_call(session_id="s2", turn_id=f"t{turn}", user_message="x", conversation_history=[])
+    assert feedback["records"]("preflight")[-1]["injection_rate"] == {"n": preflight.INJECTION_WINDOW, "injected": 0}
