@@ -70,7 +70,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Local time lookup
     "current_time",
-    # TypeSafe Jev typed decisions (gated on TYPESAFE_API_KEY via check_fn)
+    # TypeSafe Jev typed decisions (gated via check_fn on a key for a provider in
+    # TYPESAFE_PROVIDER: TYPESAFE_API_KEY, or OPENROUTER_API_KEY for the proxy)
     "typesafe_decide",
     "acceptance_criteria",
     "report_results",
