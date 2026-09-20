@@ -469,17 +469,42 @@ def machinery_paths(changed_paths: List[str], root: Optional[str] = None) -> Lis
 # The result manifest and its code-side verdicts
 # ---------------------------------------------------------------------------
 
-def parse_manifest(text: str) -> Optional[List[Dict[str, Any]]]:
-    """The ``report_results`` tool's result, raw or wrapped by the MCP bridge as {"result": "<json>"}."""
-    try:
-        payload = json.loads(text)
-    except (TypeError, ValueError):
-        return None
-    if isinstance(payload, dict) and "manifest" not in payload and isinstance(payload.get("result"), str):
-        try:
-            payload = json.loads(payload["result"])
-        except (TypeError, ValueError):
+def tool_result_payload(text: str) -> Optional[Dict[str, Any]]:
+    """Decode native results and the MCP envelopes replayed by external lanes.
+
+    Prefer structured content when present. Otherwise require exactly one
+    JSON text block; do not search arbitrary tool prose for a registration.
+    Invalid/error results leave the existing registration unchanged.
+    """
+    payload: Any = text
+    for _ in range(8):
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(payload, dict) or payload.get("isError") or payload.get("is_error"):
             return None
+        if payload.get("structuredContent") is not None:
+            payload = payload["structuredContent"]
+        elif isinstance(payload.get("result"), str):
+            payload = payload["result"]
+        elif isinstance(payload.get("content"), list):
+            blocks = [
+                item["text"] for item in payload["content"]
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+            ]
+            if len(blocks) != 1:
+                return None
+            payload = blocks[0]
+        else:
+            return payload
+    return None
+
+
+def parse_manifest(text: str) -> Optional[List[Dict[str, Any]]]:
+    """The ``report_results`` registration, raw or wrapped by the MCP bridge."""
+    payload = tool_result_payload(text)
     items = payload.get("manifest") if isinstance(payload, dict) else None
     if not isinstance(items, list):
         return None

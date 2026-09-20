@@ -1172,6 +1172,44 @@ def test_criteria_arrive_wrapped_by_the_mcp_bridge_on_the_claude_and_codex_lanes
     assert preflight._session_excluded["s1"] == ["2"]
 
 
+@pytest.mark.parametrize("structured", [False, True])
+def test_codex_mcp_result_replaces_superseded_criteria(feedback, repo, structured):
+    from agent.codex_runtime import _codex_item_completion_payload
+    from mcp.types import CallToolResult, TextContent
+    from tools.acceptance_criteria_tool import acceptance_criteria
+
+    old = "Only Opus may implement the change"
+    replacement = "The report attributes the implementation accurately"
+    _register_criteria(old)
+    raw = acceptance_criteria({"criteria": [{"content": replacement, "status": "completed"}]})
+    envelope = CallToolResult(
+        content=[TextContent(type="text", text=raw)],
+        structured_content={"result": raw} if structured else None,
+    ).model_dump(mode="json", by_alias=True, exclude_none=True)
+    result, is_error = _codex_item_completion_payload({"type": "mcpToolCall", "result": envelope})
+    assert not is_error
+    preflight.on_post_tool_call(
+        session_id="s1", tool_name="acceptance_criteria", args={}, result=result, replay=True,
+    )
+    assert [item["content"] for item in preflight.active_criteria("s1")] == [replacement]
+    _verify(paths=[str(repo / "app.py")])
+    state = feedback["jev"].calls[-1]["state"]
+    assert [item["text"] for item in state["acceptance_criteria"]["items"]] == [replacement]
+
+
+def test_failed_mcp_criteria_result_does_not_replace_registered_criteria(feedback):
+    _register_criteria(C1)
+    result = {
+        "isError": True,
+        "structuredContent": {"result": _criteria_result(C2)},
+        "content": [{"type": "text", "text": _criteria_result(C2)}],
+    }
+    preflight.on_post_tool_call(
+        session_id="s1", tool_name="acceptance_criteria", args={}, result=result, replay=True,
+    )
+    assert [item["content"] for item in preflight.active_criteria("s1")] == [C1]
+
+
 # ---------------------------------------------------------------------------
 # Evidence ledger and result manifest
 # ---------------------------------------------------------------------------

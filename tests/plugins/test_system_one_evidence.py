@@ -238,6 +238,43 @@ def test_parse_manifest_reads_the_raw_and_the_bridge_wrapped_result():
     assert many[0]["id"] == "r1" and many[0]["predicate"] == "passed"
 
 
+@pytest.mark.parametrize("structured", [False, True])
+def test_manifest_accepts_full_mcp_result_envelopes(structured):
+    from agent.codex_runtime import _codex_item_completion_payload
+    from mcp.types import CallToolResult, TextContent
+
+    raw = json.dumps(MANIFEST)
+    envelope = CallToolResult(
+        content=[TextContent(type="text", text=raw)],
+        structured_content={"result": raw} if structured else None,
+    ).model_dump(mode="json", by_alias=True, exclude_none=True)
+    result, is_error = _codex_item_completion_payload({"type": "mcpToolCall", "result": envelope})
+    assert not is_error
+    assert evidence.parse_manifest(result) == evidence.parse_manifest(raw)
+    envelope["isError"] = True
+    assert evidence.parse_manifest(json.dumps(envelope)) is None
+
+
+def test_mcp_result_parsing_rejects_ambiguous_or_malformed_content():
+    raw = json.dumps(MANIFEST)
+    for envelope in (
+        {"content": []},
+        {"content": [{"type": "text", "text": "not json"}]},
+        {"content": [{"type": "image", "data": raw}]},
+        {"content": [{"type": "text", "text": raw}] * 2},
+        {"structuredContent": {"result": "not json"}, "content": [{"type": "text", "text": raw}]},
+    ):
+        assert evidence.parse_manifest(json.dumps(envelope)) is None
+
+
+def test_mcp_structured_result_takes_precedence_over_text_and_keeps_empty_lists():
+    envelope = {
+        "structuredContent": {"result": json.dumps({"manifest": []})},
+        "content": [{"type": "text", "text": json.dumps(MANIFEST)}],
+    }
+    assert evidence.parse_manifest(json.dumps(envelope)) == []
+
+
 def _rows(tmp_path, **overrides):
     ok, out_ok = evidence.make_row(2, "pytest -q", json.dumps({"output": PYTEST_OK, "exit_code": 0}), workspace="w1")
     ok["file"] = evidence.retain_output(tmp_path / "ev", "c2", out_ok)

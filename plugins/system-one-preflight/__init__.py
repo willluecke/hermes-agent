@@ -1558,19 +1558,8 @@ def on_pre_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
 def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
     """The todo tool's result is JSON with a ``todos`` array; keep id/content/status."""
-    try:
-        payload = json.loads(text)
-    except (TypeError, ValueError):
-        return None
+    payload = evidence.tool_result_payload(text)
     items = payload.get("todos") if isinstance(payload, dict) else None
-    if items is None and isinstance(payload, dict) and isinstance(payload.get("result"), str):
-        # The MCP bridge (the Claude and Codex lanes) wraps a tool's string
-        # result as {"result": "<json>"}; the criteria are one level down.
-        try:
-            inner = json.loads(payload["result"])
-        except (TypeError, ValueError):
-            inner = None
-        items = inner.get("todos") if isinstance(inner, dict) else None
     if not isinstance(items, list):
         return None
     todos: List[Dict[str, str]] = []
