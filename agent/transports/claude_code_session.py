@@ -42,6 +42,18 @@ _TASK_NOTIFICATION_STATUS_RE = re.compile(
 _TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "stopped", "cancelled", "canceled"}
 )
+# Claude Code's Monitor tool answers with the task id and its own timeout.
+_MONITOR_STARTED_RE = re.compile(
+    r"Monitor started \(task ([A-Za-z0-9_-]+), timeout (\d+)ms\)"
+)
+# Synthetic records the transport hands to ``on_event`` so the event bridge
+# can flush commentary the model wrote before a result Hermes chose to hold.
+HERMES_RESULT_DEFERRED = "hermes.result_deferred"
+HERMES_MONITOR_NOTE = "hermes.monitor_note"
+# A Monitor keeps the Hermes turn open (see run_turn). These bound the wait
+# beyond the Monitor's own timeout and the trailing drain after it ends.
+DEFAULT_MONITOR_GRACE_SECONDS = 60.0
+DEFAULT_MONITOR_DRAIN_QUIET_SECONDS = 5.0
 
 CLAUDE_AUTH_ERROR_CODE = "claude_authentication_failed"
 CLAUDE_AUTH_REMEDIATION = (
@@ -545,6 +557,8 @@ class ClaudeCodeSession:
         self.no_tools = bool(no_tools)
         self.read_only = bool(read_only or no_tools)
         self.on_event = on_event
+        self.monitor_grace_seconds: float = DEFAULT_MONITOR_GRACE_SECONDS
+        self.monitor_drain_quiet_seconds: float = DEFAULT_MONITOR_DRAIN_QUIET_SECONDS
         self.on_session_id = on_session_id
         self.on_watchdog_timeout = on_watchdog_timeout
         self.inactivity_timeout = inactivity_timeout
@@ -810,13 +824,76 @@ class ClaudeCodeSession:
             agent_tool_ids: set[str] = set()
             pending_background_agent_tool_ids: set[str] = set()
             waiting_for_background_agents = False
+            # Monitor tool calls made this turn. A Monitor is Claude Code's
+            # "wait for a condition" primitive: its events wake the resident
+            # process between prompts, and nobody reads that output once the
+            # Hermes turn has ended (2026-09-20: a render finished, the model
+            # encoded and shipped it, and the chat never saw any of it). So a
+            # turn with a live Monitor stays open until the Monitor's stream
+            # ends, then drains the mini-turns its queued events produce.
+            monitor_tool_use_ids: set[str] = set()
+            pending_monitors: dict[str, float] = {}  # task id -> deadline
+            task_descriptions: dict[str, str] = {}
+            deferred_final_text = ""
+            monitor_wait_announced = False
+            drain_active = False
+            drain_deadline: Optional[float] = None
 
             def _waiting_for_autonomous_work() -> bool:
                 return bool(
                     waiting_for_scheduled_wakeup
                     or waiting_for_background_agents
                     or pending_background_agent_tool_ids
+                    or pending_monitors
+                    or drain_active
                 )
+
+            def _emit_hermes_note(record_type: str, **payload: Any) -> None:
+                if self.on_event is None:
+                    return
+                try:
+                    self.on_event({"type": record_type, **payload})
+                except Exception:
+                    logger.debug("Claude on_event note failed", exc_info=True)
+
+            def _release_monitor(task_id: str, why: str) -> None:
+                nonlocal drain_active, drain_deadline
+                if pending_monitors.pop(task_id, None) is None:
+                    return
+                logger.info(
+                    "Claude Code monitor %s ended (%s); %d still pending: session=%s",
+                    task_id, why, len(pending_monitors), result.session_id,
+                )
+                if not pending_monitors:
+                    drain_active = True
+                    drain_deadline = time.monotonic() + self.monitor_drain_quiet_seconds
+
+            def _handle_system_task_record(event: dict[str, Any]) -> None:
+                subtype = str(event.get("subtype") or "")
+                if subtype == "task_started":
+                    task_id = str(event.get("task_id") or "").strip()
+                    if task_id:
+                        task_descriptions[task_id] = str(event.get("description") or "")
+                    return
+                if subtype in ("task_notification", "task_updated"):
+                    task_id = str(event.get("task_id") or "").strip()
+                    status = str(
+                        event.get("status")
+                        or (event.get("patch") or {}).get("status")
+                        or ""
+                    ).strip().casefold()
+                    if task_id in pending_monitors and status in _TERMINAL_TASK_STATUSES:
+                        _release_monitor(task_id, status)
+                    return
+                if subtype == "background_tasks_changed":
+                    listed = {
+                        str(task.get("task_id") or "").strip()
+                        for task in (event.get("tasks") or [])
+                        if isinstance(task, dict)
+                    }
+                    for task_id in list(pending_monitors):
+                        if task_id not in listed:
+                            _release_monitor(task_id, "no longer listed")
 
             def _write_prompt(target: subprocess.Popen[str]) -> None:
                 assert target.stdin is not None
@@ -978,6 +1055,33 @@ class ClaudeCodeSession:
                             process, resident=False
                         )
                         continue
+                    if drain_active and drain_deadline is not None and now >= drain_deadline:
+                        # The Monitor's stream ended and its queued events have
+                        # produced no further activity: the last result stands.
+                        result.final_text = deferred_final_text
+                        drain_active = False
+                        break
+                    if pending_monitors and all(
+                        now >= deadline for deadline in pending_monitors.values()
+                    ):
+                        # Every Monitor outlived its own timeout without a
+                        # terminal notification. Finish with what the model
+                        # last said instead of holding the session forever.
+                        expired = ", ".join(sorted(pending_monitors))
+                        pending_monitors.clear()
+                        note = (
+                            "[Hermes stopped waiting for background monitor "
+                            f"{expired}: it passed its own timeout without "
+                            "reporting an end. Check its log before trusting "
+                            "the result.]"
+                        )
+                        _emit_hermes_note(HERMES_MONITOR_NOTE, text=note)
+                        result.final_text = (
+                            f"{deferred_final_text}\n\n{note}".strip()
+                            if deferred_final_text
+                            else note
+                        )
+                        break
                     if (
                         not _waiting_for_autonomous_work()
                         and now - last_activity >= self.inactivity_timeout
@@ -1023,6 +1127,11 @@ class ClaudeCodeSession:
                     _publish_session_id()
                 if self.on_event is not None:
                     self.on_event(event)
+                if drain_active and event_type != "result":
+                    # A mini-turn is in progress; wait for its result.
+                    drain_deadline = None
+                if event_type == "system":
+                    _handle_system_task_record(event)
                 message = (
                     event.get("message")
                     if isinstance(event.get("message"), dict)
@@ -1041,6 +1150,8 @@ class ClaudeCodeSession:
                             scheduled_wakeup_tool_ids.add(tool_use_id)
                         elif tool_use_id and tool_name == "agent":
                             agent_tool_ids.add(tool_use_id)
+                        elif tool_use_id and tool_name == "monitor":
+                            monitor_tool_use_ids.add(tool_use_id)
                 completed_agent_tool_ids = _completed_agent_tool_ids(event)
                 completed_agent_tool_ids.update(
                     task_completion_probe.completed_agent_tool_ids()
@@ -1066,6 +1177,33 @@ class ClaudeCodeSession:
                             scheduled_wakeup_tool_ids.discard(tool_use_id)
                             if not block.get("is_error"):
                                 scheduled_wakeup_ready = True
+                        if tool_use_id in monitor_tool_use_ids:
+                            monitor_tool_use_ids.discard(tool_use_id)
+                            started = _MONITOR_STARTED_RE.search(
+                                _content_text(block.get("content"))
+                                or str(block.get("content") or "")
+                            )
+                            if started and not block.get("is_error"):
+                                task_id = started.group(1)
+                                timeout_seconds = int(started.group(2)) / 1000.0
+                                pending_monitors[task_id] = (
+                                    time.monotonic()
+                                    + timeout_seconds
+                                    + self.monitor_grace_seconds
+                                )
+                                drain_active = False
+                                drain_deadline = None
+                                description = task_descriptions.get(task_id, "")
+                                minutes = max(1, int(round(timeout_seconds / 60)))
+                                _emit_hermes_note(
+                                    HERMES_MONITOR_NOTE,
+                                    text=(
+                                        "Waiting on a background monitor"
+                                        + (f": {description}" if description else "")
+                                        + f" (task {task_id}, up to {minutes} min). "
+                                        "This turn stays open until it reports."
+                                    ),
+                                )
                 if event_type != "result":
                     continue
                 result.final_text = str(event.get("result") or "").strip()
@@ -1091,6 +1229,28 @@ class ClaudeCodeSession:
                     if not result.final_text:
                         continue
                     waiting_for_background_agents = False
+                if not result.error and (pending_monitors or drain_active):
+                    # Hold this result: the model handed control back while a
+                    # Monitor it started is still watching (or its trailing
+                    # events are still being processed). Its text stays
+                    # visible as commentary; the turn's answer is whatever it
+                    # says once the Monitor has reported.
+                    if result.final_text:
+                        deferred_final_text = result.final_text
+                    _emit_hermes_note(HERMES_RESULT_DEFERRED)
+                    if pending_monitors and not monitor_wait_announced:
+                        monitor_wait_announced = True
+                        logger.info(
+                            "Claude Code handed back while %d monitor(s) run; "
+                            "keeping the current Hermes turn open: session=%s pid=%s",
+                            len(pending_monitors),
+                            result.session_id,
+                            process.pid,
+                        )
+                    if drain_active:
+                        drain_deadline = time.monotonic() + self.monitor_drain_quiet_seconds
+                    result.final_text = ""
+                    continue
                 if result.error or result.final_text:
                     break
                 if scheduled_wakeup_ready or waiting_for_scheduled_wakeup:

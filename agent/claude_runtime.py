@@ -14,6 +14,10 @@ import time
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
+from agent.transports.claude_code_session import (
+    HERMES_MONITOR_NOTE,
+    HERMES_RESULT_DEFERRED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +263,18 @@ def make_claude_code_event_bridge(
 
     def on_event(event: dict[str, Any]) -> None:
         event_type = event.get("type")
+        if event_type == HERMES_RESULT_DEFERRED:
+            # The transport is holding a result while a Monitor runs; what the
+            # model said so far belongs in the transcript as commentary.
+            _emit_commentary()
+            return
+        if event_type == HERMES_MONITOR_NOTE:
+            _emit_commentary()
+            note = str(event.get("text") or "").strip()
+            if note:
+                pending_text.append(note)
+                _emit_commentary()
+            return
         if event_type == "stream_event":
             stream_event = event.get("event") or {}
             delta = stream_event.get("delta") or {}

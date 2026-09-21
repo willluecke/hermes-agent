@@ -1235,3 +1235,136 @@ def test_hook_environment_and_settings_reach_the_spawned_process(monkeypatch):
     assert argv[argv.index("--settings") + 1] == '{"hooks":{}}'
     assert env["HERMES_HOOK_URL"] == "http://127.0.0.1:8642/v1/hooks/claude" and env["HERMES_HOOK_TOKEN"] == "tok"
     assert "ANTHROPIC_API_KEY" not in env
+
+
+# --- Monitor keeps the Hermes turn open (2026-09-20) -----------------------
+
+def _monitor_frames(session_id, task_id, timeout_ms, *, description="hero render"):
+    return [
+        {"type": "user", "session_id": session_id, "message": {"role": "user", "content": "Continue"}},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [
+            {"type": "tool_use", "id": "toolu_mon", "name": "Monitor",
+             "input": {"command": "while true; do sleep 5; done", "description": description}}]}},
+        {"type": "system", "subtype": "task_started", "session_id": session_id, "task_id": task_id,
+         "tool_use_id": "toolu_mon", "description": description, "is_backgrounded": True, "task_type": "local_bash"},
+        {"type": "user", "session_id": session_id, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_mon",
+             "content": f"Monitor started (task {task_id}, timeout {timeout_ms}ms). You will be notified on each event."}]}},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": "Started; back when it reports."}]}},
+        {"type": "result", "session_id": session_id, "result": "Started; back when it reports.",
+         "usage": {"input_tokens": 10, "output_tokens": 5}},
+    ]
+
+
+def test_monitor_keeps_turn_open_until_its_stream_ends_and_drains_trailing_turns():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    forwarded = []
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=session_id,
+                                resume=True, on_event=forwarded.append, inactivity_timeout=0.0)
+    session.monitor_drain_quiet_seconds = 0.2
+    frames = _monitor_frames(session_id, "t1", 30_000) + [
+        {"type": "system", "subtype": "init", "session_id": session_id},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": "Frame 60 of 120."}]}},
+        {"type": "result", "session_id": session_id, "result": "Frame 60 of 120.",
+         "origin": {"kind": "task-notification"}, "usage": {"input_tokens": 1, "output_tokens": 1}},
+        {"type": "system", "subtype": "background_tasks_changed", "session_id": session_id, "tasks": []},
+        {"type": "system", "subtype": "task_notification", "session_id": session_id, "task_id": "t1",
+         "tool_use_id": "toolu_mon", "status": "completed", "summary": "Monitor \"hero render\" stream ended"},
+        {"type": "system", "subtype": "init", "session_id": session_id},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": "Encoded and shipped."}]}},
+        {"type": "result", "session_id": session_id, "result": "Encoded and shipped.",
+         "origin": {"kind": "task-notification"}, "usage": {"input_tokens": 2, "output_tokens": 2}},
+    ]
+    _install_fake_process(session, _fake_process(20101), frames)
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Encoded and shipped."
+    assert result.error is None
+    assert result.should_retire is False
+    assert result.usage["input_tokens"] == 13
+    assert result.usage["output_tokens"] == 8
+    kinds = [event["type"] for event in forwarded]
+    # every result was held: two mid-monitor, and the last one until the quiet window confirmed no more events
+    assert kinds.count("hermes.result_deferred") == 3, kinds
+    note = next(event for event in forwarded if event["type"] == "hermes.monitor_note")
+    assert "hero render" in note["text"] and "t1" in note["text"]
+    # the note is announced right after the Monitor's tool result, before the first held result
+    assert kinds.index("hermes.monitor_note") < kinds.index("hermes.result_deferred")
+
+
+def test_monitor_that_outlives_its_timeout_finishes_with_the_held_text_and_a_note():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    forwarded = []
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=session_id,
+                                resume=True, on_event=forwarded.append, inactivity_timeout=0.0)
+    session.monitor_grace_seconds = 0.0
+    _install_fake_process(session, _fake_process(20102), _monitor_frames(session_id, "t2", 0))
+
+    with patch.object(session, "close") as close:
+        result = session.run_turn("Continue")
+
+    assert result.final_text.startswith("Started; back when it reports.")
+    assert "stopped waiting for background monitor t2" in result.final_text
+    assert result.error is None
+    assert result.should_retire is False
+    close.assert_not_called()
+    assert any(event["type"] == "hermes.monitor_note" and "stopped waiting" in event["text"] for event in forwarded)
+
+
+def test_monitor_released_by_the_background_task_list_still_drains_the_last_result():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=session_id,
+                                resume=True, inactivity_timeout=0.0)
+    session.monitor_drain_quiet_seconds = 0.2
+    frames = _monitor_frames(session_id, "t3", 30_000) + [
+        {"type": "system", "subtype": "background_tasks_changed", "session_id": session_id, "tasks": []},
+        {"type": "system", "subtype": "init", "session_id": session_id},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": "Done, 120 frames."}]}},
+        {"type": "result", "session_id": session_id, "result": "Done, 120 frames.",
+         "origin": {"kind": "task-notification"}, "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+    _install_fake_process(session, _fake_process(20103), frames)
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Done, 120 frames."
+    assert result.error is None
+
+
+def test_background_bash_task_does_not_hold_the_turn():
+    session_id = "00000000-0000-4000-8000-000000000000"
+    forwarded = []
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=session_id,
+                                resume=True, on_event=forwarded.append, inactivity_timeout=0.0)
+    _install_fake_process(session, _fake_process(20104), [
+        {"type": "user", "session_id": session_id, "message": {"role": "user", "content": "Continue"}},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [
+            {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "npm start", "run_in_background": True}}]}},
+        {"type": "system", "subtype": "task_started", "session_id": session_id, "task_id": "t4",
+         "tool_use_id": "toolu_bash", "description": "npm start", "is_backgrounded": True, "task_type": "local_bash"},
+        {"type": "user", "session_id": session_id, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_bash", "content": "Command running in background with ID: t4"}]}},
+        {"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": "Server started."}]}},
+        {"type": "result", "session_id": session_id, "result": "Server started.", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Server started."
+    assert result.error is None
+    assert not [event for event in forwarded if str(event.get("type", "")).startswith("hermes.")]
+
+
+def test_event_bridge_flushes_held_commentary_and_shows_monitor_notes():
+    emitted = []
+    agent = SimpleNamespace(show_commentary=True, _emit_interim_assistant_message=emitted.append,
+                            tool_progress_callback=None, tool_start_callback=None, tool_complete_callback=None)
+    bridge = make_claude_code_event_bridge(agent)
+    bridge({"type": "assistant", "message": {"content": [{"type": "text", "text": "Started; back when it reports."}]}})
+    assert emitted == []
+    bridge({"type": "hermes.result_deferred"})
+    assert [m["content"] for m in emitted] == ["Started; back when it reports."]
+    bridge({"type": "hermes.monitor_note", "text": "Waiting on a background monitor: hero render (task t1, up to 1 min)."})
+    assert emitted[-1]["content"].startswith("Waiting on a background monitor: hero render")
+    assert len(emitted) == 2
