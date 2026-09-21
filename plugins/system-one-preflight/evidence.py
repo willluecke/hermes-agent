@@ -47,7 +47,11 @@ EXCERPT_BEFORE = 400
 MAX_EXCERPTS = 4
 MAX_MANIFEST_ITEMS = 16
 MAX_CLAIM_CHARS = 300
+# The judge's state carries a preview of each command; the row keeps the
+# whole command so the gate re-runs what the agent ran, not a prefix of it
+# (a 500-character pytest clipped at 300 re-ran as "0 tests").
 MAX_COMMAND_CHARS = 300
+MAX_COMMAND_STORE_CHARS = 20_000
 STATUSES = ("pass", "fail", "unknown")
 VERDICTS = ("supported", "contradicted", "stale", "insufficient", "missing")
 PREDICATES = ("passed", "count", "exit_zero", "contains", "ran")
@@ -382,7 +386,8 @@ def make_row(
     row = {
         "id": f"{prefix}{n}",
         "n": n,
-        "command": _clip(command, MAX_COMMAND_CHARS),
+        "command": command.strip()[:MAX_COMMAND_STORE_CHARS],
+        "command_preview": _clip(command, MAX_COMMAND_CHARS),
         "cwd": cwd or "",
         "exit": exit_code,
         "status": observation["status"],
@@ -405,7 +410,7 @@ def row_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     """The compact form of a row for the judge's state: identity, result, freshness."""
     summary: Dict[str, Any] = {
         "id": row["id"],
-        "command": row["command"],
+        "command": row.get("command_preview") or _clip(row["command"], MAX_COMMAND_CHARS),
         "exit": row["exit"] if row["exit"] is not None else "unknown",
         "status": row["status"],
         "kind": row["kind"],

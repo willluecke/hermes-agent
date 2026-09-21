@@ -631,7 +631,9 @@ def test_the_judge_quotes_only_the_unsupported_sentence_and_sends_back_once(feed
     verdicts = [event for event in emitted if event["stage"] == "verify"]
     assert [event["decision"]["action"] for event in verdicts] == ["nudge", "ship_flagged"]
     assert verdicts[1]["decision"]["flagged_sentences"] == ["The whole test suite also passes without any failures."]
-    assert 'ship_flagged (same evidence as the previous attempt) · Unsupported by the evidence: "The whole test suite' in verdicts[1]["text"]
+    assert "ship_flagged (same evidence as the previous attempt) · flags: 0 real, 0 false, 1 unlabelled · " in verdicts[1]["text"]
+    assert 'Unsupported by the evidence: "The whole test suite' in verdicts[1]["text"]
+    assert verdicts[1]["decision"]["claim_labels"] == [{"sentence": "The whole test suite also passes without any failures.", "item": None, "code": None, "label": "unlabelled", "reason": "no manifest registered"}]
 
 
 def test_the_cap_ships_the_second_attempt_even_with_new_evidence(feedback, repo, emitted):
@@ -1350,6 +1352,7 @@ def test_failed_mcp_criteria_result_does_not_replace_registered_criteria(feedbac
 
 import subprocess as _subprocess  # noqa: E402
 import sys as _sys  # noqa: E402
+import time as _time  # noqa: E402
 
 
 def _cmd(command, result, session="s1", **kwargs):
@@ -1803,3 +1806,93 @@ def test_the_budget_note_follows_the_thresholds_alone_and_reports_its_rate(feedb
     for turn in range(11, 11 + preflight.INJECTION_WINDOW):
         preflight.on_pre_llm_call(session_id="s2", turn_id=f"t{turn}", user_message="x", conversation_history=[])
     assert feedback["records"]("preflight")[-1]["injection_rate"] == {"n": preflight.INJECTION_WINDOW, "injected": 0}
+
+
+# ---------------------------------------------------------------------------
+# Flag labels from execution: the manifest item a flagged sentence resolves to
+# and what the gate found when it ran that item's check itself
+# ---------------------------------------------------------------------------
+
+def test_match_claim_joins_by_token_containment_and_prefers_the_longest_claim():
+    verdicts = [
+        {"id": "r1", "claim": "tests pass"},
+        {"id": "r2", "claim": "all 14 unit tests pass"},
+        {"id": "r3", "claim": "the exporter writes json"},
+    ]
+    assert preflight.match_claim("All 14 unit tests pass on the new module.", verdicts)["id"] == "r2", "the longest contained claim wins"
+    assert preflight.match_claim("Tests pass.", verdicts)["id"] == "r2", "a short sentence inside two claims joins the most specific one"
+    assert preflight.match_claim("Tests pass and lint is clean.", verdicts)["id"] == "r1", "trailing punctuation and case are ignored"
+    assert preflight.match_claim("Exporter writes JSON", verdicts)["id"] == "r3", "a sentence inside the claim also joins"
+    assert preflight.match_claim("The deploy to staging succeeded.", verdicts) is None
+    assert preflight.match_claim("", verdicts) is None
+    assert preflight._claim_tokens("Ran 14 tests, 14 passed!") == frozenset({"ran", "tests", "passed"}), "bare numbers are not tokens"
+    assert preflight._claim_tokens("edited src/app.py with --json.") == frozenset({"edited", "src/app.py", "with", "json"})
+
+
+def test_label_claims_covers_every_branch_without_judgment():
+    verdicts = [
+        {"id": "r1", "claim": "unit tests pass", "verdict": "supported", "basis": "gate", "detail": "every cited row reports a pass"},
+        {"id": "r2", "claim": "lint is clean", "verdict": "supported", "basis": "agent", "detail": "every cited row reports a pass"},
+        {"id": "r3", "claim": "the build succeeds", "verdict": "contradicted", "basis": "gate", "detail": "reported failure: k2"},
+        {"id": "r4", "claim": "types check", "verdict": "insufficient", "basis": "agent", "detail": "status unknown: c3"},
+        {"id": "r5", "claim": "integration suite passes", "verdict": "stale", "basis": "agent", "detail": "ran before later edits: c1"},
+    ]
+    flagged = ["The unit tests pass.", "Lint is clean now.", "The build succeeds on CI.", "Types check across the package.", "Deployed to staging."]
+    labels, misses = preflight.label_claims(flagged, verdicts, manifest_registered=True)
+    assert [entry["label"] for entry in labels] == ["false_flag", "unlabelled", "overclaim", "unlabelled", "overclaim_unregistered"]
+    assert labels[0]["item"] == "r1" and labels[0]["reason"] == "the gate re-ran the check and it held"
+    assert labels[1]["reason"] == "supported only by the agent's own row"
+    assert labels[2]["reason"] == "reported failure: k2"
+    assert labels[4] == {"sentence": "Deployed to staging.", "item": None, "code": None, "label": "overclaim_unregistered", "reason": "no manifest item covers it"}
+    assert misses == ["r5"], "a stale item no flagged sentence resolved to is a miss"
+    # With no manifest at all, nothing can be checked against, so nothing is called an overclaim.
+    labels, misses = preflight.label_claims(["Deployed to staging."], [], manifest_registered=False)
+    assert labels[0]["label"] == "unlabelled" and labels[0]["reason"] == "no manifest registered" and misses == []
+
+
+def test_claims_precision_reads_the_plugins_own_log_window(harness, tmp_path):
+    log = tmp_path / "preflight.jsonl"
+    now = _time.time()
+    rows = [
+        {"event": "verify", "ts": now - 60, "claim_labels": [{"label": "overclaim"}, {"label": "false_flag"}, {"label": "unlabelled"}], "claim_misses": ["r9"]},
+        {"event": "verify", "ts": now - 120, "claim_labels": [{"label": "overclaim_unregistered"}], "claim_misses": []},
+        {"event": "verify", "ts": now - 30 * 86_400, "claim_labels": [{"label": "false_flag"}] * 5, "claim_misses": []},
+        {"event": "verify", "ts": now - 10, "findings": []},
+        {"event": "preflight", "ts": now - 5, "claim_labels": [{"label": "overclaim"}]},
+    ]
+    log.write_text("".join(json.dumps(row) + "\n" for row in rows) + "not json\n")
+    report = preflight.claims_precision(days=7)
+    assert report == {
+        "days": 7, "verdicts": 2, "flagged": 4, "overclaim": 1, "overclaim_unregistered": 1, "false_flag": 1, "unlabelled": 1,
+        "precision": 0.667, "precision_basis": 3, "misses": 1, "recall": 0.667,
+    }
+    harness["settings"]["log_path"] = str(tmp_path / "missing.jsonl")
+    assert preflight.claims_precision()["verdicts"] == 0
+
+
+def test_the_verify_judge_labels_its_flags_from_the_gates_own_re_run(feedback, repo, emitted, monkeypatch):
+    monkeypatch.setattr(preflight, "_ask", _ManifestJev(assertion=("supported", 0.9), guard={}))
+    feedback["jev"] = preflight._ask
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q", json.dumps({"output": "5 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
+    _cmd("npm run build", json.dumps({"output": "built", "exit_code": 0}), cwd=str(repo))
+    _manifest([_item("the unit tests pass", ["c1"], id="r1"), _item("the build succeeds", ["c2"], predicate="exit_zero", id="r2")])
+    feedback["runner"]["pytest -q"] = ("2 failed, 3 passed in 0.3s", 1)
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9, "claim_1": 0.05, "claim_2": 0.05, "claim_3": 0.05}
+    draft = "The unit tests pass on every module now. The build succeeds without any warnings at all. Deployed the bundle to the staging server."
+    result = _verify(final=draft, paths=[str(repo / "app.py")])
+    assert result is not None
+    record = feedback["records"]("verify")[-1]
+    labels = {entry["sentence"]: entry for entry in record["claim_labels"]}
+    assert labels["The unit tests pass on every module now."]["label"] == "overclaim" and labels["The unit tests pass on every module now."]["item"] == "r1", "the gate re-ran pytest itself and it failed"
+    assert labels["The unit tests pass on every module now."]["reason"].startswith("reported failure: k")
+    assert labels["The build succeeds without any warnings at all."]["label"] == "false_flag", "the gate re-ran the build itself and it held"
+    assert labels["The build succeeds without any warnings at all."]["basis"] == "gate"
+    assert labels["Deployed the bundle to the staging server."]["label"] == "overclaim_unregistered"
+    assert record["claim_misses"] == []
+    event = [e for e in emitted if e["stage"] == "verify"][-1]
+    assert event["decision"]["claim_labels"] == record["claim_labels"]
+    assert "· flags: 2 real, 1 false, 0 unlabelled · precision 0.67 on 3 (7d)" in event["text"]
+    assert event["decision"]["claims_precision"]["precision_basis"] == 3
+    # Nothing here came from Jev: the same labels result whatever probabilities it returned.
+    assert record["answers"]["claims_unverified"] == 0.9

@@ -127,6 +127,18 @@ def test_make_row_carries_identity_result_digest_and_freshness_inputs(tmp_path):
     assert row["capture_complete"] is False, "the hook script's clip marker"
 
 
+def test_the_row_keeps_the_whole_command_and_previews_it_for_the_judge():
+    long_command = "cd /app && pytest -q " + " ".join(f"tests/test_module_{index}.py" for index in range(40))
+    assert len(long_command) > evidence.MAX_COMMAND_CHARS
+    row, _ = evidence.make_row(7, long_command, PYTEST_OK, workspace="w")
+    assert row["command"] == long_command, "the gate re-runs the command the agent ran, not a prefix"
+    assert row["command_preview"].endswith("…") and len(row["command_preview"]) == evidence.MAX_COMMAND_CHARS
+    assert evidence.row_summary(row)["command"] == row["command_preview"], "the judge's state stays compact"
+    assert evidence.strip_filters(row["command"]) == long_command
+    short, _ = evidence.make_row(8, "pytest -q", PYTEST_OK)
+    assert short["command"] == short["command_preview"] == "pytest -q"
+
+
 def test_row_summary_is_compact_and_says_unknown_out_loud():
     row, _ = evidence.make_row(1, "pytest -q", PYTEST_OK, workspace="w")
     row["fresh"] = False

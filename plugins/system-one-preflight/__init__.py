@@ -300,6 +300,15 @@ CLAIM_FLAG_THRESHOLD = 0.25
 CLAIM_SENTENCE_CAP = 12
 CLAIM_SENTENCE_MIN_WORDS = 6
 CLAIM_SENTENCE_CHARS = 300
+# Every flagged sentence gets a label from code, never from Jev, the agent or
+# a person: the manifest item it resolves to and what the gate found when it
+# ran that item's check itself. Precision is real / (real + false_flag);
+# unlabelled flags (no manifest, a check the gate could not run, a row only
+# the agent ran) count in neither. Recall misses are manifest items code
+# contradicted or found stale that no flagged sentence resolved to.
+CLAIM_LABELS = ("overclaim", "overclaim_unregistered", "false_flag", "unlabelled")
+CLAIMS_PRECISION_DAYS = 7
+CLAIMS_PRECISION_MAX_RECORDS = 4_000
 DEFAULT_VERIFY_MAX_SEND_BACKS = 1
 ASSERTION_QUESTION = (
     "Do the cited evidence rows support this result claim as worded, at the "
@@ -1146,11 +1155,13 @@ def run_tune(session_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
     }
     changes = apply_recommendation(calibration, current)
     recommendation = calibration.get("recommendation") if isinstance(calibration.get("recommendation"), dict) else {}
+    precision = claims_precision()
     write_log(
         {
             "event": "tune",
             "session_id": session_id,
             "labelled": calibration.get("labelled"),
+            "claims_precision": precision,
             "recommendation": recommendation,
             "current": current,
             "changes": changes,
@@ -1174,7 +1185,7 @@ def run_tune(session_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
         _http_post_json(
             f"{sync_url()}/management/judge/tuning",
             {"Authorization": f"Bearer {sync_key()}"},
-            {"source": "system-one-preflight", "changes": changes, "thresholds": {k: state.get(k) for k in TUNE_BOUNDS}, "basis": basis},
+            {"source": "system-one-preflight", "changes": changes, "thresholds": {k: state.get(k) for k in TUNE_BOUNDS}, "basis": basis, "claims_precision": precision},
             3.0,
         )
     except Exception:
@@ -1763,6 +1774,106 @@ def claim_sentences(text: str) -> List[str]:
         if len(out) >= CLAIM_SENTENCE_CAP:
             break
     return out
+
+
+# Word tokens; dots, slashes and dashes only inside a token (file.py, a/b,
+# --json), never trailing punctuation.
+_CLAIM_TOKEN_RE = re.compile(r"[a-z0-9]+(?:[._/-]+[a-z0-9]+)*")
+
+
+def _claim_tokens(text: str) -> frozenset:
+    """Lowercased word tokens with punctuation and bare numbers dropped."""
+    return frozenset(token for token in _CLAIM_TOKEN_RE.findall((text or "").lower()) if not token.isdigit())
+
+
+def match_claim(sentence: str, verdicts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The manifest item a flagged sentence resolves to, by token containment
+    (the item's claim inside the sentence, or the sentence inside the claim),
+    the longest claim winning a tie. Deterministic; no judgment."""
+    tokens = _claim_tokens(sentence)
+    if not tokens:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    best_size = 0
+    for item in verdicts:
+        claim_tokens = _claim_tokens(str(item.get("claim") or ""))
+        if not claim_tokens:
+            continue
+        if claim_tokens <= tokens or tokens <= claim_tokens:
+            if len(claim_tokens) > best_size:
+                best, best_size = item, len(claim_tokens)
+    return best
+
+
+def label_claims(flagged: List[str], verdicts: List[Dict[str, Any]], manifest_registered: bool) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """(labels, misses): one label per flagged sentence from the code verdict of
+    the manifest item it resolves to, and the ids of contradicted or stale
+    items no flagged sentence resolved to.
+
+    supported + basis gate -> false_flag (the gate ran it and it held);
+    contradicted / stale / missing -> overclaim; insufficient, or supported on
+    the agent's own row only -> unlabelled; no item, manifest registered ->
+    overclaim_unregistered; no manifest at all -> unlabelled (nothing declared
+    to check against, which is the manifest rule's job, not a label).
+    """
+    labels: List[Dict[str, Any]] = []
+    joined: set = set()
+    for sentence in flagged:
+        item = match_claim(sentence, verdicts)
+        if item is None:
+            labels.append({
+                "sentence": sentence, "item": None, "code": None,
+                "label": "overclaim_unregistered" if manifest_registered else "unlabelled",
+                "reason": "no manifest item covers it" if manifest_registered else "no manifest registered",
+            })
+            continue
+        joined.add(item["id"])
+        code, basis = item.get("verdict"), item.get("basis", "agent")
+        if code == "supported" and basis == "gate":
+            label, reason = "false_flag", "the gate re-ran the check and it held"
+        elif code == "supported":
+            label, reason = "unlabelled", "supported only by the agent's own row"
+        elif code in ("contradicted", "stale", "missing"):
+            label, reason = "overclaim", str(item.get("detail") or code)
+        else:
+            label, reason = "unlabelled", str(item.get("detail") or "insufficient")
+        labels.append({"sentence": sentence, "item": item["id"], "code": code, "basis": basis, "label": label, "reason": reason})
+    misses = [item["id"] for item in verdicts if item.get("verdict") in ("contradicted", "stale") and item["id"] not in joined]
+    return labels, misses
+
+
+def claims_precision(days: int = CLAIMS_PRECISION_DAYS) -> Dict[str, Any]:
+    """Flag labels over the last ``days`` of this plugin's own log: counts,
+    precision = overclaim / (overclaim + false_flag), recall misses."""
+    counts = {label: 0 for label in CLAIM_LABELS}
+    verdicts = misses = 0
+    since = time.time() - days * 86_400
+    try:
+        with open(log_path(), "r", encoding="utf-8") as handle:
+            lines = handle.readlines()[-CLAIMS_PRECISION_MAX_RECORDS:]
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("event") != "verify" or not isinstance(record.get("claim_labels"), list) or record.get("ts", 0) < since:
+            continue
+        verdicts += 1
+        misses += len(record.get("claim_misses") or [])
+        for entry in record["claim_labels"]:
+            label = entry.get("label") if isinstance(entry, dict) else None
+            if label in counts:
+                counts[label] += 1
+    real = counts["overclaim"] + counts["overclaim_unregistered"]
+    decided = real + counts["false_flag"]
+    caught = real
+    return {
+        "days": days, "verdicts": verdicts, "flagged": sum(counts.values()), **counts,
+        "precision": round(real / decided, 3) if decided else None, "precision_basis": decided,
+        "misses": misses, "recall": round(caught / (caught + misses), 3) if (caught + misses) else None,
+    }
 
 
 def _send_back(findings: List[str], repeated: bool, attempt: int) -> Tuple[bool, str]:
@@ -2601,6 +2712,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     ]
     for sentence, _value in flagged:
         findings.append(CLAIM_FINDING.format(claim=sentence))
+    claim_labels, claim_misses = label_claims([sentence for sentence, _value in flagged], verdicts, manifest is not None)
     # One record per manifest item, in manifest order, with Jev's read where one was asked.
     assertion_records: List[Dict[str, Any]] = []
     jev_contradicted: List[str] = []
@@ -2658,6 +2770,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "answers": answers,
             "assertions": assertion_records,
             "claims": {"sentences": len(claim_keys), "flagged": [sentence for sentence, _value in flagged]},
+            "claim_labels": claim_labels,
+            "claim_misses": claim_misses,
             "findings": findings,
             "action": action,
             "ship_reason": ship_reason,
@@ -2666,6 +2780,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         }
     )
     met = sum(1 for key in labels if answers.get(key) is not None and answers[key] > verify_fail_threshold())
+    precision = claims_precision() if flagged or claim_misses else {}
+    label_counts = {label: sum(1 for entry in claim_labels if entry["label"] == label) for label in CLAIM_LABELS}
     text = (
         f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)} · "
         f"manifest {_manifest_summary(counts, manifest is not None)} · "
@@ -2675,6 +2791,12 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         + (" · tests weakened" if regressions or weakening["removed"] or weakening["skips"] else "")
         + f" · {action}"
         + (f" ({ship_reason})" if ship_reason else "")
+        + (
+            f" · flags: {label_counts['overclaim'] + label_counts['overclaim_unregistered']} real, {label_counts['false_flag']} false, "
+            f"{label_counts['unlabelled']} unlabelled" + (f", {len(claim_misses)} missed" if claim_misses else "")
+            + (f" · precision {precision['precision']:.2f} on {precision['precision_basis']} ({precision['days']}d)" if precision.get("precision") is not None else "")
+            if flagged or claim_misses else ""
+        )
         + (f" · {' '.join(findings)}" if findings and action in ("nudge", "ship_flagged") else "")
     )
     emit_verdict(
@@ -2687,6 +2809,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "ledger": len(rows_this_turn), "manifest": counts, "manifest_registered": manifest is not None,
             "reruns": len(reruns), "machinery": machinery, "weakening": weakening, "regressions": regressions,
             "assertions": assertion_records, "flagged_sentences": [sentence for sentence, _value in flagged],
+            "claim_labels": claim_labels, "claim_misses": claim_misses, "claims_precision": precision,
             "ship_reason": ship_reason,
         },
         model=jev_model,
