@@ -365,7 +365,7 @@ def make_claude_code_event_bridge(
         if callback:
             callback(call_id, name, args)
 
-    def _tool_completed(block: dict[str, Any]) -> None:
+    def _tool_completed(block: dict[str, Any], native_result: Any = None) -> None:
         call_id = str(block.get("tool_use_id") or "")
         prior = started.pop(call_id, None)
         name, args, started_at, raw_name = prior or ("tool", {}, time.monotonic(), "tool")
@@ -381,10 +381,16 @@ def make_claude_code_event_bridge(
                 logger.debug("Claude tool record failed", exc_info=True)
         edit_diff: dict[str, Any] = {}
         if not is_error and raw_name in {"Edit", "MultiEdit", "Write"}:
+            # Claude Code's own patch first; our computed diff only when the
+            # CLI described none (a Write that creates a file, an older CLI).
             try:
-                from agent.tool_diff import claude_tool_diff
+                from agent.tool_diff import claude_native_diff, claude_tool_diff
 
-                edit_diff = claude_tool_diff(raw_name, args, cwd=cwd) or {}
+                edit_diff = (
+                    claude_native_diff(native_result, args, cwd=cwd)
+                    or claude_tool_diff(raw_name, args, cwd=cwd)
+                    or {}
+                )
             except Exception:
                 logger.debug("Claude edit diff failed", exc_info=True)
         progress = getattr(agent, "tool_progress_callback", None)
@@ -439,9 +445,17 @@ def make_claude_code_event_bridge(
                     _tool_started(block)
             return
         if event_type == "user":
-            for block in ((event.get("message") or {}).get("content") or []):
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    _tool_completed(block)
+            results = [
+                block
+                for block in ((event.get("message") or {}).get("content") or [])
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ]
+            # ``tool_use_result`` describes the event's single tool result
+            # (Claude Code sends one result per event); never guess which of
+            # several results it belongs to.
+            native_result = event.get("tool_use_result") if len(results) == 1 else None
+            for block in results:
+                _tool_completed(block, native_result)
 
     return on_event
 

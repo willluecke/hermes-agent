@@ -1,0 +1,29 @@
+{
+ "type": "fileChange",
+ "id": "call_fixture",
+ "status": "completed",
+ "changes": [
+  {
+   "path": "/home/will/coding-projects/3dcarparts/apps/web-next/src/app/api/webhooks/ebay/account-deletion/__tests__/route.test.ts",
+   "kind": {
+    "type": "update",
+    "move_path": null
+   },
+   "diff": "@@ -1,4 +1,7 @@\n-import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';\n+import { afterEach, beforeEach, describe, expect, it } from '@jest/globals';\n+import type { jest as Jest } from '@jest/globals';\n import type { NextRequest } from 'next/server';\n \n+declare const jest: typeof Jest;\n+\n jest.mock('next/server', () => ({\n"
+  },
+  {
+   "path": "/home/will/coding-projects/3dcarparts/apps/web-next/src/lib/ebayTelemetry.ts",
+   "kind": {
+    "type": "add"
+   },
+   "diff": "const ACCOUNT_DELETION_PATH = '/api/webhooks/ebay/account-deletion';\n\ntype RequestEvent = {\n  request?: { url?: string };\n  transaction?: string;\n};\n\n// Sentry's request instrumentation can attach bodies even when the handler\n// doesn't read them. Drop both errors and transactions for this endpoint so\n// deletion notifications cannot become retained monitoring data.\nexport function filterEbayAccountDeletionTelemetry<T extends RequestEvent>(event: T): T | null {\n  const transactionPath = event.transaction?.replace(/^[A-Z]+\\s+/, '');\n  for (const value of [event.request?.url, transactionPath]) {\n    if (!value) continue;\n    try {\n      const path = new URL(value, 'https://3dcarparts.org').pathname.replace(/\\/$/, '');\n      if (path === ACCOUNT_DELETION_PATH) return null;\n    } catch {\n      // An unrelated malformed URL should not break error reporting.\n    }\n  }\n  return event;\n}\n"
+  },
+  {
+   "path": "/home/will/coding-projects/closure-engine/site/robots.txt",
+   "kind": {
+    "type": "delete"
+   },
+   "diff": "User-agent: *\nAllow: /\nSitemap: https://closure.fast/sitemap.xml\n"
+  }
+ ]
+}

@@ -125,3 +125,115 @@ def test_claude_bridge_sends_no_diff_for_a_failed_edit_and_labels_searches(tmp_p
     assert "diff" not in calls[1][1]
     assert calls[2][0][2] == "TODO in src"
     assert calls[4][0][2] == "https://example.com"
+
+
+# --- The native CLIs' own diffs win (2026-09-23) ----------------------------
+#
+# Fixtures are real output. claude_code_edit_stream.jsonl is Claude Code
+# 2.1.280 stream-json from an Edit, a Write over an existing file, a Write that
+# creates a file and two more Edits (paths rewritten to /work/probe).
+# codex_file_change_item.json holds real Codex FileChange records (an update,
+# an add, a delete from ~/.codex/sessions) in the app-server v2 item shape;
+# the app-server capture itself was blocked by the Codex usage limit.
+
+import json
+from pathlib import Path
+
+from agent.codex_runtime import make_codex_app_server_event_bridge
+from agent.tool_diff import claude_native_diff, codex_native_diff
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+
+
+def _claude_fixture_completions():
+    agent, calls = _bridge_agent()
+    bridge = make_claude_code_event_bridge(agent, cwd="/work/probe")
+    for line in (FIXTURES / "claude_code_edit_stream.jsonl").read_text().splitlines():
+        bridge(json.loads(line))
+    return [kwargs for args, kwargs in calls if args[0] == "tool.completed"]
+
+
+def test_claude_rows_use_claude_codes_own_hunks_with_real_line_numbers():
+    edit, overwrite, create, first_edit, second_edit = _claude_fixture_completions()
+
+    # the file is not on this machine, so these line numbers can only be Claude's
+    assert edit["diff"].splitlines() == [
+        "--- a/a.txt", "+++ b/a.txt", "@@ -3,6 +3,6 @@",
+        " three", " four", " five", "-six", "+SIX", " seven", " eight",
+    ]
+    assert (edit["lines_added"], edit["lines_removed"]) == (1, 1)
+    assert "@@ -5,4 +5,4 @@" in second_edit["diff"] and "+EIGHT" in second_edit["diff"]
+    assert first_edit["diff"].splitlines()[3:5] == ["-one", "+ONE"]
+
+
+def test_a_write_over_an_existing_file_shows_what_it_removed():
+    overwrite = _claude_fixture_completions()[1]
+
+    assert overwrite["diff"].splitlines()[2:] == [
+        "@@ -1,2 +1,1 @@", "-old first", "-old second", "+new only", "\\ No newline at end of file",
+    ]
+    assert (overwrite["lines_added"], overwrite["lines_removed"]) == (1, 2)
+
+
+def test_a_write_that_creates_a_file_falls_back_to_all_added():
+    create = _claude_fixture_completions()[2]
+
+    assert create["diff"].splitlines() == ["--- a/c.txt", "+++ b/c.txt", "@@ -0,0 +1 @@", "+fresh"]
+    assert (create["lines_added"], create["lines_removed"]) == (1, 0)
+
+
+def test_claude_native_diff_rejects_malformed_results():
+    assert claude_native_diff(None, {"file_path": "x"}) is None
+    assert claude_native_diff({"structuredPatch": []}, {"file_path": "x"}) is None
+    assert claude_native_diff({"filePath": "x", "structuredPatch": [{"lines": ["+a"]}]}, {}) is None
+
+
+def _codex_fixture():
+    return json.loads((FIXTURES / "codex_file_change_item.json").read_text())
+
+
+def test_codex_rows_use_codexs_own_diff_for_updates_adds_and_deletes():
+    item = _codex_fixture()
+    kinds = [change["kind"]["type"] for change in item["changes"]]
+    assert kinds == ["update", "add", "delete"]
+
+    rendered = codex_native_diff(item["changes"])
+
+    lines = rendered["diff"].splitlines()
+    update, add, delete = item["changes"]
+    # Codex's update hunks pass through verbatim under file headers
+    update_hunks = update["diff"].rstrip("\n").split("\n")
+    assert lines[:2] == [f"--- a/{update['path']}", f"+++ b/{update['path']}"]
+    assert lines[2:2 + len(update_hunks)] == update_hunks
+    add_lines = add["diff"].rstrip("\n").split("\n")
+    delete_lines = delete["diff"].rstrip("\n").split("\n")
+    assert f"@@ -0,0 +1,{len(add_lines)} @@" in lines
+    assert f"@@ -1,{len(delete_lines)} +0,0 @@" in lines
+    update_added = sum(1 for l in update_hunks if l.startswith("+"))
+    update_removed = sum(1 for l in update_hunks if l.startswith("-"))
+    assert rendered["lines_added"] == update_added + len(add_lines)
+    assert rendered["lines_removed"] == update_removed + len(delete_lines)
+
+
+def test_codex_bridge_sends_codexs_diff_even_without_a_snapshot():
+    item = _codex_fixture()
+    calls = []
+    agent = SimpleNamespace(
+        tool_progress_callback=lambda *args, **kwargs: calls.append((args, kwargs)),
+        session_cwd="/nonexistent",
+    )
+    bridge = make_codex_app_server_event_bridge(agent)
+
+    bridge({"method": "item/completed", "params": {"item": item}})
+
+    completed = [kwargs for args, kwargs in calls if args[0] == "tool.completed"][-1]
+    expected = codex_native_diff(item["changes"], cwd="/nonexistent")
+    assert completed["diff"] == expected["diff"]
+    assert completed["lines_added"] == expected["lines_added"]
+
+
+def test_a_codex_change_without_its_own_diff_keeps_the_snapshot_fallback():
+    item = _codex_fixture()
+    partial = [dict(item["changes"][0]), {k: v for k, v in item["changes"][1].items() if k != "diff"}]
+    assert codex_native_diff(partial) is None
+    assert codex_native_diff([{"path": "x", "kind": {"type": "update"}, "diff": "no hunks here"}]) is None

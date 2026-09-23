@@ -1,11 +1,16 @@
 """Unified diffs for file-edit tool rows.
 
 Hermes Chat renders a file edit as the diff Claude Code or Codex would print
-in a terminal: removed lines red, added lines green, with real line numbers
-when the file can be read. The runtimes only know what changed at the tool
-boundary, so this module turns what they have (an Edit's old/new strings, a
-Write's content, or a Codex change's before/after file lines) into one
-bounded unified diff plus exact line counts.
+in a terminal: removed lines red, added lines green, with real line numbers.
+
+The native CLIs are the source of truth. Claude Code returns its own patch
+hunks with every Edit and Write (``tool_use_result.structuredPatch``), and a
+Codex app-server file change carries Codex's own diff (``changes[].diff``);
+:func:`claude_native_diff` and :func:`codex_native_diff` only reformat those.
+The computed diffs below (an Edit's old/new strings, a Write's content,
+before/after file lines) are the fallback for anything the CLI did not
+describe: a Write that creates a file, an older CLI, or a non-CLI runtime.
+Every path ends in :func:`_finish`, one bounded diff plus exact line counts.
 """
 
 from __future__ import annotations
@@ -157,6 +162,75 @@ def claude_tool_diff(
             return None
         return _finish(_hunks([], _lines(content), shown))
     return None
+
+
+def structured_patch_diff(path: str, hunks: Any) -> Optional[dict[str, Any]]:
+    """Unified text for Claude Code's ``structuredPatch`` hunks, unchanged."""
+    if not isinstance(hunks, list) or not hunks:
+        return None
+    diff = [f"--- a/{path}", f"+++ b/{path}"]
+    for hunk in hunks:
+        if not isinstance(hunk, dict) or not isinstance(hunk.get("lines"), list):
+            return None
+        try:
+            old_start, old_lines, new_start, new_lines = (
+                int(hunk[key]) for key in ("oldStart", "oldLines", "newStart", "newLines")
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        diff.append(f"@@ -{old_start},{old_lines} +{new_start},{new_lines} @@")
+        diff.extend(str(line) for line in hunk["lines"])
+    return _finish(diff)
+
+
+def claude_native_diff(
+    tool_result: Any, args: dict[str, Any], *, cwd: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Claude Code's own patch for a completed Edit, MultiEdit or Write.
+
+    A Write that creates a file has no hunks; the caller falls back to
+    :func:`claude_tool_diff`, which shows its content as added.
+    """
+    if not isinstance(tool_result, dict):
+        return None
+    path = str(tool_result.get("filePath") or (args or {}).get("file_path") or "")
+    if not path:
+        return None
+    return structured_patch_diff(display_path(path, cwd), tool_result.get("structuredPatch"))
+
+
+def codex_native_diff(changes: Any, *, cwd: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Codex's own diff for an app-server ``fileChange`` item.
+
+    An update's ``diff`` is Codex's unified hunks (no file headers); an added
+    or deleted file's ``diff`` is its content. Returns None unless every
+    change describes itself, so a partial answer never replaces the fallback.
+    """
+    if not isinstance(changes, list) or not changes:
+        return None
+    diff: list[str] = []
+    for change in changes:
+        if not isinstance(change, dict):
+            return None
+        text, path = change.get("diff"), str(change.get("path") or "")
+        if not isinstance(text, str) or not path:
+            return None
+        kind_info = change.get("kind") if isinstance(change.get("kind"), dict) else {}
+        kind = str(kind_info.get("type") or change.get("kind") or "update")
+        body = _lines(text)
+        if len(body) >= 2 and body[0].startswith("--- ") and body[1].startswith("+++ "):
+            body = body[2:]
+        if body and body[0].startswith("@@ "):
+            hunks = body
+        elif kind == "add":
+            hunks = [f"@@ -0,0 +1,{len(body)} @@", *(f"+{line}" for line in body)]
+        elif kind == "delete":
+            hunks = [f"@@ -1,{len(body)} +0,0 @@", *(f"-{line}" for line in body)]
+        else:
+            return None
+        target = str(kind_info.get("move_path") or path)
+        diff += [f"--- a/{display_path(path, cwd)}", f"+++ b/{display_path(target, cwd)}", *hunks]
+    return _finish(diff)
 
 
 def file_change_diff(

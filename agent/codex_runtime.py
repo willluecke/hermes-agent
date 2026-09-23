@@ -920,11 +920,26 @@ def _codex_file_change_line_counts(
     item: dict,
     before: dict[str, list[bytes] | None],
 ) -> dict[str, Any]:
-    """Exact line counts, plus the unified diff Hermes Chat renders red/green."""
+    """Exact line counts, plus the unified diff Hermes Chat renders red/green.
+
+    Codex's own diff (``changes[].diff``) wins, with counts taken from it; the
+    before/after snapshot diff is the fallback when Codex did not send one.
+    """
     if item.get("type") != "fileChange":
         return {}
     if item.get("status") not in {"completed", "applied", "success"}:
         return {}
+    try:
+        from agent.tool_diff import codex_native_diff
+
+        native = codex_native_diff(
+            item.get("changes"), cwd=getattr(agent, "session_cwd", None)
+        )
+    except Exception:
+        logger.debug("Codex native file-change diff failed", exc_info=True)
+        native = None
+    if native:
+        return native
     added = 0
     removed = 0
     measured = False
