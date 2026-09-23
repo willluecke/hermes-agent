@@ -66,9 +66,18 @@ def _content_text(content: Any) -> str:
 
 
 def _claude_code_effort(reasoning_config: Any) -> Optional[str]:
-    """Translate Hermes's effort ladder to the installed Claude CLI."""
+    """Translate Hermes's effort ladder to the installed Claude CLI.
+
+    Ultracode maps to Claude Code's own ``--effort ultracode`` (xhigh plus
+    standing Workflow orchestration since CLI 2.1.280; a model without it
+    runs at its best supported effort). Effort is part of the resident
+    process's identity, so toggling Ultracode restarts the CLI and the next
+    turn resumes the same Claude session.
+    """
     if not isinstance(reasoning_config, dict):
         return None
+    if reasoning_config.get("ultracode"):
+        return "ultracode"
     if reasoning_config.get("enabled") is False:
         return "low"
     effort = str(reasoning_config.get("effort") or "").strip().lower()

@@ -544,6 +544,12 @@ def _request_reasoning_config(model_options: Any) -> Optional[Dict[str, Any]]:
         effort = reasoning.get("effort", effort)
 
     effort_norm = str(effort).strip().lower() if effort is not None else ""
+    if effort_norm == "ultracode":
+        # Hermes Chat's Ultracode: the strongest effort everywhere, plus each
+        # subscription CLI's own multi-agent mode (Claude Code's ultracode,
+        # Codex sub-agents). Providers read only ``effort``; the CLI runtimes
+        # read the flag. Never forwarded as a wire effort, which rejects it.
+        return {"enabled": True, "effort": "max", "ultracode": True}
     if enabled is False or effort_norm == "none":
         return {"enabled": False}
     if effort_norm in _REASONING_EFFORTS and effort_norm != "none":

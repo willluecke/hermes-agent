@@ -1347,3 +1347,48 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+class TestUltracodeTurns:
+    """Ultracode rides the Codex lane as effort plus a per-turn note (2026-09-23)."""
+
+    def _patch(self, monkeypatch, captured):
+        def fake_init(self, **kwargs):
+            captured.setdefault("inits", []).append(kwargs)
+            self._thread_id = "thread-uc"
+            self._resumed_existing_thread = False
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured.setdefault("inputs", []).append(user_input)
+            return TurnResult(final_text="done", projected_messages=[{"role": "assistant", "content": "done"}],
+                              turn_id="turn-uc", thread_id=self._thread_id)
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: self._thread_id)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+    def test_an_ultracode_turn_carries_the_note_and_the_flag(self, monkeypatch):
+        from agent.codex_runtime import CODEX_ULTRACODE_NOTE
+
+        captured: dict = {}
+        self._patch(monkeypatch, captured)
+        agent = _make_codex_agent(reasoning_config={"enabled": True, "effort": "max", "ultracode": True})
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("audit the sampler")
+
+        assert captured["inits"][0]["ultracode"] is True
+        assert captured["inits"][0]["effort"] == "max"
+        assert captured["inputs"][0].endswith(CODEX_ULTRACODE_NOTE)
+        assert "spawn_agent" in CODEX_ULTRACODE_NOTE and "wait_agent" in CODEX_ULTRACODE_NOTE
+
+    def test_without_ultracode_there_is_no_note(self, monkeypatch):
+        from agent.codex_runtime import CODEX_ULTRACODE_NOTE
+
+        captured: dict = {}
+        self._patch(monkeypatch, captured)
+        agent = _make_codex_agent(reasoning_config={"enabled": True, "effort": "high"})
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("audit the sampler")
+
+        assert captured["inits"][0]["ultracode"] is False
+        assert CODEX_ULTRACODE_NOTE not in captured["inputs"][0]

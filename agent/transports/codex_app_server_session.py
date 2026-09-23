@@ -527,6 +527,7 @@ class CodexAppServerSession:
         resume_thread_id: Optional[str] = None,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        ultracode: bool = False,
         parent_provider: Optional[str] = None,
         opus_worker_enabled: bool = False,
         require_exact: bool = False,
@@ -550,6 +551,11 @@ class CodexAppServerSession:
         self._resumed_existing_thread = False
         self._model = str(model or "").strip()
         self._effort = str(effort or "").strip().lower()
+        # Ultracode runs each turn at the strongest effort the model
+        # advertises (``ultra`` on GPT-5.6 Sol/Terra, else ``max`` ...),
+        # resolved once per session from model/list.
+        self._ultracode = bool(ultracode)
+        self._ultracode_effort: Optional[str] = None
         # Non-secret parent runtime facts propagated to managed children (the
         # hermes-tools stdio MCP server codex spawns). Codex builds that
         # child's tool list itself and cannot see this agent's
@@ -594,6 +600,71 @@ class CodexAppServerSession:
 
     # ---------- lifecycle ----------
 
+    def set_turn_effort(self, effort: Optional[str], *, ultracode: bool = False) -> None:
+        """Adopt this turn's effort on a resident session.
+
+        Effort travels on every ``turn/start``, so a change needs no new
+        process or thread: the next turn simply runs at the new level.
+        """
+        effort = str(effort or "").strip().lower()
+        if effort != self._effort or bool(ultracode) != self._ultracode:
+            self._effort = effort
+            self._ultracode = bool(ultracode)
+            self._exact_runtime_validated = False
+
+    def _model_entry(self) -> Optional[dict[str, Any]]:
+        """This session's model from ``model/list`` (the default when unset)."""
+        assert self._client is not None
+        cursor: Optional[str] = None
+        default: Optional[dict[str, Any]] = None
+        for _ in range(20):
+            params: dict[str, Any] = {"includeHidden": True}
+            if cursor:
+                params["cursor"] = cursor
+            response = self._client.request("model/list", params, timeout=15)
+            for candidate in response.get("data", response.get("models", [])):
+                candidate_id = str(
+                    candidate.get("id")
+                    or candidate.get("model")
+                    or candidate.get("slug")
+                    or ""
+                )
+                if self._model and candidate_id == self._model:
+                    return candidate
+                if not self._model and candidate.get("isDefault"):
+                    default = candidate
+            cursor = response.get("nextCursor")
+            if not cursor:
+                break
+        return default
+
+    @staticmethod
+    def _advertised_efforts(entry: Optional[dict[str, Any]]) -> set[str]:
+        return {
+            str(item.get("reasoningEffort") or item.get("effort") or "").lower()
+            for item in (entry or {}).get("supportedReasoningEfforts", [])
+            if isinstance(item, dict)
+        }
+
+    def _turn_effort(self) -> str:
+        """The effort sent on ``turn/start``."""
+        if not self._ultracode:
+            return self._effort
+        if self._ultracode_effort is None and self._client is not None:
+            from agent.reasoning_effort import EFFORT_LADDER
+
+            try:
+                advertised = self._advertised_efforts(self._model_entry())
+            except Exception:
+                logger.warning(
+                    "codex ultracode: model/list failed; using effort %r",
+                    self._effort, exc_info=True,
+                )
+                advertised = set()
+            ranked = [level for level in EFFORT_LADDER if level in advertised]
+            self._ultracode_effort = ranked[-1] if ranked else self._effort
+        return self._ultracode_effort or self._effort
+
     def _validate_exact_runtime(self) -> None:
         """Fail closed unless the configured model and effort are available."""
         if not self._require_exact or self._exact_runtime_validated:
@@ -634,12 +705,13 @@ class CodexAppServerSession:
                 code=-32602,
                 message=f"required Codex model {self._model!r} is unavailable",
             )
-        efforts = {
-            str(item.get("reasoningEffort") or item.get("effort") or "").lower()
-            for item in found.get("supportedReasoningEfforts", [])
-            if isinstance(item, dict)
-        }
-        if self._effort not in efforts:
+        efforts = self._advertised_efforts(found)
+        if self._ultracode:
+            from agent.reasoning_effort import EFFORT_LADDER
+
+            ranked = [level for level in EFFORT_LADDER if level in efforts]
+            self._ultracode_effort = ranked[-1] if ranked else self._effort
+        if self._turn_effort() not in efforts:
             raise CodexAppServerError(
                 code=-32602,
                 message=(
@@ -942,6 +1014,9 @@ class CodexAppServerSession:
         self._last_policy_block_reason = None
         try:
             self.ensure_started()
+            # A resident session whose effort changed since startup is
+            # re-checked here (a no-op unless the runtime must be exact).
+            self._validate_exact_runtime()
         except (CodexAppServerError, TimeoutError) as exc:
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
@@ -980,7 +1055,7 @@ class CodexAppServerSession:
                     "threadId": self._thread_id,
                     "input": turn_input,
                     **({"model": self._model} if self._model else {}),
-                    **({"effort": self._effort} if self._effort else {}),
+                    **({"effort": effort} if (effort := self._turn_effort()) else {}),
                 },
                 timeout=10,
             )

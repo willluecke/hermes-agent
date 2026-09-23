@@ -2085,3 +2085,77 @@ def test_compaction_without_final_expires_after_bounded_grace():
     assert result.compacted and result.interrupted and result.should_retire
     assert result.final_text == ''
     assert 'post-compaction continuation grace' in result.error
+
+
+# ---- Ultracode: the strongest advertised effort per turn (2026-09-23) ----
+
+_EFFORT_LEVELS = [{"reasoningEffort": level} for level in ("low", "medium", "high", "xhigh", "max", "ultra")]
+
+
+def _ultracode_client(models=None, *, fail_model_list=False):
+    client = FakeClient()
+    models = models if models is not None else [
+        {"id": "gpt-5.6-sol", "isDefault": True, "supportedReasoningEfforts": _EFFORT_LEVELS},
+        {"id": "gpt-5.5", "supportedReasoningEfforts": _EFFORT_LEVELS[:4]},
+    ]
+
+    def handler(method, params):
+        if method == "model/list":
+            if fail_model_list:
+                raise RuntimeError("model/list unavailable")
+            return {"data": models}
+        if method == "thread/start":
+            return {"thread": {"id": "thread-fake-001"}, "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-fake-001"}}
+        return {}
+
+    client._request_handler = handler
+    return client
+
+
+def _run_one_turn(client, session):
+    client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
+    client.queue_notification("item/completed", item={"type": "agentMessage", "id": "m1", "text": "ok"},
+                              threadId="t", turnId="tu1")
+    client.queue_notification("turn/completed", threadId="t", turn={"id": "tu1", "status": "completed", "error": None})
+    session.run_turn("hi", turn_timeout=2.0)
+    return [params for method, params in client.requests if method == "turn/start"][-1]
+
+
+class TestUltracodeEffort:
+    def test_ultracode_uses_the_models_strongest_advertised_effort(self):
+        client = _ultracode_client()
+        session = make_session(client, model="gpt-5.6-sol", effort="max", ultracode=True)
+        assert _run_one_turn(client, session)["effort"] == "ultra"
+
+    def test_a_model_that_tops_out_lower_gets_its_own_top(self):
+        client = _ultracode_client()
+        session = make_session(client, model="gpt-5.5", effort="max", ultracode=True)
+        assert _run_one_turn(client, session)["effort"] == "xhigh"
+
+    def test_the_default_model_is_used_when_none_is_named(self):
+        client = _ultracode_client()
+        session = make_session(client, effort="max", ultracode=True)
+        assert _run_one_turn(client, session)["effort"] == "ultra"
+
+    def test_an_unreadable_model_list_falls_back_to_max(self):
+        client = _ultracode_client(fail_model_list=True)
+        session = make_session(client, model="gpt-5.6-sol", effort="max", ultracode=True)
+        assert _run_one_turn(client, session)["effort"] == "max"
+
+    def test_toggling_takes_effect_next_turn_on_the_same_thread(self):
+        client = _ultracode_client()
+        session = make_session(client, model="gpt-5.6-sol", effort="high")
+        assert _run_one_turn(client, session)["effort"] == "high"
+        session.set_turn_effort("max", ultracode=True)
+        assert _run_one_turn(client, session)["effort"] == "ultra"
+        session.set_turn_effort("medium")
+        assert _run_one_turn(client, session)["effort"] == "medium"
+        assert sum(1 for method, _ in client.requests if method == "thread/start") == 1
+
+    def test_exact_runtime_validates_the_resolved_ultracode_effort(self):
+        client = _ultracode_client()
+        session = make_session(client, model="gpt-5.5", effort="max", ultracode=True, require_exact=True)
+        # max is not advertised for gpt-5.5, but Ultracode resolves to xhigh, which is
+        assert _run_one_turn(client, session)["effort"] == "xhigh"

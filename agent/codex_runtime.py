@@ -978,6 +978,23 @@ def _codex_file_change_line_counts(
     return counts
 
 
+# Codex has no ultracode keyword; its multi-agent tools (spawn_agent,
+# wait_agent, on by default since Codex 0.14x) are used when the model is told
+# to. This rides each Ultracode turn like the preflight note: never durable.
+CODEX_ULTRACODE_NOTE = (
+    "[Ultracode is on for this turn: optimize for the most exhaustive, correct "
+    "answer, not the fastest or cheapest. For substantive work, split independent "
+    "parts across sub-agents with spawn_agent, collect them with wait_agent, and "
+    "adversarially verify their findings before you report them. Work solo only "
+    "on conversational turns or trivial edits. Token cost is not a constraint.]"
+)
+
+
+def _codex_ultracode(agent: Any) -> bool:
+    config = getattr(agent, "reasoning_config", None)
+    return bool(isinstance(config, dict) and config.get("ultracode"))
+
+
 def _hermes_tool_name(raw: str) -> str:
     """Map a projected codex call name onto the Hermes tool it stands for."""
     if raw == "exec_command":
@@ -1689,6 +1706,7 @@ def run_codex_app_server_turn(
             resume_thread_id=resume_thread_id,
             model=getattr(agent, "model", ""),
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
+            ultracode=_codex_ultracode(agent),
             parent_provider=str(getattr(agent, "provider", "") or ""),
             opus_worker_enabled=_agent_opus_worker_enabled(agent),
             require_exact=require_exact,
@@ -1713,6 +1731,16 @@ def run_codex_app_server_turn(
         agent._codex_session._on_event = make_codex_app_server_event_bridge(agent)
         agent._codex_session.on_watchdog_timeout = _watchdog_timeout
         agent._codex_session.first_event_timeout = first_event_timeout
+        # Effort rides each turn/start, so a resident session adopts this
+        # turn's level (including an Ultracode toggle) on the same thread.
+        from agent.reasoning_effort import requested_effort
+
+        set_turn_effort = getattr(agent._codex_session, "set_turn_effort", None)
+        if callable(set_turn_effort):
+            set_turn_effort(
+                requested_effort(getattr(agent, "reasoning_config", None)),
+                ultracode=_codex_ultracode(agent),
+            )
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
@@ -1755,6 +1783,12 @@ def run_codex_app_server_turn(
             # of the user message on the default loop. It is not part of
             # the durable dialogue entries, so it never replays.
             turn_input = f"{turn_input}\n\n{plugin_user_context}"
+        if _codex_ultracode(agent):
+            turn_input = (
+                [*turn_input, {"type": "text", "text": CODEX_ULTRACODE_NOTE}]
+                if isinstance(turn_input, list)
+                else f"{turn_input}\n\n{CODEX_ULTRACODE_NOTE}"
+            )
         # Record what this thread is about to consume before the turn runs. A
         # turn that dies mid-flight still leaves a thread holding this input,
         # and re-seeding it from scratch next time would duplicate everything.
