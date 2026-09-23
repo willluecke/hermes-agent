@@ -2053,6 +2053,37 @@ class TestRunToolEventIdentity:
         assert '"lines_removed": 3' in body
 
     @pytest.mark.asyncio
+    async def test_file_edit_diff_rides_the_completed_event(self, adapter):
+        """The app renders an edit red/green from the diff on tool.completed."""
+        app = _create_runs_app(adapter)
+        diff = "--- a/app.py\n+++ b/app.py\n@@ -4 +4 @@\n-old = 1\n+new = 2"
+
+        def script(cb):
+            cb("tool.started", "apply_patch", "app.py", {"file_path": "app.py"},
+               tool_call_id="call_edit")
+            cb("tool.completed", "apply_patch", None, None,
+               duration=0.1, is_error=False, result="updated",
+               lines_added=1, lines_removed=1, diff=diff,
+               tool_call_id="call_edit")
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        completed = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ") and '"tool.completed"' in line
+        ]
+        assert completed[0]["diff"] == diff
+        assert completed[0]["lines_added"] == 1
+
+    @pytest.mark.asyncio
     async def test_live_tool_output_is_ordered_redacted_capped_and_replayable(
         self, adapter
     ):

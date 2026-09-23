@@ -286,15 +286,45 @@ def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) ->
     )
 
 
+def _claude_tool_preview(raw_name: str, args: dict[str, Any], cwd: Optional[str]) -> str:
+    """The row label a terminal agent would print: path, pattern, URL or command."""
+    from agent.tool_diff import display_path
+
+    def text(*keys: str) -> str:
+        for key in keys:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    if raw_name in {"Edit", "MultiEdit", "Write", "Read", "NotebookEdit"}:
+        return display_path(text("file_path", "notebook_path"), cwd)
+    if raw_name == "Grep":
+        pattern, where = text("pattern"), text("path")
+        where = display_path(where, cwd) if where else ""
+        return f"{pattern} in {where}" if pattern and where else pattern
+    if raw_name == "Glob":
+        return text("pattern")
+    if raw_name == "WebFetch":
+        return text("url")
+    if raw_name in {"WebSearch", "ToolSearch"}:
+        return text("query")
+    return text("command", "description", "query", "url", "prompt")
+
+
 def make_claude_code_event_bridge(
     agent: Any,
     record: Optional[Callable[[str, str, dict[str, Any], str, str], None]] = None,
+    *,
+    cwd: Optional[str] = None,
 ) -> Callable[[dict[str, Any]], None]:
     """Project Claude Code stream-json records onto Hermes run events.
 
     ``record(raw_name, name, args, result, call_id)`` is told about every
     completed tool call so the turn can replay them through the observer
-    hooks afterwards (see :func:`_claude_hook_parity`).
+    hooks afterwards (see :func:`_claude_hook_parity`). A successful Edit,
+    MultiEdit or Write also reports its unified diff and line counts, which
+    Hermes Chat renders red and green.
     """
     started: dict[str, tuple[str, dict[str, Any], float, str]] = {}
     pending_text: list[str] = []
@@ -327,7 +357,7 @@ def make_claude_code_event_bridge(
             progress(
                 "tool.started",
                 name,
-                str(args.get("command") or args.get("description") or "")[:500],
+                _claude_tool_preview(raw_name, args, cwd)[:500],
                 args,
                 tool_call_id=call_id,
             )
@@ -349,6 +379,14 @@ def make_claude_code_event_bridge(
                 record(raw_name, name, args, result, call_id)
             except Exception:
                 logger.debug("Claude tool record failed", exc_info=True)
+        edit_diff: dict[str, Any] = {}
+        if not is_error and raw_name in {"Edit", "MultiEdit", "Write"}:
+            try:
+                from agent.tool_diff import claude_tool_diff
+
+                edit_diff = claude_tool_diff(raw_name, args, cwd=cwd) or {}
+            except Exception:
+                logger.debug("Claude edit diff failed", exc_info=True)
         progress = getattr(agent, "tool_progress_callback", None)
         if progress:
             progress(
@@ -360,6 +398,7 @@ def make_claude_code_event_bridge(
                 is_error=is_error,
                 result=result,
                 tool_call_id=call_id,
+                **edit_diff,
             )
         callback = getattr(agent, "tool_complete_callback", None)
         if callback:
@@ -1011,7 +1050,7 @@ def run_claude_code_turn(
         def _record(raw_name: str, name: str, args: dict[str, Any], result: str, call_id: str) -> None:
             calls.append((raw_name, name, args, result, call_id))
 
-        bridge = make_claude_code_event_bridge(agent, record=_record)
+        bridge = make_claude_code_event_bridge(agent, record=_record, cwd=cwd)
         hook_token, hook_env, hook_settings = _claude_hook_binding(agent, read_only=read_only)
 
         def _late_answer(record: dict[str, Any]) -> None:

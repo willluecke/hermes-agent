@@ -126,6 +126,11 @@ def test_file_change_completion_reports_exact_line_counts(tmp_path):
     _args, kwargs = calls["tool_progress"][-1]
     assert kwargs["lines_added"] == 2
     assert kwargs["lines_removed"] == 1
+    # the rendered diff comes from the same before/after snapshot
+    assert kwargs["diff"].splitlines() == [
+        "--- a/example.py", "+++ b/example.py", "@@ -1,3 +1,4 @@",
+        " one", "-two", "+second", " three", "+four",
+    ]
 
 
 def test_command_output_delta_keeps_stable_id_and_wire_order():

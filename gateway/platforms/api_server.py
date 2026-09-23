@@ -8496,6 +8496,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         and value >= 0
                     ):
                         event[field] = value
+                # A file edit's unified diff (agent.tool_diff, already bounded)
+                # so the app can render the change red/green.
+                diff = kwargs.get("diff")
+                if isinstance(diff, str) and diff.strip():
+                    event["diff"] = redact_sensitive_text(diff[:60_000], force=True)
                 _push(event)
             elif event_type == "reasoning.available":
                 _push({

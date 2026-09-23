@@ -919,7 +919,8 @@ def _codex_file_change_line_counts(
     agent: Any,
     item: dict,
     before: dict[str, list[bytes] | None],
-) -> dict[str, int]:
+) -> dict[str, Any]:
+    """Exact line counts, plus the unified diff Hermes Chat renders red/green."""
     if item.get("type") != "fileChange":
         return {}
     if item.get("status") not in {"completed", "applied", "success"}:
@@ -927,6 +928,7 @@ def _codex_file_change_line_counts(
     added = 0
     removed = 0
     measured = False
+    snapshots: list[tuple[str, list[bytes] | None, list[bytes] | None]] = []
     for change in item.get("changes") or []:
         if not isinstance(change, dict):
             continue
@@ -941,7 +943,24 @@ def _codex_file_change_line_counts(
         added += file_added
         removed += file_removed
         measured = True
-    return {"lines_added": added, "lines_removed": removed} if measured else {}
+        from agent.tool_diff import display_path
+
+        snapshots.append(
+            (display_path(str(path), getattr(agent, "session_cwd", None)), before_lines, after_lines)
+        )
+    if not measured:
+        return {}
+    counts: dict[str, Any] = {"lines_added": added, "lines_removed": removed}
+    try:
+        from agent.tool_diff import file_change_diff
+
+        rendered = file_change_diff(snapshots)
+    except Exception:
+        logger.debug("Codex file-change diff failed", exc_info=True)
+        rendered = None
+    if rendered:
+        counts["diff"] = rendered["diff"]
+    return counts
 
 
 def _hermes_tool_name(raw: str) -> str:
