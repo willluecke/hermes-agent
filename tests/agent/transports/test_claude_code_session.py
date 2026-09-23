@@ -1332,28 +1332,220 @@ def test_monitor_released_by_the_background_task_list_still_drains_the_last_resu
     assert result.error is None
 
 
-def test_background_bash_task_does_not_hold_the_turn():
-    session_id = "00000000-0000-4000-8000-000000000000"
+# --- Background shell commands hold the turn; late output is kept (2026-09-23)
+
+SID = "00000000-0000-4000-8000-000000000000"
+
+
+def _shell_frames(*, description="deploy poll", task_id="t4", reply="Waiting on the poll."):
+    return [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Continue"}},
+        {"type": "assistant", "session_id": SID, "message": {"content": [
+            {"type": "tool_use", "id": "toolu_bash", "name": "Bash",
+             "input": {"command": "until done; do sleep 20; done", "description": description,
+                       "run_in_background": True}}]}},
+        {"type": "system", "subtype": "task_started", "session_id": SID, "task_id": task_id,
+         "tool_use_id": "toolu_bash", "description": description, "is_backgrounded": True, "task_type": "local_bash"},
+        {"type": "user", "session_id": SID, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_bash",
+             "content": f"Command running in background with ID: {task_id}. Output is being written to: /tmp/{task_id}.output"}]}},
+        {"type": "assistant", "session_id": SID, "message": {"content": [{"type": "text", "text": reply}]}},
+        {"type": "result", "session_id": SID, "result": reply, "usage": {"input_tokens": 3, "output_tokens": 2}},
+    ]
+
+
+def _notification_frames(text, *, task_id="t4", tool_use_id="toolu_bash"):
+    notification = (
+        f"<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>{tool_use_id}</tool-use-id>\n"
+        f"<output-file>/tmp/{task_id}.output</output-file>\n<status>completed</status>\n</task-notification>"
+    )
+    return [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": notification}},
+        {"type": "assistant", "session_id": SID, "message": {"content": [{"type": "text", "text": text}]}},
+        {"type": "result", "session_id": SID, "result": text, "origin": {"kind": "task-notification"},
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+
+
+def _shell_session(forwarded=None, **kwargs):
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=SID, resume=True,
+                                on_event=(forwarded.append if forwarded is not None else None),
+                                inactivity_timeout=0.0, **kwargs)
+    session.monitor_drain_quiet_seconds = 0.2
+    session.late_answer_log = None
+    return session
+
+
+def test_background_shell_holds_the_turn_and_its_report_becomes_the_answer():
     forwarded = []
-    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=session_id,
-                                resume=True, on_event=forwarded.append, inactivity_timeout=0.0)
-    _install_fake_process(session, _fake_process(20104), [
-        {"type": "user", "session_id": session_id, "message": {"role": "user", "content": "Continue"}},
-        {"type": "assistant", "session_id": session_id, "message": {"content": [
-            {"type": "tool_use", "id": "toolu_bash", "name": "Bash", "input": {"command": "npm start", "run_in_background": True}}]}},
-        {"type": "system", "subtype": "task_started", "session_id": session_id, "task_id": "t4",
-         "tool_use_id": "toolu_bash", "description": "npm start", "is_backgrounded": True, "task_type": "local_bash"},
-        {"type": "user", "session_id": session_id, "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "toolu_bash", "content": "Command running in background with ID: t4"}]}},
-        {"type": "assistant", "session_id": session_id, "message": {"content": [{"type": "text", "text": "Server started."}]}},
-        {"type": "result", "session_id": session_id, "result": "Server started.", "usage": {"input_tokens": 1, "output_tokens": 1}},
-    ])
+    session = _shell_session(forwarded)
+    _install_fake_process(session, _fake_process(20104),
+                          _shell_frames() + _notification_frames("Deploy succeeded: build 42 is live."))
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Deploy succeeded: build 42 is live."
+    assert result.error is None
+    assert result.should_retire is False
+    kinds = [event["type"] for event in forwarded]
+    note = next(event for event in forwarded if event["type"] == "hermes.monitor_note")
+    assert "deploy poll" in note["text"] and "t4" in note["text"]
+    # the note appears at the hand-back, not when the command started
+    assert kinds.index("hermes.monitor_note") > kinds.index("assistant")
+    assert "hermes.result_deferred" in kinds
+
+
+def test_background_shell_that_ended_before_the_hand_back_still_drains_the_follow_up():
+    # 2026-09-22: the poll finished a second before the model said "the
+    # result will arrive from the background poll"; Claude answered the
+    # queued notification in a follow-up turn the chat never read.
+    session = _shell_session()
+    frames = _shell_frames(reply="The deploy result will arrive from the background poll.")
+    frames.insert(4, {"type": "system", "subtype": "task_notification", "session_id": SID,
+                      "task_id": "t4", "tool_use_id": "toolu_bash", "status": "completed"})
+    _install_fake_process(session, _fake_process(20105),
+                          frames + _notification_frames("Deploy: success, production is live."))
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Deploy: success, production is live."
+    assert result.error is None
+
+
+def test_background_shell_that_outlives_the_hold_ends_with_the_held_text_and_a_note():
+    forwarded = []
+    session = _shell_session(forwarded)
+    session.background_shell_hold_seconds = 0.05
+    _install_fake_process(session, _fake_process(20106), _shell_frames())
+
+    with patch.object(session, "close") as close:
+        result = session.run_turn("Continue")
+
+    assert result.final_text.startswith("Waiting on the poll.")
+    assert "stopped holding this turn for background command t4" in result.final_text
+    assert "late answer" in result.final_text
+    assert result.error is None
+    assert result.should_retire is False
+    close.assert_not_called()
+
+
+def test_background_shell_hold_can_be_turned_off():
+    forwarded = []
+    session = _shell_session(forwarded)
+    session.background_shell_hold_seconds = 0
+    _install_fake_process(session, _fake_process(20107), _shell_frames(reply="Server started."))
 
     result = session.run_turn("Continue")
 
     assert result.final_text == "Server started."
     assert result.error is None
     assert not [event for event in forwarded if str(event.get("type", "")).startswith("hermes.")]
+
+
+def test_background_shell_absent_from_a_task_list_that_never_showed_it_keeps_the_hold():
+    session = _shell_session()
+    frames = _shell_frames()
+    frames.append({"type": "system", "subtype": "background_tasks_changed", "session_id": SID, "tasks": []})
+    _install_fake_process(session, _fake_process(20108), frames + _notification_frames("Done: 3 of 3 checks passed."))
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Done: 3 of 3 checks passed."
+
+
+def _wait_for(predicate, timeout=3.0):
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(0.02)
+    return predicate()
+
+
+def test_output_after_a_closed_turn_is_kept_as_a_late_answer(tmp_path):
+    late = []
+    session = _shell_session(on_late_result=late.append)
+    session.late_drain_interval_seconds = 0.05
+    session.late_answer_log = str(tmp_path / "late.jsonl")
+    session.late_answer_context = {"hermes_session_id": "hermes-chat-c_test"}
+    frames = [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Continue"}},
+        {"type": "result", "session_id": SID, "result": "Started; I will report back.",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ] + _notification_frames("Deploy succeeded: build 42 is live.", task_id="t9", tool_use_id="toolu_other")
+    _install_fake_process(session, _fake_process(20109), frames)
+
+    result = session.run_turn("Continue")
+
+    assert result.final_text == "Started; I will report back."
+    assert _wait_for(lambda: late) and session.wait_for_late_results()
+    record = late[0]
+    assert record["text"] == "Deploy succeeded: build 42 is live."
+    assert record["complete"] is True
+    assert record["origin"] == "task-notification"
+    assert record["hermes_session_id"] == "hermes-chat-c_test"
+    logged = [json.loads(line) for line in (tmp_path / "late.jsonl").read_text().splitlines()]
+    assert logged[0]["text"] == "Deploy succeeded: build 42 is live."
+
+
+def test_late_output_still_queued_when_the_next_turn_starts_is_kept_but_not_shown():
+    late = []
+    forwarded = []
+    session = _shell_session(forwarded, on_late_result=late.append)
+    session.late_drain_interval_seconds = 60.0  # the next turn starts first
+    frames = [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "one"}},
+        {"type": "result", "session_id": SID, "result": "first"},
+    ] + _notification_frames("Background job finished.", task_id="t8", tool_use_id="toolu_x") + [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "two"}},
+        {"type": "assistant", "session_id": SID, "message": {"content": [{"type": "text", "text": "second"}]}},
+        {"type": "result", "session_id": SID, "result": "second"},
+    ]
+    _install_fake_process(session, _fake_process(20110), frames)
+
+    assert session.run_turn("one").final_text == "first"
+    forwarded.clear()
+    assert session.run_turn("two").final_text == "second"
+
+    assert session.wait_for_late_results() and [r["text"] for r in late] == ["Background job finished."]
+    shown = json.dumps(forwarded)
+    assert "Background job finished." not in shown
+
+
+def test_a_turn_that_errored_captures_no_late_output():
+    late = []
+    session = _shell_session(on_late_result=late.append)
+    session.late_drain_interval_seconds = 0.02
+    frames = [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Continue"}},
+        {"type": "result", "session_id": SID, "result": "API Error: overloaded", "is_error": True},
+    ] + _notification_frames("Should not be kept.", task_id="t7", tool_use_id="toolu_y")
+    _install_fake_process(session, _fake_process(20111), frames)
+
+    result = session.run_turn("Continue")
+
+    assert result.error
+    assert not _wait_for(lambda: late, timeout=0.3)
+
+
+def test_a_late_turn_cut_off_by_process_exit_is_kept_as_incomplete():
+    late = []
+    session = _shell_session(on_late_result=late.append)
+    session.late_drain_interval_seconds = 0.02
+    frames = [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Continue"}},
+        {"type": "result", "session_id": SID, "result": "Started."},
+        {"type": "assistant", "session_id": SID, "message": {"content": [{"type": "text", "text": "Halfway through the report"}]}},
+    ]
+    process = _install_fake_process(session, _fake_process(20112), frames)
+    session._output_queue.put(None)
+    del process
+
+    assert session.run_turn("Continue").final_text == "Started."
+    assert _wait_for(lambda: late) and session.wait_for_late_results()
+    assert late[0]["text"] == "Halfway through the report"
+    assert late[0]["complete"] is False
 
 
 def test_event_bridge_flushes_held_commentary_and_shows_monitor_notes():

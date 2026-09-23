@@ -92,6 +92,15 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
 
 logger = logging.getLogger(__name__)
 
+# Assistant rows written outside a live turn. A Claude Code turn can close
+# before the CLI finishes answering (a background task wakes it later); that
+# answer is stored with this display kind. Clients adopt rows of the
+# ADOPTABLE kinds into their own transcripts (Hermes Chat's sync store does,
+# via GET /api/adoptable-messages). The rows stay ordinary assistant text for
+# replay, search and handoff.
+LATE_ANSWER_DISPLAY_KIND = "late_answer"
+ADOPTABLE_DISPLAY_KINDS = (LATE_ANSWER_DISPLAY_KIND,)
+
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
 
@@ -11079,6 +11088,56 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 current = child_id
 
             return best if best is not None else session_id
+
+    def list_adoptable_messages(
+        self,
+        *,
+        after_id: int = 0,
+        limit: int = 200,
+        kinds: tuple[str, ...] = ADOPTABLE_DISPLAY_KINDS,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Rows of the adoptable display kinds after ``after_id``, across sessions.
+
+        Returns ``(rows, max_id)`` where ``max_id`` is the table's highest row
+        id when the read began. A caller whose page came back short may
+        advance its cursor to ``max_id``: SQLite has one writer, so every row
+        at or below it is already committed, and a sweep never rescans rows
+        that can no longer match.
+        """
+        wanted = tuple(kind for kind in kinds if isinstance(kind, str) and kind)
+        if not wanted:
+            return [], int(after_id)
+        page = max(1, min(int(limit), 500))
+        placeholders = ",".join("?" for _ in wanted)
+        with self._read_ctx() as conn:
+            max_row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+            max_id = int((max_row[0] if max_row else 0) or 0)
+            rows = conn.execute(
+                "SELECT id, session_id, role, content, timestamp, display_kind, "
+                "display_metadata FROM messages "
+                f"WHERE id > ? AND id <= ? AND active = 1 AND display_kind IN ({placeholders}) "
+                "ORDER BY id LIMIT ?",
+                (int(after_id), max_id, *wanted, page),
+            ).fetchall()
+        adoptable: List[Dict[str, Any]] = []
+        for row in rows:
+            metadata = (
+                self._decode_display_metadata(row["display_metadata"])
+                if row["display_metadata"]
+                else None
+            )
+            adoptable.append(
+                {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "role": row["role"],
+                    "content": self._decode_content(row["content"]),
+                    "timestamp": row["timestamp"],
+                    "display_kind": row["display_kind"],
+                    "display_metadata": metadata,
+                }
+            )
+        return adoptable, max(max_id, int(after_id))
 
     def get_messages_as_conversation(
         self,

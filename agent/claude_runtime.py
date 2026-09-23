@@ -7,11 +7,14 @@ import binascii
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import tempfile
 import time
 from typing import Any, Callable, Optional
+import urllib.error
+import urllib.request
 
 from agent.redact import redact_sensitive_text
 from agent.transports.claude_code_session import (
@@ -32,6 +35,9 @@ _TOOL_NAMES = {
 }
 
 _CLAUDE_SESSION_STATE_KEY = "claude_code_session"
+# hermes_state.LATE_ANSWER_DISPLAY_KIND, kept local so this module does not
+# import the session store at load time.
+_LATE_ANSWER_DISPLAY_KIND = "late_answer"
 _CLAUDE_SESSION_STATE_VERSION = 1
 _CLAUDE_EFFORT_MAP = {
     "none": "low",
@@ -95,7 +101,15 @@ def _fingerprint_text(content: Any) -> str:
 def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
     """Hash the outer transcript prefix represented by a Claude session."""
     digest = hashlib.sha256()
+    included = 0
     for message in messages:
+        if message.get("display_kind") == _LATE_ANSWER_DISPLAY_KIND:
+            # A late answer is appended to the store whenever the CLI writes
+            # it, possibly while the next turn is already loading history.
+            # The Claude session holds it either way, so it never counts
+            # toward the prefix that decides whether that session continues.
+            continue
+        included += 1
         payload = [
             str(message.get("role") or ""),
             _fingerprint_text(message.get("content")),
@@ -106,7 +120,7 @@ def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
             )
         )
         digest.update(b"\n")
-    return f"v1:{len(messages)}:{digest.hexdigest()}"
+    return f"v1:{included}:{digest.hexdigest()}"
 
 
 def _normalized_cwd(cwd: str) -> str:
@@ -157,6 +171,96 @@ def _persist_claude_session_state(
         )
     except Exception:
         logger.warning("Claude Code session-state persistence failed", exc_info=True)
+
+
+def _sync_store_ping(session_id: str) -> None:
+    """Tell Hermes Chat's sync store a conversation has a row to adopt.
+
+    Best effort: the sync store also sweeps on a timer, so a missed ping only
+    delays the answer's appearance in the app.
+    """
+    if not session_id.startswith("hermes-chat-"):
+        return
+    base = os.environ.get("HERMES_SYNC_URL", "http://127.0.0.1:8643").rstrip("/")
+    key_file = os.environ.get("HERMES_SYNC_KEY_FILE", "").strip()
+    try:
+        key = Path(key_file or Path.home() / ".hermes-api-key").read_text(
+            encoding="utf-8"
+        ).strip()
+    except OSError:
+        logger.debug("Sync store key unavailable; skipping the adoption ping")
+        return
+    if not key:
+        return
+    request = urllib.request.Request(
+        f"{base}/adoptable-messages/changed",
+        data=json.dumps({"sessionId": session_id}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5.0) as response:  # noqa: S310
+            response.read()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        logger.info("Sync store adoption ping failed for %s: %s", session_id, exc)
+
+
+def save_claude_late_answer(agent: Any, record: dict[str, Any]) -> Optional[int]:
+    """Store output Claude wrote after its Hermes turn closed.
+
+    The row is ordinary assistant text marked with the late-answer display
+    kind, so it replays, searches and hands off like any answer, is skipped
+    by the continuity fingerprint, and is adoptable by Hermes Chat.
+    """
+    text = str(record.get("text") or "").strip()
+    if not text:
+        return None
+    session_db = getattr(agent, "_session_db", None)
+    outer_session_id = str(getattr(agent, "session_id", "") or "")
+    if (
+        session_db is None
+        or not outer_session_id
+        or getattr(agent, "_persist_disabled", False)
+    ):
+        logger.warning(
+            "Late Claude answer kept only in the late-answer log: no session "
+            "store for session %s",
+            outer_session_id or "-",
+        )
+        return None
+    complete = bool(record.get("complete", True))
+    metadata = {
+        "source": "claude_code",
+        "complete": complete,
+        "is_error": bool(record.get("is_error")),
+        "origin": str(record.get("origin") or ""),
+        "claude_session_id": str(record.get("claude_session_id") or ""),
+        "captured_at": record.get("captured_at"),
+    }
+    try:
+        row_id = session_db.append_message(
+            outer_session_id,
+            "assistant",
+            text,
+            finish_reason="stop" if complete else "incomplete",
+            timestamp=record.get("captured_at"),
+            display_kind=_LATE_ANSWER_DISPLAY_KIND,
+            display_metadata=metadata,
+        )
+    except Exception:
+        logger.warning(
+            "Could not store a late Claude answer for session %s",
+            outer_session_id,
+            exc_info=True,
+        )
+        return None
+    logger.info(
+        "Stored a late Claude answer as row %s in session %s",
+        row_id,
+        outer_session_id,
+    )
+    _sync_store_ping(outer_session_id)
+    return row_id
 
 
 def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) -> str:
@@ -909,6 +1013,11 @@ def run_claude_code_turn(
 
         bridge = make_claude_code_event_bridge(agent, record=_record)
         hook_token, hook_env, hook_settings = _claude_hook_binding(agent, read_only=read_only)
+
+        def _late_answer(record: dict[str, Any]) -> None:
+            save_claude_late_answer(agent, record)
+
+        late_context = {"hermes_session_id": str(getattr(agent, "session_id", "") or "")}
         if session is None:
             session = ClaudeCodeSession(
                 cwd=cwd,
@@ -921,11 +1030,13 @@ def run_claude_code_turn(
                 on_event=bridge,
                 on_session_id=_remember_confirmed_session,
                 on_watchdog_timeout=_watchdog_timeout,
+                on_late_result=_late_answer,
                 resident_first_event_timeout=resident_first_event_timeout,
                 startup_first_event_timeout=startup_first_event_timeout,
                 extra_env=hook_env,
                 settings_json=hook_settings,
             )
+            session.late_answer_context = late_context
             session.history_fingerprint = prior_fingerprint
             agent._claude_code_session = session
         else:
@@ -934,6 +1045,8 @@ def run_claude_code_turn(
             session.on_event = bridge
             session.on_session_id = _remember_confirmed_session
             session.on_watchdog_timeout = _watchdog_timeout
+            session.on_late_result = _late_answer
+            session.late_answer_context = late_context
             session.resident_first_event_timeout = resident_first_event_timeout
             session.startup_first_event_timeout = startup_first_event_timeout
         try:

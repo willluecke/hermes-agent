@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- GET  /api/adoptable-messages — rows written outside a live turn, after a cursor
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -2692,6 +2693,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("GET", "/api/adoptable-messages", self._handle_adoptable_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -5265,6 +5267,44 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    async def _handle_adoptable_messages(self, request: "web.Request") -> "web.Response":
+        """GET /api/adoptable-messages?after=<row id>&limit=<n>.
+
+        Assistant rows written outside a live turn (late Claude answers),
+        across all sessions, after a row-id cursor. Hermes Chat's sync store
+        polls this to adopt them into the conversations the app displays.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        try:
+            after = int(request.query.get("after", "0"))
+            limit = int(request.query.get("limit", "200"))
+        except (TypeError, ValueError):
+            after, limit = -1, -1
+        if after < 0 or limit < 1:
+            return web.json_response(
+                _openai_error(
+                    "after must be a non-negative integer and limit a positive one",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+        limit = min(limit, 500)
+        rows, max_id = await asyncio.to_thread(
+            db.list_adoptable_messages, after_id=after, limit=limit
+        )
+        next_after = rows[-1]["id"] if len(rows) >= limit else max_id
+        return web.json_response(
+            {"object": "list", "data": rows, "next_after": next_after}
+        )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""

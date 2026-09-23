@@ -40,7 +40,7 @@ _TASK_NOTIFICATION_STATUS_RE = re.compile(
     r"<status>\s*([^<]+?)\s*</status>", re.IGNORECASE
 )
 _TERMINAL_TASK_STATUSES = frozenset(
-    {"completed", "failed", "stopped", "cancelled", "canceled"}
+    {"completed", "failed", "stopped", "killed", "cancelled", "canceled"}
 )
 # Claude Code's Monitor tool answers with the task id and its own timeout.
 _MONITOR_STARTED_RE = re.compile(
@@ -54,6 +54,42 @@ HERMES_MONITOR_NOTE = "hermes.monitor_note"
 # beyond the Monitor's own timeout and the trailing drain after it ends.
 DEFAULT_MONITOR_GRACE_SECONDS = 60.0
 DEFAULT_MONITOR_DRAIN_QUIET_SECONDS = 5.0
+# A background shell command (Bash with run_in_background) also keeps the turn
+# open once the model hands back, until the command ends. On 2026-09-22 a
+# deploy poll finished a second after the model said "the result will arrive
+# from the background poll"; Claude reported it in a follow-up turn nobody
+# read. Previews run as project services (brenuc-preview), so a background
+# command is normally finite; the cap bounds a stray long-lived one, and
+# anything it reports after the cap is still kept as a late answer. Zero
+# restores the old behaviour (never hold for a background shell).
+DEFAULT_BACKGROUND_SHELL_HOLD_SECONDS = 30 * 60.0
+BACKGROUND_SHELL_HOLD_ENV = "HERMES_CLAUDE_BACKGROUND_SHELL_HOLD_SECONDS"
+_BACKGROUND_SHELL_STARTED_RE = re.compile(
+    r"running in background with ID: ([A-Za-z0-9_-]+)"
+)
+# Output the resident CLI produces after its Hermes turn has closed (a task
+# notification woke it, a held wait hit its cap, a scheduled wakeup fired) is
+# never read by a turn. It is assembled into late answers, appended to this
+# JSONL log, and handed to ``on_late_result`` instead of being discarded.
+LATE_ANSWER_LOG_ENV = "HERMES_CLAUDE_LATE_ANSWER_LOG"
+
+
+def _background_shell_hold_seconds() -> float:
+    raw = os.environ.get(BACKGROUND_SHELL_HOLD_ENV, "").strip()
+    if not raw:
+        return DEFAULT_BACKGROUND_SHELL_HOLD_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_BACKGROUND_SHELL_HOLD_SECONDS
+
+
+def _default_late_answer_log() -> str:
+    configured = os.environ.get(LATE_ANSWER_LOG_ENV, "").strip()
+    if configured:
+        return str(Path(configured).expanduser())
+    home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    return str(home / "logs" / "claude-late-answers.jsonl")
 
 CLAUDE_AUTH_ERROR_CODE = "claude_authentication_failed"
 CLAUDE_AUTH_REMEDIATION = (
@@ -437,6 +473,56 @@ def _completed_agent_tool_ids(event: dict[str, Any]) -> set[str]:
     }
 
 
+class _LateOutputCollector:
+    """Assemble autonomous Claude turns that arrive while no Hermes turn reads.
+
+    Claude's stream emits the assistant messages of a turn and then one
+    ``result`` record carrying the turn's final text. A late answer is that
+    result text; the assistant text is kept only so a turn cut off before its
+    result (process retired mid-turn) can still be recorded as incomplete.
+    """
+
+    def __init__(self) -> None:
+        self._text_parts: list[str] = []
+
+    def reset(self) -> None:
+        self._text_parts = []
+
+    def feed(self, event: dict[str, Any]) -> Optional[dict[str, Any]]:
+        event_type = event.get("type")
+        if event_type == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                text = _content_text(message.get("content"))
+                if text:
+                    self._text_parts.append(text)
+            return None
+        if event_type != "result":
+            return None
+        text = str(event.get("result") or "").strip() or "\n\n".join(
+            self._text_parts
+        ).strip()
+        self._text_parts = []
+        if not text:
+            return None
+        origin = event.get("origin") if isinstance(event.get("origin"), dict) else {}
+        return {
+            "text": text,
+            "complete": True,
+            "is_error": bool(event.get("is_error")),
+            "claude_session_id": str(event.get("session_id") or ""),
+            "origin": str(origin.get("kind") or ""),
+            "usage": dict(event.get("usage") or {}),
+        }
+
+    def flush_partial(self) -> Optional[dict[str, Any]]:
+        text = "\n\n".join(self._text_parts).strip()
+        self._text_parts = []
+        if not text:
+            return None
+        return {"text": text, "complete": False, "is_error": False}
+
+
 def claude_code_args(
     *,
     model: str,
@@ -535,6 +621,7 @@ class ClaudeCodeSession:
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
         on_watchdog_timeout: Optional[Callable[[dict[str, Any]], None]] = None,
+        on_late_result: Optional[Callable[[dict[str, Any]], None]] = None,
         inactivity_timeout: float = DEFAULT_INACTIVITY_TIMEOUT,
         absolute_timeout: float = DEFAULT_ABSOLUTE_TIMEOUT,
         resident_first_event_timeout: Optional[float] = DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT,
@@ -559,6 +646,19 @@ class ClaudeCodeSession:
         self.on_event = on_event
         self.monitor_grace_seconds: float = DEFAULT_MONITOR_GRACE_SECONDS
         self.monitor_drain_quiet_seconds: float = DEFAULT_MONITOR_DRAIN_QUIET_SECONDS
+        self.background_shell_hold_seconds: float = _background_shell_hold_seconds()
+        # Late answers: output that arrives while no turn is reading stdout.
+        self.on_late_result = on_late_result
+        self.late_answer_log: Optional[str] = _default_late_answer_log()
+        self.late_answer_context: dict[str, Any] = {}
+        self.late_drain_interval_seconds: float = 1.0
+        self._route_lock = threading.Lock()
+        self._turn_reading = False
+        self._late_capture = False
+        self._drain_generation = 0
+        self._late_collector = _LateOutputCollector()
+        self._late_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._late_thread: Optional[threading.Thread] = None
         self.on_session_id = on_session_id
         self.on_watchdog_timeout = on_watchdog_timeout
         self.inactivity_timeout = inactivity_timeout
@@ -782,493 +882,832 @@ class ClaudeCodeSession:
             separators=(",", ":"),
         )
 
+    # --- late answers -------------------------------------------------------
+    #
+    # Between turns nothing reads the CLI's stdout, yet a resident process can
+    # still run whole turns on its own. While no turn is reading, a drain loop
+    # empties the output queue into the late-answer collector; the next turn
+    # quarantines anything that is still queued when it starts and feeds that
+    # to the collector too. One lock covers the hand-over at both ends, and
+    # the stdout reader itself is unchanged, so order is preserved.
+
+    def _drain_between_turns(self, generation: int) -> None:
+        while True:
+            time.sleep(self.late_drain_interval_seconds)
+            with self._route_lock:
+                if (
+                    generation != self._drain_generation
+                    or self._turn_reading
+                    or not self._late_capture
+                ):
+                    return
+                output_queue = self._output_queue
+                get_nowait = getattr(output_queue, "get_nowait", None)
+                if get_nowait is None:
+                    return
+                saw_eof = False
+                while True:
+                    try:
+                        item = get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        saw_eof = True
+                        break
+                    self._capture_late_line_locked(item)
+                if saw_eof:
+                    # The CLI exited or was retired. Keep a turn it was still
+                    # writing, and leave the sentinel for whoever reads next.
+                    output_queue.put(None)
+                    partial = self._late_collector.flush_partial()
+                    if partial:
+                        self._enqueue_late_locked(partial)
+                    return
+                if self._closed and self._process is None:
+                    return
+
+    def _capture_late_line_locked(self, line: str) -> None:
+        if not self._late_capture:
+            return
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(event, dict):
+            self._capture_late_event_locked(event)
+
+    def _capture_late_event_locked(self, event: dict[str, Any]) -> None:
+        if not self._late_capture:
+            return
+        payload = self._late_collector.feed(event)
+        if payload:
+            self._enqueue_late_locked(payload)
+
+    def _capture_late_event(self, event: dict[str, Any]) -> None:
+        with self._route_lock:
+            self._capture_late_event_locked(event)
+
+    def _flush_late_partial(self) -> None:
+        with self._route_lock:
+            if not self._late_capture:
+                self._late_collector.reset()
+                return
+            partial = self._late_collector.flush_partial()
+            if partial:
+                self._enqueue_late_locked(partial)
+
+    def _enqueue_late_locked(self, payload: dict[str, Any]) -> None:
+        record = {
+            **payload,
+            "captured_at": time.time(),
+            "claude_session_id": str(
+                payload.get("claude_session_id") or self.session_id or ""
+            ),
+            "model": self.model,
+            "cwd": self.cwd,
+            **dict(self.late_answer_context),
+        }
+        self._late_queue.put(record)
+        thread = self._late_thread
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(
+                target=self._deliver_late_results,
+                daemon=True,
+                name="claude-late-answers",
+            )
+            self._late_thread = thread
+            thread.start()
+
+    def _deliver_late_results(self) -> None:
+        # Delivery (a log append and a database write) runs off the stdout
+        # reader so a slow write can never stall the CLI's pipe.
+        while True:
+            try:
+                record = self._late_queue.get(timeout=30.0)
+            except queue.Empty:
+                with self._route_lock:
+                    if self._late_queue.empty():
+                        self._late_thread = None
+                        return
+                continue
+            try:
+                self._record_late_result(record)
+            finally:
+                self._late_queue.task_done()
+
+    def _record_late_result(self, record: dict[str, Any]) -> None:
+        logger.warning(
+            "Claude Code produced output after its Hermes turn closed; keeping it "
+            "as a late answer: claude_session=%s complete=%s chars=%d",
+            record.get("claude_session_id"),
+            record.get("complete"),
+            len(str(record.get("text") or "")),
+        )
+        path = self.late_answer_log
+        if path:
+            try:
+                target = Path(path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            except OSError:
+                logger.warning("Could not append the late-answer log", exc_info=True)
+        callback = self.on_late_result
+        if callback is None:
+            return
+        try:
+            callback(dict(record))
+        except Exception:
+            logger.warning("Claude Code late-answer callback failed", exc_info=True)
+
+    def wait_for_late_results(self, timeout: float = 10.0) -> bool:
+        """Block until queued late answers are delivered (tests, shutdown)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._late_queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return self._late_queue.unfinished_tasks == 0
+
+    def _begin_turn_reading(self) -> None:
+        with self._route_lock:
+            self._turn_reading = True
+            self._drain_generation += 1
+
+    def _end_turn_reading(self, *, capture: bool) -> None:
+        """Hand stdout to late capture once a turn stops reading it.
+
+        Anything the CLI writes from here on belongs to a later, autonomous
+        turn. A turn that ended in an error, an interrupt, or a retirement
+        leaves no trustworthy stream to capture from.
+        """
+        with self._route_lock:
+            self._turn_reading = False
+            self._late_capture = capture
+            self._late_collector.reset()
+            self._drain_generation += 1
+            if not capture:
+                return
+            threading.Thread(
+                target=self._drain_between_turns,
+                args=(self._drain_generation,),
+                daemon=True,
+                name="claude-late-drain",
+            ).start()
+
     def run_turn(self, prompt: str) -> ClaudeCodeTurnResult:
         with self._turn_lock:
-            self._interrupt.clear()
-            resident_candidate = self._process if self.is_alive() else None
-            if resident_candidate is not None and self._auth_generation:
-                if not claude_subscription_auth_available(
-                    min_validity_seconds=self.absolute_timeout + 10 * 60
-                ):
-                    raise ClaudeCodeError(
-                        f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
-                        error_code=CLAUDE_AUTH_ERROR_CODE,
+            self._begin_turn_reading()
+            result: Optional[ClaudeCodeTurnResult] = None
+            try:
+                result = self._run_turn_locked(prompt)
+                return result
+            finally:
+                self._end_turn_reading(
+                    capture=bool(
+                        result is not None
+                        and not result.error
+                        and not result.interrupted
+                        and not result.should_retire
                     )
-                current_generation = _current_claude_auth_generation()
-                if (
-                    current_generation
-                    and current_generation != self._auth_generation
-                ):
-                    # A different Hermes/Claude process rotated the shared OAuth
-                    # pair.  Resume through a fresh CLI so this process never
-                    # reaches expiry with its stale in-memory refresh token.
-                    self._retire_process(resident_candidate)
-                    resident_candidate = None
-            process = self._ensure_process()
-            resident_process = process is resident_candidate
-            started_at = time.monotonic()
-            result = ClaudeCodeTurnResult(session_id=self.session_id)
-            reported_session_ids: set[str] = set()
-            attempt = 0
+                )
+
+    def _run_turn_locked(self, prompt: str) -> ClaudeCodeTurnResult:
+        self._interrupt.clear()
+        resident_candidate = self._process if self.is_alive() else None
+        if resident_candidate is not None and self._auth_generation:
+            if not claude_subscription_auth_available(
+                min_validity_seconds=self.absolute_timeout + 10 * 60
+            ):
+                raise ClaudeCodeError(
+                    f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
+                    error_code=CLAUDE_AUTH_ERROR_CODE,
+                )
+            current_generation = _current_claude_auth_generation()
+            if (
+                current_generation
+                and current_generation != self._auth_generation
+            ):
+                # A different Hermes/Claude process rotated the shared OAuth
+                # pair.  Resume through a fresh CLI so this process never
+                # reaches expiry with its stale in-memory refresh token.
+                self._retire_process(resident_candidate)
+                resident_candidate = None
+        process = self._ensure_process()
+        resident_process = process is resident_candidate
+        started_at = time.monotonic()
+        result = ClaudeCodeTurnResult(session_id=self.session_id)
+        reported_session_ids: set[str] = set()
+        attempt = 0
+        prompt_accepted = False
+        stream_synchronized = False
+        transcript_probe = _ClaudeTranscriptPromptProbe.begin(
+            result.session_id, prompt
+        )
+        task_completion_probe = _ClaudeTranscriptTaskCompletionProbe.begin(
+            result.session_id
+        )
+        scheduled_wakeup_tool_ids: set[str] = set()
+        scheduled_wakeup_ready = False
+        waiting_for_scheduled_wakeup = False
+        agent_tool_ids: set[str] = set()
+        pending_background_agent_tool_ids: set[str] = set()
+        waiting_for_background_agents = False
+        # Monitor tool calls made this turn. A Monitor is Claude Code's
+        # "wait for a condition" primitive: its events wake the resident
+        # process between prompts, and nobody reads that output once the
+        # Hermes turn has ended (2026-09-20: a render finished, the model
+        # encoded and shipped it, and the chat never saw any of it). So a
+        # turn with a live Monitor stays open until the Monitor's stream
+        # ends, then drains the mini-turns its queued events produce.
+        monitor_tool_use_ids: set[str] = set()
+        pending_monitors: dict[str, float] = {}  # task id -> deadline
+        task_descriptions: dict[str, str] = {}
+        deferred_final_text = ""
+        monitor_wait_announced = False
+        drain_active = False
+        drain_deadline: Optional[float] = None
+        # Background shell commands (Bash run_in_background) started this
+        # turn. While the model works they only run; if the model hands back
+        # while one still runs, it joins pending_monitors with the hold cap as
+        # its deadline. One that ends before the hand-back may have a queued
+        # notification Claude answers right after the result, so the result
+        # is then drained like a Monitor's.
+        background_shell_tool_ids: dict[str, str] = {}  # tool use id -> label
+        running_shells: dict[str, str] = {}  # task id -> label
+        shell_task_by_tool_id: dict[str, str] = {}
+        held_shell_task_ids: set[str] = set()
+        listed_task_ids: set[str] = set()
+        shell_hold_started_at: Optional[float] = None
+        drain_after_result = False
+
+        def _waiting_for_autonomous_work() -> bool:
+            return bool(
+                waiting_for_scheduled_wakeup
+                or waiting_for_background_agents
+                or pending_background_agent_tool_ids
+                or pending_monitors
+                or drain_active
+            )
+
+        def _emit_hermes_note(record_type: str, **payload: Any) -> None:
+            if self.on_event is None:
+                return
+            try:
+                self.on_event({"type": record_type, **payload})
+            except Exception:
+                logger.debug("Claude on_event note failed", exc_info=True)
+
+        def _release_monitor(task_id: str, why: str) -> None:
+            nonlocal drain_active, drain_deadline
+            if pending_monitors.pop(task_id, None) is None:
+                return
+            logger.info(
+                "Claude Code background task %s ended (%s); %d still pending: session=%s",
+                task_id, why, len(pending_monitors), result.session_id,
+            )
+            if not pending_monitors:
+                drain_active = True
+                drain_deadline = time.monotonic() + self.monitor_drain_quiet_seconds
+
+        def _finish_shell(task_id: str, why: str) -> None:
+            nonlocal drain_after_result
+            if running_shells.pop(task_id, None) is not None:
+                logger.info(
+                    "Claude Code background command %s ended (%s) before the "
+                    "model handed back: session=%s",
+                    task_id, why, result.session_id,
+                )
+                drain_after_result = True
+                return
+            _release_monitor(task_id, why)
+
+        def _handle_system_task_record(event: dict[str, Any]) -> None:
+            subtype = str(event.get("subtype") or "")
+            if subtype == "task_started":
+                task_id = str(event.get("task_id") or "").strip()
+                if task_id:
+                    task_descriptions[task_id] = str(event.get("description") or "")
+                return
+            if subtype in ("task_notification", "task_updated"):
+                task_id = str(event.get("task_id") or "").strip()
+                status = str(
+                    event.get("status")
+                    or (event.get("patch") or {}).get("status")
+                    or ""
+                ).strip().casefold()
+                if status in _TERMINAL_TASK_STATUSES:
+                    if task_id in running_shells:
+                        _finish_shell(task_id, status)
+                    elif task_id in pending_monitors:
+                        _release_monitor(task_id, status)
+                return
+            if subtype == "background_tasks_changed":
+                listed = {
+                    str(task.get("task_id") or "").strip()
+                    for task in (event.get("tasks") or [])
+                    if isinstance(task, dict)
+                }
+                # A shell counts as ended by absence only once the list has
+                # shown it, so a list that omitted it never releases a hold.
+                previously_listed = set(listed_task_ids)
+                listed_task_ids.update(listed)
+                for task_id in list(running_shells):
+                    if task_id not in listed and task_id in previously_listed:
+                        _finish_shell(task_id, "no longer listed")
+                for task_id in list(pending_monitors):
+                    if task_id in listed:
+                        continue
+                    if (
+                        task_id in held_shell_task_ids
+                        and task_id not in previously_listed
+                    ):
+                        continue
+                    _release_monitor(task_id, "no longer listed")
+
+        def _write_prompt(target: subprocess.Popen[str]) -> None:
+            assert target.stdin is not None
+            try:
+                target.stdin.write(self._user_record(prompt) + "\n")
+                target.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                if self._process is target:
+                    self._process = None
+                raise ClaudeCodeError("Claude Code input stream closed") from exc
+
+        def _observe_session_id(value: Any) -> None:
+            confirmed_id = str(value or "").strip()
+            if not confirmed_id:
+                return
+            self.session_id = confirmed_id
+            self._confirmed = True
+            self.resume = True
+            result.session_id = confirmed_id
+
+        def _publish_session_id() -> None:
+            confirmed_id = str(result.session_id or self.session_id or "").strip()
+            if not confirmed_id:
+                return
+            result.session_confirmed = True
+            if confirmed_id in reported_session_ids:
+                return
+            reported_session_ids.add(confirmed_id)
+            if self.on_session_id is not None:
+                try:
+                    self.on_session_id(confirmed_id)
+                except Exception:
+                    logger.warning(
+                        "Claude Code session-id callback failed", exc_info=True
+                    )
+
+        def _notify_watchdog(*, timeout: float, retrying: bool) -> None:
+            payload = {
+                "code": "claude_first_event_timeout",
+                "attempt": attempt + 1,
+                "retrying": retrying,
+                "timeout_seconds": timeout,
+                "session_id": result.session_id,
+            }
+            logger.warning(
+                "Claude Code first-event watchdog expired: "
+                "attempt=%d retrying=%s timeout_seconds=%.1f session=%s pid=%s "
+                "debug_file=%s stderr_tail=%s",
+                attempt + 1,
+                retrying,
+                timeout,
+                result.session_id,
+                process.pid,
+                self._debug_file,
+                (" | ".join(self._stderr_tail).strip() or "<empty>")[-2000:],
+            )
+            if self.on_watchdog_timeout is not None:
+                try:
+                    self.on_watchdog_timeout(payload)
+                except Exception:
+                    logger.warning(
+                        "Claude Code watchdog callback failed", exc_info=True
+                    )
+
+        def _dispatch(
+            target: subprocess.Popen[str], *, resident: bool
+        ) -> tuple[float, float, Optional[float]]:
+            nonlocal process
+            nonlocal prompt_accepted, stream_synchronized, transcript_probe
+            process = target
             prompt_accepted = False
             stream_synchronized = False
             transcript_probe = _ClaudeTranscriptPromptProbe.begin(
                 result.session_id, prompt
             )
-            task_completion_probe = _ClaudeTranscriptTaskCompletionProbe.begin(
-                result.session_id
+            _write_prompt(target)
+            dispatched_at = time.monotonic()
+            timeout = (
+                self.resident_first_event_timeout
+                if resident
+                else self.startup_first_event_timeout
             )
-            scheduled_wakeup_tool_ids: set[str] = set()
-            scheduled_wakeup_ready = False
-            waiting_for_scheduled_wakeup = False
-            agent_tool_ids: set[str] = set()
-            pending_background_agent_tool_ids: set[str] = set()
-            waiting_for_background_agents = False
-            # Monitor tool calls made this turn. A Monitor is Claude Code's
-            # "wait for a condition" primitive: its events wake the resident
-            # process between prompts, and nobody reads that output once the
-            # Hermes turn has ended (2026-09-20: a render finished, the model
-            # encoded and shipped it, and the chat never saw any of it). So a
-            # turn with a live Monitor stays open until the Monitor's stream
-            # ends, then drains the mini-turns its queued events produce.
-            monitor_tool_use_ids: set[str] = set()
-            pending_monitors: dict[str, float] = {}  # task id -> deadline
-            task_descriptions: dict[str, str] = {}
-            deferred_final_text = ""
-            monitor_wait_announced = False
-            drain_active = False
-            drain_deadline: Optional[float] = None
+            return dispatched_at, dispatched_at, timeout
 
-            def _waiting_for_autonomous_work() -> bool:
-                return bool(
-                    waiting_for_scheduled_wakeup
-                    or waiting_for_background_agents
-                    or pending_background_agent_tool_ids
-                    or pending_monitors
-                    or drain_active
+        attempt_started_at, last_activity, first_event_timeout = _dispatch(
+            process, resident=resident_process
+        )
+
+        while True:
+            if self._interrupt.is_set():
+                result.interrupted = True
+                result.should_retire = True
+                break
+            now = time.monotonic()
+            if now - started_at > self.absolute_timeout:
+                result.error = f"Claude Code exceeded the {self.absolute_timeout:g}-second turn limit"
+                result.should_retire = True
+                break
+            if not prompt_accepted and transcript_probe.acknowledged():
+                prompt_accepted = True
+                result.prompt_acknowledged = True
+                _publish_session_id()
+            wait_timeout = 0.5
+            if first_event_timeout is not None and not prompt_accepted:
+                wait_timeout = min(
+                    wait_timeout,
+                    max(0.01, first_event_timeout - (now - attempt_started_at)),
                 )
-
-            def _emit_hermes_note(record_type: str, **payload: Any) -> None:
-                if self.on_event is None:
-                    return
-                try:
-                    self.on_event({"type": record_type, **payload})
-                except Exception:
-                    logger.debug("Claude on_event note failed", exc_info=True)
-
-            def _release_monitor(task_id: str, why: str) -> None:
-                nonlocal drain_active, drain_deadline
-                if pending_monitors.pop(task_id, None) is None:
-                    return
-                logger.info(
-                    "Claude Code monitor %s ended (%s); %d still pending: session=%s",
-                    task_id, why, len(pending_monitors), result.session_id,
+            if not _waiting_for_autonomous_work():
+                wait_timeout = min(
+                    wait_timeout,
+                    max(0.01, self.inactivity_timeout - (now - last_activity)),
                 )
-                if not pending_monitors:
-                    drain_active = True
-                    drain_deadline = time.monotonic() + self.monitor_drain_quiet_seconds
-
-            def _handle_system_task_record(event: dict[str, Any]) -> None:
-                subtype = str(event.get("subtype") or "")
-                if subtype == "task_started":
-                    task_id = str(event.get("task_id") or "").strip()
-                    if task_id:
-                        task_descriptions[task_id] = str(event.get("description") or "")
-                    return
-                if subtype in ("task_notification", "task_updated"):
-                    task_id = str(event.get("task_id") or "").strip()
-                    status = str(
-                        event.get("status")
-                        or (event.get("patch") or {}).get("status")
-                        or ""
-                    ).strip().casefold()
-                    if task_id in pending_monitors and status in _TERMINAL_TASK_STATUSES:
-                        _release_monitor(task_id, status)
-                    return
-                if subtype == "background_tasks_changed":
-                    listed = {
-                        str(task.get("task_id") or "").strip()
-                        for task in (event.get("tasks") or [])
-                        if isinstance(task, dict)
-                    }
-                    for task_id in list(pending_monitors):
-                        if task_id not in listed:
-                            _release_monitor(task_id, "no longer listed")
-
-            def _write_prompt(target: subprocess.Popen[str]) -> None:
-                assert target.stdin is not None
-                try:
-                    target.stdin.write(self._user_record(prompt) + "\n")
-                    target.stdin.flush()
-                except (BrokenPipeError, OSError) as exc:
-                    if self._process is target:
-                        self._process = None
-                    raise ClaudeCodeError("Claude Code input stream closed") from exc
-
-            def _observe_session_id(value: Any) -> None:
-                confirmed_id = str(value or "").strip()
-                if not confirmed_id:
-                    return
-                self.session_id = confirmed_id
-                self._confirmed = True
-                self.resume = True
-                result.session_id = confirmed_id
-
-            def _publish_session_id() -> None:
-                confirmed_id = str(result.session_id or self.session_id or "").strip()
-                if not confirmed_id:
-                    return
-                result.session_confirmed = True
-                if confirmed_id in reported_session_ids:
-                    return
-                reported_session_ids.add(confirmed_id)
-                if self.on_session_id is not None:
-                    try:
-                        self.on_session_id(confirmed_id)
-                    except Exception:
-                        logger.warning(
-                            "Claude Code session-id callback failed", exc_info=True
-                        )
-
-            def _notify_watchdog(*, timeout: float, retrying: bool) -> None:
-                payload = {
-                    "code": "claude_first_event_timeout",
-                    "attempt": attempt + 1,
-                    "retrying": retrying,
-                    "timeout_seconds": timeout,
-                    "session_id": result.session_id,
-                }
-                logger.warning(
-                    "Claude Code first-event watchdog expired: "
-                    "attempt=%d retrying=%s timeout_seconds=%.1f session=%s pid=%s "
-                    "debug_file=%s stderr_tail=%s",
-                    attempt + 1,
-                    retrying,
-                    timeout,
-                    result.session_id,
-                    process.pid,
-                    self._debug_file,
-                    (" | ".join(self._stderr_tail).strip() or "<empty>")[-2000:],
-                )
-                if self.on_watchdog_timeout is not None:
-                    try:
-                        self.on_watchdog_timeout(payload)
-                    except Exception:
-                        logger.warning(
-                            "Claude Code watchdog callback failed", exc_info=True
-                        )
-
-            def _dispatch(
-                target: subprocess.Popen[str], *, resident: bool
-            ) -> tuple[float, float, Optional[float]]:
-                nonlocal process
-                nonlocal prompt_accepted, stream_synchronized, transcript_probe
-                process = target
-                prompt_accepted = False
-                stream_synchronized = False
-                transcript_probe = _ClaudeTranscriptPromptProbe.begin(
-                    result.session_id, prompt
-                )
-                _write_prompt(target)
-                dispatched_at = time.monotonic()
-                timeout = (
-                    self.resident_first_event_timeout
-                    if resident
-                    else self.startup_first_event_timeout
-                )
-                return dispatched_at, dispatched_at, timeout
-
-            attempt_started_at, last_activity, first_event_timeout = _dispatch(
-                process, resident=resident_process
-            )
-
-            while True:
-                if self._interrupt.is_set():
-                    result.interrupted = True
-                    result.should_retire = True
-                    break
+            try:
+                line = self._output_queue.get(timeout=wait_timeout)
+            except queue.Empty:
                 now = time.monotonic()
-                if now - started_at > self.absolute_timeout:
-                    result.error = f"Claude Code exceeded the {self.absolute_timeout:g}-second turn limit"
-                    result.should_retire = True
-                    break
                 if not prompt_accepted and transcript_probe.acknowledged():
                     prompt_accepted = True
                     result.prompt_acknowledged = True
                     _publish_session_id()
-                wait_timeout = 0.5
-                if first_event_timeout is not None and not prompt_accepted:
-                    wait_timeout = min(
-                        wait_timeout,
-                        max(0.01, first_event_timeout - (now - attempt_started_at)),
+                if (
+                    first_event_timeout is not None
+                    and not prompt_accepted
+                    and now - attempt_started_at >= first_event_timeout
+                ):
+                    retrying = attempt == 0
+                    _notify_watchdog(
+                        timeout=first_event_timeout,
+                        retrying=retrying,
                     )
-                if not _waiting_for_autonomous_work():
-                    wait_timeout = min(
-                        wait_timeout,
-                        max(0.01, self.inactivity_timeout - (now - last_activity)),
-                    )
-                try:
-                    line = self._output_queue.get(timeout=wait_timeout)
-                except queue.Empty:
-                    now = time.monotonic()
-                    if not prompt_accepted and transcript_probe.acknowledged():
-                        prompt_accepted = True
-                        result.prompt_acknowledged = True
-                        _publish_session_id()
-                    if (
-                        first_event_timeout is not None
-                        and not prompt_accepted
-                        and now - attempt_started_at >= first_event_timeout
-                    ):
-                        retrying = attempt == 0
-                        _notify_watchdog(
-                            timeout=first_event_timeout,
-                            retrying=retrying,
+                    if not retrying:
+                        result.error_code = "claude_first_event_timeout"
+                        result.error = (
+                            "Claude Code did not acknowledge the turn after "
+                            "the runtime was reset"
                         )
-                        if not retrying:
-                            result.error_code = "claude_first_event_timeout"
-                            result.error = (
-                                "Claude Code did not acknowledge the turn after "
-                                "the runtime was reset"
-                            )
-                            result.should_retire = True
-                            break
-                        reaped = self._retire_process(
-                            process, grace_seconds=2.0
-                        )
-                        if not reaped:
-                            result.error_code = "claude_runtime_reap_timeout"
-                            result.error = (
-                                "Claude Code did not acknowledge the turn and its "
-                                "stalled runtime could not be stopped safely"
-                            )
-                            result.should_retire = True
-                            break
-                        if self._interrupt.is_set():
-                            result.interrupted = True
-                            result.should_retire = True
-                            break
-                        attempt += 1
-                        result.watchdog_retries += 1
-                        process = self._start_process()
-                        attempt_started_at, last_activity, first_event_timeout = _dispatch(
-                            process, resident=False
-                        )
-                        continue
-                    if drain_active and drain_deadline is not None and now >= drain_deadline:
-                        # The Monitor's stream ended and its queued events have
-                        # produced no further activity: the last result stands.
-                        result.final_text = deferred_final_text
-                        drain_active = False
-                        break
-                    if pending_monitors and all(
-                        now >= deadline for deadline in pending_monitors.values()
-                    ):
-                        # Every Monitor outlived its own timeout without a
-                        # terminal notification. Finish with what the model
-                        # last said instead of holding the session forever.
-                        expired = ", ".join(sorted(pending_monitors))
-                        pending_monitors.clear()
-                        note = (
-                            "[Hermes stopped waiting for background monitor "
-                            f"{expired}: it passed its own timeout without "
-                            "reporting an end. Check its log before trusting "
-                            "the result.]"
-                        )
-                        _emit_hermes_note(HERMES_MONITOR_NOTE, text=note)
-                        result.final_text = (
-                            f"{deferred_final_text}\n\n{note}".strip()
-                            if deferred_final_text
-                            else note
-                        )
-                        break
-                    if (
-                        not _waiting_for_autonomous_work()
-                        and now - last_activity >= self.inactivity_timeout
-                    ):
-                        result.error = "Claude Code produced no activity for ten minutes"
                         result.should_retire = True
                         break
-                    continue
-                if line is None:
-                    code = process.poll()
-                    detail = "\n".join(self._stderr_tail).strip()
-                    result.error = detail or f"Claude Code exited {code}"
-                    result.should_retire = True
-                    break
-                last_activity = time.monotonic()
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                _observe_session_id(event.get("session_id"))
-                event_type = event.get("type")
-                auth_failure = _auth_failure_detail(event)
-                if auth_failure:
-                    result.prompt_acknowledged = True
-                    result.error_code = CLAUDE_AUTH_ERROR_CODE
-                    result.error = f"{auth_failure.rstrip('.')}. {CLAUDE_AUTH_REMEDIATION}"
-                    result.should_retire = True
-                    break
-                if not stream_synchronized:
-                    if not _is_prompt_replay(event, prompt):
-                        logger.debug(
-                            "Quarantining Claude output emitted before the current "
-                            "prompt replay: session=%s type=%s",
-                            result.session_id,
-                            event_type,
-                        )
-                        continue
-                    stream_synchronized = True
-                    prompt_accepted = True
-                    result.prompt_acknowledged = True
-                    _publish_session_id()
-                if self.on_event is not None:
-                    self.on_event(event)
-                if drain_active and event_type != "result":
-                    # A mini-turn is in progress; wait for its result.
-                    drain_deadline = None
-                if event_type == "system":
-                    _handle_system_task_record(event)
-                message = (
-                    event.get("message")
-                    if isinstance(event.get("message"), dict)
-                    else {}
-                )
-                blocks = message.get("content") or []
-                if not isinstance(blocks, list):
-                    blocks = []
-                if event_type == "assistant":
-                    for block in blocks:
-                        if not isinstance(block, dict) or block.get("type") != "tool_use":
-                            continue
-                        tool_use_id = str(block.get("id") or "").strip()
-                        tool_name = str(block.get("name") or "").casefold()
-                        if tool_use_id and tool_name == "schedulewakeup":
-                            scheduled_wakeup_tool_ids.add(tool_use_id)
-                        elif tool_use_id and tool_name == "agent":
-                            agent_tool_ids.add(tool_use_id)
-                        elif tool_use_id and tool_name == "monitor":
-                            monitor_tool_use_ids.add(tool_use_id)
-                completed_agent_tool_ids = _completed_agent_tool_ids(event)
-                completed_agent_tool_ids.update(
-                    task_completion_probe.completed_agent_tool_ids()
-                )
-                if completed_agent_tool_ids:
-                    pending_background_agent_tool_ids.difference_update(
-                        completed_agent_tool_ids
+                    reaped = self._retire_process(
+                        process, grace_seconds=2.0
                     )
-                if event_type == "user":
-                    for block in blocks:
-                        if not isinstance(block, dict) or block.get("type") != "tool_result":
-                            continue
-                        result.tool_iterations += 1
-                        tool_use_id = str(block.get("tool_use_id") or "").strip()
-                        if tool_use_id in agent_tool_ids:
-                            agent_tool_ids.discard(tool_use_id)
-                            if (
-                                not block.get("is_error")
-                                and _is_async_agent_launch_result(block)
-                            ):
-                                pending_background_agent_tool_ids.add(tool_use_id)
-                        if tool_use_id in scheduled_wakeup_tool_ids:
-                            scheduled_wakeup_tool_ids.discard(tool_use_id)
-                            if not block.get("is_error"):
-                                scheduled_wakeup_ready = True
-                        if tool_use_id in monitor_tool_use_ids:
-                            monitor_tool_use_ids.discard(tool_use_id)
-                            started = _MONITOR_STARTED_RE.search(
-                                _content_text(block.get("content"))
-                                or str(block.get("content") or "")
-                            )
-                            if started and not block.get("is_error"):
-                                task_id = started.group(1)
-                                timeout_seconds = int(started.group(2)) / 1000.0
-                                pending_monitors[task_id] = (
-                                    time.monotonic()
-                                    + timeout_seconds
-                                    + self.monitor_grace_seconds
-                                )
-                                drain_active = False
-                                drain_deadline = None
-                                description = task_descriptions.get(task_id, "")
-                                minutes = max(1, int(round(timeout_seconds / 60)))
-                                _emit_hermes_note(
-                                    HERMES_MONITOR_NOTE,
-                                    text=(
-                                        "Waiting on a background monitor"
-                                        + (f": {description}" if description else "")
-                                        + f" (task {task_id}, up to {minutes} min). "
-                                        "This turn stays open until it reports."
-                                    ),
-                                )
-                if event_type != "result":
+                    if not reaped:
+                        result.error_code = "claude_runtime_reap_timeout"
+                        result.error = (
+                            "Claude Code did not acknowledge the turn and its "
+                            "stalled runtime could not be stopped safely"
+                        )
+                        result.should_retire = True
+                        break
+                    if self._interrupt.is_set():
+                        result.interrupted = True
+                        result.should_retire = True
+                        break
+                    attempt += 1
+                    result.watchdog_retries += 1
+                    process = self._start_process()
+                    attempt_started_at, last_activity, first_event_timeout = _dispatch(
+                        process, resident=False
+                    )
                     continue
-                result.final_text = str(event.get("result") or "").strip()
-                _observe_session_id(event.get("session_id"))
+                if drain_active and drain_deadline is not None and now >= drain_deadline:
+                    # The Monitor's stream ended and its queued events have
+                    # produced no further activity: the last result stands.
+                    result.final_text = deferred_final_text
+                    drain_active = False
+                    break
+                if pending_monitors and all(
+                    now >= deadline for deadline in pending_monitors.values()
+                ):
+                    # Every Monitor outlived its own timeout without a
+                    # terminal notification. Finish with what the model
+                    # last said instead of holding the session forever.
+                    expired_monitors = sorted(
+                        task_id for task_id in pending_monitors
+                        if task_id not in held_shell_task_ids
+                    )
+                    expired_shells = sorted(
+                        task_id for task_id in pending_monitors
+                        if task_id in held_shell_task_ids
+                    )
+                    pending_monitors.clear()
+                    notes = []
+                    if expired_monitors:
+                        notes.append(
+                            "[Hermes stopped waiting for background monitor "
+                            f"{', '.join(expired_monitors)}: it passed its own "
+                            "timeout without reporting an end. Check its log "
+                            "before trusting the result.]"
+                        )
+                    if expired_shells:
+                        held_minutes = max(
+                            1,
+                            int(round((now - (shell_hold_started_at or now)) / 60)),
+                        )
+                        notes.append(
+                            "[Hermes stopped holding this turn for background "
+                            f"command {', '.join(expired_shells)} after "
+                            f"{held_minutes} min. It may still be running; "
+                            "anything Claude reports about it later is saved "
+                            "to this conversation as a late answer.]"
+                        )
+                    note = " ".join(notes)
+                    _emit_hermes_note(HERMES_MONITOR_NOTE, text=note)
+                    result.final_text = (
+                        f"{deferred_final_text}\n\n{note}".strip()
+                        if deferred_final_text
+                        else note
+                    )
+                    break
+                if (
+                    not _waiting_for_autonomous_work()
+                    and now - last_activity >= self.inactivity_timeout
+                ):
+                    result.error = "Claude Code produced no activity for ten minutes"
+                    result.should_retire = True
+                    break
+                continue
+            if line is None:
+                code = process.poll()
+                detail = "\n".join(self._stderr_tail).strip()
+                result.error = detail or f"Claude Code exited {code}"
+                result.should_retire = True
+                break
+            last_activity = time.monotonic()
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            _observe_session_id(event.get("session_id"))
+            event_type = event.get("type")
+            auth_failure = _auth_failure_detail(event)
+            if auth_failure:
+                result.prompt_acknowledged = True
+                result.error_code = CLAUDE_AUTH_ERROR_CODE
+                result.error = f"{auth_failure.rstrip('.')}. {CLAUDE_AUTH_REMEDIATION}"
+                result.should_retire = True
+                break
+            if not stream_synchronized:
+                if not _is_prompt_replay(event, prompt):
+                    logger.debug(
+                        "Quarantining Claude output emitted before the current "
+                        "prompt replay: session=%s type=%s",
+                        result.session_id,
+                        event_type,
+                    )
+                    # Not this turn's output, but not noise either: an
+                    # autonomous turn that finished after the last Hermes turn
+                    # closed. Keep it as a late answer.
+                    self._capture_late_event(event)
+                    continue
+                stream_synchronized = True
+                self._flush_late_partial()
+                prompt_accepted = True
+                result.prompt_acknowledged = True
                 _publish_session_id()
-                result.usage = _merge_usage(
-                    result.usage, dict(event.get("usage") or {})
+            if self.on_event is not None:
+                self.on_event(event)
+            if drain_active and event_type != "result":
+                # A mini-turn is in progress; wait for its result.
+                drain_deadline = None
+            if event_type == "system":
+                _handle_system_task_record(event)
+            message = (
+                event.get("message")
+                if isinstance(event.get("message"), dict)
+                else {}
+            )
+            blocks = message.get("content") or []
+            if not isinstance(blocks, list):
+                blocks = []
+            if event_type == "assistant":
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    tool_use_id = str(block.get("id") or "").strip()
+                    tool_name = str(block.get("name") or "").casefold()
+                    if tool_use_id and tool_name == "schedulewakeup":
+                        scheduled_wakeup_tool_ids.add(tool_use_id)
+                    elif tool_use_id and tool_name == "agent":
+                        agent_tool_ids.add(tool_use_id)
+                    elif tool_use_id and tool_name == "monitor":
+                        monitor_tool_use_ids.add(tool_use_id)
+                    elif tool_use_id and tool_name == "bash":
+                        tool_input = (
+                            block.get("input")
+                            if isinstance(block.get("input"), dict)
+                            else {}
+                        )
+                        if (
+                            tool_input.get("run_in_background")
+                            and self.background_shell_hold_seconds > 0
+                        ):
+                            background_shell_tool_ids[tool_use_id] = str(
+                                tool_input.get("description")
+                                or tool_input.get("command")
+                                or ""
+                            ).strip()[:120]
+            completed_agent_tool_ids = _completed_agent_tool_ids(event)
+            completed_agent_tool_ids.update(
+                task_completion_probe.completed_agent_tool_ids()
+            )
+            if completed_agent_tool_ids:
+                pending_background_agent_tool_ids.difference_update(
+                    completed_agent_tool_ids
                 )
-                if event.get("is_error"):
-                    result.error = result.final_text or "Claude Code returned an error"
-                if not result.error and pending_background_agent_tool_ids:
-                    waiting_for_background_agents = True
+                for completed_tool_id in completed_agent_tool_ids:
+                    shell_task_id = shell_task_by_tool_id.get(completed_tool_id)
+                    if shell_task_id and (
+                        shell_task_id in running_shells
+                        or shell_task_id in pending_monitors
+                    ):
+                        _finish_shell(shell_task_id, "completed")
+            if event_type == "user":
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    result.tool_iterations += 1
+                    tool_use_id = str(block.get("tool_use_id") or "").strip()
+                    if tool_use_id in agent_tool_ids:
+                        agent_tool_ids.discard(tool_use_id)
+                        if (
+                            not block.get("is_error")
+                            and _is_async_agent_launch_result(block)
+                        ):
+                            pending_background_agent_tool_ids.add(tool_use_id)
+                    if tool_use_id in scheduled_wakeup_tool_ids:
+                        scheduled_wakeup_tool_ids.discard(tool_use_id)
+                        if not block.get("is_error"):
+                            scheduled_wakeup_ready = True
+                    if tool_use_id in monitor_tool_use_ids:
+                        monitor_tool_use_ids.discard(tool_use_id)
+                        started = _MONITOR_STARTED_RE.search(
+                            _content_text(block.get("content"))
+                            or str(block.get("content") or "")
+                        )
+                        if started and not block.get("is_error"):
+                            task_id = started.group(1)
+                            timeout_seconds = int(started.group(2)) / 1000.0
+                            pending_monitors[task_id] = (
+                                time.monotonic()
+                                + timeout_seconds
+                                + self.monitor_grace_seconds
+                            )
+                            drain_active = False
+                            drain_deadline = None
+                            description = task_descriptions.get(task_id, "")
+                            minutes = max(1, int(round(timeout_seconds / 60)))
+                            _emit_hermes_note(
+                                HERMES_MONITOR_NOTE,
+                                text=(
+                                    "Waiting on a background monitor"
+                                    + (f": {description}" if description else "")
+                                    + f" (task {task_id}, up to {minutes} min). "
+                                    "This turn stays open until it reports."
+                                ),
+                            )
+                    if tool_use_id in background_shell_tool_ids:
+                        label = background_shell_tool_ids.pop(tool_use_id)
+                        started = _BACKGROUND_SHELL_STARTED_RE.search(
+                            _content_text(block.get("content"))
+                            or str(block.get("content") or "")
+                        )
+                        if started and not block.get("is_error"):
+                            shell_task_id = started.group(1)
+                            running_shells[shell_task_id] = (
+                                task_descriptions.get(shell_task_id) or label
+                            )
+                            shell_task_by_tool_id[tool_use_id] = shell_task_id
+            if event_type != "result":
+                continue
+            result.final_text = str(event.get("result") or "").strip()
+            _observe_session_id(event.get("session_id"))
+            _publish_session_id()
+            result.usage = _merge_usage(
+                result.usage, dict(event.get("usage") or {})
+            )
+            if event.get("is_error"):
+                result.error = result.final_text or "Claude Code returned an error"
+            if not result.error and pending_background_agent_tool_ids:
+                waiting_for_background_agents = True
+                logger.info(
+                    "Claude Code has %d native background agent(s) outstanding; "
+                    "keeping the current Hermes turn open: session=%s pid=%s",
+                    len(pending_background_agent_tool_ids),
+                    result.session_id,
+                    process.pid,
+                )
+                result.final_text = ""
+                continue
+            if waiting_for_background_agents:
+                if not result.final_text:
+                    continue
+                waiting_for_background_agents = False
+            if not result.error and running_shells:
+                # The model handed back while background commands it started
+                # still run: hold the turn until they end, within the cap and
+                # always before the absolute turn limit would kill them.
+                hold_now = time.monotonic()
+                hold_until = max(
+                    hold_now,
+                    min(
+                        hold_now + self.background_shell_hold_seconds,
+                        started_at + self.absolute_timeout - 60.0,
+                    ),
+                )
+                labels = []
+                for shell_task_id, label in running_shells.items():
+                    pending_monitors[shell_task_id] = hold_until
+                    held_shell_task_ids.add(shell_task_id)
+                    labels.append(
+                        f"{label} (task {shell_task_id})" if label else f"task {shell_task_id}"
+                    )
+                running_shells.clear()
+                if shell_hold_started_at is None:
+                    shell_hold_started_at = hold_now
+                drain_active = False
+                drain_deadline = None
+                drain_after_result = False
+                minutes = max(1, int(round((hold_until - hold_now) / 60)))
+                plural = len(labels) > 1
+                _emit_hermes_note(
+                    HERMES_MONITOR_NOTE,
+                    text=(
+                        f"Waiting on background command{'s' if plural else ''}: "
+                        + "; ".join(labels)
+                        + f" (up to {minutes} min). This turn stays open until "
+                        + ("they end." if plural else "it ends.")
+                    ),
+                )
+                logger.info(
+                    "Claude Code handed back while %d background command(s) run; "
+                    "keeping the current Hermes turn open for up to %.0fs: "
+                    "session=%s pid=%s",
+                    len(labels),
+                    hold_until - hold_now,
+                    result.session_id,
+                    process.pid,
+                )
+            if drain_after_result and not result.error:
+                drain_after_result = False
+                drain_active = True
+            if not result.error and (pending_monitors or drain_active):
+                # Hold this result: the model handed control back while a
+                # Monitor it started is still watching (or its trailing
+                # events are still being processed). Its text stays
+                # visible as commentary; the turn's answer is whatever it
+                # says once the Monitor has reported.
+                if result.final_text:
+                    deferred_final_text = result.final_text
+                _emit_hermes_note(HERMES_RESULT_DEFERRED)
+                if pending_monitors and not monitor_wait_announced:
+                    monitor_wait_announced = True
                     logger.info(
-                        "Claude Code has %d native background agent(s) outstanding; "
+                        "Claude Code handed back while %d monitor(s) run; "
                         "keeping the current Hermes turn open: session=%s pid=%s",
-                        len(pending_background_agent_tool_ids),
+                        len(pending_monitors),
                         result.session_id,
                         process.pid,
                     )
-                    result.final_text = ""
-                    continue
-                if waiting_for_background_agents:
-                    if not result.final_text:
-                        continue
-                    waiting_for_background_agents = False
-                if not result.error and (pending_monitors or drain_active):
-                    # Hold this result: the model handed control back while a
-                    # Monitor it started is still watching (or its trailing
-                    # events are still being processed). Its text stays
-                    # visible as commentary; the turn's answer is whatever it
-                    # says once the Monitor has reported.
-                    if result.final_text:
-                        deferred_final_text = result.final_text
-                    _emit_hermes_note(HERMES_RESULT_DEFERRED)
-                    if pending_monitors and not monitor_wait_announced:
-                        monitor_wait_announced = True
-                        logger.info(
-                            "Claude Code handed back while %d monitor(s) run; "
-                            "keeping the current Hermes turn open: session=%s pid=%s",
-                            len(pending_monitors),
-                            result.session_id,
-                            process.pid,
-                        )
-                    if drain_active:
-                        drain_deadline = time.monotonic() + self.monitor_drain_quiet_seconds
-                    result.final_text = ""
-                    continue
-                if result.error or result.final_text:
-                    break
-                if scheduled_wakeup_ready or waiting_for_scheduled_wakeup:
-                    if not waiting_for_scheduled_wakeup:
-                        logger.info(
-                            "Claude Code scheduled an autonomous continuation; "
-                            "keeping the current Hermes turn open: session=%s pid=%s",
-                            result.session_id,
-                            process.pid,
-                        )
-                    scheduled_wakeup_ready = False
-                    waiting_for_scheduled_wakeup = True
-                    continue
+                if drain_active:
+                    drain_deadline = time.monotonic() + self.monitor_drain_quiet_seconds
+                result.final_text = ""
+                continue
+            if result.error or result.final_text:
                 break
+            if scheduled_wakeup_ready or waiting_for_scheduled_wakeup:
+                if not waiting_for_scheduled_wakeup:
+                    logger.info(
+                        "Claude Code scheduled an autonomous continuation; "
+                        "keeping the current Hermes turn open: session=%s pid=%s",
+                        result.session_id,
+                        process.pid,
+                    )
+                scheduled_wakeup_ready = False
+                waiting_for_scheduled_wakeup = True
+                continue
+            break
 
-            if not result.final_text and not result.error and not result.interrupted:
-                result.error = "Claude Code completed without an authoritative final answer"
-                result.should_retire = True
-            if result.should_retire:
-                self.close()
-            return result
+        if not result.final_text and not result.error and not result.interrupted:
+            result.error = "Claude Code completed without an authoritative final answer"
+            result.should_retire = True
+        if result.should_retire:
+            self.close()
+        return result
