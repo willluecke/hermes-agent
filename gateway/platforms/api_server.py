@@ -515,8 +515,6 @@ _RUNTIME_AGENT_OVERRIDE_KEYS = (
     "credential_pool",
     "max_tokens",
 )
-
-
 def _clean_request_string(value: Any) -> Optional[str]:
     """Return a stripped request string, or None for absent/non-string values."""
     if not isinstance(value, str):
@@ -3372,6 +3370,21 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 current_count = None
 
+        # Rows past the checkpoint that are all late answers leave the agent
+        # coherent. Checked outside the cache lock (it reads the session DB),
+        # so it vouches only for the checkpoint it was made against.
+        late_answers_from = None
+        if session_id and isinstance(current_count, int):
+            with cache_lock:
+                peeked = cache.get(cache_key)
+            peeked_count = (
+                peeked[2] if isinstance(peeked, tuple) and len(peeked) > 2 else None
+            )
+            if self._only_late_answers_since(
+                session_id, peeked_count, current_count
+            ):
+                late_answers_from = peeked_count
+
         evicted_agent = None
         agent = None
         with cache_lock:
@@ -3386,10 +3399,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     or cached_session_id == session_id
                     or getattr(cached_agent, "session_id", None) == session_id
                 )
+                only_late_answers = bool(
+                    late_answers_from is not None
+                    and cached_count == late_answers_from
+                )
                 transcript_current = bool(
                     cached_count is None
                     or current_count is None
                     or cached_count == current_count
+                    or only_late_answers
                 )
                 if (
                     cached_signature == signature
@@ -3397,6 +3415,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     and transcript_current
                 ):
                     agent = cached_agent
+                    if only_late_answers:
+                        cache[cache_key] = (
+                            *entry[:2],
+                            current_count,
+                            *entry[3:],
+                        )
                     if hasattr(cache, "move_to_end"):
                         cache.move_to_end(cache_key)
                 else:
@@ -3444,6 +3468,49 @@ class APIServerAdapter(BasePlatformAdapter):
                 if field in agent_kwargs:
                     setattr(agent, field, agent_kwargs[field])
         return agent, reused
+
+    def _only_late_answers_since(
+        self, session_id: str, checkpoint: Any, current_count: Any
+    ) -> bool:
+        """Whether every row added since ``checkpoint`` is a late Claude answer.
+
+        The resident Claude Code CLI writes a late answer itself, after its
+        Hermes turn closed (agent.claude_runtime.save_claude_late_answer), so
+        the transcript grew without leaving the agent behind; the continuity
+        fingerprint skips those rows for the same reason. Treating one as
+        drift would evict the agent on the next turn, and eviction kills the
+        CLI along with any workflow or background agent it still runs.
+        """
+        if not isinstance(checkpoint, int) or not isinstance(current_count, int):
+            return False
+        if current_count <= checkpoint:
+            return False
+        try:
+            from hermes_state import LATE_ANSWER_DISPLAY_KIND
+
+            db = self._ensure_session_db()
+            count = current_count
+            # A late answer can land between the count and the tail read, and
+            # would push the oldest new row, possibly real drift, out of the
+            # window. Appends only raise the count (a rewind or reset lowers
+            # it, which is drift), so an unchanged count after the read proves
+            # the window held exactly the rows added since the checkpoint.
+            for _ in range(3):
+                kinds = db.newest_message_display_kinds(
+                    session_id, count - checkpoint
+                )
+                row = db.get_session(session_id)
+                settled = row.get("message_count") if row else None
+                if settled == count:
+                    return len(kinds) == count - checkpoint and all(
+                        kind == LATE_ANSWER_DISPLAY_KIND for kind in kinds
+                    )
+                if not isinstance(settled, int) or settled < count:
+                    return False
+                count = settled
+        except Exception:
+            return False
+        return False
 
     def _refresh_runtime_cache_checkpoint(
         self, cache_key: str, signature: str, agent: Any
@@ -5195,8 +5262,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """GET /api/sessions/{session_id}/background — work still running for a chat.
 
         Lists the background tasks (agents, workflows, shells, monitors) the
-        session's resident Claude Code CLI reports as live, and the detached
-        jobs registered to the session (gateway.background_jobs).
+        session's resident Claude Code CLI reports as live, a follow-up reply
+        it is writing between turns (task type ``late_turn``), and the
+        detached jobs registered to the session (gateway.background_jobs).
         """
         auth_err = self._check_auth(request)
         if auth_err:

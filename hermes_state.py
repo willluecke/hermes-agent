@@ -10760,6 +10760,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def newest_message_display_kinds(
+        self, session_id: str, limit: int
+    ) -> List[Optional[str]]:
+        """``display_kind`` of the newest ``limit`` active messages, newest first.
+
+        Selects no content, so a caller can inspect a long run of new rows
+        (late Claude answers pile up while nobody is chatting) cheaply.
+        """
+        if limit <= 0:
+            return []
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
+                "SELECT display_kind FROM messages WHERE session_id = ? "
+                "AND active = 1 ORDER BY id DESC LIMIT ?",
+                (session_id, int(limit)),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
     def get_messages(
         self,
         session_id: str,

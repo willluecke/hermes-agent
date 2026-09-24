@@ -83,8 +83,9 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 # A resident Claude Code CLI keeps its background work (workflows, background
 # agents and shells) running between turns, and evicting the agent kills that
-# CLI. Neither cache sweep evicts an agent whose CLI reports such work, up to
-# this age, so one stuck task cannot pin an agent forever.
+# CLI. No cache sweep evicts an agent whose CLI reports such work (or is
+# writing a follow-up reply between turns) that began less than this long
+# ago, so work that is stuck cannot pin an agent forever.
 _BACKGROUND_WORK_MAX_AGE_SECS = 12 * 3600.0
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # Telegram cold polling now proves one real getUpdates round trip before connect
@@ -27429,10 +27430,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is the missing valve.  Above the configured anonymous-RSS budget
         it evicts LRU agents through the same soft path the cap enforcer uses,
         so the transcript is dropped and rebuilt from the persisted session on
-        the next turn.  Three things are never touched: agents mid-turn (their
-        clients and sandboxes are in use), the most recently used sessions
-        (whose prompt cache is worth the most), and any session whose live
-        transcript has not finished reaching disk.
+        the next turn.  Four things are never touched: agents mid-turn (their
+        clients and sandboxes are in use), agents whose resident Claude Code
+        CLI still runs background work (eviction kills that CLI and the work
+        with it), the most recently used sessions (whose prompt cache is worth
+        the most), and any session whose live transcript has not finished
+        reaching disk.
 
         Returns the number of entries evicted (0 when memory is fine).
         """
@@ -27467,6 +27470,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return False
             if id(agent) in running_ids:
                 return False
+            if self._agent_has_background_work(agent):
+                return False  # eviction would kill its CLI's background work
             return transcript_persistence_caught_up(agent)
 
         with _lock:
@@ -27493,11 +27498,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and id(a) not in running_ids
                 and not transcript_persistence_caught_up(a)
             )
+            _background = sum(
+                1
+                for _, a in ordered
+                if a is not None
+                and a is not _AGENT_PENDING_SENTINEL
+                and id(a) not in running_ids
+                and self._agent_has_background_work(a)
+            )
             logger.warning(
                 "Agent cache pressure: anon RSS %dMB over budget %dMB but no "
-                "evictable session (%d cached, %d mid-turn, %d blocked on "
-                "un-flushed persistence)%s",
-                rss_mb, bounds.memory_high_mb, len(ordered), _mid_turn, _unflushed,
+                "evictable session (%d cached, %d mid-turn, %d running "
+                "background work, %d blocked on un-flushed persistence)%s",
+                rss_mb, bounds.memory_high_mb, len(ordered), _mid_turn,
+                _background, _unflushed,
                 (
                     " — transcripts are not reaching the session DB "
                     "(session persistence disabled or failing?); the memory "
@@ -27645,8 +27659,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _agent_has_background_work(agent: Any) -> bool:
+        """Whether evicting the agent would kill work its resident CLI runs.
+
+        Protected while any live background task, or a follow-up reply the
+        CLI writes between turns, began within the age bound: measured from
+        the newest, so one stuck task cannot strip fresh work of protection.
+        """
         session = getattr(agent, "_claude_code_session", None)
-        probe = getattr(session, "background_work_age", None)
+        probe = getattr(session, "youngest_background_work_age", None)
         if not callable(probe):
             return False
         try:

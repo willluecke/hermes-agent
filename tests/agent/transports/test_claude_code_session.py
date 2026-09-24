@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import queue
+import threading
+import time
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
@@ -24,6 +26,7 @@ def _install_fake_process(session, process, events):
     for event in events:
         output.put(json.dumps(event) + "\n")
     session._process = process
+    session._background_tasks.follow(process)
     session._output_queue = output
     return process
 
@@ -1562,68 +1565,297 @@ def test_event_bridge_flushes_held_commentary_and_shows_monitor_notes():
     assert len(emitted) == 2
 
 
+# --- Background work and late turns, from the stdout reader (2026-09-23) ---
+
+def _line(event):
+    return json.dumps(event) + "\n"
+
+
+def _tasks_changed(*task_ids):
+    return {"type": "system", "subtype": "background_tasks_changed", "session_id": SID,
+            "tasks": [{"task_id": task_id, "task_type": "local_workflow", "description": task_id}
+                      for task_id in task_ids]}
+
+
+def _pump(session, process, *events):
+    """Feed records through the process's stdout reader, as the CLI writes them."""
+    process.stdout = io.StringIO("".join(_line(event) for event in events))
+    output = queue.Queue()
+    session._pump_stdout(process, output)
+    return output
+
+
+def _gateway_protects(session):
+    from gateway.run import GatewayRunner
+
+    return GatewayRunner._agent_has_background_work(SimpleNamespace(_claude_code_session=session))
+
+
+class _ScriptedCli:
+    """A resident CLI stand-in: each prompt written to stdin releases the next
+    scripted batch of stdout records, as the real CLI answers a prompt."""
+
+    def __init__(self, pid, turns):
+        self.pid = pid
+        self.returncode = None
+        self._turns = [list(turn) for turn in turns]
+        self._lines = queue.Queue()
+        self.stdin = self
+        self.stdout = iter(self._lines.get, None)
+
+    def write(self, text):
+        if self._turns:
+            for event in self._turns.pop(0):
+                self.emit(event)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def emit(self, event):
+        self._lines.put(_line(event))
+
+    def exit(self):
+        self.returncode = 0
+        self._lines.put(None)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _attach(session, cli):
+    """Make ``cli`` the resident process with its real stdout reader running."""
+    session._process = cli
+    session._background_tasks.follow(cli)
+    session._output_queue = queue.Queue()
+    reader = threading.Thread(target=session._pump_stdout, args=(cli, session._output_queue), daemon=True)
+    reader.start()
+    return reader
+
+
+def _resident_session():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=SID, resume=True)
+    session.late_answer_log = None
+    return session
+
+
 def test_background_tasks_follow_the_cli_task_records():
-    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5",
-                                session_id="00000000-0000-4000-8000-000000000000")
-    _install_fake_process(session, _fake_process(30101), [])
-    tracker = session._background_tasks
+    session = _resident_session()
+    process = _install_fake_process(session, _fake_process(30101), [])
 
-    tracker.observe({"type": "system", "subtype": "task_started", "task_id": "fg",
-                     "description": "Run tests", "is_backgrounded": False,
-                     "task_type": "local_bash"})
+    _pump(session, process, {"type": "system", "subtype": "task_started", "task_id": "fg",
+                             "description": "Run tests", "is_backgrounded": False,
+                             "task_type": "local_bash"})
     assert session.background_tasks() == []  # a foreground command is the turn's own work
-    assert session.background_work_age() is None
+    assert session.youngest_background_work_age() is None
 
-    tracker.observe({"type": "system", "subtype": "task_started", "task_id": "wf",
-                     "description": "build", "is_backgrounded": True,
-                     "task_type": "local_workflow"})
-    tracker.observe({"type": "system", "subtype": "background_tasks_changed", "tasks": [
-        {"task_id": "wf", "task_type": "local_workflow", "description": "build"},
-        {"task_id": "ag", "task_type": "local_agent", "description": "review", "ambient": True},
-    ]})
+    _pump(session, process,
+          {"type": "system", "subtype": "task_started", "task_id": "wf", "description": "build",
+           "is_backgrounded": True, "task_type": "local_workflow"},
+          {"type": "system", "subtype": "background_tasks_changed", "tasks": [
+              {"task_id": "wf", "task_type": "local_workflow", "description": "build"},
+              {"task_id": "ag", "task_type": "local_agent", "description": "review", "ambient": True},
+          ]})
     listed = session.background_tasks()
     assert [(t["task_id"], t["task_type"], t["ambient"]) for t in listed] == [
         ("wf", "local_workflow", False), ("ag", "local_agent", True),
     ]
-    assert session.background_work_age() is not None
+    assert session.youngest_background_work_age() is not None
 
-    tracker.observe({"type": "system", "subtype": "task_notification", "task_id": "wf",
-                     "status": "completed"})
+    _pump(session, process, {"type": "system", "subtype": "task_notification", "task_id": "wf",
+                             "status": "completed"})
     assert [t["task_id"] for t in session.background_tasks()] == ["ag"]
     # the level signal replaces the set
-    tracker.observe({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+    _pump(session, process, _tasks_changed())
     assert session.background_tasks() == []
 
 
 def test_background_tasks_are_empty_once_the_cli_is_gone():
-    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5",
-                                session_id="00000000-0000-4000-8000-000000000000")
+    session = _resident_session()
     process = _install_fake_process(session, _fake_process(30102), [])
-    session._background_tasks.observe({"type": "system", "subtype": "background_tasks_changed",
-                                       "tasks": [{"task_id": "wf", "task_type": "local_workflow",
-                                                  "description": "build"}]})
-    assert session.background_work_age() is not None
+    _pump(session, process, _tasks_changed("wf"))
+    assert session.youngest_background_work_age() is not None
 
     process.poll = lambda: 0
     assert session.background_tasks() == []
-    assert session.background_work_age() is None
+    assert session.youngest_background_work_age() is None
 
 
-def test_background_tasks_listed_between_turns_are_tracked():
-    session = _shell_session()
-    session.late_answer_log = None
-    session.late_drain_interval_seconds = 0.02
-    _install_fake_process(session, _fake_process(30103), [
+def test_the_stdout_reader_queues_every_line_in_order_after_looking_at_it():
+    session = _resident_session()
+    process = _install_fake_process(session, _fake_process(30103), [])
+    events = [_tasks_changed("wf"), {"type": "assistant", "session_id": SID, "message": {"content": []}},
+              {"type": "result", "session_id": SID, "result": "Done."}]
+
+    output = _pump(session, process, *events)
+
+    queued = [output.get_nowait() for _ in range(len(events) + 1)]
+    assert queued == [_line(event) for event in events] + [None]
+
+
+def test_background_work_started_during_a_turn_is_tracked_after_it():
+    session = _resident_session()
+    cli = _ScriptedCli(30104, [[
         {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Start the build"}},
+        {"type": "system", "subtype": "task_started", "session_id": SID, "task_id": "wf",
+         "description": "build", "is_backgrounded": True, "task_type": "local_workflow"},
+        {"type": "system", "subtype": "background_tasks_changed", "session_id": SID, "tasks": [
+            {"task_id": "wf", "task_type": "local_workflow", "description": "build"},
+            {"task_id": "ag", "task_type": "local_agent", "description": "review"},
+        ]},
         {"type": "result", "session_id": SID, "result": "Started the build.",
          "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]])
+    _attach(session, cli)
+
+    result = session.run_turn("Start the build")
+
+    assert result.final_text == "Started the build."
+    assert [t["task_id"] for t in session.background_tasks()] == ["wf", "ag"]
+    assert _gateway_protects(session) is True
+    cli.exit()
+
+
+def test_background_work_listed_before_the_prompt_replay_is_tracked():
+    # A record the CLI wrote before it replayed the prompt is quarantined from
+    # the turn's output, but it still describes live work.
+    session = _resident_session()
+    cli = _ScriptedCli(30105, [[
+        _tasks_changed("wf"),
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Status?"}},
+        {"type": "result", "session_id": SID, "result": "Still building."},
+    ]])
+    _attach(session, cli)
+
+    assert session.run_turn("Status?").final_text == "Still building."
+    assert [t["task_id"] for t in session.background_tasks()] == ["wf"]
+    assert _gateway_protects(session) is True
+    cli.exit()
+
+
+def test_background_work_is_still_tracked_after_an_error_turn():
+    # An error turn starts no late-answer drain, so nothing reads the queue
+    # until the next turn; the stdout reader keeps the tracker current.
+    session = _resident_session()
+    process = _install_fake_process(session, _fake_process(30106), [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Continue"}},
+        {"type": "result", "session_id": SID, "result": "API Error: overloaded", "is_error": True},
     ])
 
-    assert session.run_turn("Start the build").final_text == "Started the build."
-    session._output_queue.put(json.dumps({
-        "type": "system", "subtype": "background_tasks_changed", "session_id": SID,
-        "tasks": [{"task_id": "wf", "task_type": "local_workflow", "description": "build"}],
-    }) + "\n")
+    result = session.run_turn("Continue")
 
-    assert _wait_for(lambda: session.background_tasks())
+    assert result.error and not result.should_retire
+    assert session._late_capture is False
+    _pump(session, process, _tasks_changed("wf"))
     assert [t["task_id"] for t in session.background_tasks()] == ["wf"]
+    _pump(session, process, _tasks_changed())
+    assert session.background_tasks() == []
+
+
+def test_a_late_turn_is_listed_from_its_first_record_to_its_result():
+    session = _resident_session()
+    process = _install_fake_process(session, _fake_process(30107), [])
+
+    _pump(session, process, _tasks_changed())  # bookkeeping, not a turn
+    assert session.background_tasks() == []
+
+    _pump(session, process, {"type": "system", "subtype": "init", "session_id": SID})
+    [late] = session.background_tasks()
+    assert late == {"task_id": "late-turn", "task_type": "late_turn",
+                    "description": "Writing a follow-up reply", "ambient": False,
+                    "started_at": late["started_at"]}
+    _pump(session, process, {"type": "assistant", "session_id": SID,
+                             "message": {"content": [{"type": "text", "text": "The build passed."}]}})
+    assert session.background_tasks() == [late]  # stamped by its first record
+    assert _gateway_protects(session) is True
+
+    _pump(session, process, {"type": "result", "session_id": SID, "result": "The build passed."})
+    assert session.background_tasks() == []
+    assert _gateway_protects(session) is False
+
+
+def test_turn_records_never_open_a_late_turn_and_turn_edges_close_one():
+    session = _resident_session()
+    process = _install_fake_process(session, _fake_process(30108), [])
+    tracker = session._background_tasks
+    record = {"type": "stream_event", "session_id": SID, "event": {}}
+
+    session._begin_turn_reading()
+    _pump(session, process, {"type": "assistant", "session_id": SID, "message": {"content": []}})
+    assert session.background_tasks() == []
+    # The reader judged this record just before the turn began; the turn
+    # read that late turn, so its end clears it.
+    tracker.observe(record, source=process, turn_reading=False)
+    assert tracker.late_turn_open()
+    session._end_turn_reading(capture=False)
+    assert not tracker.late_turn_open()
+
+    # A late turn still running when a Hermes turn begins becomes that turn's.
+    _pump(session, process, record)
+    assert tracker.late_turn_open()
+    session._begin_turn_reading()
+    assert not tracker.late_turn_open()
+    session._end_turn_reading(capture=False)
+
+
+def test_retiring_the_cli_forgets_its_work_and_ignores_its_reader():
+    session = _resident_session()
+    old = _ScriptedCli(30109, [])
+    old_reader = _attach(session, old)
+    old.emit(_tasks_changed("stale"))
+    old.emit({"type": "assistant", "session_id": SID, "message": {"content": []}})
+    assert _wait_for(lambda: len(session.background_tasks()) == 2)
+
+    old.returncode = 0  # it has exited, so retiring it sends no signal
+    assert session._retire_process(old) is True
+    assert session._background_tasks.snapshot() == []
+    assert session._background_tasks.youngest_age() is None
+
+    replacement = SimpleNamespace(
+        pid=30110, stdin=io.StringIO(), stdout=io.StringIO(_line(_tasks_changed("fresh"))),
+        stderr=io.StringIO(""), poll=lambda: None,
+    )
+    with patch(
+        "agent.transports.claude_code_session.find_claude_binary", return_value="/usr/bin/claude",
+    ), patch(
+        "agent.transports.claude_code_session.claude_subscription_auth_available", return_value=True,
+    ), patch(
+        "agent.transports.claude_code_session._current_claude_auth_generation", return_value="gen",
+    ), patch(
+        "agent.transports.claude_code_session.subprocess.Popen", return_value=replacement,
+    ), patch.dict("os.environ", {"HERMES_CLAUDE_CODE_DEBUG": "0"}):
+        session._start_process()
+    assert _wait_for(lambda: [t["task_id"] for t in session.background_tasks()] == ["fresh"])
+
+    # The retired process's reader, still draining its pipe, adds nothing.
+    old.emit(_tasks_changed("stale", "stale-2"))
+    old.emit({"type": "assistant", "session_id": SID, "message": {"content": []}})
+    old._lines.put(None)
+    old_reader.join(timeout=3)
+    assert not old_reader.is_alive()
+    assert [t["task_id"] for t in session.background_tasks()] == ["fresh"]
+
+
+def test_the_newest_work_bounds_the_protection_not_the_oldest():
+    from gateway import run as gw_run
+
+    session = _resident_session()
+    process = _install_fake_process(session, _fake_process(30111), [])
+    _pump(session, process, _tasks_changed("stuck", "fresh"))
+    tasks = session._background_tasks._tasks
+    tasks["stuck"]["started_at"] = time.time() - 13 * 3600
+    tasks["fresh"]["started_at"] = time.time() - 5 * 60
+
+    assert 5 * 60 <= session.youngest_background_work_age() < 6 * 60
+    assert _gateway_protects(session) is True
+
+    _pump(session, process, _tasks_changed("stuck"))
+    assert session.youngest_background_work_age() > gw_run._BACKGROUND_WORK_MAX_AGE_SECS
+    assert _gateway_protects(session) is False
+
+    # a late turn is fresh work too
+    _pump(session, process, {"type": "user", "session_id": SID, "message": {"content": "notification"}})
+    assert _gateway_protects(session) is True

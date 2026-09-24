@@ -72,6 +72,29 @@ _BACKGROUND_SHELL_STARTED_RE = re.compile(
 # never read by a turn. It is assembled into late answers, appended to this
 # JSONL log, and handed to ``on_late_result`` instead of being discarded.
 LATE_ANSWER_LOG_ENV = "HERMES_CLAUDE_LATE_ANSWER_LOG"
+# Records that only a turn in progress writes. The first of these while no
+# Hermes turn reads opens a late turn; its ``result`` closes it. Progress
+# records are left out: one about a background tool, arriving between turns,
+# would open a late turn that no result ever closes.
+_LATE_TURN_RECORD_TYPES = frozenset({"assistant", "user", "stream_event"})
+_LATE_TURN_SYSTEM_SUBTYPES = frozenset({"init"})
+# The stdout reader parses a line only when it contains one of these quoted
+# values: a tool result line can run to megabytes, and most lines matter to
+# neither the task list nor the late turn. A quote inside a JSON string is
+# escaped, so text that merely mentions a marker never matches.
+_BACKGROUND_TASK_MARKERS = (
+    '"background_tasks_changed"',
+    '"task_started"',
+    '"task_notification"',
+    '"task_updated"',
+)
+_LATE_TURN_MARKERS = tuple(
+    f'"{name}"'
+    for name in sorted(_LATE_TURN_RECORD_TYPES | _LATE_TURN_SYSTEM_SUBTYPES)
+)
+_RESULT_MARKER = '"result"'
+# The synthetic entry background_tasks() lists while a late turn is open.
+LATE_TURN_TASK_ID = "late-turn"
 
 
 def _background_shell_hold_seconds() -> float:
@@ -474,7 +497,7 @@ def _completed_agent_tool_ids(event: dict[str, Any]) -> set[str]:
 
 
 class _BackgroundTaskTracker:
-    """The resident CLI's live background tasks, from its own task records.
+    """The resident CLI's live background work, from its own stream records.
 
     ``background_tasks_changed`` is Claude Code's level signal: after every
     membership change it lists each live background task (shells, agents,
@@ -484,80 +507,135 @@ class _BackgroundTaskTracker:
     gateway reads this to show the work and to keep an idle-cache sweep from
     killing a CLI whose background work is still running (2026-09-23: a
     build workflow died with its CLI one hour after the turn that started it).
+
+    It also follows a late turn: a reply the CLI writes on its own between
+    Hermes turns, typically about background work that just finished, from
+    its first record to its ``result``. The task list is already empty then
+    and the agent's activity stamp only moves on Hermes turns, so without it
+    the idle sweep could kill the CLI mid-reply.
+
+    The tracker follows one CLI process at a time and ignores records from
+    any other, so the reader of a retired process, still draining its pipe,
+    cannot add work to the process that replaced it.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._source: Any = None
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._late_turn_started_at: Optional[float] = None
 
-    def observe(self, event: dict[str, Any]) -> None:
-        if event.get("type") != "system":
-            return
-        subtype = str(event.get("subtype") or "")
+    def follow(self, source: Any) -> None:
+        """Start over for ``source``, the resident CLI process (None: none)."""
+        with self._lock:
+            self._source = source
+            self._tasks = {}
+            self._late_turn_started_at = None
+
+    def observe(
+        self, event: dict[str, Any], *, source: Any, turn_reading: bool
+    ) -> None:
         now = time.time()
         with self._lock:
-            if subtype == "task_started":
-                task_id = str(event.get("task_id") or "").strip()
-                if task_id and event.get("is_backgrounded") is True:
-                    self._tasks.setdefault(task_id, {
-                        "task_id": task_id,
-                        "task_type": str(event.get("task_type") or ""),
-                        "description": str(event.get("description") or ""),
-                        "ambient": False,
-                        "started_at": now,
-                    })
+            if source is not self._source:
                 return
-            if subtype in ("task_notification", "task_updated"):
-                task_id = str(event.get("task_id") or "").strip()
-                status = str(
-                    event.get("status")
-                    or (event.get("patch") or {}).get("status")
-                    or ""
-                ).strip().casefold()
-                if task_id and status in _TERMINAL_TASK_STATUSES:
-                    self._tasks.pop(task_id, None)
-                return
-            if subtype != "background_tasks_changed":
-                return
-            listed = event.get("tasks")
-            if not isinstance(listed, list):
-                return
-            tasks: dict[str, dict[str, Any]] = {}
-            for entry in listed:
-                if not isinstance(entry, dict):
-                    continue
-                task_id = str(entry.get("task_id") or "").strip()
-                if not task_id:
-                    continue
-                known = self._tasks.get(task_id) or {}
-                tasks[task_id] = {
+            event_type = event.get("type")
+            subtype = (
+                str(event.get("subtype") or "") if event_type == "system" else ""
+            )
+            if event_type == "result":
+                self._late_turn_started_at = None
+            elif (
+                not turn_reading
+                and self._late_turn_started_at is None
+                and (
+                    event_type in _LATE_TURN_RECORD_TYPES
+                    or subtype in _LATE_TURN_SYSTEM_SUBTYPES
+                )
+            ):
+                self._late_turn_started_at = now
+            if subtype:
+                self._observe_task_record_locked(event, subtype, now)
+
+    def _observe_task_record_locked(
+        self, event: dict[str, Any], subtype: str, now: float
+    ) -> None:
+        if subtype == "task_started":
+            task_id = str(event.get("task_id") or "").strip()
+            if task_id and event.get("is_backgrounded") is True:
+                self._tasks.setdefault(task_id, {
                     "task_id": task_id,
-                    "task_type": str(
-                        entry.get("task_type") or known.get("task_type") or ""
-                    ),
-                    "description": str(
-                        entry.get("description") or known.get("description") or ""
-                    ),
-                    "ambient": entry.get("ambient") is True,
-                    "started_at": known.get("started_at", now),
-                }
-            self._tasks = tasks
+                    "task_type": str(event.get("task_type") or ""),
+                    "description": str(event.get("description") or ""),
+                    "ambient": False,
+                    "started_at": now,
+                })
+            return
+        if subtype in ("task_notification", "task_updated"):
+            task_id = str(event.get("task_id") or "").strip()
+            patch = event.get("patch") if isinstance(event.get("patch"), dict) else {}
+            status = str(
+                event.get("status") or patch.get("status") or ""
+            ).strip().casefold()
+            if task_id and status in _TERMINAL_TASK_STATUSES:
+                self._tasks.pop(task_id, None)
+            return
+        if subtype != "background_tasks_changed":
+            return
+        listed = event.get("tasks")
+        if not isinstance(listed, list):
+            return
+        tasks: dict[str, dict[str, Any]] = {}
+        for entry in listed:
+            if not isinstance(entry, dict):
+                continue
+            task_id = str(entry.get("task_id") or "").strip()
+            if not task_id:
+                continue
+            known = self._tasks.get(task_id) or {}
+            tasks[task_id] = {
+                "task_id": task_id,
+                "task_type": str(
+                    entry.get("task_type") or known.get("task_type") or ""
+                ),
+                "description": str(
+                    entry.get("description") or known.get("description") or ""
+                ),
+                "ambient": entry.get("ambient") is True,
+                "started_at": known.get("started_at", now),
+            }
+        self._tasks = tasks
+
+    def end_late_turn(self) -> None:
+        with self._lock:
+            self._late_turn_started_at = None
+
+    def late_turn_open(self) -> bool:
+        return self._late_turn_started_at is not None
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
             tasks = [dict(task) for task in self._tasks.values()]
+            late_turn_started_at = self._late_turn_started_at
+        if late_turn_started_at is not None:
+            tasks.append({
+                "task_id": LATE_TURN_TASK_ID,
+                "task_type": "late_turn",
+                "description": "Writing a follow-up reply",
+                "ambient": False,
+                "started_at": late_turn_started_at,
+            })
         return sorted(tasks, key=lambda task: task["started_at"])
 
-    def oldest_age(self) -> Optional[float]:
+    def youngest_age(self) -> Optional[float]:
+        """Seconds since the newest live task or open late turn began."""
         with self._lock:
-            if not self._tasks:
-                return None
-            oldest = min(task["started_at"] for task in self._tasks.values())
-        return max(0.0, time.time() - oldest)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._tasks = {}
+            starts = [task["started_at"] for task in self._tasks.values()]
+            if self._late_turn_started_at is not None:
+                starts.append(self._late_turn_started_at)
+        if not starts:
+            return None
+        return max(0.0, time.time() - max(starts))
 
 
 class _LateOutputCollector:
@@ -774,16 +852,23 @@ class ClaudeCodeSession:
         return bool(process is not None and process.poll() is None and not self._closed)
 
     def background_tasks(self) -> list[dict[str, Any]]:
-        """Background tasks the resident CLI reports as still running."""
+        """Background tasks the resident CLI reports as still running.
+
+        A late turn in progress is listed too, as ``LATE_TURN_TASK_ID``.
+        """
         if not self.is_alive():
             return []
         return self._background_tasks.snapshot()
 
-    def background_work_age(self) -> Optional[float]:
-        """Seconds the oldest running background task has run, or None."""
+    def youngest_background_work_age(self) -> Optional[float]:
+        """Seconds since the newest live background work began, or None.
+
+        The newest, not the oldest: one stuck task must not strip the
+        protection from work that started minutes ago.
+        """
         if not self.is_alive():
             return None
-        return self._background_tasks.oldest_age()
+        return self._background_tasks.youngest_age()
 
     def compatible_with(
         self,
@@ -817,7 +902,7 @@ class ClaudeCodeSession:
             process = self._process
         if process is not None:
             self._retire_process(process)
-        self._background_tasks.clear()
+        self._background_tasks.follow(None)
 
     def _retire_process(
         self,
@@ -843,7 +928,7 @@ class ClaudeCodeSession:
                     pass
             if reaped and self._process is process:
                 self._process = None
-                self._background_tasks.clear()
+                self._background_tasks.follow(None)
             return reaped
 
     def _terminate_process(self, sig: signal.Signals) -> None:
@@ -932,26 +1017,20 @@ class ClaudeCodeSession:
         assert process.stdout is not None
         assert process.stderr is not None
         self._process = process
-        self._background_tasks.clear()
+        self._background_tasks.follow(process)
         self._auth_generation = _current_claude_auth_generation()
         output_queue: queue.Queue[Optional[str]] = queue.Queue()
         stderr_tail: deque[str] = deque(maxlen=40)
         self._output_queue = output_queue
         self._stderr_tail = stderr_tail
 
-        def _read_stdout() -> None:
-            try:
-                for line in process.stdout:
-                    output_queue.put(line)
-            finally:
-                output_queue.put(None)
-
         def _read_stderr() -> None:
             for line in process.stderr:
                 stderr_tail.append(line.rstrip())
 
         threading.Thread(
-            target=_read_stdout,
+            target=self._pump_stdout,
+            args=(process, output_queue),
             daemon=True,
             name=f"claude-stdout-{process.pid}",
         ).start()
@@ -969,6 +1048,55 @@ class ClaudeCodeSession:
                 return process
             self._process = None
             return self._start_process()
+
+    def _pump_stdout(
+        self,
+        process: subprocess.Popen[str],
+        output_queue: "queue.Queue[Optional[str]]",
+    ) -> None:
+        """Move one CLI process's stdout onto its queue, in order."""
+        try:
+            for line in process.stdout:
+                try:
+                    self._observe_stdout_line(process, line)
+                except Exception:
+                    logger.debug(
+                        "Claude Code background-work tracking failed",
+                        exc_info=True,
+                    )
+                output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    def _observe_stdout_line(
+        self, process: subprocess.Popen[str], line: str
+    ) -> None:
+        """Follow background work and late turns from one line of output.
+
+        Only the reader sees every line, in order, whatever consumes the
+        queue: a turn, the late-answer drain, or nobody at all (after an
+        error or interrupted turn the drain never starts). A line is seen
+        here before it is queued, so the tracker is never behind a turn.
+        """
+        if self._process is not process:
+            return
+        tracker = self._background_tasks
+        wanted = any(marker in line for marker in _BACKGROUND_TASK_MARKERS)
+        if not wanted:
+            if tracker.late_turn_open():
+                wanted = _RESULT_MARKER in line
+            elif not self._turn_reading:
+                wanted = any(marker in line for marker in _LATE_TURN_MARKERS)
+        if not wanted:
+            return
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(event, dict):
+            tracker.observe(
+                event, source=process, turn_reading=self._turn_reading
+            )
 
     @staticmethod
     def _user_record(prompt: str) -> str:
@@ -992,7 +1120,8 @@ class ClaudeCodeSession:
     # empties the output queue into the late-answer collector; the next turn
     # quarantines anything that is still queued when it starts and feeds that
     # to the collector too. One lock covers the hand-over at both ends, and
-    # the stdout reader itself is unchanged, so order is preserved.
+    # the stdout reader only looks at lines before queueing them, so order
+    # is preserved.
 
     def _drain_between_turns(self, generation: int) -> None:
         while True:
@@ -1040,7 +1169,6 @@ class ClaudeCodeSession:
             self._capture_late_event_locked(event)
 
     def _capture_late_event_locked(self, event: dict[str, Any]) -> None:
-        self._background_tasks.observe(event)
         if not self._late_capture:
             return
         payload = self._late_collector.feed(event)
@@ -1136,6 +1264,9 @@ class ClaudeCodeSession:
     def _begin_turn_reading(self) -> None:
         with self._route_lock:
             self._turn_reading = True
+            # A late turn still running is now this turn's to read: its
+            # records reach the quarantine, and the agent is running.
+            self._background_tasks.end_late_turn()
             self._drain_generation += 1
 
     def _end_turn_reading(self, *, capture: bool) -> None:
@@ -1147,6 +1278,9 @@ class ClaudeCodeSession:
         """
         with self._route_lock:
             self._turn_reading = False
+            # Start clean: a late turn the reader opened just as this turn
+            # began was this turn's to read, and it has been read.
+            self._background_tasks.end_late_turn()
             self._late_capture = capture
             self._late_collector.reset()
             self._drain_generation += 1
@@ -1592,7 +1726,6 @@ class ClaudeCodeSession:
                 # A mini-turn is in progress; wait for its result.
                 drain_deadline = None
             if event_type == "system":
-                self._background_tasks.observe(event)
                 _handle_system_task_record(event)
             message = (
                 event.get("message")
