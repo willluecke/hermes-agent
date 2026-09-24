@@ -399,10 +399,6 @@ LINGERING_NOTE = (
     "the acceptance_criteria tool (retire: [{{content, reason}}]) giving a reason the "
     "user will see. Do not leave them open silently."
 )
-CLEAR_REFUSED_NOTE = (
-    "Clear refused: this turn has {n} acceptance criteria of its own, and clear only "
-    "drops carried ones. Retire carried criteria by item with retire: [{{content, reason}}]."
-)
 RETIRE_REFUSED_NOTE = (
     "Retire refused for {items}: no such carried or registered criterion. Use the "
     "criterion's text as registered, or its id."
@@ -1311,7 +1307,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             and p_build >= BUILD_THRESHOLD
             and session_id not in _session_nudged
         ):
-            # Once per session: criteria clear on every new request, and a
+            # Once per session: the running list carries, and a
             # reminder on every build turn would be a constant.
             _session_nudged.add(session_id)
             context = f"{context}\n\n{CRITERIA_NUDGE}" if context else CRITERIA_NUDGE
@@ -1632,10 +1628,10 @@ def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
 
 
 def parse_retirements(text: str) -> Dict[str, Any]:
-    """``retire`` items and a ``clear`` reason from the criteria tool's result, if any."""
+    """``retire`` items from the criteria tool's result, if any."""
     payload = evidence.tool_result_payload(text)
     if not isinstance(payload, dict):
-        return {"retire": [], "clear": ""}
+        return {"retire": []}
     retire = []
     for item in payload.get("retire") or [] if isinstance(payload.get("retire"), list) else []:
         if isinstance(item, dict):
@@ -1643,38 +1639,26 @@ def parse_retirements(text: str) -> Dict[str, Any]:
             reason = str(item.get("reason") or "").strip()
             if target:
                 retire.append({"target": _clip(target, 400), "reason": _clip(reason, 300)})
-    clear = payload.get("clear")
-    clear_reason = str(clear.get("reason") or "").strip() if isinstance(clear, dict) else (clear.strip() if isinstance(clear, str) else "")
-    return {"retire": retire, "clear": _clip(clear_reason, 300)}
+    return {"retire": retire}
 
 
 def apply_retirements(session_id: str, todos: List[Dict[str, str]], retirements: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[str]]:
     """Take the model's retirements out of the list, each as a row the user
     sees, and return (the registered items that remain, notes for the model).
 
-    Nothing leaves the list silently: a ``cancelled`` item, a ``retire``
-    entry and a ``clear`` each become a ``criteria`` verdict row with the
-    stated reason (or "no reason given" for a plain todo cancel). A clear is
-    refused while this turn has criteria of its own; a retire that names
-    nothing on the list is refused by name. Refusals go back to the model.
+    Nothing leaves the list silently: a ``retire`` entry becomes a
+    ``criteria`` verdict row with the stated reason, and the plain todo
+    tool's ``cancelled`` status (which has no reason field) becomes one that
+    says "no reason given". A retire that names nothing on the list is
+    refused by name; refusals go back to the model.
     """
     notes: List[str] = []
     carried = [item for item in _session_todos.get(session_id, []) if item.get("carried")]
-    fresh_now = [item for item in _session_todos.get(session_id, []) if not item.get("carried")]
     remaining = [item for item in todos if item.get("status") != "cancelled"]
     rows: List[Dict[str, str]] = []
     for item in todos:
         if item.get("status") == "cancelled":
             rows.append({"content": item["content"], "reason": item.get("reason") or "", "how": "cancelled"})
-    clear_reason = retirements.get("clear") or ""
-    if clear_reason:
-        if fresh_now or remaining:
-            notes.append(CLEAR_REFUSED_NOTE.format(n=len(fresh_now or remaining)))
-            write_log({"event": "criteria", "session_id": session_id, "action": "clear_refused", "reason": clear_reason, "fresh": len(fresh_now or remaining)})
-        else:
-            for item in carried:
-                rows.append({"content": item["content"], "reason": clear_reason, "how": "cleared"})
-            carried = []
     missing: List[str] = []
     for entry in retirements.get("retire") or []:
         target, reason = entry["target"], entry.get("reason") or ""
@@ -1698,12 +1682,10 @@ def apply_retirements(session_id: str, todos: List[Dict[str, str]], retirements:
         by_how: Dict[str, List[Dict[str, str]]] = {}
         for row in rows:
             by_how.setdefault(row["how"], []).append(row)
-        parts = []
-        for how, group in by_how.items():
-            if how == "cleared":
-                parts.append(f"cleared by the model: {len(group)} -- reason: {group[0]['reason']} -- " + "; ".join(f'"{_clip(row["content"], 100)}"' for row in group))
-            else:
-                parts.append(f"{how} by the model: " + "; ".join(f'"{_clip(row["content"], 100)}" -- reason: {row["reason"] or "no reason given"}' for row in group))
+        parts = [
+            f"{how} by the model: " + "; ".join(f'"{_clip(row["content"], 100)}" -- reason: {row["reason"] or "no reason given"}' for row in group)
+            for how, group in by_how.items()
+        ]
         emit_verdict(
             session_id, "criteria", "Criteria " + " · ".join(parts),
             answers={}, decision={"retired": rows},

@@ -2021,19 +2021,16 @@ def test_retire_drops_named_carried_criteria_with_a_row_and_refuses_unknown_ones
     assert [r["action"] for r in records] == ["retire_refused", "retired"] and records[0]["targets"] == ["Nothing like this"]
 
 
-def test_clear_drops_every_carried_criterion_with_one_row_but_never_this_turns_own(feedback, emitted):
+def test_retiring_every_carried_criterion_is_how_the_list_is_cleared(feedback, emitted):
     _carry_three(feedback)
-    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [], "clear": {"reason": "user dropped the redesign"}}))
+    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [], "retire": [
+        {"target": "p1", "reason": "user dropped the redesign"}, {"target": "p2", "reason": "user dropped the redesign"}, {"target": "p3", "reason": "user dropped the redesign"},
+    ]}))
     assert preflight.active_criteria("s1") == []
     [row] = _criteria_rows(emitted)
-    assert row["text"].startswith('Criteria cleared by the model: 3 -- reason: user dropped the redesign -- "Greeting returns hello world"; "Errors are logged"; "Docs updated"')
-    # With criteria of its own registered this turn, a clear is refused and the list is untouched.
-    _carry_three(feedback, prefix="u")
-    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [{"id": "1", "content": "CSV output has a header row", "status": "in_progress"}]}))
-    result = preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, steerable=True, session_id="s1", result=json.dumps({"todos": [{"id": "1", "content": "CSV output has a header row", "status": "in_progress"}], "clear": {"reason": "tidy"}}))
-    assert result is not None and "Clear refused: this turn has 1 acceptance criteria of its own" in result["message"]
-    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "p1", "p2", "p3"]
-    assert feedback["records"]("criteria")[-1]["action"] == "clear_refused"
+    assert row["text"] == ('Criteria retired by the model: "Greeting returns hello world" -- reason: user dropped the redesign; '
+                           '"Errors are logged" -- reason: user dropped the redesign; "Docs updated" -- reason: user dropped the redesign')
+    assert len(row["decision"]["retired"]) == 3
 
 
 def test_a_cancelled_criterion_is_a_row_with_its_reason_or_the_lack_of_one(feedback, emitted):
@@ -2045,7 +2042,7 @@ def test_a_cancelled_criterion_is_a_row_with_its_reason_or_the_lack_of_one(feedb
     ]}), session_id="s1")
     assert [item["content"] for item in preflight.active_criteria("s1")] == ["Flag parses"]
     [row] = _criteria_rows(emitted)
-    assert row["text"] == 'Criteria cancelled by the model: "Docs updated" -- reason: no reason given; "Changelog entry" -- reason: no changelog in this repo'
+    assert row["text"] == 'Criteria cancelled by the model: "Docs updated" -- reason: no reason given; "Changelog entry" -- reason: no changelog in this repo', "the plain todo tool's cancel still surfaces"
 
 
 def test_a_criterion_open_for_three_requests_is_raised_to_the_user_and_the_model(feedback, emitted):

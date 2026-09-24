@@ -52,22 +52,18 @@ def test_records_a_status_per_item_so_progress_can_be_marked():
         ("Flag parses", "completed"), ("Tests pass", "pending"), ("Docs updated", "in_progress"), ("Changelog entry", "in_progress"),
     ]
     schema = module.ACCEPTANCE_CRITERIA_SCHEMA["parameters"]["properties"]["criteria"]["items"]
-    assert schema["anyOf"][1]["properties"]["status"]["enum"] == ["pending", "in_progress", "completed", "cancelled"]
+    assert schema["anyOf"][1]["properties"]["status"]["enum"] == ["pending", "in_progress", "completed"]
     assert "status" in module.ACCEPTANCE_CRITERIA_SCHEMA["description"]
 
 
-def test_retire_and_clear_need_a_reason_and_are_echoed_for_the_plugin():
+def test_retire_needs_a_reason_and_is_echoed_for_the_plugin():
     assert "needs a reason" in json.loads(module.acceptance_criteria({"retire": [{"content": "Docs updated"}]}))["error"]
-    assert "needs a reason" in json.loads(module.acceptance_criteria({"clear": {}}))["error"]
-    assert "needs a reason" in json.loads(module.acceptance_criteria({"criteria": [{"content": "Docs updated", "status": "cancelled"}]}))["error"]
-    result = json.loads(module.acceptance_criteria({"criteria": [], "retire": [{"content": "Docs updated", "reason": "user said skip the docs"}, {"id": "p2", "reason": "superseded"}]}))
+    result = json.loads(module.acceptance_criteria({"retire": [{"content": "Docs updated", "reason": "user said skip the docs"}, {"id": "p2", "reason": "superseded"}]}))
     assert result["todos"] == [] and result["retire"] == [{"target": "Docs updated", "reason": "user said skip the docs"}, {"target": "p2", "reason": "superseded"}]
     assert "retired with a stated reason" in result["note"]
-    result = json.loads(module.acceptance_criteria({"clear": {"reason": "user dropped the redesign"}, "criteria": ["Flat header renders"]}))
-    assert result["clear"] == {"reason": "user dropped the redesign"} and [item["content"] for item in result["todos"]] == ["Flat header renders"]
-    result = json.loads(module.acceptance_criteria({"criteria": [{"content": "Docs updated", "status": "cancelled", "reason": "out of scope now"}, "Tests pass"]}))
-    assert result["todos"][0] == {"id": "1", "content": "Docs updated", "status": "cancelled", "reason": "out of scope now"}
+    result = json.loads(module.acceptance_criteria({"criteria": ["Flat header renders"], "retire": [{"content": "Glass header", "reason": "user dropped the redesign"}]}))
+    assert [item["content"] for item in result["todos"]] == ["Flat header renders"] and result["retire"][0]["reason"] == "user dropped the redesign"
     assert "error" in json.loads(module.acceptance_criteria({"retire": "Docs updated"}))
     schema = module.ACCEPTANCE_CRITERIA_SCHEMA["parameters"]
-    assert schema["required"] == [] and set(schema["properties"]) == {"criteria", "retire", "clear"}
+    assert schema["required"] == [] and set(schema["properties"]) == {"criteria", "retire"}, "one way out of the list"
     assert "never retire silently" in module.ACCEPTANCE_CRITERIA_SCHEMA["description"]
