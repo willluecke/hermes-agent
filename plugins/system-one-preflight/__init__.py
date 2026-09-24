@@ -390,6 +390,23 @@ _pending_fidelity_note: Dict[str, str] = {}
 # when its read stands out from the session's usual, not on every turn.
 _injection_window: List[bool] = []
 _session_nudged: set = set()
+# A carried criterion open this many requests is raised: a row for the user,
+# a line for the model to finish it or retire it with a reason.
+LINGER_REQUESTS = 3
+LINGERING_NOTE = (
+    "Preflight: {n} acceptance criteria from earlier requests are still open after "
+    "{requests}+ requests: {items}. Either finish them this turn, or retire them with "
+    "the acceptance_criteria tool (retire: [{{content, reason}}]) giving a reason the "
+    "user will see. Do not leave them open silently."
+)
+CLEAR_REFUSED_NOTE = (
+    "Clear refused: this turn has {n} acceptance criteria of its own, and clear only "
+    "drops carried ones. Retire carried criteria by item with retire: [{{content, reason}}]."
+)
+RETIRE_REFUSED_NOTE = (
+    "Retire refused for {items}: no such carried or registered criterion. Use the "
+    "criterion's text as registered, or its id."
+)
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
 # acceptance criterion the recent calls serve; "none" at or above the
 # threshold steers the model back, at most DRIFT_MAX_STEERS times per turn.
@@ -1299,6 +1316,20 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             _session_nudged.add(session_id)
             context = f"{context}\n\n{CRITERIA_NUDGE}" if context else CRITERIA_NUDGE
             note_reason = note_reason or "criteria_nudge"
+        lingering = [item for item in _session_todos.get(session_id, []) if item.get("carried") and int(item.get("carried_requests") or 0) >= LINGER_REQUESTS]
+        if lingering:
+            line = LINGERING_NOTE.format(
+                n=len(lingering), requests=LINGER_REQUESTS,
+                items="; ".join(f'"{_clip(item["content"], 100)}" ({item["carried_requests"]} requests)' for item in lingering),
+            )
+            context = f"{context}\n\n{line}" if context else line
+            note_reason = note_reason or "lingering"
+            write_log({"event": "criteria", "session_id": session_id, "action": "lingering", "items": [item["content"] for item in lingering], "requests": [item["carried_requests"] for item in lingering]})
+            emit_verdict(
+                session_id, "criteria",
+                f"Criteria still open after {LINGER_REQUESTS}+ requests: " + "; ".join(f'"{_clip(item["content"], 100)}" ({item["carried_requests"]})' for item in lingering) + " · raised to the model: finish or retire with a reason",
+                answers={}, decision={"lingering": [item["content"] for item in lingering]},
+            )
         injected = context is not None
         injection_rate = record_injection(injected)
     else:
@@ -1576,7 +1607,7 @@ def on_pre_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
-    """The todo tool's result is JSON with a ``todos`` array; keep id/content/status."""
+    """The todo tool's result is JSON with a ``todos`` array; keep id/content/status (and a reason, if given)."""
     payload = evidence.tool_result_payload(text)
     items = payload.get("todos") if isinstance(payload, dict) else None
     if not isinstance(items, list):
@@ -1588,14 +1619,96 @@ def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
         content = str(item.get("content") or "").strip()
         if not content:
             continue
-        todos.append(
-            {
-                "id": str(item.get("id") or len(todos) + 1),
-                "content": _clip(content, 400),
-                "status": str(item.get("status") or "pending"),
-            }
-        )
+        todo = {
+            "id": str(item.get("id") or len(todos) + 1),
+            "content": _clip(content, 400),
+            "status": str(item.get("status") or "pending"),
+        }
+        reason = str(item.get("reason") or "").strip()
+        if reason:
+            todo["reason"] = _clip(reason, 300)
+        todos.append(todo)
     return todos
+
+
+def parse_retirements(text: str) -> Dict[str, Any]:
+    """``retire`` items and a ``clear`` reason from the criteria tool's result, if any."""
+    payload = evidence.tool_result_payload(text)
+    if not isinstance(payload, dict):
+        return {"retire": [], "clear": ""}
+    retire = []
+    for item in payload.get("retire") or [] if isinstance(payload.get("retire"), list) else []:
+        if isinstance(item, dict):
+            target = str(item.get("target") or item.get("content") or item.get("id") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if target:
+                retire.append({"target": _clip(target, 400), "reason": _clip(reason, 300)})
+    clear = payload.get("clear")
+    clear_reason = str(clear.get("reason") or "").strip() if isinstance(clear, dict) else (clear.strip() if isinstance(clear, str) else "")
+    return {"retire": retire, "clear": _clip(clear_reason, 300)}
+
+
+def apply_retirements(session_id: str, todos: List[Dict[str, str]], retirements: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[str]]:
+    """Take the model's retirements out of the list, each as a row the user
+    sees, and return (the registered items that remain, notes for the model).
+
+    Nothing leaves the list silently: a ``cancelled`` item, a ``retire``
+    entry and a ``clear`` each become a ``criteria`` verdict row with the
+    stated reason (or "no reason given" for a plain todo cancel). A clear is
+    refused while this turn has criteria of its own; a retire that names
+    nothing on the list is refused by name. Refusals go back to the model.
+    """
+    notes: List[str] = []
+    carried = [item for item in _session_todos.get(session_id, []) if item.get("carried")]
+    fresh_now = [item for item in _session_todos.get(session_id, []) if not item.get("carried")]
+    remaining = [item for item in todos if item.get("status") != "cancelled"]
+    rows: List[Dict[str, str]] = []
+    for item in todos:
+        if item.get("status") == "cancelled":
+            rows.append({"content": item["content"], "reason": item.get("reason") or "", "how": "cancelled"})
+    clear_reason = retirements.get("clear") or ""
+    if clear_reason:
+        if fresh_now or remaining:
+            notes.append(CLEAR_REFUSED_NOTE.format(n=len(fresh_now or remaining)))
+            write_log({"event": "criteria", "session_id": session_id, "action": "clear_refused", "reason": clear_reason, "fresh": len(fresh_now or remaining)})
+        else:
+            for item in carried:
+                rows.append({"content": item["content"], "reason": clear_reason, "how": "cleared"})
+            carried = []
+    missing: List[str] = []
+    for entry in retirements.get("retire") or []:
+        target, reason = entry["target"], entry.get("reason") or ""
+        key = _criterion_key(target)
+        match = next((item for item in carried if item["id"] == target or _criterion_key(item["content"]) == key), None)
+        if match is None:
+            match = next((item for item in remaining if item["id"] == target or _criterion_key(item["content"]) == key), None)
+            if match is None:
+                missing.append(target)
+                continue
+            remaining = [item for item in remaining if item is not match]
+        else:
+            carried = [item for item in carried if item is not match]
+        rows.append({"content": match["content"], "reason": reason, "how": "retired"})
+    if missing:
+        notes.append(RETIRE_REFUSED_NOTE.format(items="; ".join(f'"{_clip(text, 80)}"' for text in missing)))
+        write_log({"event": "criteria", "session_id": session_id, "action": "retire_refused", "targets": missing})
+    _session_todos[session_id] = [item for item in _session_todos.get(session_id, []) if not item.get("carried")] + carried
+    if rows:
+        write_log({"event": "criteria", "session_id": session_id, "action": "retired", "items": rows})
+        by_how: Dict[str, List[Dict[str, str]]] = {}
+        for row in rows:
+            by_how.setdefault(row["how"], []).append(row)
+        parts = []
+        for how, group in by_how.items():
+            if how == "cleared":
+                parts.append(f"cleared by the model: {len(group)} -- reason: {group[0]['reason']} -- " + "; ".join(f'"{_clip(row["content"], 100)}"' for row in group))
+            else:
+                parts.append(f"{how} by the model: " + "; ".join(f'"{_clip(row["content"], 100)}" -- reason: {row["reason"] or "no reason given"}' for row in group))
+        emit_verdict(
+            session_id, "criteria", "Criteria " + " · ".join(parts),
+            answers={}, decision={"retired": rows},
+        )
+    return remaining, notes
 
 
 # ---------------------------------------------------------------------------
@@ -1964,7 +2077,10 @@ def carry_criteria(session_id: str) -> None:
         return
     # Re-keyed p1..pN every turn so carried ids never collide with the ids
     # the new turn registers, or with each other across several carries.
-    _session_todos[session_id] = [{**item, "id": f"p{index}", "carried": True} for index, item in enumerate(todos, 1)]
+    _session_todos[session_id] = [
+        {**item, "id": f"p{index}", "carried": True, "carried_requests": int(item.get("carried_requests") or 0) + 1}
+        for index, item in enumerate(todos, 1)
+    ]
     _session_excluded.pop(session_id, None)
     _session_fidelity.pop(session_id, None)
 
@@ -2259,13 +2375,16 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         # tool on the Codex and Claude lanes; it answers in the same shape.
         todos = parse_todos(text)
         if todos is not None:
+            todos, retire_notes = apply_retirements(session_id, todos, parse_retirements(text))
             _session_todos[session_id] = merge_criteria(session_id, todos)
             _bound(_session_todos)
             try:
-                fidelity = check_fidelity(session_id, todos, replay=bool(kwargs.get("replay")))
+                fidelity = check_fidelity(session_id, todos, replay=bool(kwargs.get("replay"))) if todos else None
             except Exception:
                 logger.debug("system-one-preflight: fidelity check failed", exc_info=True)
                 fidelity = None
+            if retire_notes:
+                fidelity = {"message": "\n\n".join([*(f["message"] for f in [fidelity] if f), *retire_notes]), "finding": (fidelity or {}).get("finding", "")}
     elif tool_name == "terminal":
         try:
             record_command(session_id, str(args.get("command") or ""), text, cwd=cwd)

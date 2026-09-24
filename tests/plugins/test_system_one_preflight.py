@@ -1989,3 +1989,80 @@ def test_the_criteria_nudge_goes_out_once_per_session(feedback):
     assert preflight.on_pre_llm_call(session_id="s5", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) == {"context": preflight.CRITERIA_NUDGE}
     assert preflight.on_pre_llm_call(session_id="s5", turn_id="t2", user_message="Now add --csv too", conversation_history=[]) is None, "criteria cleared with the new request, and the reminder is not repeated"
     assert preflight.on_pre_llm_call(session_id="s6", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) is not None, "a new session gets it once"
+
+
+# ---------------------------------------------------------------------------
+# Leaving the list is explicit: retire and clear with a reason, every one a row
+# ---------------------------------------------------------------------------
+
+def _criteria_rows(emitted):
+    return [e for e in emitted if e["stage"] == "criteria"]
+
+
+def _carry_three(feedback, prefix="t"):
+    preflight.on_pre_llm_call(session_id="s1", turn_id=f"{prefix}1", user_message="Add a --json flag", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    preflight.on_pre_llm_call(session_id="s1", turn_id=f"{prefix}2", user_message="now add --csv", conversation_history=[])
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["p1", "p2", "p3"]
+
+
+def test_retire_drops_named_carried_criteria_with_a_row_and_refuses_unknown_ones(feedback, emitted):
+    _carry_three(feedback)
+    result = preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, steerable=True, session_id="s1", result=json.dumps({
+        "todos": [{"id": "1", "content": "CSV output has a header row", "status": "in_progress"}],
+        "retire": [{"target": "Docs updated", "reason": "user said skip the docs"}, {"target": "p2", "reason": "logging landed last week"}, {"target": "Nothing like this", "reason": "x"}],
+    }))
+    assert [(item["id"], item["content"]) for item in preflight.active_criteria("s1")] == [("1", "CSV output has a header row"), ("p1", "Greeting returns hello world")]
+    [row] = _criteria_rows(emitted)
+    assert row["text"] == 'Criteria retired by the model: "Docs updated" -- reason: user said skip the docs; "Errors are logged" -- reason: logging landed last week'
+    assert row["decision"]["retired"][0] == {"content": "Docs updated", "reason": "user said skip the docs", "how": "retired"}
+    assert result is not None and 'Retire refused for "Nothing like this"' in result["message"]
+    records = feedback["records"]("criteria")
+    assert [r["action"] for r in records] == ["retire_refused", "retired"] and records[0]["targets"] == ["Nothing like this"]
+
+
+def test_clear_drops_every_carried_criterion_with_one_row_but_never_this_turns_own(feedback, emitted):
+    _carry_three(feedback)
+    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [], "clear": {"reason": "user dropped the redesign"}}))
+    assert preflight.active_criteria("s1") == []
+    [row] = _criteria_rows(emitted)
+    assert row["text"].startswith('Criteria cleared by the model: 3 -- reason: user dropped the redesign -- "Greeting returns hello world"; "Errors are logged"; "Docs updated"')
+    # With criteria of its own registered this turn, a clear is refused and the list is untouched.
+    _carry_three(feedback, prefix="u")
+    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [{"id": "1", "content": "CSV output has a header row", "status": "in_progress"}]}))
+    result = preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, steerable=True, session_id="s1", result=json.dumps({"todos": [{"id": "1", "content": "CSV output has a header row", "status": "in_progress"}], "clear": {"reason": "tidy"}}))
+    assert result is not None and "Clear refused: this turn has 1 acceptance criteria of its own" in result["message"]
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "p1", "p2", "p3"]
+    assert feedback["records"]("criteria")[-1]["action"] == "clear_refused"
+
+
+def test_a_cancelled_criterion_is_a_row_with_its_reason_or_the_lack_of_one(feedback, emitted):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [
+        {"id": "1", "content": "Flag parses", "status": "in_progress"},
+        {"id": "2", "content": "Docs updated", "status": "cancelled"},
+        {"id": "3", "content": "Changelog entry", "status": "cancelled", "reason": "no changelog in this repo"},
+    ]}), session_id="s1")
+    assert [item["content"] for item in preflight.active_criteria("s1")] == ["Flag parses"]
+    [row] = _criteria_rows(emitted)
+    assert row["text"] == 'Criteria cancelled by the model: "Docs updated" -- reason: no reason given; "Changelog entry" -- reason: no changelog in this repo'
+
+
+def test_a_criterion_open_for_three_requests_is_raised_to_the_user_and_the_model(feedback, emitted):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "Docs updated", "status": "in_progress"}]}), session_id="s1")
+    for turn in ("t2", "t3"):
+        result = preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="something else", conversation_history=[])
+        assert result is None and _criteria_rows(emitted) == []
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="and another thing", conversation_history=[])
+    assert result is not None and '1 acceptance criteria from earlier requests are still open after 3+ requests: "Docs updated" (3 requests)' in result["context"]
+    assert "retire them with the acceptance_criteria tool" in result["context"]
+    record = feedback["records"]("preflight")[-1]
+    assert record["injected"] is True and record["note_reason"] == "lingering"
+    [row] = _criteria_rows(emitted)
+    assert row["text"] == 'Criteria still open after 3+ requests: "Docs updated" (3) · raised to the model: finish or retire with a reason'
+    assert feedback["records"]("criteria")[-1] == {**feedback["records"]("criteria")[-1], "action": "lingering", "items": ["Docs updated"], "requests": [3]}
+    # Retiring it with a reason ends the raise.
+    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [], "retire": [{"target": "Docs updated", "reason": "user never asked for docs"}]}))
+    assert preflight.active_criteria("s1") == []
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="next", conversation_history=[]) is None
