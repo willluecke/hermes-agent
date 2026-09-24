@@ -1905,42 +1905,48 @@ def test_the_verify_judge_labels_its_flags_from_the_gates_own_re_run(feedback, r
 # Scope: criteria belong to the turn, the judge only runs on build turns
 # ---------------------------------------------------------------------------
 
-def test_criteria_roll_to_the_new_request_by_entailment_and_survive_a_continuation(feedback, emitted):
+def test_criteria_are_a_running_list_that_grows_per_request_and_retires_what_the_judge_rates_met(feedback, repo, emitted):
+    feedback["jev"].kind = "build"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag", conversation_history=[])
     preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
-    assert len(preflight.active_criteria("s1")) == 3
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "2", "3"]
+    # Next request: the open criteria carry, keyed apart, and no Jev call is spent on them.
     calls = len(feedback["jev"].calls)
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="proceed as recommended", conversation_history=[])
-    assert len(preflight.active_criteria("s1")) == 3 and len(feedback["jev"].calls) == calls + 1, "a continuation keeps the proposed work's criteria without a roll call"
-    # A stopped run resubmitted with a change keeps what still follows and drops the rest.
-    feedback["jev"].guard = {"entails_1": 0.9, "entails_2": 0.2, "entails_3": 0.85}
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="actually, make the flag --json-out and skip the docs", conversation_history=[
-        {"role": "user", "content": "Add a --json flag"}, {"role": "assistant", "content": "Adding it now."},
-    ])
-    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "3"]
-    record = feedback["records"]("fidelity")[-1]
-    assert record["rolled"] is True and record["kept"] == ["1", "3"] and record["dropped"] == ["2"] and record["error"] == ""
-    roll = [e for e in emitted if e["stage"] == "fidelity"][-1]
-    assert roll["text"] == "Jev criteria roll: kept 2 of 3 for the new request" and roll["decision"]["dropped"] == ["2"]
-    call = feedback["jev"].calls[-2]
-    assert set(call["questions"]) == {"entails_1", "entails_2", "entails_3"}, "entailment only; coverage is verified at the end, not demanded here"
-    assert call["state"]["request"]["text"].startswith("actually, make the flag") and "Add a --json flag" in call["state"]["earlier_instructions"]["items"]
-    # An unrelated question drops them all.
-    feedback["jev"].guard = {"entails_1": 0.1, "entails_3": 0.05}
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="why did that take so long?", conversation_history=[])
-    assert preflight.active_criteria("s1") == [] and feedback["records"]("fidelity")[-1]["kept"] == []
-    assert preflight._session_excluded.get("s1") is None and preflight._session_fidelity.get("s1") is None
-    # Nothing stale survives an outage or the switch being off.
-    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
-    feedback["jev"].raise_exc = RuntimeError("down")
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="now the csv flag", conversation_history=[])
-    assert preflight.active_criteria("s1") == [] and "down" in feedback["records"]("fidelity")[-1]["error"]
-    feedback["jev"].raise_exc = None
-    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
-    feedback["settings"]["fidelity_check"] = "off"
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t6", user_message="and the yaml flag", conversation_history=[])
-    assert preflight.active_criteria("s1") == [] and feedback["records"]("fidelity")[-1]["checked"] is False
-    assert [e for e in emitted if e["stage"] == "fidelity"][-1]["text"] == "Jev criteria roll: kept 0 of 3 for the new request · not checked, all dropped"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="now add --csv", conversation_history=[])
+    assert len(feedback["jev"].calls) == calls + 1, "only the preflight call"
+    assert [(item["id"], item["carried"]) for item in preflight.active_criteria("s1")] == [("p1", True), ("p2", True), ("p3", True)]
+    # This turn's registration adds its own and restates one of the carried ones.
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [
+        {"id": "1", "content": "CSV output has a header row", "status": "in_progress"},
+        {"id": "2", "content": "Docs updated", "status": "in_progress"},
+    ]}), session_id="s1")
+    assert [(item["id"], item["content"]) for item in preflight.active_criteria("s1")] == [
+        ("1", "CSV output has a header row"), ("2", "Docs updated"), ("p1", "Greeting returns hello world"), ("p2", "Errors are logged"),
+    ]
+    # The judge rates this turn's criteria and the carried ones; a carried one rated met is retired, an unmet one stays open and is not a finding.
+    feedback["jev"].guard = {"criterion_1": 0.9, "criterion_2": 0.9, "criterion_3": 0.85, "criterion_4": 0.05, "request_met": 0.9, "claims_unverified": 0.05}
+    result = preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is None, "an open carried criterion never sends the model back"
+    record = feedback["records"]("verify")[-1]
+    assert record["carried_done"] == ["Greeting returns hello world"] and record["carried_open"] == ["Errors are logged"] and record["findings"] == []
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "2", "p2"]
+    event = [e for e in emitted if e["stage"] == "verify"][-1]
+    assert event["text"].startswith("Jev verify (attempt 1): criteria met 2/2 · carried 1 done, 1 open")
+    assert event["decision"]["carried_open"] == ["Errors are logged"]
+    # This turn's own unmet criterion is still a finding.
+    feedback["jev"].guard = {"criterion_1": 0.05, "criterion_2": 0.9, "criterion_3": 0.05, "request_met": 0.9, "claims_unverified": 0.05}
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s1")
+    result = preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is not None and "CSV output has a header row" in result["message"] and "Errors are logged" not in result["message"]
+    # A question with only carried criteria open is not judged, and the carried list is re-keyed without collisions.
+    feedback["jev"].kind = "answer"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="why did that take so long?", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="write_file", args={"path": "notes.md"}, result="ok", session_id="s1")
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Ten minutes went on reading the engine first.", changed_paths=[str(repo / "notes.md")]) is None
+    assert feedback["records"]("verify")[-1]["skipped"] == "not a build turn"
+    assert [(item["id"], item["content"]) for item in preflight.active_criteria("s1")] == [
+        ("p1", "CSV output has a header row"), ("p2", "Docs updated"), ("p3", "Errors are logged"),
+    ]
 
 
 def test_the_verify_judge_checks_the_request_as_a_whole_beside_the_criteria(feedback, repo):

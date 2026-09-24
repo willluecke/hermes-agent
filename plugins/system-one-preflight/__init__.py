@@ -100,8 +100,10 @@ sentence so the model knows what to prove or drop. A build turn that ran
 checks, made a claim the evidence does not show and registered no manifest
 is asked for one in the same note. A turn that is not a build by the
 preflight read, ran no check and registered no criteria or manifest is not
-judged at all; acceptance criteria belong to the turn that registered them
-and clear on the next request unless it is a continuation.
+judged at all. Acceptance criteria are a running list of open work: each
+request's criteria are added, a criterion the judge rates met is retired,
+and one carried over from an earlier request is reported as still open but
+never sends the model back.
 The gate sends a turn back at most ``verify_max_send_backs`` times (default
 1; ``agent.max_verify_nudges`` is the loop's outer bound) and only when the
 evidence (diff, paths, commands with outputs) changed since the last
@@ -1230,6 +1232,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     user_message = kwargs.get("user_message")
     remember_scope(session_id, user_message, history if isinstance(history, list) else [])
     reset_drift(session_id)
+    carry_criteria(session_id)
     arm = resolve_arm(mode, session_id)
     state = build_state(user_message, history if isinstance(history, list) else [])
     started = time.monotonic()
@@ -1256,7 +1259,6 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     else:
         _session_previous_answer.pop(session_id, None)
     _bound(_session_previous_answer)
-    roll_criteria(session_id, _text_of(user_message))
     if arm == "feedback" and previous:
         state["previous_answer"] = {"source": "agent", "text": _clip(previous, 1_500)}
         questions["previous_outcome"] = {"type": "choice", "instructions": OUTCOME_QUESTION, "criteria": OUTCOME_CRITERIA}
@@ -1947,93 +1949,31 @@ def _first_open_criterion(todos: List[Dict[str, str]]) -> Optional[Dict[str, str
     return None
 
 
-def roll_criteria(session_id: str, request: str) -> None:
-    """A new request: re-validate the previous turn's acceptance criteria
-    against it and keep only what the new request still asks for.
+def _criterion_key(content: str) -> str:
+    return " ".join(str(content or "").lower().split())
 
-    A stopped run resubmitted with a change ("make it 1.5 not 2") keeps the
-    criteria that still follow; an unrelated question drops them all
-    (judging one against a redesign's twelve criteria rated every one unmet
-    and sent the model back, 2026-09-24). A continuation ("proceed",
-    "continue") keeps them without a call: they are the proposed work.
-    With the fidelity check off, or Jev unavailable, nothing stale is kept.
-    """
-    previous = list(_session_todos.get(session_id) or [])
-    if not previous:
+
+def carry_criteria(session_id: str) -> None:
+    """A new request: whatever is still open stays on the list as carried
+    work, keyed apart from the ids the new turn will register. The list
+    grows by each request's criteria and shrinks when the verify judge
+    rates one met; a carried criterion is never a reason to send the model
+    back, since the turn that could have met it is over."""
+    todos = _session_todos.get(session_id)
+    if not todos:
         return
-    if continuation_request(request):
-        return
+    # Re-keyed p1..pN every turn so carried ids never collide with the ids
+    # the new turn registers, or with each other across several carries.
+    _session_todos[session_id] = [{**item, "id": f"p{index}", "carried": True} for index, item in enumerate(todos, 1)]
     _session_excluded.pop(session_id, None)
     _session_fidelity.pop(session_id, None)
-    kept: List[Dict[str, str]] = []
-    entailment: Dict[str, Optional[float]] = {}
-    error = ""
-    jev_model = ""
-    latency_ms = 0
-    if fidelity_check_enabled() and request:
-        scope = list(_session_scope.get(session_id) or [])
-        questions = {
-            f"entails_{item['id']}": {
-                "type": "noul",
-                "instructions": FIDELITY_ENTAILMENT_QUESTION.format(criterion=_clip(item["content"], 300)),
-                "criteria": FIDELITY_ENTAILMENT_CRITERIA,
-            }
-            for item in previous
-        }
-        jev_state = {
-            "provenance": (
-                "request was typed by the user just now and replaces the previous request. earlier_instructions "
-                "were typed by the user before it, most recent last. previous_answer was written by the agent for the "
-                "previous request. acceptance_criteria were written by the agent for the previous request; the question "
-                "is which of them the new request still asks for."
-            ),
-            "request": {"source": "user", "text": _clip(request, 1_500)},
-            "earlier_instructions": {"source": "user", "items": scope[:-1][-3:]},
-            "previous_answer": {"source": "agent, previous turn", "text": _session_previous_answer.get(session_id, "")},
-            "acceptance_criteria": {"source": "agent, previous request", "items": [{"id": item["id"], "text": _clip(item["content"], 300)} for item in previous]},
-        }
-        started = time.monotonic()
-        try:
-            ask = _ask
-            if ask is None:
-                from tools.typesafe_tool import ask_jev
 
-                ask = ask_jev
-            body = ask(jev_state, questions, timeout=fidelity_timeout_seconds())
-            answers = body.get("answers") or {}
-            jev_model = str(body.get("model") or "")
-            for item in previous:
-                entailment[item["id"]] = _noul(answers, f"entails_{item['id']}")
-            if all(value is None for value in entailment.values()):
-                error = "no noul in answer"
-        except Exception as exc:
-            error = f"{exc.__class__.__name__}: {exc}"[:300]
-        latency_ms = int((time.monotonic() - started) * 1000)
-        if not error:
-            kept = [
-                item for item in previous
-                if entailment.get(item["id"]) is not None and entailment[item["id"]] >= fidelity_entailment_threshold()
-            ]
-    if kept:
-        _session_todos[session_id] = kept
-    else:
-        _session_todos.pop(session_id, None)
-    dropped = [item["id"] for item in previous if item not in kept]
-    write_log({
-        "event": "fidelity", "session_id": session_id, "rolled": True, "criteria": len(previous),
-        "kept": [item["id"] for item in kept], "dropped": dropped, "entailment": entailment,
-        "entailment_threshold": fidelity_entailment_threshold(), "checked": bool(entailment),
-        "latency_ms": latency_ms, "error": error,
-    })
-    emit_verdict(
-        session_id, "fidelity",
-        f"Jev criteria roll: kept {len(kept)} of {len(previous)} for the new request"
-        + ("" if entailment else " · not checked, all dropped" if not error else "")
-        + (f" · {error}" if error else ""),
-        answers={item["content"]: entailment.get(item["id"]) for item in previous},
-        decision={"rolled": True, "kept": [item["id"] for item in kept], "dropped": dropped, "entailment_threshold": fidelity_entailment_threshold()},
-        model=jev_model, latency_ms=latency_ms,
-    )
+
+def merge_criteria(session_id: str, todos: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """This turn's list plus the carried criteria it does not restate."""
+    stated = {_criterion_key(item.get("content", "")) for item in todos}
+    carried = [item for item in _session_todos.get(session_id, []) if item.get("carried") and _criterion_key(item.get("content", "")) not in stated]
+    return list(todos) + carried
 
 
 def active_criteria(session_id: str) -> List[Dict[str, str]]:
@@ -2319,7 +2259,7 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         # tool on the Codex and Claude lanes; it answers in the same shape.
         todos = parse_todos(text)
         if todos is not None:
-            _session_todos[session_id] = todos
+            _session_todos[session_id] = merge_criteria(session_id, todos)
             _bound(_session_todos)
             try:
                 fidelity = check_fidelity(session_id, todos, replay=bool(kwargs.get("replay")))
@@ -2508,8 +2448,9 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     final_response = str(kwargs.get("final_response") or "")
     todos = active_criteria(session_id)
     excluded = list(_session_excluded.get(session_id) or [])
+    fresh = [item for item in todos if not item.get("carried")]
     criteria = [item for item in todos if item.get("status") in ("completed", "in_progress")]
-    pending = [item for item in todos if item.get("status") == "pending"]
+    pending = [item for item in fresh if item.get("status") == "pending"]
     request = (_session_scope.get(session_id) or [""])[-1]
     bundle = collect_evidence(changed)
     started = time.monotonic()
@@ -2534,7 +2475,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     # check, registered no criteria and no manifest. A question that wrote a
     # note file is not a change to verify; judging it against nothing sent
     # the model back to prove sentences about its own timing (2026-09-24).
-    if not drift_state(session_id).get("build") and not checks_ran and manifest is None and not todos:
+    if not drift_state(session_id).get("build") and not checks_ran and manifest is None and not fresh:
         write_log({
             "event": "verify", "session_id": session_id, "attempt": attempt, "skipped": "not a build turn",
             "changed_paths": len(changed), "ledger": len(rows_this_turn), "ledger_checks": 0, "criteria": 0,
@@ -2767,10 +2708,18 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             + ", ".join(entry["path"] for entry in weakening["files"])
             + ". Restore them or state why in the answer."
         )
+    # Carried criteria are judged only to be retired: met, they leave the
+    # list; unmet, they stay open and are reported, never a finding.
+    carried_keys = {f"criterion_{index}" for index, item in enumerate(criteria, 1) if item.get("carried")}
+    carried_done = [labels[key] for key in carried_keys if answers.get(key) is not None and answers[key] > verify_fail_threshold()]
+    carried_open = [labels[key] for key in carried_keys if key not in labels or answers.get(key) is None or answers[key] <= verify_fail_threshold()]
+    if carried_done:
+        done_keys = {_criterion_key(text) for text in carried_done}
+        _session_todos[session_id] = [item for item in _session_todos.get(session_id, []) if not (item.get("carried") and _criterion_key(item.get("content", "")) in done_keys)]
     unmet = [
         (labels[key], answers.get(key))
         for key in labels
-        if answers.get(key) is not None and answers[key] <= verify_fail_threshold()
+        if key not in carried_keys and answers.get(key) is not None and answers[key] <= verify_fail_threshold()
     ]
     if unmet:
         findings.append(
@@ -2870,6 +2819,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "claims": {"sentences": len(claim_keys), "flagged": [sentence for sentence, _value in flagged]},
             "claim_labels": claim_labels,
             "claim_misses": claim_misses,
+            "carried_done": carried_done,
+            "carried_open": carried_open,
             "findings": findings,
             "rule": rule,
             "action": action,
@@ -2878,11 +2829,12 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "error": error,
         }
     )
-    met = sum(1 for key in labels if answers.get(key) is not None and answers[key] > verify_fail_threshold())
+    met = sum(1 for key in labels if key not in carried_keys and answers.get(key) is not None and answers[key] > verify_fail_threshold())
     precision = claims_precision() if flagged or claim_misses else {}
     label_counts = {label: sum(1 for entry in claim_labels if entry["label"] == label) for label in CLAIM_LABELS}
     text = (
-        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)}"
+        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels) - len(carried_keys)}"
+        + (f" · carried {len(carried_done)} done, {len(carried_open)} open" if carried_keys else "")
         + (f" · request {_fmt(request_met)}" if request_met is not None else "") + " · "
         f"manifest {_manifest_summary(counts, manifest is not None)} · "
         f"claims beyond {_fmt(claims)} · checks failing {_fmt(checks_failing)} · ledger {len(rows_this_turn)} rows"
@@ -2910,6 +2862,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "reruns": len(reruns), "machinery": machinery, "weakening": weakening, "regressions": regressions,
             "assertions": assertion_records, "flagged_sentences": [sentence for sentence, _value in flagged],
             "claim_labels": claim_labels, "claim_misses": claim_misses, "claims_precision": precision,
+            "carried_done": carried_done, "carried_open": carried_open,
             "rule": rule, "ship_reason": ship_reason,
         },
         model=jev_model,
