@@ -60,8 +60,8 @@ PREDICATES = ("passed", "count", "exit_zero", "contains", "ran")
 DECISIVE = ("passed", "count", "exit_zero")
 
 CHECK_COMMAND_RE = re.compile(
-    r"\b(pytest|npm (run )?(test|lint|build|typecheck)|pnpm (test|lint|build)|"
-    r"yarn (test|lint|build)|vitest|jest|mocha|go test|cargo (test|check|clippy)|"
+    r"\b(pytest|npm (run )?(test|lint|build|typecheck|type-check|check|verify)|pnpm (run )?(test|lint|build|typecheck|type-check|check)|"
+    r"yarn (run )?(test|lint|build|typecheck|type-check|check)|vitest|jest|mocha|playwright test|go test|cargo (test|check|clippy)|"
     r"make (test|check|lint)|node --test|node (--[\w-]+ )*--test|tsc\b|eslint|ruff|mypy|flake8|"
     r"black --check|prettier --check)",
     re.IGNORECASE,
@@ -630,15 +630,15 @@ def _decide_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], fin
 _SEGMENT_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
 _SAFE_SEGMENT_RE = re.compile(
     r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
-    r"(?:timeout\s+\d+[smh]?\s+)?"
+    r"(?:time\s+)?(?:timeout\s+\d+[smh]?\s+)?"
     r"(?:"
     r"cd\s+\S+"
     r"|(?:\S*/)?(?:python3?|py)(?:\s+-[a-zA-Z]+)*\s+-m\s+pytest\b.*"
     r"|(?:\S*/)?pytest\b.*"
-    r"|npm\s+(?:run\s+)?(?:test|lint|build|typecheck)(?::[\w.-]+)?(?:\s+--\s+.*)?(?:\s+--[\w=-]+)*"
-    r"|pnpm\s+(?:test|lint|build)\b.*"
-    r"|yarn\s+(?:test|lint|build)\b.*"
-    r"|npx\s+(?:vitest|jest|tsc|eslint|prettier\s+--check)\b.*"
+    r"|npm\s+(?:run\s+)?(?:test|lint|build|typecheck|type-check|check|verify)(?::[\w.-]+)?(?:\s+--prefix\s+\S+)?(?:\s+--\s+.*)?(?:\s+--[\w=-]+)*"
+    r"|pnpm\s+(?:run\s+)?(?:test|lint|build|typecheck|type-check|check)\b.*"
+    r"|yarn\s+(?:run\s+)?(?:test|lint|build|typecheck|type-check|check)\b.*"
+    r"|npx\s+(?:vitest|jest|tsc|eslint|playwright\s+test|prettier\s+--check)\b.*"
     r"|node\s+(?:--[\w-]+(?:=\S+)?\s+)*--test\b.*"
     r"|(?:\S*/)?(?:vitest|jest|tsc|eslint|ruff|mypy|flake8)\b.*"
     r"|go\s+test\b.*"

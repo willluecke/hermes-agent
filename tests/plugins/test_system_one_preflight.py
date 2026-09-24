@@ -73,6 +73,7 @@ def harness(tmp_path, monkeypatch):
     preflight._pending_fidelity.clear()
     preflight._pending_fidelity_note.clear()
     preflight._injection_window.clear()
+    preflight._session_nudged.clear()
 
     def records(event=None):
         path = tmp_path / "preflight.jsonl"
@@ -364,11 +365,10 @@ def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedba
     [event] = emitted
     assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True, "note_reason": "candidates", "injection_rate": {"n": 1, "injected": 1}}
     assert event["text"].endswith("· note sent (candidates) · 1 of last 1 sent")
-    # Hard but not checkable: criteria first, one candidate, no finish loop.
+    # Hard but not checkable: one candidate, no finish loop, and no note.
     feedback["jev"].checkable = 0.2
-    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[])
-    assert "write the acceptance criteria first" in result["context"]
-    assert feedback["records"]("preflight")[-1]["k"] == 1
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[]) is None
+    assert feedback["records"]("preflight")[-1]["k"] == 1 and feedback["records"]("preflight")[-1]["injected"] is False
     assert emitted[-1]["decision"]["plan"] == "criteria_only" and emitted[-1]["decision"]["finish_loop"] is False
 
 
@@ -527,6 +527,7 @@ def test_verify_judge_lets_a_satisfied_change_finish(feedback, repo):
 
 
 def test_verify_judge_uses_the_request_when_there_are_no_todos(feedback, repo):
+    feedback["jev"].kind = "build"
     preflight.on_pre_llm_call(session_id="s2", turn_id="t1", user_message="Make greet return hello world", conversation_history=[])
     feedback["jev"].guard = {"criterion_1": 0.92, "claims_unverified": 0.05}
     assert preflight.on_pre_verify(session_id="s2", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
@@ -536,6 +537,7 @@ def test_verify_judge_uses_the_request_when_there_are_no_todos(feedback, repo):
 
 
 def test_verify_judge_fails_open_and_respects_its_switches(feedback, repo):
+    preflight.drift_state("s1")["build"] = True
     feedback["jev"].raise_exc = RuntimeError("down")
     assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="x", changed_paths=[str(repo / "app.py")]) is None
     [record] = feedback["records"]("verify")
@@ -575,6 +577,7 @@ def test_every_command_is_a_ledger_row_and_only_checks_count_as_checks(feedback,
 
 def test_an_unchanged_finding_is_not_nudged_twice(feedback, repo):
     feedback["settings"]["verify_max_send_backs"] = 3
+    feedback["jev"].kind = "build"
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9, "claim_1": 0.05}
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
     draft = "Done. The full test suite passes on every module now."
@@ -608,6 +611,7 @@ def test_claim_sentences_drop_code_and_short_lines_and_cap_at_twelve():
 
 def test_the_judge_quotes_only_the_unsupported_sentence_and_sends_back_once(feedback, repo, emitted):
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 app.py"}, result="hello world", session_id="s1")
+    feedback["jev"].kind = "build"
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9, "claim_1": 0.95, "claim_2": 0.05}
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make greet say hello world", conversation_history=[])
     draft = "Running app.py now prints hello world as requested. The whole test suite also passes without any failures."
@@ -637,6 +641,7 @@ def test_the_judge_quotes_only_the_unsupported_sentence_and_sends_back_once(feed
 
 
 def test_the_cap_ships_the_second_attempt_even_with_new_evidence(feedback, repo, emitted):
+    feedback["jev"].kind = "build"
     feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
     draft = "The integration tests pass against the live database now."
@@ -657,6 +662,7 @@ def test_the_cap_ships_the_second_attempt_even_with_new_evidence(feedback, repo,
 
 def test_flag_only_mode_emits_the_verdict_and_never_nudges(feedback, repo, emitted):
     feedback["settings"]["verify_send_back"] = "off"
+    feedback["jev"].kind = "build"
     feedback["jev"].guard = {"criterion_1": 0.05, "claim_1": 0.05}
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
     draft = "Everything is wired up and the deploy succeeded on staging."
@@ -667,21 +673,23 @@ def test_flag_only_mode_emits_the_verdict_and_never_nudges(feedback, repo, emitt
     assert event["decision"]["action"] == "ship_flagged" and event["decision"]["flagged_sentences"] == [draft]
     # The manifest rule honours the same switch.
     feedback["settings"]["manifest_required"] = "on"
-    preflight._session_todos.clear()
     preflight.on_pre_llm_call(session_id="s3", turn_id="t1", user_message="build the exporter", conversation_history=[])
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s3")
-    assert preflight.on_pre_verify(session_id="s3", attempt=0, coding=True, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    assert preflight.on_pre_verify(session_id="s3", attempt=0, coding=True, final_response="The exporter suite passes on every platform now.", changed_paths=[str(repo / "app.py")]) is None
     assert feedback["records"]("verify")[-1]["rule"] == "no_manifest" and feedback["records"]("verify")[-1]["action"] == "ship_flagged"
 
 
 def test_the_manifest_rule_sends_back_once_then_ships(feedback, repo):
     feedback["settings"]["manifest_required"] = "on"
+    feedback["jev"].kind = "build"
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
     preflight.on_pre_llm_call(session_id="s3", turn_id="t1", user_message="build the exporter", conversation_history=[])
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s3")
-    first = preflight.on_pre_verify(session_id="s3", attempt=0, coding=True, final_response="Done.", changed_paths=[str(repo / "app.py")])
-    assert first is not None and "No result manifest" in first["message"]
+    draft = "The exporter suite passes on every platform now."
+    first = preflight.on_pre_verify(session_id="s3", attempt=0, coding=True, final_response=draft, changed_paths=[str(repo / "app.py")])
+    assert first is not None and "No result manifest" in first["message"] and 'Unsupported by the evidence: "The exporter suite' in first["message"]
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q tests/"}, result="4 passed", session_id="s3")
-    assert preflight.on_pre_verify(session_id="s3", attempt=1, coding=True, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    assert preflight.on_pre_verify(session_id="s3", attempt=1, coding=True, final_response=draft, changed_paths=[str(repo / "app.py")]) is None
     records = feedback["records"]("verify")
     assert [row["action"] for row in records] == ["nudge", "ship_flagged"] and records[1]["ship_reason"] == "send-back cap of 1 reached"
 
@@ -711,6 +719,7 @@ def test_the_runtimes_shared_consumer_sees_one_send_back_then_a_ship(feedback, r
     from hermes_cli import plugins as plugin_api
 
     monkeypatch.setattr(plugin_api, "invoke_hook", lambda name, **kwargs: [preflight.on_pre_verify(**kwargs)])
+    feedback["jev"].kind = "build"
     feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="do it", conversation_history=[])
     draft = "The nightly job now finishes under the five minute budget."
@@ -846,6 +855,7 @@ def test_the_verify_judge_uses_the_tuned_claims_threshold(tuner, feedback, repo)
     preflight.run_tune("s1")
     assert preflight.claims_flag_threshold() == 0.55
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.6}
+    preflight.drift_state("s1")["build"] = True
     result = preflight.on_pre_verify(session_id="s1", platform="api_server", model="m", coding=True, attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
     # The whole-message noul is asked and logged above the tuned threshold, but it no longer sends the model back on its own.
     assert result is None
@@ -929,8 +939,8 @@ def _serving_calls(harness):
 
 
 def test_drift_check_judges_every_window_and_holds_the_next_call_with_the_steer(drift, emitted):
-    _register()
     _turn()
+    _register()
     assert _reads(2) == [None, None]
     assert _serving_calls(drift) == [], "nothing is asked before the window fills"
     assert _reads(1, start=2) == [None], "without a steerable caller the steer waits for the next tool call"
@@ -963,8 +973,8 @@ def test_drift_check_judges_every_window_and_holds_the_next_call_with_the_steer(
 
 
 def test_drift_check_hands_the_steer_to_a_caller_that_can_deliver_it(drift):
-    _register()
     _turn()
+    _register()
     results = _reads(3, steerable=True)
     assert results[:2] == [None, None]
     assert results[2] == {"message": preflight.DRIFT_TEMPLATE.format(n=3, p=0.8, target="The --json flag prints valid JSON")}
@@ -974,8 +984,8 @@ def test_drift_check_hands_the_steer_to_a_caller_that_can_deliver_it(drift):
 
 def test_drift_check_stays_quiet_when_the_calls_serve_a_criterion(drift, emitted):
     drift["jev"].serving = ("c2", 0.9)
-    _register()
     _turn()
+    _register()
     assert _reads(3) == [None, None, None]
     assert preflight._pending_drift == {}
     [record] = drift["records"]("drift")
@@ -1007,8 +1017,8 @@ def test_drift_check_leaves_a_non_build_turn_without_criteria_alone(drift):
 
 
 def test_drift_check_fails_open_and_respects_its_switch_and_replay(drift):
-    _register()
     _turn()
+    _register()
     drift["jev"].raise_exc = RuntimeError("jev down")
     assert _reads(3) == [None, None, None]
     [record] = drift["records"]("drift")
@@ -1027,8 +1037,8 @@ def test_drift_check_fails_open_and_respects_its_switch_and_replay(drift):
 
 def test_drift_steers_are_bounded_per_turn_and_a_new_turn_resets_the_window(drift):
     drift["settings"]["drift_max_steers"] = 1
-    _register()
     _turn()
+    _register()
     _reads(3)
     assert preflight._pending_drift["s1"]["message"]
     preflight._pending_drift.clear()
@@ -1037,14 +1047,15 @@ def test_drift_steers_are_bounded_per_turn_and_a_new_turn_resets_the_window(drif
     assert drift["records"]("drift")[-1]["drifting"] is True and drift["records"]("drift")[-1]["steer"] is False
     _reads(2)
     _turn(turn="t2")
+    _register()
     _reads(1)
     assert len(_serving_calls(drift)) == 2, "the new turn started a fresh window"
     assert preflight.drift_state("s1")["total"] == 1
 
 
 def test_an_undelivered_drift_steer_becomes_a_verify_finding(drift, repo):
-    _register()
     _turn()
+    _register()
     _reads(3)
     assert preflight._pending_drift["s1"]
     drift["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.9, "claims_unverified": 0.1}
@@ -1439,37 +1450,26 @@ def test_report_results_is_captured_raw_and_through_the_bridge_wrapper_and_count
     assert preflight.drift_state("s1")["calls"][-1] == {"tool": "report_results", "summary": "results reported"}
 
 
-def test_a_build_turn_that_ran_checks_without_a_manifest_is_sent_back_by_rule_with_no_jev_call(feedback, repo, emitted):
+def test_a_build_turn_that_ran_checks_without_a_manifest_is_asked_for_one_only_when_a_sentence_needs_it(feedback, repo, emitted):
     feedback["settings"]["manifest_required"] = "on"
+    feedback["jev"].kind = "build"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     _cmd("pytest -q", "3 passed", cwd=str(repo))
-    calls = len(feedback["jev"].calls)
-    result = _verify(final="Done, 3 passed.", paths=[str(repo / "app.py")])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.9}
+    assert _verify(final="The greeting test passes after the change.", paths=[str(repo / "app.py")]) is None, "every sentence supported: no manifest is demanded"
+    record = feedback["records"]("verify")[-1]
+    assert record["rule"] == "" and record["action"] == "finish" and record["manifest_registered"] is False
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
+    result = _verify(final="The whole suite passes on every platform now.", paths=[str(repo / "app.py")])
     assert result is not None and "No result manifest was registered although 1 check commands ran" in result["message"] and "(ledger rows c1)" in result["message"]
-    assert len(feedback["jev"].calls) == calls, "by rule: no Jev call"
-    [record] = feedback["records"]("verify")
-    assert record["rule"] == "no_manifest" and record["ledger"] == 1 and record["manifest_registered"] is False
+    assert 'Unsupported by the evidence: "The whole suite passes' in result["message"]
+    record = feedback["records"]("verify")[-1]
+    assert record["rule"] == "no_manifest" and record["ledger"] == 1 and record["manifest_registered"] is False and record["answers"]["claim_1"] == 0.05
     event = emitted[-1]
-    assert event["stage"] == "verify" and "no result manifest on a build turn that ran 1 checks" in event["text"] and event["decision"]["rule"] == "no_manifest"
-    # The same answer again: repeated, the turn finishes.
-    assert _verify(attempt=1, paths=[str(repo / "app.py")]) is None
+    assert event["stage"] == "verify" and event["decision"]["rule"] == "no_manifest"
+    # The same answer over the same evidence: repeated, the turn ships flagged.
+    assert _verify(attempt=1, final="The whole suite passes on every platform now.", paths=[str(repo / "app.py")]) is None
     assert feedback["records"]("verify")[-1]["repeated"] is True
-    # A build turn that ran no checks needs no manifest.
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="tweak", conversation_history=[])
-    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
-    assert _verify(paths=[str(repo / "app.py")]) is None
-    assert feedback["records"]("verify")[-1].get("rule") is None
-    # Nor does a turn that is not a build.
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="explain", conversation_history=[])
-    _cmd("pytest -q", "3 passed", cwd=str(repo))
-    assert _verify(paths=[str(repo / "app.py")], coding=False) is None
-    assert feedback["records"]("verify")[-1].get("rule") is None
-    # An empty manifest satisfies the rule: the answer claims no check result.
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="fix", conversation_history=[])
-    _cmd("pytest -q", "3 passed", cwd=str(repo))
-    _manifest([])
-    assert _verify(paths=[str(repo / "app.py")]) is None
-    assert feedback["records"]("verify")[-1]["manifest_registered"] is True and feedback["records"]("verify")[-1].get("rule") is None
 
 
 def test_code_checks_each_manifest_claim_and_contradiction_and_missing_rows_are_findings(feedback, repo, emitted):
@@ -1616,6 +1616,7 @@ def test_assertion_questions_are_grouped_by_criterion_under_the_question_cap_and
 def test_a_change_to_tests_or_runner_config_is_flagged_for_the_human_not_as_a_finding(feedback, repo, emitted):
     (repo / "tests").mkdir()
     (repo / "tests" / "test_app.py").write_text("def test_x():\n    pass\n")
+    feedback["jev"].kind = "build"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     assert _verify(paths=[str(repo / "app.py"), str(repo / "tests" / "test_app.py")]) is None
@@ -1700,6 +1701,7 @@ def test_removed_assertions_or_added_skips_in_existing_tests_are_a_finding_once(
     _subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "tests"], check=True, capture_output=True)
     (repo / "app.py").write_text("def greet():\n    return 'changed'\n")
     (tests / "test_app.py").write_text("import pytest\n\n\n@pytest.mark.skip\ndef test_a():\n    pass\n")
+    feedback["jev"].kind = "build"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     paths = [str(repo / "app.py"), str(tests / "test_app.py")]
@@ -1785,14 +1787,15 @@ def test_the_budget_note_follows_the_thresholds_alone_and_reports_its_rate(feedb
     assert record["injected"] is False and record["note_reason"] == "" and record["injection_rate"] == {"n": 5, "injected": 4}
     assert "baseline_n" not in record
     assert emitted[-1]["stage"] == "budget" and emitted[-1]["text"].endswith("· note withheld · 4 of last 5 sent")
-    # The criteria-first plan sends it on every hard turn, not only the first that stands out.
+    # Hard but not checkable is logged as the criteria-first plan and sends nothing: criteria Jev cannot check are process.
     feedback["jev"].ambiguous = 0.1
     feedback["jev"].hard = 0.8
     feedback["jev"].checkable = 0.2
     for turn in range(6, 10):
-        result = preflight.on_pre_llm_call(session_id="s1", turn_id=f"t{turn}", user_message="x", conversation_history=[])
-        assert result is not None and "write the acceptance criteria first" in result["context"]
-        assert feedback["records"]("preflight")[-1]["note_reason"] == "criteria_only"
+        assert preflight.on_pre_llm_call(session_id="s1", turn_id=f"t{turn}", user_message="x", conversation_history=[]) is None
+        record = feedback["records"]("preflight")[-1]
+        assert record["note_reason"] == "" and record["injected"] is False and record["k"] == 1
+    assert emitted[-1]["decision"]["plan"] == "criteria_only" and emitted[-1]["decision"]["finish_loop"] is False
     # The build criteria nudge counts as an injection with its own reason.
     feedback["jev"].hard = 0.1
     feedback["jev"].kind = "build"
@@ -1896,3 +1899,42 @@ def test_the_verify_judge_labels_its_flags_from_the_gates_own_re_run(feedback, r
     assert event["decision"]["claims_precision"]["precision_basis"] == 3
     # Nothing here came from Jev: the same labels result whatever probabilities it returned.
     assert record["answers"]["claims_unverified"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Scope: criteria belong to the turn, the judge only runs on build turns
+# ---------------------------------------------------------------------------
+
+def test_criteria_clear_on_a_new_request_and_survive_a_continuation(feedback):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    assert len(preflight.active_criteria("s1")) == 3
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="proceed as recommended", conversation_history=[])
+    assert len(preflight.active_criteria("s1")) == 3, "a continuation keeps the proposed work's criteria"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="why did that take so long?", conversation_history=[])
+    assert preflight.active_criteria("s1") == [], "a new request is not judged against the last one's criteria"
+    assert preflight._session_excluded.get("s1") is None and preflight._session_fidelity.get("s1") is None
+
+
+def test_the_judge_skips_a_turn_that_is_not_a_build_and_ran_nothing(feedback, repo, emitted):
+    # A question that wrote a note file: not a build by the preflight read, no check, no criteria, no manifest.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="why did that take 45 minutes?", conversation_history=[])
+    calls = len(feedback["jev"].calls)
+    assert _verify(final="Ten minutes went on reading the engine before the change.", paths=[str(repo / "app.py")]) is None
+    assert len(feedback["jev"].calls) == calls, "nothing asked"
+    [record] = feedback["records"]("verify")
+    assert record["skipped"] == "not a build turn" and record["action"] == "skipped" and record["findings"] == []
+    event = [e for e in emitted if e["stage"] == "verify"][-1]
+    assert event["text"].startswith("Jev verify: skipped · not a build turn") and event["decision"] == {"action": "skipped", "reason": "not a build turn", "changed_paths": 1}
+    # Any one of the four signals brings the judge back: a check this turn.
+    _cmd("pytest -q", "3 passed", cwd=str(repo))
+    feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.9}
+    assert _verify(final="Ten minutes went on reading the engine before the change.", paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["action"] == "finish" and len(feedback["jev"].calls) == calls + 1
+
+
+def test_the_criteria_nudge_goes_out_once_per_session(feedback):
+    feedback["jev"].guard = {"is_build": 0.9}
+    assert preflight.on_pre_llm_call(session_id="s5", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) == {"context": preflight.CRITERIA_NUDGE}
+    assert preflight.on_pre_llm_call(session_id="s5", turn_id="t2", user_message="Now add --csv too", conversation_history=[]) is None, "criteria cleared with the new request, and the reminder is not repeated"
+    assert preflight.on_pre_llm_call(session_id="s6", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) is not None, "a new session gets it once"

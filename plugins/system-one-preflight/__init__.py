@@ -97,7 +97,11 @@ message ("is this claim supported by the evidence shown"), and one typed
 choice per assertion code could not settle; and keeps the model going with a
 findings note when something is confidently unmet, quoting each unsupported
 sentence so the model knows what to prove or drop. A build turn that ran
-checks and registered no manifest is sent back by rule, with no Jev call.
+checks, made a claim the evidence does not show and registered no manifest
+is asked for one in the same note. A turn that is not a build by the
+preflight read, ran no check and registered no criteria or manifest is not
+judged at all; acceptance criteria belong to the turn that registered them
+and clear on the next request unless it is a continuation.
 The gate sends a turn back at most ``verify_max_send_backs`` times (default
 1; ``agent.max_verify_nudges`` is the loop's outer bound) and only when the
 evidence (diff, paths, commands with outputs) changed since the last
@@ -220,10 +224,6 @@ PLAN_CANDIDATES = (
     "highest (a sum only counts criteria, and a candidate that fails one "
     "mandatory criterion is out), and never pick among your own candidates by "
     "reasoning alone."
-)
-PLAN_CRITERIA_ONLY = (
-    "This looks hard but not objectively checkable, so write the acceptance "
-    "criteria first and state every assumption you make in the answer."
 )
 PLAN_ASK = (
     "If the ambiguity is real, ask the user one focused clarifying question "
@@ -387,6 +387,7 @@ _pending_fidelity_note: Dict[str, str] = {}
 # Running means of the budget reads per session, so a turn's note is sent
 # when its read stands out from the session's usual, not on every turn.
 _injection_window: List[bool] = []
+_session_nudged: set = set()
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
 # acceptance criterion the recent calls serve; "none" at or above the
 # threshold steers the model back, at most DRIFT_MAX_STEERS times per turn.
@@ -983,8 +984,6 @@ def budget_context(
     parts: List[str] = []
     if plan.get("plan") == "candidates":
         parts.append(PLAN_CANDIDATES.format(k=plan.get("k", CANDIDATES_WHEN_HARD)))
-    elif plan.get("plan") == "criteria_only":
-        parts.append(PLAN_CRITERIA_ONLY)
     if ask:
         parts.append(PLAN_ASK)
     if not parts:
@@ -1003,15 +1002,16 @@ def continuation_request(text: str) -> bool:
 def budget_note_reason(p_ambiguous: Optional[float], plan: Dict[str, Any]) -> str:
     """Why the note goes out this turn, or an empty string to withhold it.
 
-    Candidates and the criteria-first plan are rare and actionable; ambiguity
-    at or above ``ambiguity_threshold`` is what a clarifying question answers.
-    Nothing else sends it: not the session's first turns, not a read that
-    stands out from the session's mean, and not the unsure band.
+    Candidates are rare and actionable; ambiguity at or above
+    ``ambiguity_threshold`` is what a clarifying question answers. Nothing
+    else sends it: not the criteria-first plan (criteria for a request Jev
+    cannot check are process, and "write the acceptance criteria first"
+    turned a one-line change into a project on 2026-09-24), not the session's
+    first turns, not a read that stands out from the session's mean, and not
+    the unsure band. The plan still goes to the log and the verdict row.
     """
     if plan.get("plan") == "candidates":
         return "candidates"
-    if plan.get("plan") == "criteria_only":
-        return "criteria_only"
     if p_ambiguous is not None and p_ambiguous >= ambiguity_threshold():
         return "ambiguous"
     return ""
@@ -1230,6 +1230,8 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     user_message = kwargs.get("user_message")
     remember_scope(session_id, user_message, history if isinstance(history, list) else [])
     reset_drift(session_id)
+    if not continuation_request(_text_of(user_message)):
+        reset_criteria(session_id)
     arm = resolve_arm(mode, session_id)
     state = build_state(user_message, history if isinstance(history, list) else [])
     started = time.monotonic()
@@ -1289,8 +1291,11 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             and verify_judge_enabled()
             and p_build is not None
             and p_build >= BUILD_THRESHOLD
-            and not _session_todos.get(session_id)
+            and session_id not in _session_nudged
         ):
+            # Once per session: criteria clear on every new request, and a
+            # reminder on every build turn would be a constant.
+            _session_nudged.add(session_id)
             context = f"{context}\n\n{CRITERIA_NUDGE}" if context else CRITERIA_NUDGE
             note_reason = note_reason or "criteria_nudge"
         injected = context is not None
@@ -1943,8 +1948,18 @@ def _first_open_criterion(todos: List[Dict[str, str]]) -> Optional[Dict[str, str
     return None
 
 
+def reset_criteria(session_id: str) -> None:
+    """A new request: the previous turn's acceptance criteria are not this
+    turn's. Judging a question against a redesign's twelve criteria rated all
+    of them unmet and sent the model back (2026-09-24). A continuation
+    ("proceed", "continue") keeps them: they are the proposed work."""
+    _session_todos.pop(session_id, None)
+    _session_excluded.pop(session_id, None)
+    _session_fidelity.pop(session_id, None)
+
+
 def active_criteria(session_id: str) -> List[Dict[str, str]]:
-    """The session's criteria minus the ones the fidelity check excluded."""
+    """The turn's criteria minus the ones the fidelity check excluded."""
     excluded = set(_session_excluded.get(session_id) or [])
     return [item for item in _session_todos.get(session_id, []) if item.get("id") not in excluded]
 
@@ -2102,6 +2117,10 @@ def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay
     state = drift_state(session_id)
     state["calls"].append({"tool": tool_name, "summary": _call_summary(tool_name, args)})
     del state["calls"][:-MAX_DRIFT_CALLS_KEPT]
+    if tool_name in ("todo", "acceptance_criteria", "report_results"):
+        # Defining the criteria or reporting against them is not work that
+        # could drift from them; it stays in the recent calls, out of the window.
+        return None
     state["total"] += 1
     if replay:
         return None
@@ -2433,40 +2452,22 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     checks_ran = [row for row in rows_this_turn if row.get("check")]
     machinery = evidence.machinery_paths(changed, bundle["root"])
 
-    # By rule, no Jev call: a build turn that ran checks says which results it claims.
-    if manifest is None and manifest_required() and build and checks_ran:
-        finding = MANIFEST_REQUIRED_FINDING.format(n=len(checks_ran), ids=", ".join(row["id"] for row in checks_ran[-6:]))
-        findings = [finding]
-        key = _verify_key(bundle["diff"], changed, rows_this_turn)
-        repeated = attempt > 0 and _verify_memo.get(session_id) == key
-        _verify_memo[session_id] = key
-        _bound(_verify_memo)
-        send_back, ship_reason = _send_back(findings, repeated, attempt)
-        action = "nudge" if send_back else "ship_flagged"
+    # Nothing to judge: the turn is not a build by the preflight read, ran no
+    # check, registered no criteria and no manifest. A question that wrote a
+    # note file is not a change to verify; judging it against nothing sent
+    # the model back to prove sentences about its own timing (2026-09-24).
+    if not drift_state(session_id).get("build") and not checks_ran and manifest is None and not todos:
         write_log({
-            "event": "verify", "session_id": session_id, "attempt": attempt, "repeated": repeated, "rule": "no_manifest",
-            "changed_paths": len(changed), "criteria": len(criteria), "excluded": len(excluded), "pending": len(pending),
-            "ledger": len(rows_this_turn), "ledger_checks": len(checks_ran), "manifest_registered": False,
-            "manifest": evidence.manifest_counts([]), "reruns": [], "machinery": machinery, "workspace": final_digest,
-            "diff_chars": len(bundle["diff"]), "answers": {}, "findings": findings, "action": action, "ship_reason": ship_reason,
-            "latency_ms": int((time.monotonic() - started) * 1000), "error": "",
+            "event": "verify", "session_id": session_id, "attempt": attempt, "skipped": "not a build turn",
+            "changed_paths": len(changed), "ledger": len(rows_this_turn), "ledger_checks": 0, "criteria": 0,
+            "manifest_registered": False, "findings": [], "action": "skipped", "latency_ms": int((time.monotonic() - started) * 1000), "error": "",
         })
         emit_verdict(
             session_id, "verify",
-            f"Jev verify (attempt {attempt + 1}): no result manifest on a build turn that ran {len(checks_ran)} checks · "
-            f"ledger {len(rows_this_turn)} rows" + (f" · machinery changed ({len(machinery)})" if machinery else "") + f" · {action}"
-            + (f" ({ship_reason})" if ship_reason else "") + f" · {finding}",
-            answers={},
-            decision={
-                "action": action, "rule": "no_manifest", "findings": findings, "criteria": len(criteria), "excluded": len(excluded),
-                "pending": len(pending), "ledger": len(rows_this_turn), "manifest": evidence.manifest_counts([]),
-                "manifest_registered": False, "reruns": 0, "machinery": machinery, "assertions": [], "ship_reason": ship_reason,
-            },
-            attempt=attempt,
+            f"Jev verify: skipped · not a build turn (no check ran, no criteria, no manifest) · {len(changed)} path{'s' if len(changed) != 1 else ''} changed",
+            answers={}, decision={"action": "skipped", "reason": "not a build turn", "changed_paths": len(changed)}, attempt=attempt,
         )
-        if not send_back:
-            return None
-        return {"action": "continue", "message": VERIFY_TEMPLATE.format(findings=finding)}
+        return None
 
     # Code decides each manifest item. A decisive claim (passed, count,
     # exit_zero) is supported only by a row the gate produced itself: every
@@ -2712,6 +2713,14 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     ]
     for sentence, _value in flagged:
         findings.append(CLAIM_FINDING.format(claim=sentence))
+    # The manifest is for the gate's labels, not for Jev, which reads the
+    # outputs directly. It is asked for only when a sentence needs one: a
+    # build turn that ran checks, made a claim the evidence does not show,
+    # and declared nothing the gate could re-run.
+    rule = ""
+    if flagged and manifest is None and manifest_required() and build and checks_ran:
+        rule = "no_manifest"
+        findings.append(MANIFEST_REQUIRED_FINDING.format(n=len(checks_ran), ids=", ".join(row["id"] for row in checks_ran[-6:])))
     claim_labels, claim_misses = label_claims([sentence for sentence, _value in flagged], verdicts, manifest is not None)
     # One record per manifest item, in manifest order, with Jev's read where one was asked.
     assertion_records: List[Dict[str, Any]] = []
@@ -2773,6 +2782,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "claim_labels": claim_labels,
             "claim_misses": claim_misses,
             "findings": findings,
+            "rule": rule,
             "action": action,
             "ship_reason": ship_reason,
             "latency_ms": latency_ms,
@@ -2810,7 +2820,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "reruns": len(reruns), "machinery": machinery, "weakening": weakening, "regressions": regressions,
             "assertions": assertion_records, "flagged_sentences": [sentence for sentence, _value in flagged],
             "claim_labels": claim_labels, "claim_misses": claim_misses, "claims_precision": precision,
-            "ship_reason": ship_reason,
+            "rule": rule, "ship_reason": ship_reason,
         },
         model=jev_model,
         latency_ms=latency_ms,
