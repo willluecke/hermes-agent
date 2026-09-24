@@ -2704,6 +2704,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("GET", "/api/sessions/{session_id}/background", self._handle_session_background),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             # Managed Claude Code processes report each tool call here through
             # their own command hooks; authenticated by a per-session token,
@@ -5154,6 +5155,67 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+
+    def _session_background_tasks(self, session_id: str) -> list[dict[str, Any]]:
+        """Background tasks the session's resident Claude Code CLI still runs."""
+        runner = self.gateway_runner
+        cache = getattr(runner, "_agent_cache", None)
+        cache_lock = getattr(runner, "_agent_cache_lock", None)
+        if not session_id or cache is None or cache_lock is None:
+            return []
+        with cache_lock:
+            agents = [
+                entry[0]
+                for key, entry in cache.items()
+                if isinstance(entry, tuple)
+                and entry
+                and entry[0] is not None
+                and (
+                    str(key).endswith(f":{session_id}")
+                    or (len(entry) > 3 and entry[3] == session_id)
+                    or getattr(entry[0], "session_id", None) == session_id
+                )
+            ]
+        tasks: list[dict[str, Any]] = []
+        for agent in agents:
+            session = getattr(agent, "_claude_code_session", None)
+            probe = getattr(session, "background_tasks", None)
+            if not callable(probe):
+                continue
+            try:
+                listed = probe()
+            except Exception:
+                continue
+            for task in listed or []:
+                if isinstance(task, dict) and task.get("task_id"):
+                    tasks.append({**task, "kind": "claude_task", "running": True})
+        return tasks
+
+    async def _handle_session_background(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/background — work still running for a chat.
+
+        Lists the background tasks (agents, workflows, shells, monitors) the
+        session's resident Claude Code CLI reports as live, and the detached
+        jobs registered to the session (gateway.background_jobs).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = str(request.match_info["session_id"] or "").strip()
+        from gateway.background_jobs import registered_jobs
+
+        tasks = self._session_background_tasks(session_id)
+        jobs = await asyncio.to_thread(registered_jobs, session_id)
+        return web.json_response(
+            {
+                "object": "hermes.session.background",
+                "session_id": session_id,
+                "tasks": tasks,
+                "jobs": jobs,
+                "checked_at": time.time(),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""

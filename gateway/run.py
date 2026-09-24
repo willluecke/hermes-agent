@@ -81,6 +81,11 @@ from hermes_cli.fallback_config import get_fallback_chain
 # (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+# A resident Claude Code CLI keeps its background work (workflows, background
+# agents and shells) running between turns, and evicting the agent kills that
+# CLI. Neither cache sweep evicts an agent whose CLI reports such work, up to
+# this age, so one stuck task cannot pin an agent forever.
+_BACKGROUND_WORK_MAX_AGE_SECS = 12 * 3600.0
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # Telegram cold polling now proves one real getUpdates round trip before connect
 # returns. Leave enough outer budget for initialize/deleteWebhook/start_polling
@@ -27604,6 +27609,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 agent = entry[0] if isinstance(entry, tuple) and entry else None
                 if agent is not None and id(agent) in running_ids:
                     continue  # active mid-turn; don't evict, don't substitute
+                if agent is not None and self._agent_has_background_work(agent):
+                    continue  # its CLI still runs background work
                 evict_plan.append((key, agent))
 
         for key, _ in evict_plan:
@@ -27635,6 +27642,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     daemon=True,
                     name=f"agent-cache-evict-{key[:24]}",
                 ).start()
+
+    @staticmethod
+    def _agent_has_background_work(agent: Any) -> bool:
+        session = getattr(agent, "_claude_code_session", None)
+        probe = getattr(session, "background_work_age", None)
+        if not callable(probe):
+            return False
+        try:
+            age = probe()
+        except Exception:
+            return False
+        return (
+            isinstance(age, (int, float))
+            and 0 <= age < _BACKGROUND_WORK_MAX_AGE_SECS
+        )
 
     def _sweep_idle_cached_agents(self) -> int:
         """Evict cached agents whose AIAgent has been idle past the idle TTL.
@@ -27669,6 +27691,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_activity = getattr(agent, "_last_activity_ts", None)
                 if last_activity is None:
                     continue
+                if (
+                    (now - last_activity) > idle_ttl
+                    and self._agent_has_background_work(agent)
+                ):
+                    continue  # idle turn, but its CLI still runs background work
                 if (now - last_activity) > idle_ttl:
                     # Check whether the session has actually expired in the
                     # session store.  If it hasn't (e.g. daily-reset mode

@@ -1560,3 +1560,70 @@ def test_event_bridge_flushes_held_commentary_and_shows_monitor_notes():
     bridge({"type": "hermes.monitor_note", "text": "Waiting on a background monitor: hero render (task t1, up to 1 min)."})
     assert emitted[-1]["content"].startswith("Waiting on a background monitor: hero render")
     assert len(emitted) == 2
+
+
+def test_background_tasks_follow_the_cli_task_records():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5",
+                                session_id="00000000-0000-4000-8000-000000000000")
+    _install_fake_process(session, _fake_process(30101), [])
+    tracker = session._background_tasks
+
+    tracker.observe({"type": "system", "subtype": "task_started", "task_id": "fg",
+                     "description": "Run tests", "is_backgrounded": False,
+                     "task_type": "local_bash"})
+    assert session.background_tasks() == []  # a foreground command is the turn's own work
+    assert session.background_work_age() is None
+
+    tracker.observe({"type": "system", "subtype": "task_started", "task_id": "wf",
+                     "description": "build", "is_backgrounded": True,
+                     "task_type": "local_workflow"})
+    tracker.observe({"type": "system", "subtype": "background_tasks_changed", "tasks": [
+        {"task_id": "wf", "task_type": "local_workflow", "description": "build"},
+        {"task_id": "ag", "task_type": "local_agent", "description": "review", "ambient": True},
+    ]})
+    listed = session.background_tasks()
+    assert [(t["task_id"], t["task_type"], t["ambient"]) for t in listed] == [
+        ("wf", "local_workflow", False), ("ag", "local_agent", True),
+    ]
+    assert session.background_work_age() is not None
+
+    tracker.observe({"type": "system", "subtype": "task_notification", "task_id": "wf",
+                     "status": "completed"})
+    assert [t["task_id"] for t in session.background_tasks()] == ["ag"]
+    # the level signal replaces the set
+    tracker.observe({"type": "system", "subtype": "background_tasks_changed", "tasks": []})
+    assert session.background_tasks() == []
+
+
+def test_background_tasks_are_empty_once_the_cli_is_gone():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5",
+                                session_id="00000000-0000-4000-8000-000000000000")
+    process = _install_fake_process(session, _fake_process(30102), [])
+    session._background_tasks.observe({"type": "system", "subtype": "background_tasks_changed",
+                                       "tasks": [{"task_id": "wf", "task_type": "local_workflow",
+                                                  "description": "build"}]})
+    assert session.background_work_age() is not None
+
+    process.poll = lambda: 0
+    assert session.background_tasks() == []
+    assert session.background_work_age() is None
+
+
+def test_background_tasks_listed_between_turns_are_tracked():
+    session = _shell_session()
+    session.late_answer_log = None
+    session.late_drain_interval_seconds = 0.02
+    _install_fake_process(session, _fake_process(30103), [
+        {"type": "user", "session_id": SID, "message": {"role": "user", "content": "Start the build"}},
+        {"type": "result", "session_id": SID, "result": "Started the build.",
+         "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+
+    assert session.run_turn("Start the build").final_text == "Started the build."
+    session._output_queue.put(json.dumps({
+        "type": "system", "subtype": "background_tasks_changed", "session_id": SID,
+        "tasks": [{"task_id": "wf", "task_type": "local_workflow", "description": "build"}],
+    }) + "\n")
+
+    assert _wait_for(lambda: session.background_tasks())
+    assert [t["task_id"] for t in session.background_tasks()] == ["wf"]
