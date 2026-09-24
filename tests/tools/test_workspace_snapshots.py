@@ -190,3 +190,23 @@ def test_vanished_source_files_are_a_warning_not_a_failure(
     record = Path(snapshot.path)
     assert record.is_dir()
     assert (record / "manifest.json").is_file()
+
+
+def test_a_workspace_containing_the_snapshot_store_is_skipped_not_failed(snapshot_env, tmp_path):
+    # Hermes Chat's command-center project is the home directory, which holds
+    # HERMES_HOME and so the snapshot store; every Codex turn there used to fail.
+    hermes_home, _workspace, policy = snapshot_env
+    home_like = tmp_path
+    (home_like / "notes.txt").write_text("a file in the home directory", encoding="utf-8")
+
+    assert (
+        capture_workspace_snapshot(
+            workspace_root=str(home_like),
+            project="command-center",
+            session_id="session-1",
+            task_id="task-1",
+            policy=policy,
+        )
+        is None
+    )
+    assert not (hermes_home / "workspace-snapshots").exists()

@@ -16,6 +16,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -27,6 +28,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 from hermes_constants import get_hermes_home
 
@@ -269,9 +272,17 @@ def capture_workspace_snapshot(
     except ValueError:
         pass
     else:
-        raise WorkspaceSnapshotError(
-            "workspace snapshot store cannot be inside the selected workspace"
+        # A workspace that contains the snapshot store itself cannot hold its
+        # own recovery point: the copy would include the store and span the
+        # whole home directory. Hermes Chat's command-center base project is
+        # /home/will, so every Codex turn there failed with this as an error
+        # (2026-09-23). Skip it like scratch; Trash capture for rm-style
+        # deletes, approvals and git history still apply.
+        logger.warning(
+            "workspace snapshot skipped: %s contains the snapshot store %s",
+            workspace, store,
         )
+        return None
 
     project_key = project.strip() or workspace.name or "workspace"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
