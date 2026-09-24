@@ -33,7 +33,7 @@ class _FakeJev:
         for key in questions:
             if key == "missing_verification":
                 answers[key] = {"type": "noul", "noul": self.p}
-            elif key.startswith("entails_") or key == "coverage":
+            elif key.startswith("entails_") or key in ("coverage", "request_met"):
                 # The fidelity check: criteria are entailed and cover the request unless a test says otherwise.
                 answers[key] = {"type": "noul", "noul": self.guard.get(key, 0.9)}
             else:
@@ -1515,7 +1515,7 @@ def test_code_checks_each_manifest_claim_and_contradiction_and_missing_rows_are_
     event = emitted[-1]
     assert event["text"].startswith("Jev verify (attempt 1): criteria met 1/1 · manifest 2 supported, 1 contradicted, 1 missing · claims beyond 0.05 · checks failing 0.10 · ledger 2 rows · 2 re-run by the gate · nudge")
     assert event["decision"]["manifest"]["contradicted"] == 1 and event["decision"]["ledger"] == 2 and event["decision"]["reruns"] == 2
-    assert set(event["answers"]) == {"fix greet", "claims_unverified", "checks_failing"}, "assertion reads stay out of the calibration answers"
+    assert set(event["answers"]) == {"fix greet", "request_met", "claims_unverified", "checks_failing"}, "assertion reads stay out of the calibration answers"
 
 
 def test_a_check_that_ran_before_a_later_edit_is_stale_and_the_gate_reruns_it_itself(feedback, repo, emitted, monkeypatch):
@@ -1905,15 +1905,60 @@ def test_the_verify_judge_labels_its_flags_from_the_gates_own_re_run(feedback, r
 # Scope: criteria belong to the turn, the judge only runs on build turns
 # ---------------------------------------------------------------------------
 
-def test_criteria_clear_on_a_new_request_and_survive_a_continuation(feedback):
+def test_criteria_roll_to_the_new_request_by_entailment_and_survive_a_continuation(feedback, emitted):
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag", conversation_history=[])
     preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
     assert len(preflight.active_criteria("s1")) == 3
+    calls = len(feedback["jev"].calls)
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="proceed as recommended", conversation_history=[])
-    assert len(preflight.active_criteria("s1")) == 3, "a continuation keeps the proposed work's criteria"
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="why did that take so long?", conversation_history=[])
-    assert preflight.active_criteria("s1") == [], "a new request is not judged against the last one's criteria"
+    assert len(preflight.active_criteria("s1")) == 3 and len(feedback["jev"].calls) == calls + 1, "a continuation keeps the proposed work's criteria without a roll call"
+    # A stopped run resubmitted with a change keeps what still follows and drops the rest.
+    feedback["jev"].guard = {"entails_1": 0.9, "entails_2": 0.2, "entails_3": 0.85}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="actually, make the flag --json-out and skip the docs", conversation_history=[
+        {"role": "user", "content": "Add a --json flag"}, {"role": "assistant", "content": "Adding it now."},
+    ])
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["1", "3"]
+    record = feedback["records"]("fidelity")[-1]
+    assert record["rolled"] is True and record["kept"] == ["1", "3"] and record["dropped"] == ["2"] and record["error"] == ""
+    roll = [e for e in emitted if e["stage"] == "fidelity"][-1]
+    assert roll["text"] == "Jev criteria roll: kept 2 of 3 for the new request" and roll["decision"]["dropped"] == ["2"]
+    call = feedback["jev"].calls[-2]
+    assert set(call["questions"]) == {"entails_1", "entails_2", "entails_3"}, "entailment only; coverage is verified at the end, not demanded here"
+    assert call["state"]["request"]["text"].startswith("actually, make the flag") and "Add a --json flag" in call["state"]["earlier_instructions"]["items"]
+    # An unrelated question drops them all.
+    feedback["jev"].guard = {"entails_1": 0.1, "entails_3": 0.05}
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="why did that take so long?", conversation_history=[])
+    assert preflight.active_criteria("s1") == [] and feedback["records"]("fidelity")[-1]["kept"] == []
     assert preflight._session_excluded.get("s1") is None and preflight._session_fidelity.get("s1") is None
+    # Nothing stale survives an outage or the switch being off.
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    feedback["jev"].raise_exc = RuntimeError("down")
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="now the csv flag", conversation_history=[])
+    assert preflight.active_criteria("s1") == [] and "down" in feedback["records"]("fidelity")[-1]["error"]
+    feedback["jev"].raise_exc = None
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    feedback["settings"]["fidelity_check"] = "off"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t6", user_message="and the yaml flag", conversation_history=[])
+    assert preflight.active_criteria("s1") == [] and feedback["records"]("fidelity")[-1]["checked"] is False
+    assert [e for e in emitted if e["stage"] == "fidelity"][-1]["text"] == "Jev criteria roll: kept 0 of 3 for the new request · not checked, all dropped"
+
+
+def test_the_verify_judge_checks_the_request_as_a_whole_beside_the_criteria(feedback, repo):
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag and document it", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s1")
+    feedback["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.9, "request_met": 0.1, "claims_unverified": 0.05}
+    result = preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[str(repo / "app.py")])
+    assert result is not None
+    assert 'The change may not satisfy the request as a whole (P(satisfied)=0.10): "Add a --json flag and document it".' in result["message"]
+    call = feedback["jev"].calls[-1]
+    assert "request as a whole: Add a --json flag and document it" in call["questions"]["request_met"]["instructions"]
+    record = feedback["records"]("verify")[-1]
+    assert record["answers"]["request_met"] == 0.1
+    feedback["jev"].guard = {"criterion_1": 0.95, "criterion_2": 0.9, "request_met": 0.9, "claims_unverified": 0.05}
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q"}, result="3 passed", session_id="s1")
+    assert preflight.on_pre_verify(session_id="s1", attempt=1, final_response="Done.", changed_paths=[str(repo / "app.py")]) is None
+    assert feedback["records"]("verify")[-1]["findings"] == ["Todo items still pending: 1."] or feedback["records"]("verify")[-1]["action"] in ("finish", "ship_flagged")
 
 
 def test_the_judge_skips_a_turn_that_is_not_a_build_and_ran_nothing(feedback, repo, emitted):

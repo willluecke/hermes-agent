@@ -1230,8 +1230,6 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     user_message = kwargs.get("user_message")
     remember_scope(session_id, user_message, history if isinstance(history, list) else [])
     reset_drift(session_id)
-    if not continuation_request(_text_of(user_message)):
-        reset_criteria(session_id)
     arm = resolve_arm(mode, session_id)
     state = build_state(user_message, history if isinstance(history, list) else [])
     started = time.monotonic()
@@ -1258,6 +1256,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     else:
         _session_previous_answer.pop(session_id, None)
     _bound(_session_previous_answer)
+    roll_criteria(session_id, _text_of(user_message))
     if arm == "feedback" and previous:
         state["previous_answer"] = {"source": "agent", "text": _clip(previous, 1_500)}
         questions["previous_outcome"] = {"type": "choice", "instructions": OUTCOME_QUESTION, "criteria": OUTCOME_CRITERIA}
@@ -1948,14 +1947,93 @@ def _first_open_criterion(todos: List[Dict[str, str]]) -> Optional[Dict[str, str
     return None
 
 
-def reset_criteria(session_id: str) -> None:
-    """A new request: the previous turn's acceptance criteria are not this
-    turn's. Judging a question against a redesign's twelve criteria rated all
-    of them unmet and sent the model back (2026-09-24). A continuation
-    ("proceed", "continue") keeps them: they are the proposed work."""
-    _session_todos.pop(session_id, None)
+def roll_criteria(session_id: str, request: str) -> None:
+    """A new request: re-validate the previous turn's acceptance criteria
+    against it and keep only what the new request still asks for.
+
+    A stopped run resubmitted with a change ("make it 1.5 not 2") keeps the
+    criteria that still follow; an unrelated question drops them all
+    (judging one against a redesign's twelve criteria rated every one unmet
+    and sent the model back, 2026-09-24). A continuation ("proceed",
+    "continue") keeps them without a call: they are the proposed work.
+    With the fidelity check off, or Jev unavailable, nothing stale is kept.
+    """
+    previous = list(_session_todos.get(session_id) or [])
+    if not previous:
+        return
+    if continuation_request(request):
+        return
     _session_excluded.pop(session_id, None)
     _session_fidelity.pop(session_id, None)
+    kept: List[Dict[str, str]] = []
+    entailment: Dict[str, Optional[float]] = {}
+    error = ""
+    jev_model = ""
+    latency_ms = 0
+    if fidelity_check_enabled() and request:
+        scope = list(_session_scope.get(session_id) or [])
+        questions = {
+            f"entails_{item['id']}": {
+                "type": "noul",
+                "instructions": FIDELITY_ENTAILMENT_QUESTION.format(criterion=_clip(item["content"], 300)),
+                "criteria": FIDELITY_ENTAILMENT_CRITERIA,
+            }
+            for item in previous
+        }
+        jev_state = {
+            "provenance": (
+                "request was typed by the user just now and replaces the previous request. earlier_instructions "
+                "were typed by the user before it, most recent last. previous_answer was written by the agent for the "
+                "previous request. acceptance_criteria were written by the agent for the previous request; the question "
+                "is which of them the new request still asks for."
+            ),
+            "request": {"source": "user", "text": _clip(request, 1_500)},
+            "earlier_instructions": {"source": "user", "items": scope[:-1][-3:]},
+            "previous_answer": {"source": "agent, previous turn", "text": _session_previous_answer.get(session_id, "")},
+            "acceptance_criteria": {"source": "agent, previous request", "items": [{"id": item["id"], "text": _clip(item["content"], 300)} for item in previous]},
+        }
+        started = time.monotonic()
+        try:
+            ask = _ask
+            if ask is None:
+                from tools.typesafe_tool import ask_jev
+
+                ask = ask_jev
+            body = ask(jev_state, questions, timeout=fidelity_timeout_seconds())
+            answers = body.get("answers") or {}
+            jev_model = str(body.get("model") or "")
+            for item in previous:
+                entailment[item["id"]] = _noul(answers, f"entails_{item['id']}")
+            if all(value is None for value in entailment.values()):
+                error = "no noul in answer"
+        except Exception as exc:
+            error = f"{exc.__class__.__name__}: {exc}"[:300]
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if not error:
+            kept = [
+                item for item in previous
+                if entailment.get(item["id"]) is not None and entailment[item["id"]] >= fidelity_entailment_threshold()
+            ]
+    if kept:
+        _session_todos[session_id] = kept
+    else:
+        _session_todos.pop(session_id, None)
+    dropped = [item["id"] for item in previous if item not in kept]
+    write_log({
+        "event": "fidelity", "session_id": session_id, "rolled": True, "criteria": len(previous),
+        "kept": [item["id"] for item in kept], "dropped": dropped, "entailment": entailment,
+        "entailment_threshold": fidelity_entailment_threshold(), "checked": bool(entailment),
+        "latency_ms": latency_ms, "error": error,
+    })
+    emit_verdict(
+        session_id, "fidelity",
+        f"Jev criteria roll: kept {len(kept)} of {len(previous)} for the new request"
+        + ("" if entailment else " · not checked, all dropped" if not error else "")
+        + (f" · {error}" if error else ""),
+        answers={item["content"]: entailment.get(item["id"]) for item in previous},
+        decision={"rolled": True, "kept": [item["id"] for item in kept], "dropped": dropped, "entailment_threshold": fidelity_entailment_threshold()},
+        model=jev_model, latency_ms=latency_ms,
+    )
 
 
 def active_criteria(session_id: str) -> List[Dict[str, str]]:
@@ -2565,6 +2643,14 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     if excerpts:
         questions["checks_failing"] = {"type": "noul", "instructions": CHECKS_FAILING_QUESTION}
     questions["claims_unverified"] = {"type": "noul", "instructions": CLAIMS_QUESTION, "criteria": CLAIMS_CRITERIA}
+    if criteria and request and len(questions) < JEV_MAX_QUESTIONS:
+        # Coverage is verified here, once, against the request as a whole,
+        # rather than demanded up front as more criteria.
+        questions["request_met"] = {
+            "type": "noul",
+            "instructions": f"Taking the acceptance criteria as the agent's own reading, do the code changes fully satisfy the user's request as a whole: {_clip(request, 400)}",
+            "criteria": CRITERION_CRITERIA,
+        }
     sentences = claim_sentences(final_response)[: max(0, JEV_MAX_QUESTIONS - len(questions))]
     claim_keys: Dict[str, str] = {}
     for index, sentence in enumerate(sentences, 1):
@@ -2692,6 +2778,9 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             + "; ".join(f'"{_clip(text, 120)}" (P(satisfied)={value:.2f})' for text, value in unmet)
             + "."
         )
+    request_met = answers.get("request_met")
+    if request_met is not None and request_met <= verify_fail_threshold():
+        findings.append(f"The change may not satisfy the request as a whole (P(satisfied)={request_met:.2f}): \"{_clip(request, 160)}\".")
     if pending:
         findings.append(f"Todo items still pending: {len(pending)}.")
     stale_drift = _pending_drift.pop(session_id, None)
@@ -2793,7 +2882,8 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     precision = claims_precision() if flagged or claim_misses else {}
     label_counts = {label: sum(1 for entry in claim_labels if entry["label"] == label) for label in CLAIM_LABELS}
     text = (
-        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)} · "
+        f"Jev verify (attempt {attempt + 1}): criteria met {met}/{len(labels)}"
+        + (f" · request {_fmt(request_met)}" if request_met is not None else "") + " · "
         f"manifest {_manifest_summary(counts, manifest is not None)} · "
         f"claims beyond {_fmt(claims)} · checks failing {_fmt(checks_failing)} · ledger {len(rows_this_turn)} rows"
         + (f" · {len(reruns)} re-run by the gate" if reruns else "")
@@ -2813,7 +2903,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         session_id,
         "verify",
         text,
-        answers={**{labels[key]: answers.get(key) for key in labels}, "claims_unverified": claims, "checks_failing": checks_failing},
+        answers={**{labels[key]: answers.get(key) for key in labels}, "request_met": request_met, "claims_unverified": claims, "checks_failing": checks_failing},
         decision={
             "action": action, "findings": findings, "criteria": len(labels), "excluded": len(excluded), "pending": len(pending),
             "ledger": len(rows_this_turn), "manifest": counts, "manifest_registered": manifest is not None,
