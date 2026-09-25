@@ -118,6 +118,22 @@ def _is_transcript_scaffolding(message: dict[str, Any]) -> bool:
         return bool(message.get("_pre_verify_synthetic") or message.get("_verification_stop_synthetic"))
 
 
+def _fingerprint_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rows of the outer transcript a Claude session is measured against."""
+    rows: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("display_kind") == _LATE_ANSWER_DISPLAY_KIND:
+            # A late answer is appended to the store whenever the CLI writes
+            # it, possibly while the next turn is already loading history.
+            # The Claude session holds it either way, so it never counts
+            # toward the prefix that decides whether that session continues.
+            continue
+        if _is_transcript_scaffolding(message):
+            continue
+        rows.append(message)
+    return rows
+
+
 def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
     """Hash the outer transcript prefix represented by a Claude session.
 
@@ -129,17 +145,8 @@ def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
     session" two minutes after the previous answer).
     """
     digest = hashlib.sha256()
-    included = 0
-    for message in messages:
-        if message.get("display_kind") == _LATE_ANSWER_DISPLAY_KIND:
-            # A late answer is appended to the store whenever the CLI writes
-            # it, possibly while the next turn is already loading history.
-            # The Claude session holds it either way, so it never counts
-            # toward the prefix that decides whether that session continues.
-            continue
-        if _is_transcript_scaffolding(message):
-            continue
-        included += 1
+    rows = _fingerprint_rows(messages)
+    for message in rows:
         payload = [
             str(message.get("role") or ""),
             _fingerprint_text(message.get("content")),
@@ -150,7 +157,34 @@ def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
             )
         )
         digest.update(b"\n")
-    return f"v1:{included}:{digest.hexdigest()}"
+    return f"v1:{len(rows)}:{digest.hexdigest()}"
+
+
+def _claude_history_continues(
+    recorded: Optional[str], messages: list[dict[str, Any]]
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Whether the transcript a Claude session recorded is still the start of
+    ``messages``, and the rows added since.
+
+    A session keeps its context as long as nothing it saw was changed; rows
+    appended after its last turn (a worker's review, an adopted late answer,
+    another device's turn) are handed to it as a delta rather than costing
+    the session. Only a diverged prefix (an edited or rolled-back transcript)
+    reads as discontinuity.
+    """
+    if not recorded:
+        return False, []
+    try:
+        _version, count_text, _digest = str(recorded).split(":", 2)
+        count = int(count_text)
+    except ValueError:
+        return False, []
+    rows = _fingerprint_rows(messages)
+    if count > len(rows):
+        return False, []
+    if _claude_history_fingerprint(rows[:count]) != recorded:
+        return False, []
+    return True, rows[count:]
 
 
 def _normalized_cwd(cwd: str) -> str:
@@ -293,7 +327,21 @@ def save_claude_late_answer(agent: Any, record: dict[str, Any]) -> Optional[int]
     return row_id
 
 
-def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) -> str:
+CLAUDE_HANDOFF_LEAD = (
+    "Continue this existing Hermes Chat conversation. Use the transcript "
+    "as context; do not restart completed discovery."
+)
+CLAUDE_DELTA_LEAD = (
+    "You are continuing your own Claude session in this Hermes Chat "
+    "conversation. Since your last turn, the messages below were added to the "
+    "conversation without you; read them as context, then answer the current "
+    "request."
+)
+
+
+def claude_history_handoff(
+    messages: list[dict[str, Any]], user_message: str, *, lead: str = CLAUDE_HANDOFF_LEAD
+) -> str:
     blocks: list[str] = []
     for message in messages[-24:]:
         role = message.get("role")
@@ -309,8 +357,7 @@ def claude_history_handoff(messages: list[dict[str, Any]], user_message: str) ->
     if not transcript:
         return user_message
     return (
-        "Continue this existing Hermes Chat conversation. Use the transcript "
-        "as context; do not restart completed discovery.\n\n"
+        f"{lead}\n\n"
         f"Recent transcript:\n{transcript}\n\n"
         f"Current request:\n{user_message}"
     )
@@ -945,11 +992,14 @@ def run_claude_code_turn(
     prior_fingerprint = _claude_history_fingerprint(prior_messages)
     prior_state = _load_claude_session_state(agent)
     prior_session_id = str(prior_state.get("session_id") or "").strip()
+    durable_continues, durable_delta = _claude_history_continues(
+        prior_state.get("history_fingerprint"), prior_messages
+    )
     durable_resume = bool(
         prior_session_id
         and prior_state.get("version") == _CLAUDE_SESSION_STATE_VERSION
         and prior_state.get("cwd") == cwd
-        and prior_state.get("history_fingerprint") == prior_fingerprint
+        and durable_continues
     )
     runtime_contract = (
         "You are the selected Claude subscription runtime inside Hermes Chat. "
@@ -980,6 +1030,10 @@ def run_claude_code_turn(
         default=DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT,
     )
     session = getattr(agent, "_claude_code_session", None)
+    resident_continues, resident_delta = _claude_history_continues(
+        getattr(session, "history_fingerprint", None) if session is not None else None,
+        prior_messages,
+    )
     resident_continuity = bool(
         session is not None
         and session.compatible_with(
@@ -989,7 +1043,7 @@ def run_claude_code_turn(
             system_prompt=runtime_contract,
             read_only=read_only,
         )
-        and getattr(session, "history_fingerprint", None) == prior_fingerprint
+        and resident_continues
     )
     if session is not None and not resident_continuity:
         # A project/model/transcript switch is a real continuity boundary. Do
@@ -1001,6 +1055,26 @@ def run_claude_code_turn(
             logger.debug("Claude Code stale-session cleanup failed", exc_info=True)
         agent._claude_code_session = None
         session = None
+    continuity_delta = resident_delta if resident_continuity else durable_delta if durable_resume else []
+    if not resident_continuity and not durable_resume:
+        # Every one of these starts a new Claude session with a transcript
+        # handoff, which the model reads as a fresh session. Say why, so a
+        # handoff is never silent (2026-09-25).
+        reason = (
+            "no recorded Claude session"
+            if not prior_session_id
+            else "session state version changed"
+            if prior_state.get("version") != _CLAUDE_SESSION_STATE_VERSION
+            else f"working directory changed ({prior_state.get('cwd')} -> {cwd})"
+            if prior_state.get("cwd") != cwd
+            else "transcript diverged from what the session saw"
+        )
+        logger.warning(
+            "Claude session %s not continued for Hermes session %s: %s; starting a new session with a transcript handoff",
+            prior_session_id or "(none)",
+            getattr(agent, "session_id", ""),
+            reason,
+        )
 
     with tempfile.TemporaryDirectory(prefix="hermes-claude-images-") as image_dir:
         image_content = (
@@ -1018,11 +1092,14 @@ def run_claude_code_turn(
         )
         if not prompt_text and attached_images:
             prompt_text = "Please inspect the attached image(s)."
-        prompt = (
-            prompt_text
-            if resident_continuity or durable_resume
-            else claude_history_handoff(prior_messages, prompt_text)
-        )
+        if resident_continuity or durable_resume:
+            prompt = (
+                claude_history_handoff(continuity_delta, prompt_text, lead=CLAUDE_DELTA_LEAD)
+                if continuity_delta
+                else prompt_text
+            )
+        else:
+            prompt = claude_history_handoff(prior_messages, prompt_text)
         sections = [prompt]
         if plugin_user_context:
             # The pre_llm_call hook's note (the preflight judge, gateway

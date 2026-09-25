@@ -9,7 +9,13 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import agent.claude_runtime as claude_runtime
-from agent.claude_runtime import _claude_history_fingerprint, save_claude_late_answer
+from agent.claude_runtime import (
+    CLAUDE_DELTA_LEAD,
+    _claude_history_continues,
+    _claude_history_fingerprint,
+    claude_history_handoff,
+    save_claude_late_answer,
+)
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import ADOPTABLE_DISPLAY_KINDS, LATE_ANSWER_DISPLAY_KIND, SessionDB
@@ -74,6 +80,31 @@ def test_fingerprint_ignores_the_verify_judges_synthetic_nudge():
     stop_nudge = {"role": "user", "content": "verify before finishing", "_verification_stop_synthetic": True}
     assert _claude_history_fingerprint([user, interim, stop_nudge, final]) == persisted
     assert _claude_history_fingerprint([user, interim, {"role": "user", "content": "a real question"}, final]) != persisted
+
+
+def test_a_session_continues_across_rows_appended_after_its_turn_but_not_a_diverged_prefix():
+    user = {"role": "user", "content": "Add the GPU path"}
+    answer = {"role": "assistant", "content": "Done: 1.56x on HIP."}
+    recorded = _claude_history_fingerprint([user, answer])
+    # Exactly what the session saw: continue, nothing to hand over.
+    assert _claude_history_continues(recorded, [user, answer]) == (True, [])
+    # Rows added after the session's turn (a worker review, another device's turn) ride along as a delta.
+    review = {"role": "assistant", "content": "Worker review: the commit is clean."}
+    extra = {"role": "user", "content": "(sent from the laptop) also check EEVEE"}
+    assert _claude_history_continues(recorded, [user, answer, review, extra]) == (True, [review, extra])
+    # Scaffolding and late answers never break or pad the delta.
+    nudge = {"role": "user", "content": "prove it", "_pre_verify_synthetic": True}
+    late = {"role": "assistant", "content": "late", "display_kind": LATE_ANSWER_DISPLAY_KIND}
+    assert _claude_history_continues(recorded, [user, nudge, answer, late]) == (True, [])
+    # An edited or rolled-back transcript is a real boundary.
+    assert _claude_history_continues(recorded, [user, {"role": "assistant", "content": "Done: 2x on HIP."}]) == (False, [])
+    assert _claude_history_continues(recorded, [user]) == (False, [])
+    assert _claude_history_continues(None, [user, answer]) == (False, [])
+    assert _claude_history_continues("garbage", [user, answer]) == (False, [])
+    # The delta prompt names itself as a continuation of the model's own session.
+    prompt = claude_history_handoff([review, extra], "So is the GPU on?", lead=CLAUDE_DELTA_LEAD)
+    assert prompt.startswith(CLAUDE_DELTA_LEAD) and "Worker review" in prompt and prompt.endswith("Current request:\nSo is the GPU on?")
+    assert claude_history_handoff([], "So is the GPU on?", lead=CLAUDE_DELTA_LEAD) == "So is the GPU on?"
 
 
 def test_late_answer_is_stored_marked_and_adoptable(session_db, pings):
