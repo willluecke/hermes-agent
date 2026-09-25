@@ -16,6 +16,13 @@ from typing import Any, Callable, Optional
 import urllib.error
 import urllib.request
 
+from agent.continuity import (
+    emit_continuity,
+    ensure_claude_transcript_retention,
+    handoff_disclosure,
+    plural,
+    render_history_blocks,
+)
 from agent.redact import redact_sensitive_text
 from agent.transports.claude_code_session import (
     HERMES_MONITOR_NOTE,
@@ -331,36 +338,80 @@ CLAUDE_HANDOFF_LEAD = (
     "Continue this existing Hermes Chat conversation. Use the transcript "
     "as context; do not restart completed discovery."
 )
+CLAUDE_REBUILD_LEAD = (
+    "You are continuing an existing Hermes Chat conversation in a new Claude "
+    "session. Your earlier session for it could not be resumed ({reason}), so "
+    "Hermes restored the conversation below from its stored transcript. It is "
+    "the conversation so far, not a summary. Continue it: do not restart "
+    "completed discovery or describe this as a fresh start."
+)
 CLAUDE_DELTA_LEAD = (
     "You are continuing your own Claude session in this Hermes Chat "
     "conversation. Since your last turn, the messages below were added to the "
     "conversation without you; read them as context, then answer the current "
     "request."
 )
+# How much of the stored transcript a rebuilt session is given. The old cap
+# (24 messages, 60k characters) turned a lost session into a summary; this is
+# about 200k tokens, a fifth of a Claude window, which holds the whole text
+# transcript of nearly any conversation. Past it the oldest messages are
+# dropped, and both the model and the user are told how many.
+CLAUDE_HANDOFF_MAX_CHARS = 800_000
+
+
+def _claude_handoff_entries(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for message in messages:
+        role = message.get("role")
+        if role not in {"user", "assistant"} or _is_transcript_scaffolding(message):
+            continue
+        text = _content_text(message.get("content"))
+        if role == "user":
+            text = strip_reattached_image_notes(text)
+        if text:
+            entries.append((str(role), text))
+    return entries
+
+
+def claude_handoff_coverage(messages: list[dict[str, Any]]) -> tuple[int, int]:
+    """``(carried, omitted)`` message counts a handoff of ``messages`` would have."""
+    entries = _claude_handoff_entries(messages)
+    _, omitted, _ = render_history_blocks(
+        entries, CLAUDE_HANDOFF_MAX_CHARS, _render_claude_block
+    )
+    return len(entries) - omitted, omitted
+
+
+def _render_claude_block(role: str, text: str) -> str:
+    return f"{'Will' if role == 'user' else 'Assistant'}: {text}"
 
 
 def claude_history_handoff(
     messages: list[dict[str, Any]], user_message: str, *, lead: str = CLAUDE_HANDOFF_LEAD
 ) -> str:
-    blocks: list[str] = []
-    for message in messages[-24:]:
-        role = message.get("role")
-        if role not in {"user", "assistant"}:
-            continue
-        text = _content_text(message.get("content"))
-        if role == "user":
-            text = strip_reattached_image_notes(text)
-        if not text:
-            continue
-        blocks.append(f"{'Will' if role == 'user' else 'Assistant'}: {text}")
-    transcript = "\n\n".join(blocks)[-60_000:]
-    if not transcript:
+    blocks, omitted, truncated = render_history_blocks(
+        _claude_handoff_entries(messages), CLAUDE_HANDOFF_MAX_CHARS, _render_claude_block
+    )
+    if not blocks:
         return user_message
+    transcript = "\n\n".join(blocks) + handoff_disclosure(omitted, truncated)
     return (
         f"{lead}\n\n"
-        f"Recent transcript:\n{transcript}\n\n"
+        f"Transcript:\n{transcript}\n\n"
         f"Current request:\n{user_message}"
     )
+
+
+def claude_session_file(session_id: str) -> Optional[Path]:
+    """The Claude Code transcript that ``--resume <session_id>`` would load."""
+    from agent.transports.claude_code_session import _claude_transcript_root
+
+    if not session_id or "/" in session_id or session_id.startswith("."):
+        return None
+    try:
+        return next((_claude_transcript_root() / "projects").glob(f"*/{session_id}.jsonl"), None)
+    except OSError:
+        return None
 
 
 def _claude_tool_preview(raw_name: str, args: dict[str, Any], cwd: Optional[str]) -> str:
@@ -500,6 +551,23 @@ def make_claude_code_event_bridge(
             if note:
                 pending_text.append(note)
                 _emit_commentary()
+            return
+        if event_type == "system" and event.get("subtype") == "compact_boundary":
+            meta = event.get("compact_metadata") or {}
+            before, after = meta.get("pre_tokens"), meta.get("post_tokens")
+            sizes = (
+                f" ({round(before / 1000)}k → {round(after / 1000)}k tokens)"
+                if isinstance(before, int) and isinstance(after, int)
+                else ""
+            )
+            emit_continuity(
+                agent, "claude-code", "compacted",
+                f"Claude Code compacted this session's context{sizes}, "
+                f"{'automatically' if meta.get('trigger') == 'auto' else 'on request'}. "
+                "The full session stays on disk; the transcript here is unchanged.",
+                trigger=str(meta.get("trigger") or ""),
+                pre_tokens=before, post_tokens=after,
+            )
             return
         if event_type == "stream_event":
             stream_event = event.get("event") or {}
@@ -966,6 +1034,58 @@ def _claude_hook_parity(
     return follow_ups
 
 
+_RETENTION_CHECKED = False
+
+
+def _announce_claude_continuity(
+    agent: Any,
+    *,
+    prior_messages: list[dict[str, Any]],
+    rebuild_reason: str,
+    resumed_from_disk: bool,
+    delta: list[dict[str, Any]],
+    session_id: str,
+    resume_cause: str = "",
+) -> None:
+    """Show the user every turn that did not simply continue its session."""
+    short = session_id[:8]
+    if rebuild_reason:
+        carried, omitted = claude_handoff_coverage(prior_messages)
+        if not carried and not omitted:
+            return  # A new conversation: nothing was lost.
+        text = (
+            f"Session rebuilt from the stored transcript: {rebuild_reason}. "
+            f"The new Claude session was given {plural(carried, 'message')}"
+            + (f"; the {plural(omitted, 'oldest message')} did not fit." if omitted else ".")
+        )
+        emit_continuity(
+            agent, "claude-code", "rebuilt", text,
+            reason=rebuild_reason, carried=carried, omitted=omitted,
+            previous_session_id=session_id,
+        )
+        return
+    if resumed_from_disk:
+        text = (
+            f"Session resumed from disk: Claude session {short}"
+            + (f" ({resume_cause})" if resume_cause else "")
+            + (
+                f", plus the {plural(len(delta), 'message')} added since its last turn."
+                if delta else "."
+            )
+        )
+        emit_continuity(
+            agent, "claude-code", "resumed", text,
+            caught_up=len(delta), session_id=session_id, cause=resume_cause,
+        )
+        return
+    if delta:
+        emit_continuity(
+            agent, "claude-code", "caught_up",
+            f"Passed {plural(len(delta), 'message')} added since this session's last turn to Claude session {short}.",
+            caught_up=len(delta), session_id=session_id,
+        )
+
+
 def run_claude_code_turn(
     agent: Any,
     *,
@@ -986,6 +1106,12 @@ def run_claude_code_turn(
         ClaudeCodeSession,
     )
 
+    global _RETENTION_CHECKED
+    if not _RETENTION_CHECKED:
+        # Before any CLI starts: Claude Code sweeps old transcripts at
+        # startup, and a swept transcript can never be resumed.
+        _RETENTION_CHECKED = True
+        ensure_claude_transcript_retention()
     cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
     cwd = _normalized_cwd(cwd)
     prior_messages = messages[:-1]
@@ -995,11 +1121,15 @@ def run_claude_code_turn(
     durable_continues, durable_delta = _claude_history_continues(
         prior_state.get("history_fingerprint"), prior_messages
     )
+    # ``--resume`` of a transcript Claude Code no longer has fails the turn;
+    # rebuilding from the stored transcript is the step down instead.
+    prior_session_file = claude_session_file(prior_session_id) if prior_session_id else None
     durable_resume = bool(
         prior_session_id
         and prior_state.get("version") == _CLAUDE_SESSION_STATE_VERSION
         and prior_state.get("cwd") == cwd
         and durable_continues
+        and prior_session_file is not None
     )
     runtime_contract = (
         "You are the selected Claude subscription runtime inside Hermes Chat. "
@@ -1045,6 +1175,11 @@ def run_claude_code_turn(
         )
         and resident_continues
     )
+    resume_cause = (
+        "the model or effort changed"
+        if session is not None and resident_continues and not resident_continuity
+        else "the CLI process was not running"
+    )
     if session is not None and not resident_continuity:
         # A project/model/transcript switch is a real continuity boundary. Do
         # not feed it into the old native process; the durable handoff path
@@ -1056,25 +1191,37 @@ def run_claude_code_turn(
         agent._claude_code_session = None
         session = None
     continuity_delta = resident_delta if resident_continuity else durable_delta if durable_resume else []
+    rebuild_reason = ""
     if not resident_continuity and not durable_resume:
-        # Every one of these starts a new Claude session with a transcript
-        # handoff, which the model reads as a fresh session. Say why, so a
-        # handoff is never silent (2026-09-25).
-        reason = (
-            "no recorded Claude session"
+        # Every one of these starts a new Claude session seeded with the
+        # stored transcript. Say why, in the log and in the conversation, so
+        # a lost session is never silent (2026-09-25).
+        rebuild_reason = (
+            "no Claude session was recorded for this conversation on this runtime"
             if not prior_session_id
-            else "session state version changed"
+            else "its session record is from an older Hermes version"
             if prior_state.get("version") != _CLAUDE_SESSION_STATE_VERSION
-            else f"working directory changed ({prior_state.get('cwd')} -> {cwd})"
+            else f"the working directory changed ({prior_state.get('cwd')} -> {cwd})"
             if prior_state.get("cwd") != cwd
-            else "transcript diverged from what the session saw"
+            else "the transcript was edited or rolled back since its last turn"
+            if not durable_continues
+            else "its transcript file is gone from Claude Code's session store"
         )
         logger.warning(
             "Claude session %s not continued for Hermes session %s: %s; starting a new session with a transcript handoff",
             prior_session_id or "(none)",
             getattr(agent, "session_id", ""),
-            reason,
+            rebuild_reason,
         )
+    _announce_claude_continuity(
+        agent,
+        prior_messages=prior_messages,
+        rebuild_reason=rebuild_reason,
+        resumed_from_disk=bool(durable_resume and not resident_continuity),
+        resume_cause=resume_cause,
+        delta=continuity_delta,
+        session_id=prior_session_id,
+    )
 
     with tempfile.TemporaryDirectory(prefix="hermes-claude-images-") as image_dir:
         image_content = (
@@ -1099,7 +1246,11 @@ def run_claude_code_turn(
                 else prompt_text
             )
         else:
-            prompt = claude_history_handoff(prior_messages, prompt_text)
+            prompt = claude_history_handoff(
+                prior_messages,
+                prompt_text,
+                lead=CLAUDE_REBUILD_LEAD.format(reason=rebuild_reason),
+            )
         sections = [prompt]
         if plugin_user_context:
             # The pre_llm_call hook's note (the preflight judge, gateway

@@ -465,7 +465,7 @@ def resident_cache(tmp_path, monkeypatch):
         )
 
     try:
-        yield SimpleNamespace(db=db, session_id=session_id, acquire=acquire,
+        yield SimpleNamespace(db=db, session_id=session_id, acquire=acquire, adapter=adapter,
                               cache=adapter.gateway_runner._agent_cache, created=created)
     finally:
         db.close()
@@ -617,3 +617,108 @@ def test_concurrent_polls_stamp_an_ended_job_once(tmp_path, monkeypatch):
     assert writes == ["hermes-bg-once.json"]  # the lock lets one poll stamp it
     assert json.loads(path.read_text())["ended_at"] == 2000.0
     assert all([job["running"] for job in jobs] == [False] for jobs in results)
+
+
+# --- A switch never silently kills a busy CLI ---------------------------------
+
+
+def _busy(agent, age=30.0):
+    agent._claude_code_session.youngest_background_work_age = lambda: age
+
+
+def _acquire(resident_cache, signature="sig", events=None, **kwargs):
+    return resident_cache.adapter._create_or_reuse_runtime_agent(
+        cache_key=f"api_server:default:{resident_cache.session_id}",
+        signature=signature,
+        session_id=resident_cache.session_id,
+        tool_progress_callback=(
+            (lambda event, name, preview, args, **kw: events.append((event, preview, kw)))
+            if events is not None else None
+        ),
+        **kwargs,
+    )
+
+
+@pytest.fixture
+def switch_cache(resident_cache):
+    adapter = resident_cache.adapter
+    original = adapter._create_agent
+
+    def create_agent(session_id=None, **kwargs):
+        agent = original(session_id=session_id, **kwargs)
+        agent.provider, agent.model = "claude-code", kwargs.get("requested_model") or "claude-opus-5-5"
+        agent.tool_progress_callback = kwargs.get("tool_progress_callback")
+        return agent
+
+    adapter._create_agent = create_agent
+    return resident_cache
+
+
+def test_a_busy_cli_is_kept_when_the_transcript_grew(switch_cache):
+    agent, _ = _acquire(switch_cache)
+    cli = agent._claude_code_session
+    _busy(agent)
+    switch_cache.db.append_message(switch_cache.session_id, "user", "Worker review")
+
+    again, reused = _acquire(switch_cache)
+
+    assert reused is True and again is agent
+    cli.close.assert_not_called()
+    [entry] = switch_cache.cache.values()
+    assert entry[2] == switch_cache.db.get_session(switch_cache.session_id)["message_count"]
+
+
+def test_an_effort_switch_waits_for_background_work_and_says_so(switch_cache):
+    agent, _ = _acquire(switch_cache, requested_model="claude-opus-5-5")
+    cli = agent._claude_code_session
+    _busy(agent)
+    events = []
+
+    again, reused = _acquire(
+        switch_cache, signature="sig-ultracode", events=events,
+        requested_model="claude-opus-5-5", requested_provider="claude-code",
+    )
+
+    assert reused is True and again is agent
+    cli.close.assert_not_called()
+    [row] = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert row[1]["mode"] == "switch_deferred"
+    assert row[0].startswith("Settings change deferred: this session is still running background work")
+    # The old signature stays, so the switch applies once the work ends.
+    [entry] = switch_cache.cache.values()
+    assert entry[1] == "sig"
+    agent._claude_code_session.youngest_background_work_age = lambda: None
+    replacement, reused = _acquire(
+        switch_cache, signature="sig-ultracode",
+        requested_model="claude-opus-5-5", requested_provider="claude-code",
+    )
+    assert reused is False and replacement is not agent
+    cli.close.assert_called_once()
+
+
+def test_a_model_switch_goes_ahead_and_names_the_stopped_work(switch_cache):
+    agent, _ = _acquire(switch_cache, requested_model="claude-opus-5-5")
+    cli = agent._claude_code_session
+    _busy(agent)
+    events = []
+
+    replacement, reused = _acquire(
+        switch_cache, signature="sig-fable", events=events,
+        requested_model="claude-fable-5-1", requested_provider="claude-code",
+    )
+
+    assert reused is False and replacement is not agent
+    cli.close.assert_called_once()
+    [row] = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert row[1]["mode"] == "switch_stopped_work"
+    assert "background work was stopped" in row[0]
+
+
+def test_an_idle_switch_replaces_the_agent_without_a_row(switch_cache):
+    agent, _ = _acquire(switch_cache)
+    events = []
+
+    replacement, reused = _acquire(switch_cache, signature="sig-2", events=events)
+
+    assert reused is False and replacement is not agent
+    assert not [event for event, _, _ in events if event == "session.continuity"]

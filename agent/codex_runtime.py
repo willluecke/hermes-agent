@@ -25,6 +25,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.continuity import emit_continuity, handoff_disclosure, plural, render_history_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.codex_coordination import COORDINATION_ITEM_TYPES, coordination_item
 
@@ -244,43 +245,11 @@ def _codex_resume_plan(
 
 def _render_history_blocks(entries: List[tuple], budget: int) -> tuple:
     """Render the newest entries that fit, returning ``(blocks, omitted, truncated)``."""
-    rendered: list[str] = []
-    used = 0
-    omitted = 0
-    truncated = False
-    for index in range(len(entries) - 1, -1, -1):
-        role, text = entries[index]
-        block = f"{role.upper()}:\n{text}"
-        block_truncated = False
-        if len(block) > budget:
-            block = block[-budget:]
-            block_truncated = True
-        if used + len(block) > budget:
-            # Stop here rather than skipping this message and continuing with
-            # older, smaller ones. Skipping punches a hole in the middle of the
-            # transcript and discloses it only as a count, which reads as
-            # "older context omitted" when it is really "a reply you are about
-            # to see is missing". An unbroken recent window is the honest cut.
-            omitted = index + 1
-            break
-        rendered.append(block)
-        used += len(block)
-        truncated = truncated or block_truncated
-    rendered.reverse()
-    return rendered, omitted, truncated
+    return render_history_blocks(entries, budget)
 
 
 def _handoff_disclosure(omitted: int, truncated: bool) -> str:
-    notes: list[str] = []
-    if omitted:
-        notes.append(
-            f"[{omitted} older messages omitted — handoff size limit reached.]"
-        )
-    if truncated:
-        notes.append(
-            "[The oldest included message was cut at its start to fit.]"
-        )
-    return ("\n" + "\n".join(notes)) if notes else ""
+    return handoff_disclosure(omitted, truncated)
 
 
 def _wrap_turn_input(context: str, user_message: Any, closing: str) -> Any:
@@ -346,6 +315,62 @@ def _codex_catch_up_handoff(entries: List[tuple], user_message: Any) -> Any:
         "<current_user_request>\n"
     )
     return _wrap_turn_input(context, user_message, "\n</current_user_request>")
+
+
+_CODEX_CONTINUITY_REASONS = {
+    "no-bound-thread": "no Codex thread was recorded for this conversation",
+    "no-recorded-history": "the thread predates continuity records",
+    "thread-rebound": "the conversation is bound to a different thread",
+    "cwd-changed": "the working directory changed",
+    "unusable-seen-count": "the thread's continuity record is unreadable",
+    "transcript-shortened": "the transcript is shorter than what the thread saw (edited or rolled back)",
+    "transcript-diverged": "the transcript was edited or rolled back since the thread's last turn",
+    "resume": "the recorded thread could not be resumed",
+}
+
+
+def _announce_codex_continuity(
+    agent: Any,
+    *,
+    rebuilt: bool,
+    resumed: bool,
+    entries: List[tuple],
+    reason: str,
+    thread_id: str,
+) -> None:
+    """Show the user every turn that did not simply continue its thread."""
+    thread = thread_id[:8]
+    if rebuilt:
+        if not entries:
+            return  # A new conversation: nothing was lost.
+        _, omitted, _ = _render_history_blocks(entries, _CODEX_HISTORY_HANDOFF_MAX_CHARS)
+        carried = len(entries) - omitted
+        text = (
+            "Session rebuilt from the stored transcript: "
+            f"{_CODEX_CONTINUITY_REASONS.get(reason, reason)}. "
+            f"New Codex thread {thread} was given {plural(carried, 'message')}"
+            + (f"; the {plural(omitted, 'oldest message')} did not fit." if omitted else ".")
+        )
+        emit_continuity(
+            agent, "codex", "rebuilt", text,
+            reason=reason, carried=carried, omitted=omitted, thread_id=thread_id,
+        )
+        return
+    if resumed:
+        text = f"Session resumed from disk: Codex thread {thread}" + (
+            f", plus the {plural(len(entries), 'message')} added since its last turn."
+            if entries else "."
+        )
+        emit_continuity(
+            agent, "codex", "resumed", text, caught_up=len(entries), thread_id=thread_id,
+        )
+        return
+    if entries:
+        emit_continuity(
+            agent, "codex", "caught_up",
+            f"Passed {plural(len(entries), 'message')} added since this thread's last turn to Codex thread {thread}.",
+            caught_up=len(entries), thread_id=thread_id,
+        )
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -1777,6 +1802,17 @@ def run_codex_app_server_turn(
             if handoff_entries
             else user_message
         )
+        _announce_codex_continuity(
+            agent,
+            rebuilt=build_turn_input is _codex_history_handoff,
+            resumed=bool(
+                created_codex_session
+                and getattr(agent._codex_session, "_resumed_existing_thread", False)
+            ),
+            entries=handoff_entries,
+            reason=continuity_reason,
+            thread_id=str(thread_id or ""),
+        )
         if plugin_user_context:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the turn input here as it rides the API copy
@@ -1798,6 +1834,13 @@ def run_codex_app_server_turn(
             agent, thread_id=thread_id, cwd=codex_cwd, entries=prior_entries
         )
         turn = agent._codex_session.run_turn(user_input=turn_input)
+        if getattr(turn, "compacted", False):
+            emit_continuity(
+                agent, "codex", "compacted",
+                "Codex compacted this thread's context to make room. The full "
+                "thread stays on disk; the transcript here is unchanged.",
+                thread_id=str(thread_id or ""),
+            )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

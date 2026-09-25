@@ -5,6 +5,8 @@ from pathlib import Path
 from uuid import uuid4
 from unittest.mock import patch
 
+import pytest
+
 import run_agent
 from agent.transports.claude_code_session import (
     CLAUDE_AUTH_ERROR_CODE,
@@ -13,6 +15,23 @@ from agent.transports.claude_code_session import (
     ClaudeCodeTurnResult,
 )
 from hermes_state import SessionDB
+
+
+@pytest.fixture(autouse=True)
+def _claude_config_dir(tmp_path, monkeypatch):
+    """Claude Code's config dir: the retention floor and --resume transcripts."""
+    root = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root))
+    return root
+
+
+def _write_transcript(session_id):
+    """What Claude Code does once a session exists: its transcript on disk."""
+    import os
+
+    path = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "-work" / f"{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
 
 
 def _make_agent(*, session_id=None, session_db=None, reasoning_config=None):
@@ -158,6 +177,7 @@ def test_continuing_claude_turn_materializes_multimodal_input(monkeypatch):
     def _run_turn(session, prompt):
         prompts.append(prompt)
         session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
         return ClaudeCodeTurnResult(
             final_text=f"answer {len(prompts)}",
             session_id=session.session_id,
@@ -196,6 +216,7 @@ def test_reattached_history_images_are_reference_not_new_uploads(monkeypatch):
     def _run_turn(session, prompt):
         prompts.append(prompt)
         session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
         return ClaudeCodeTurnResult(
             final_text=f"answer {len(prompts)}",
             session_id=session.session_id,
@@ -308,6 +329,7 @@ def test_new_hermes_parent_resumes_same_claude_session(monkeypatch):
             }
         )
         session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
         return ClaudeCodeTurnResult(
             final_text=f"answer {len(calls)}",
             session_id=session.session_id,
@@ -348,6 +370,7 @@ def test_failed_turn_still_persists_claude_session_for_resume(monkeypatch):
     def _run_turn(session, prompt):
         calls.append((session.session_id, session.resume, prompt))
         session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
         if len(calls) == 1:
             return ClaudeCodeTurnResult(
                 session_id=session.session_id,
@@ -389,6 +412,7 @@ def test_transcript_discontinuity_starts_fresh_claude_parent(monkeypatch):
     def _run_turn(session, prompt):
         calls.append((session.session_id, session.resume, prompt))
         session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
         return ClaudeCodeTurnResult(
             final_text=f"answer {len(calls)}",
             session_id=session.session_id,
@@ -402,6 +426,8 @@ def test_transcript_discontinuity_starts_fresh_claude_parent(monkeypatch):
     first = _make_agent(session_id=outer_session_id, session_db=db)
     first.run_conversation("Use Claude first.")
     history = db.get_messages_as_conversation(outer_session_id)
+    # An edited earlier row: what the session saw is no longer the prefix.
+    history[0] = {**history[0], "content": "Use Claude first, edited."}
     history.extend(
         [
             {"role": "user", "content": "Use a different runtime."},
@@ -409,11 +435,98 @@ def test_transcript_discontinuity_starts_fresh_claude_parent(monkeypatch):
         ]
     )
 
+    events = []
     second = _make_agent(session_id=outer_session_id, session_db=db)
+    second.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
     second.run_conversation("Return to Claude.", conversation_history=history)
 
     assert calls[1][1] is False
     assert calls[1][0] != calls[0][0]
-    assert "Recent transcript:" in calls[1][2]
+    assert "could not be resumed (the transcript was edited or rolled back" in calls[1][2]
+    assert "Transcript:\nWill: Use Claude first, edited." in calls[1][2]
     assert "Other runtime answer." in calls[1][2]
+    rows = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert len(rows) == 1 and rows[0][1]["mode"] == "rebuilt"
+    assert rows[0][0].startswith("Session rebuilt from the stored transcript: the transcript was edited")
+    assert rows[0][1]["carried"] == 4 and rows[0][1]["omitted"] == 0
+    db.close()
+
+
+def test_appended_rows_resume_the_same_session_with_a_delta(monkeypatch):
+    calls = []
+
+    def _run_turn(session, prompt):
+        calls.append((session.session_id, session.resume, prompt))
+        session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
+        return ClaudeCodeTurnResult(
+            final_text=f"answer {len(calls)}",
+            session_id=session.session_id,
+            session_confirmed=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-appended-{uuid4()}"
+    first = _make_agent(session_id=outer_session_id, session_db=db)
+    first.run_conversation("Use Claude first.")
+    history = db.get_messages_as_conversation(outer_session_id)
+    history.extend(
+        [
+            {"role": "user", "content": "Use a different runtime."},
+            {"role": "assistant", "content": "Other runtime answer."},
+        ]
+    )
+
+    events = []
+    second = _make_agent(session_id=outer_session_id, session_db=db)
+    second.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
+    second.run_conversation("Return to Claude.", conversation_history=history)
+
+    assert calls[1][1] is True and calls[1][0] == calls[0][0]
+    assert "Other runtime answer." in calls[1][2]
+    assert "Use Claude first." not in calls[1][2]
+    rows = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert [kw["mode"] for _, kw in rows] == ["resumed"]
+    assert rows[0][0].startswith(f"Session resumed from disk: Claude session {calls[0][0][:8]} (the CLI process was not running), plus the 2 messages")
+    db.close()
+
+
+def test_missing_transcript_file_rebuilds_instead_of_resuming(monkeypatch, _claude_config_dir):
+    calls = []
+
+    def _run_turn(session, prompt):
+        calls.append((session.session_id, session.resume, prompt))
+        session.on_session_id(session.session_id)
+        return ClaudeCodeTurnResult(
+            final_text=f"answer {len(calls)}",
+            session_id=session.session_id,
+            session_confirmed=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    monkeypatch.setattr("agent.claude_runtime._RETENTION_CHECKED", False)
+    db = SessionDB()
+    outer_session_id = f"claude-swept-{uuid4()}"
+    first = _make_agent(session_id=outer_session_id, session_db=db)
+    first.run_conversation("Remember the heron.")
+    history = db.get_messages_as_conversation(outer_session_id)
+
+    events = []
+    second = _make_agent(session_id=outer_session_id, session_db=db)
+    second.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
+    second.run_conversation("Which bird?", conversation_history=history)
+
+    # No transcript was ever written, as after Claude Code's cleanup sweep:
+    # a --resume would fail the turn, so the session is rebuilt instead.
+    assert calls[1][1] is False and calls[1][0] != calls[0][0]
+    assert "Will: Remember the heron." in calls[1][2]
+    rows = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert rows[0][1]["mode"] == "rebuilt"
+    assert "its transcript file is gone" in rows[0][0]
+    # The retention floor was raised before the first CLI started.
+    import json as _json
+
+    settings = _json.loads((_claude_config_dir / "settings.json").read_text())
+    assert settings["cleanupPeriodDays"] == 3650
     db.close()

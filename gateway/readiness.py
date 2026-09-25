@@ -68,6 +68,28 @@ def _probe_disk(home: Path) -> dict[str, Any]:
         return _check("degraded", type(exc).__name__)
 
 
+def _probe_transcript_retention() -> dict[str, Any]:
+    """Whether Claude Code keeps the transcripts ``--resume`` needs.
+
+    Status and a day count only: never the path or the settings content.
+    """
+    from agent.continuity import (
+        TRANSCRIPT_RETENTION_DAYS,
+        claude_config_dir,
+        claude_transcript_retention_days,
+    )
+
+    root = claude_config_dir()
+    if not (root / "projects").exists():
+        return _check("ok", "no Claude Code sessions")
+    days = claude_transcript_retention_days(root)
+    if days is None:
+        return _check("degraded", "settings unreadable")
+    if days < TRANSCRIPT_RETENTION_DAYS:
+        return _check("degraded", "transcripts expire", days=days, required_days=TRANSCRIPT_RETENTION_DAYS)
+    return _check("ok", days=days)
+
+
 def _probe_gateway(runtime_status: dict[str, Any]) -> dict[str, Any]:
     state = str(runtime_status.get("gateway_state") or "unknown")
     platforms = runtime_status.get("platforms")
@@ -108,6 +130,7 @@ def collect_runtime_readiness(
         "model": _check("ok" if str(configured_model or "").strip() else "degraded"),
         "disk": _probe_disk(home),
         "gateway": _probe_gateway(runtime),
+        "transcript_retention": _probe_transcript_retention(),
         "background_queues": _check(
             "ok",
             active_api_runs=max(0, int(active_api_runs)),

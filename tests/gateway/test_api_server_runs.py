@@ -1897,6 +1897,56 @@ class TestRunToolEventIdentity:
         }
 
     @pytest.mark.asyncio
+    async def test_session_continuity_is_a_durable_structured_run_event(self, adapter):
+        app = _create_runs_app(adapter)
+
+        def script(cb):
+            cb(
+                "session.continuity",
+                "claude-code",
+                "Session rebuilt from the stored transcript: its transcript file is gone "
+                "from Claude Code's session store. The new Claude session was given 12 messages.",
+                None,
+                mode="rebuilt",
+                reason="its transcript file is gone from Claude Code's session store",
+                carried=12,
+                omitted=0,
+                previous_session_id="a160e0bc",
+                session_id="",
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_create_agent",
+                side_effect=self._agent_factory(script),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "go"})
+                run_id = (await resp.json())["run_id"]
+                body = await (
+                    await cli.get(f"/v1/runs/{run_id}/events")
+                ).text()
+
+        events = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        row = next(event for event in events if event.get("event") == "session.continuity")
+        assert {k: v for k, v in row.items() if k not in {"run_seq", "emitted_at_ms", "timestamp"}} == {
+            "event": "session.continuity",
+            "run_id": run_id,
+            "runtime": "claude-code",
+            "mode": "rebuilt",
+            "text": "Session rebuilt from the stored transcript: its transcript file is gone "
+            "from Claude Code's session store. The new Claude session was given 12 messages.",
+            "reason": "its transcript file is gone from Claude Code's session store",
+            "carried": 12,
+            "omitted": 0,
+            "previous_session_id": "a160e0bc",
+        }
+
+    @pytest.mark.asyncio
     async def test_judge_outcome_is_a_durable_structured_run_event(self, adapter):
         app = _create_runs_app(adapter)
 

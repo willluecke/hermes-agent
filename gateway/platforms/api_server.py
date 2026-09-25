@@ -3387,6 +3387,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         evicted_agent = None
         agent = None
+        deferred_switch = False
+        stopped_work = False
         with cache_lock:
             entry = cache.get(cache_key)
             if isinstance(entry, tuple) and entry:
@@ -3409,13 +3411,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     or cached_count == current_count
                     or only_late_answers
                 )
+                busy = bool(
+                    same_session
+                    and runner._agent_has_background_work(cached_agent)
+                )
+                defer_switch = bool(
+                    busy
+                    and cached_signature != signature
+                    and self._same_runtime_identity(
+                        cached_agent, cwd=cwd, project=project, **agent_kwargs
+                    )
+                )
                 if (
                     cached_signature == signature
                     and same_session
-                    and transcript_current
-                ):
+                    and (transcript_current or busy)
+                ) or defer_switch:
+                    # A busy agent keeps its CLI: evicting it would kill the
+                    # background work (workflows, background shells, agents)
+                    # that process runs. The native runtimes hand a resident
+                    # session any rows it missed, so a longer transcript is
+                    # no reason to evict; an effort or settings change waits
+                    # for the work to finish, and the turn says so.
                     agent = cached_agent
-                    if only_late_answers:
+                    deferred_switch = defer_switch
+                    if only_late_answers or not transcript_current:
                         cache[cache_key] = (
                             *entry[:2],
                             current_count,
@@ -3427,6 +3447,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     evicted = cache.pop(cache_key, None)
                     if isinstance(evicted, tuple) and evicted:
                         evicted_agent = evicted[0]
+                        stopped_work = busy
 
         if evicted_agent is not None:
             try:
@@ -3467,7 +3488,58 @@ class APIServerAdapter(BasePlatformAdapter):
             ):
                 if field in agent_kwargs:
                     setattr(agent, field, agent_kwargs[field])
+        if deferred_switch:
+            from agent.continuity import emit_continuity
+
+            logger.info(
+                "Runtime settings change deferred for %s: its CLI has background work",
+                cache_key,
+            )
+            emit_continuity(
+                agent, self._continuity_runtime(agent), "switch_deferred",
+                "Settings change deferred: this session is still running "
+                "background work, and restarting its CLI would stop it. This "
+                "turn keeps the current effort and settings; the change "
+                "applies on the first turn after the work finishes.",
+            )
+        elif stopped_work:
+            from agent.continuity import emit_continuity
+
+            emit_continuity(
+                agent, self._continuity_runtime(agent), "switch_stopped_work",
+                "Switched runtime: the previous session's background work was "
+                "stopped, because a different model, provider or project needs "
+                "a new CLI. The conversation itself carries over.",
+            )
         return agent, reused
+
+    @staticmethod
+    def _continuity_runtime(agent: Any) -> str:
+        provider = str(getattr(agent, "provider", "") or "")
+        return "codex" if "codex" in provider else "claude-code" if "claude" in provider else provider
+
+    @staticmethod
+    def _same_runtime_identity(
+        cached_agent: Any, *, cwd: str = "", project: str = "", **agent_kwargs: Any
+    ) -> bool:
+        """Whether a request names the cached agent's own provider, model and
+        workspace, so only its effort or other settings differ."""
+
+        def clean(value: Any) -> str:
+            return str(value or "").strip().lower()
+
+        route = agent_kwargs.get("route") if isinstance(agent_kwargs.get("route"), dict) else {}
+        wanted_provider = clean(route.get("provider") or agent_kwargs.get("requested_provider"))
+        wanted_model = clean(route.get("model") or agent_kwargs.get("requested_model"))
+        if wanted_provider and wanted_provider != clean(getattr(cached_agent, "provider", "")):
+            return False
+        if wanted_model and wanted_model != clean(getattr(cached_agent, "model", "")):
+            return False
+        if cwd and clean(cwd) != clean(getattr(cached_agent, "session_cwd", "")):
+            return False
+        if project and clean(project) != clean(getattr(cached_agent, "session_project", "")):
+            return False
+        return True
 
     def _only_late_answers_since(
         self, session_id: str, checkpoint: Any, current_count: Any
@@ -8664,6 +8736,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 for key in ("answers", "decision", "model", "latency_ms", "attempt"):
                     value = kwargs.get(key)
                     if value is not None:
+                        event[key] = value
+                _push(event)
+            elif event_type == "session.continuity":
+                # The native CLI session did not simply continue: it was
+                # resumed from disk, caught up, rebuilt from the stored
+                # transcript, compacted, or a switch waited for background
+                # work (agent.continuity). ``text`` is the fixed row the
+                # user sees; the rest stays on the archived event.
+                event = {
+                    "event": "session.continuity",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "runtime": str(tool_name or ""),
+                    "mode": str(kwargs.get("mode") or ""),
+                    "text": redact_sensitive_text(str(preview or ""), force=True),
+                }
+                for key in (
+                    "reason", "cause", "carried", "omitted", "caught_up",
+                    "session_id", "previous_session_id", "thread_id",
+                    "trigger", "pre_tokens", "post_tokens",
+                ):
+                    value = kwargs.get(key)
+                    if value not in (None, ""):
                         event[key] = value
                 _push(event)
             elif event_type == "runtime.first_event_timeout":
