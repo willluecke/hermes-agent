@@ -325,6 +325,7 @@ _CODEX_CONTINUITY_REASONS = {
     "unusable-seen-count": "the thread's continuity record is unreadable",
     "transcript-shortened": "the transcript is shorter than what the thread saw (edited or rolled back)",
     "transcript-diverged": "the transcript was edited or rolled back since the thread's last turn",
+    "history-restored": "earlier messages from before this chat's first Hermes turn were restored to its history",
     "resume": "the recorded thread could not be resumed",
 }
 
@@ -1604,6 +1605,14 @@ def run_codex_app_server_turn(
         prior_entries=prior_entries,
         cwd=codex_cwd,
     )
+    if (
+        continuity_reason in {"transcript-shortened", "transcript-diverged"}
+        and isinstance(getattr(agent, "_history_prefix_restored", 0), int)
+        and getattr(agent, "_history_prefix_restored", 0) > 0
+    ):
+        # Not an edit: the gateway just put the part of the chat that
+        # predates its first Hermes turn back in front of the stored rows.
+        continuity_reason = "history-restored"
     if pending_entries and resume_thread_id:
         logger.info(
             "codex thread %s is behind this conversation by %d messages; "

@@ -530,3 +530,89 @@ def test_missing_transcript_file_rebuilds_instead_of_resuming(monkeypatch, _clau
     settings = _json.loads((_claude_config_dir / "settings.json").read_text())
     assert settings["cleanupPeriodDays"] == 3650
     db.close()
+
+
+def test_imported_prefix_keeps_the_same_claude_session(monkeypatch):
+    """A chat's first Hermes turn is seeded from the client's history; the
+    next turn replays that recorded prefix ahead of the stored rows and the
+    Claude session simply continues."""
+    calls = []
+
+    def _run_turn(session, prompt):
+        calls.append((session.session_id, session.resume, prompt))
+        session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
+        return ClaudeCodeTurnResult(
+            final_text=f"answer {len(calls)}",
+            session_id=session.session_id,
+            session_confirmed=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-imported-prefix-{uuid4()}"
+    earlier = [
+        {"role": "user", "content": "Proceed"},
+        {"role": "assistant", "content": "worker answer"},
+    ]
+    db.record_session_imported_history(outer_session_id, earlier, source="client")
+
+    first = _make_agent(session_id=outer_session_id, session_db=db)
+    first.run_conversation("Continue", conversation_history=list(earlier))
+    history = (
+        db.get_session_imported_history(outer_session_id)
+        + db.get_messages_as_conversation(outer_session_id)
+    )
+
+    events = []
+    second = _make_agent(session_id=outer_session_id, session_db=db)
+    second.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
+    second.run_conversation("One more question", conversation_history=history)
+
+    assert calls[1][0] == calls[0][0]
+    assert calls[1][1] is True
+    assert calls[1][2] == "One more question"
+    rows = [kw["mode"] for event, _, kw in events if event == "session.continuity"]
+    assert rows == ["resumed"]
+    db.close()
+
+
+def test_restored_prefix_rebuild_names_the_reason(monkeypatch):
+    calls = []
+
+    def _run_turn(session, prompt):
+        calls.append((session.session_id, session.resume, prompt))
+        session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
+        return ClaudeCodeTurnResult(
+            final_text=f"answer {len(calls)}",
+            session_id=session.session_id,
+            session_confirmed=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-restored-prefix-{uuid4()}"
+
+    first = _make_agent(session_id=outer_session_id, session_db=db)
+    first.run_conversation("Continue")
+    # The gateway just put back the part of the chat before its first turn.
+    history = [
+        {"role": "user", "content": "Proceed"},
+        {"role": "assistant", "content": "worker answer"},
+    ] + db.get_messages_as_conversation(outer_session_id)
+
+    events = []
+    second = _make_agent(session_id=outer_session_id, session_db=db)
+    second._history_prefix_restored = 2
+    second.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
+    second.run_conversation("Circling back", conversation_history=history)
+
+    assert calls[1][1] is False
+    assert "Will: Proceed" in calls[1][2]
+    rows = [preview for event, preview, kw in events if event == "session.continuity"]
+    assert rows and rows[0].startswith(
+        "Session rebuilt from the stored transcript: 2 earlier messages from "
+        "before this chat's first Hermes turn were restored to its history."
+    )
+    db.close()

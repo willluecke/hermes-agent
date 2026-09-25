@@ -429,6 +429,18 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+-- The part of a conversation that happened before its first Hermes turn
+-- (e.g. turns a native worker answered), adopted once from the client so
+-- every later turn replays the whole chat, not just the rows Hermes wrote.
+-- ``messages`` is a JSON list of {role, content}. No FK: the first turn
+-- records it before its session row exists; session deletion clears it.
+CREATE TABLE IF NOT EXISTS session_imported_history (
+    session_id TEXT PRIMARY KEY,
+    messages TEXT NOT NULL,
+    source TEXT,
+    imported_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

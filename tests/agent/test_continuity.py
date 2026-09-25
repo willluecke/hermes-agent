@@ -135,3 +135,17 @@ def test_readiness_reports_expiring_transcripts(tmp_path, monkeypatch):
     }
     (tmp_path / "settings.json").write_text(json.dumps({"cleanupPeriodDays": 3650}))
     assert _probe_transcript_retention() == {"status": "ok", "days": 3650}
+
+
+def test_codex_rebuild_after_a_restored_prefix_is_not_called_an_edit():
+    agent = _Agent()
+    codex_runtime._announce_codex_continuity(
+        agent, rebuilt=True, resumed=False, entries=[("user", "a"), ("assistant", "b")],
+        reason="history-restored", thread_id="0123456789",
+    )
+    [(_, _, text, _)] = agent.events
+    assert text == (
+        "Session rebuilt from the stored transcript: earlier messages from before "
+        "this chat's first Hermes turn were restored to its history. New Codex "
+        "thread 01234567 was given 2 messages."
+    )

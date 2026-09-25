@@ -687,6 +687,59 @@ def _is_compressed_summary_message(message: Any) -> bool:
     return is_compaction_summary_message(message)
 
 
+def _history_text_key(content: Any) -> str:
+    """Whitespace-collapsed text of a history message, for alignment only."""
+    if isinstance(content, list):
+        content = "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+        )
+    return " ".join(str(content or "").split())
+
+
+def _pre_session_prefix(
+    client_history: List[Dict[str, Any]],
+    persisted_history: List[Dict[str, Any]],
+) -> tuple[Optional[List[Dict[str, Any]]], str]:
+    """The client messages that predate a session's first stored row.
+
+    A chat that began on another runtime (a native worker, before Hermes
+    Chat routed every turn through the gateway) reaches the gateway with a
+    history the store never held. Its stored user rows must be the tail of
+    the client's user messages; everything before the first of them is the
+    missing prefix. A stored row may carry text the gateway appended (a
+    re-attached-images note), so it only has to start with the client's
+    text. Returns ``(None, reason)`` when the two do not line up.
+    """
+    stored_users = [
+        _history_text_key(message.get("content"))
+        for message in persisted_history
+        if message.get("role") == "user"
+        and message.get("display_kind") != "auto_continue"
+    ]
+    if not stored_users:
+        return None, "the stored rows hold no user message"
+    client_users = [
+        index for index, message in enumerate(client_history)
+        if message.get("role") == "user"
+    ]
+    if len(client_users) < len(stored_users):
+        return None, (
+            f"the client sent {len(client_users)} user messages but "
+            f"{len(stored_users)} are stored"
+        )
+    tail = client_users[len(client_users) - len(stored_users):]
+    for position, (index, stored) in enumerate(zip(tail, stored_users)):
+        sent = _history_text_key(client_history[index].get("content"))
+        if sent and not stored.startswith(sent):
+            return None, f"stored user message {position + 1} differs from the client's"
+    return [
+        {"role": message.get("role"), "content": message.get("content")}
+        for message in client_history[: tail[0]]
+    ], ""
+
+
 def _project_client_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """Remove model-only compaction scaffolding from a client message.
 
@@ -3623,12 +3676,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if not session_id:
             return fallback
         try:
-            getter = getattr(
-                self._ensure_session_db(), "get_messages_as_conversation", None
-            )
+            db = self._ensure_session_db()
+            getter = getattr(db, "get_messages_as_conversation", None)
             history = getter(session_id) if callable(getter) else None
             if history:
-                return list(history)
+                imported_getter = getattr(db, "get_session_imported_history", None)
+                imported = imported_getter(session_id) if callable(imported_getter) else None
+                return list(imported or []) + list(history)
         except Exception:
             logger.debug(
                 "API durable-runtime history refresh failed for session=%s",
@@ -3636,6 +3690,89 @@ class APIServerAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
         return fallback
+
+    def _canonical_run_history(
+        self,
+        db: Any,
+        session_id: str,
+        client_history: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """The history a /v1/runs turn replays, and how many earlier messages
+        were adopted into it for the first time on this turn.
+
+        Stored rows are authoritative, but they only start at the gateway's
+        first turn in the session. What the client showed before that is
+        recorded once (``session_imported_history``) and replayed ahead of
+        the stored rows on every later turn, so a chat that began on another
+        runtime keeps its whole transcript and its fingerprint stays stable
+        instead of collapsing to the gateway's own rows (2026-09-25: a
+        95-message chat rebuilt its Claude session from 3). ``db`` is resolved
+        on the event loop, where the request's profile scope is visible.
+        """
+        getter = getattr(db, "get_messages_as_conversation", None)
+        if not callable(getter):
+            return client_history, 0
+        try:
+            persisted = list(getter(session_id) or [])
+        except Exception:
+            logger.warning(
+                "Failed to load session history for %s", session_id, exc_info=True
+            )
+            return client_history, 0
+
+        imported: Optional[List[Dict[str, Any]]] = None
+        restored = 0
+        read_imported = getattr(db, "get_session_imported_history", None)
+        record_imported = getattr(db, "record_session_imported_history", None)
+        if callable(read_imported) and callable(record_imported):
+            try:
+                imported = read_imported(session_id)
+                if imported is None:
+                    if persisted:
+                        prefix, reason = _pre_session_prefix(client_history, persisted)
+                    else:
+                        # The gateway's first turn: everything the client
+                        # shows came before it.
+                        prefix, reason = list(client_history), ""
+                    if prefix is None:
+                        logger.info(
+                            "Not adopting the client's earlier messages for "
+                            "session %s: %s; replaying the stored rows only",
+                            session_id,
+                            reason,
+                        )
+                    elif record_imported(session_id, prefix, source="client"):
+                        imported = prefix
+                        if persisted and prefix:
+                            restored = len(prefix)
+                            logger.warning(
+                                "Restored %d messages that predate session %s's "
+                                "first stored row",
+                                restored,
+                                session_id,
+                            )
+                    else:
+                        imported = read_imported(session_id)
+            except Exception:
+                logger.warning(
+                    "Imported-history lookup failed for %s", session_id, exc_info=True
+                )
+                imported = None
+
+        if not persisted and not imported:
+            return client_history, 0
+        history = list(imported or []) + persisted
+        if client_history and history != client_history:
+            logger.info(
+                "Using canonical session history for /v1/runs resume "
+                "(session=%s client_messages=%d persisted_messages=%d "
+                "imported_messages=%d)",
+                session_id,
+                len(client_history),
+                len(persisted),
+                len(imported or []),
+            )
+        return history, restored
 
     def _evict_runtime_cache_agent(self, cache_key: str, agent: Any) -> None:
         """Retire one failed resident runtime without ending its transcript."""
@@ -9070,20 +9207,15 @@ class APIServerAdapter(BasePlatformAdapter):
         # tool results, or mid-turn commentary. This is deliberately the first
         # await after the durable claim: no async session work can race a
         # duplicate request into creating a second run.
+        history_restored = 0
         if session_id:
-            persisted_history = await self._conversation_history_for_session(
-                session_id
+            session_db = await self._ensure_session_db_async()
+            conversation_history, history_restored = await asyncio.to_thread(
+                self._canonical_run_history,
+                session_db,
+                session_id,
+                conversation_history,
             )
-            if persisted_history:
-                if conversation_history and conversation_history != persisted_history:
-                    logger.info(
-                        "Using canonical session history for /v1/runs resume "
-                        "(session=%s client_messages=%d persisted_messages=%d)",
-                        session_id,
-                        len(conversation_history),
-                        len(persisted_history),
-                    )
-                conversation_history = persisted_history
 
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
@@ -9356,6 +9488,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             run_history = self._runtime_conversation_history(
                                 session_id, conversation_history
                             )
+                            # Lets a native runtime say why its session was
+                            # rebuilt when the history just grew a prefix.
+                            agent._history_prefix_restored = history_restored
                             goal_user_initiated = True
                             goal_turn = 0
                             if goal_directive is not None:
@@ -9392,6 +9527,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     run_kwargs["persist_user_message"] = user_message
 
                                 r = agent.run_conversation(**run_kwargs)
+                                agent._history_prefix_restored = 0
                                 if not isinstance(r, dict) or (
                                     r.get("failed")
                                     or r.get("completed") is False

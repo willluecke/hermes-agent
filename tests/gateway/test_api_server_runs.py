@@ -575,12 +575,13 @@ class TestStartRun:
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
 
+        session_db = MagicMock()
+        session_db.get_messages_as_conversation.return_value = canonical_history
+        session_db.get_session_imported_history.return_value = []
+        adapter._session_db = session_db
+
         async with TestClient(TestServer(app)) as cli:
             with patch.object(
-                adapter,
-                "_conversation_history_for_session",
-                return_value=canonical_history,
-            ) as load_history, patch.object(
                 adapter, "_create_agent", return_value=mock_agent
             ):
                 response = await cli.post(
@@ -601,7 +602,10 @@ class TestStartRun:
                         break
                     await asyncio.sleep(0.025)
 
-        load_history.assert_awaited_once_with("iteration-limited-session")
+        session_db.get_messages_as_conversation.assert_any_call(
+            "iteration-limited-session"
+        )
+        session_db.record_session_imported_history.assert_not_called()
         assert captured["history"] == canonical_history
 
     @pytest.mark.asyncio
@@ -623,12 +627,14 @@ class TestStartRun:
         mock_agent.session_completion_tokens = 0
         mock_agent.session_total_tokens = 0
 
+        session_db = MagicMock()
+        session_db.get_messages_as_conversation.return_value = []
+        session_db.get_session_imported_history.return_value = None
+        session_db.record_session_imported_history.return_value = True
+        adapter._session_db = session_db
+
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(
-                adapter,
-                "_conversation_history_for_session",
-                return_value=[],
-            ), patch.object(adapter, "_create_agent", return_value=mock_agent):
+            with patch.object(adapter, "_create_agent", return_value=mock_agent):
                 response = await cli.post(
                     "/v1/runs",
                     json={
@@ -647,6 +653,11 @@ class TestStartRun:
                     await asyncio.sleep(0.025)
 
         assert captured["history"] == bootstrap_history
+        # The gateway's first turn: what the client showed is recorded once
+        # so later turns replay it ahead of the stored rows.
+        session_db.record_session_imported_history.assert_called_once_with(
+            "not-yet-persisted", bootstrap_history, source="client"
+        )
 
     @pytest.mark.asyncio
     async def test_iteration_limit_failure_preserves_generated_summary(self, adapter):

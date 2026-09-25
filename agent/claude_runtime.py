@@ -194,6 +194,20 @@ def _claude_history_continues(
     return True, rows[count:]
 
 
+def _history_prefix_restored(agent: Any) -> int:
+    """Messages the gateway just prepended to this conversation's history:
+    the part of the chat that happened before its first Hermes turn."""
+    count = getattr(agent, "_history_prefix_restored", 0)
+    return count if isinstance(count, int) and count > 0 else 0
+
+
+def _restored_prefix_reason(agent: Any) -> str:
+    return (
+        f"{plural(_history_prefix_restored(agent), 'earlier message')} from "
+        "before this chat's first Hermes turn were restored to its history"
+    )
+
+
 def _normalized_cwd(cwd: str) -> str:
     return str(Path(cwd).expanduser().resolve())
 
@@ -1203,6 +1217,8 @@ def run_claude_code_turn(
             if prior_state.get("version") != _CLAUDE_SESSION_STATE_VERSION
             else f"the working directory changed ({prior_state.get('cwd')} -> {cwd})"
             if prior_state.get("cwd") != cwd
+            else _restored_prefix_reason(agent)
+            if not durable_continues and _history_prefix_restored(agent)
             else "the transcript was edited or rolled back since its last turn"
             if not durable_continues
             else "its transcript file is gone from Claude Code's session store"

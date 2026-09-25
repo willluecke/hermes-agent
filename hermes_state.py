@@ -7641,6 +7641,66 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             config = raw
         return config.get(key, default)
 
+    def get_session_imported_history(
+        self, session_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """The conversation that predates this session's own rows, or None.
+
+        ``None`` means nothing was ever recorded (the gateway may still adopt
+        a prefix); ``[]`` means it looked and the session starts at its own
+        first row.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT messages FROM session_imported_history WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(parsed, list):
+            return None
+        return [
+            {"role": str(m.get("role") or ""), "content": m.get("content")}
+            for m in parsed
+            if isinstance(m, dict) and m.get("role")
+        ]
+
+    def record_session_imported_history(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        source: str = "",
+    ) -> bool:
+        """Record a session's pre-Hermes conversation once. Returns True when
+        this call wrote it; an existing record is never overwritten, so the
+        prefix every later turn replays stays fixed."""
+        if not session_id:
+            return False
+        payload = json.dumps(
+            [
+                {"role": str(m.get("role") or ""), "content": m.get("content")}
+                for m in messages
+                if isinstance(m, dict) and m.get("role")
+            ],
+            ensure_ascii=False,
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO session_imported_history "
+                "(session_id, messages, source, imported_at) VALUES (?, ?, ?, ?)",
+                (session_id, payload, source or None, time.time()),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     def update_session_runtime_lock(
         self,
         session_id: str,
@@ -10679,6 +10739,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE session_id = ? AND active = 1",
                 (session_id,),
             )
+            # The compacted set was built from the whole replayed history,
+            # imported prefix included, so the prefix must not be prepended
+            # again. Empty (not deleted) keeps it from being re-adopted.
+            conn.execute(
+                "UPDATE session_imported_history SET messages = '[]' "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, compacted_messages
             )
@@ -12030,6 +12098,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
             conn.execute(
+                "DELETE FROM session_imported_history WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
@@ -12127,6 +12199,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute(
+                "DELETE FROM session_imported_history WHERE session_id = ?",
+                (session_id,),
+            )
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
             return True
