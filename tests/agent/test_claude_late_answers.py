@@ -63,6 +63,19 @@ def test_fingerprint_ignores_late_answers_wherever_they_land():
     assert base.startswith("v1:2:")
 
 
+def test_fingerprint_ignores_the_verify_judges_synthetic_nudge():
+    """The store never persists the nudge, so the next turn's prefix lacks it; the session must still match."""
+    user = {"role": "user", "content": "Write the AGENTS.md"}
+    interim = {"role": "assistant", "content": "Written, committed as ef5cc81."}
+    nudge = {"role": "user", "content": "Preflight judge: prove or drop the claim.", "_pre_verify_synthetic": True}
+    final = {"role": "assistant", "content": "The judge was right; recommitted as 4f1bde6."}
+    persisted = _claude_history_fingerprint([user, interim, final])
+    assert _claude_history_fingerprint([user, interim, nudge, final]) == persisted
+    stop_nudge = {"role": "user", "content": "verify before finishing", "_verification_stop_synthetic": True}
+    assert _claude_history_fingerprint([user, interim, stop_nudge, final]) == persisted
+    assert _claude_history_fingerprint([user, interim, {"role": "user", "content": "a real question"}, final]) != persisted
+
+
 def test_late_answer_is_stored_marked_and_adoptable(session_db, pings):
     session_id = session_db.create_session("hermes-chat-c_late1", "api_server")
     session_db.append_message(session_id, "user", "ship it")

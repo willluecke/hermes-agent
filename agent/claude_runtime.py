@@ -107,8 +107,27 @@ def _fingerprint_text(content: Any) -> str:
     return "\n".join(pieces)
 
 
+def _is_transcript_scaffolding(message: dict[str, Any]) -> bool:
+    """A row the durable transcript never keeps: the verify judge's synthetic
+    nudge and its siblings (``run_agent._EPHEMERAL_SCAFFOLDING_FLAGS``)."""
+    try:
+        from run_agent import _is_ephemeral_scaffolding
+
+        return bool(_is_ephemeral_scaffolding(message))
+    except Exception:
+        return bool(message.get("_pre_verify_synthetic") or message.get("_verification_stop_synthetic"))
+
+
 def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
-    """Hash the outer transcript prefix represented by a Claude session."""
+    """Hash the outer transcript prefix represented by a Claude session.
+
+    Only rows the durable transcript keeps count. The live list a turn ends
+    with can hold rows the store drops, and the next turn's prefix comes from
+    the store: a synthetic verify nudge in the fingerprint meant every turn
+    the judge sent back closed its Claude session and handed the next turn a
+    60k-character transcript instead (2026-09-24, "you're asking in a fresh
+    session" two minutes after the previous answer).
+    """
     digest = hashlib.sha256()
     included = 0
     for message in messages:
@@ -117,6 +136,8 @@ def _claude_history_fingerprint(messages: list[dict[str, Any]]) -> str:
             # it, possibly while the next turn is already loading history.
             # The Claude session holds it either way, so it never counts
             # toward the prefix that decides whether that session continues.
+            continue
+        if _is_transcript_scaffolding(message):
             continue
         included += 1
         payload = [
