@@ -336,9 +336,25 @@ def _build_server() -> Any:
     return mcp
 
 
+def _load_env() -> None:
+    """Read ~/.hermes/.env into this process.
+
+    The CLI that spawns this server hands its children a credential-free
+    environment (see ``claude_subscription_env``), so the tools served here
+    (consults, Jev) take their keys from the env file, not from the parent.
+    """
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv(hermes_home=os.environ.get("HERMES_HOME") or None)
+    except Exception:
+        logger.debug("hermes-tools MCP server: .env not loaded", exc_info=True)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     """Entry point for `python -m agent.transports.hermes_tools_mcp_server`."""
     argv = argv or sys.argv[1:]
+    _load_env()
     verbose = "--verbose" in argv or "-v" in argv
 
     log_level = logging.INFO if verbose else logging.WARNING

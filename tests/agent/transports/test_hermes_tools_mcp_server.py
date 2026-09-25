@@ -244,3 +244,31 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+def test_main_loads_the_hermes_env_file_before_building_the_server(monkeypatch):
+    """The CLI hands this server a credential-free environment; the keys come from ~/.hermes/.env."""
+    from agent.transports import hermes_tools_mcp_server as module
+
+    order = []
+    monkeypatch.setattr(module, "_load_env", lambda: order.append("env"))
+
+    class _Server:
+        def run(self):
+            order.append("run")
+
+    monkeypatch.setattr(module, "_build_server", lambda: (order.append("build"), _Server())[1])
+    assert module.main([]) == 0
+    assert order == ["env", "build", "run"]
+
+
+def test_load_env_reads_the_dotenv_for_the_configured_home(monkeypatch, tmp_path):
+    import os
+
+    from agent.transports import hermes_tools_mcp_server as module
+
+    (tmp_path / ".env").write_text("OPENROUTER_API_KEY=from-the-env-file\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    module._load_env()
+    assert os.environ.get("OPENROUTER_API_KEY") == "from-the-env-file"

@@ -155,9 +155,26 @@ def find_claude_binary() -> str:
     return candidate
 
 
+_CREDENTIAL_NAME_RE = re.compile(r"(API_KEY|_KEY|_TOKEN|_SECRET|PASSWORD|PASSPHRASE)$")
+_SUBSCRIPTION_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+
+
 def claude_subscription_env() -> dict[str, str]:
-    """Keep native OAuth, but never inherit an API or third-party route."""
-    env = os.environ.copy()
+    """Keep native OAuth, but never inherit an API key or a third-party route.
+
+    The CLI's tool shell is where the model runs curl, and it needs no
+    credential but the subscription's own OAuth token. An ambient provider
+    key makes a metered route the path of least resistance: on 2026-09-24 a
+    turn found OPENAI_API_KEY in its shell and billed gpt-image-2 through
+    the API while the ChatGPT subscription's image_gen sat unused. So the
+    shell gets the same strip-by-default environment as every other Hermes
+    spawn, plus a sweep of any remaining credential-shaped name. The
+    hermes-tools MCP server the CLI spawns loads ~/.hermes/.env itself, so
+    consults and Jev keep their keys without the shell having them.
+    """
+    from tools.environments.local import hermes_subprocess_env
+
+    env = hermes_subprocess_env(inherit_credentials=False)
     for key in (
         "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN",
         "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
@@ -165,6 +182,12 @@ def claude_subscription_env() -> dict[str, str]:
         "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
     ):
         env.pop(key, None)
+    for key in list(env):
+        if key not in _SUBSCRIPTION_ENV_KEEP and _CREDENTIAL_NAME_RE.search(key):
+            env.pop(key, None)
+    oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if oauth:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
     return env
 
 

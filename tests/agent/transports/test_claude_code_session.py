@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import json
 import queue
 import threading
@@ -112,15 +113,22 @@ def test_subscription_environment_preserves_oauth_not_api_routes(monkeypatch):
     from agent.transports.claude_code_session import claude_subscription_env
     forbidden = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN",
         "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE")
+        "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
+        # Every other provider or tool credential: the shell of a subscription
+        # CLI needs none of them, and an ambient one is a metered route waiting
+        # to be found (OPENAI_API_KEY was, on 2026-09-24).
+        "OPENAI_API_KEY", "OPENROUTER_API_KEY", "TYPESAFE_API_KEY", "FAL_KEY", "GEMINI_API_KEY",
+        "GITHUB_TOKEN", "API_SERVER_KEY", "HERMES_PREVIEW_AUTH_SECRET", "SOME_VENDOR_PASSWORD")
     for key in forbidden:
         monkeypatch.setenv(key, "test-not-a-credential")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "fake-subscription-token")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/test-native-claude")
+    monkeypatch.setenv("HERMES_HOME", "/tmp/test-hermes-home")
     env = claude_subscription_env()
     assert not set(forbidden).intersection(env)
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fake-subscription-token"
     assert env["CLAUDE_CONFIG_DIR"] == "/tmp/test-native-claude"
+    assert env["PATH"] == os.environ["PATH"]
 
 
 def test_error_result_confirms_session_before_returning():
