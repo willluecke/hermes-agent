@@ -47,18 +47,33 @@ def emit_continuity(
         return False
 
 
+def _cut_middle(block: str, cap: int) -> str:
+    """Shorten ``block`` to about ``cap`` characters, keeping both ends."""
+    cut = len(block) - cap
+    marker = f"\n[… {cut} characters cut here to fit the handoff …]\n"
+    head = (cap * 2) // 3
+    return block[:head] + marker + block[len(block) - (cap - head):]
+
+
 def render_history_blocks(
     entries: List[tuple],
     budget: int,
     render: Optional[Callable[[str, str], str]] = None,
+    message_cap: Optional[int] = None,
 ) -> tuple:
     """Render the newest ``(role, text)`` entries that fit ``budget`` characters.
 
     Returns ``(blocks, omitted, truncated)``: the blocks oldest first, how many
-    of the oldest entries did not fit, and whether the oldest included block
-    was cut at its start.
+    of the oldest entries did not fit, and whether any included block was cut.
+
+    A block longer than ``message_cap`` (a quarter of the budget by default) is
+    shortened in place, keeping its start and end with the cut marked. Without
+    the cap one oversized row ended the window: a 371k-character row of base64
+    text left a rebuilt Codex thread with 3 of 9 messages and without the
+    user's original request (2026-09-26, logoception).
     """
     render = render or (lambda role, text: f"{role.upper()}:\n{text}")
+    cap = max(1, message_cap if message_cap is not None else budget // 4)
     rendered: list[str] = []
     used = 0
     omitted = 0
@@ -66,10 +81,9 @@ def render_history_blocks(
     for index in range(len(entries) - 1, -1, -1):
         role, text = entries[index]
         block = render(role, text)
-        block_truncated = False
-        if len(block) > budget:
-            block = block[-budget:]
-            block_truncated = True
+        if len(block) > cap:
+            block = _cut_middle(block, cap)
+            truncated = True
         if used + len(block) > budget:
             # Stop here rather than skipping this message and continuing with
             # older, smaller ones. Skipping punches a hole in the middle of the
@@ -80,7 +94,6 @@ def render_history_blocks(
             break
         rendered.append(block)
         used += len(block)
-        truncated = truncated or block_truncated
     rendered.reverse()
     return rendered, omitted, truncated
 
@@ -93,7 +106,7 @@ def handoff_disclosure(omitted: int, truncated: bool) -> str:
         )
     if truncated:
         notes.append(
-            "[The oldest included message was cut at its start to fit.]"
+            "[Some long messages were shortened to fit; each cut is marked where it was made.]"
         )
     return ("\n" + "\n".join(notes)) if notes else ""
 

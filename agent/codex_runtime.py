@@ -279,6 +279,34 @@ def _codex_history_fingerprint(entries: List[tuple]) -> str:
     return f"v1:{len(entries)}:{digest.hexdigest()}"
 
 
+def _without_screenshot_lines(text: str) -> str:
+    return "\n".join(
+        line for line in text.split("\n") if line.strip() != "[screenshot]"
+    ).strip()
+
+
+def _legacy_image_prefixes(entries: List[tuple]) -> List[List[tuple]]:
+    """The same prefix as a record written before 18e321311 would hash it.
+
+    Those records hashed the turn's own image message from memory, without the
+    ``[screenshot]`` placeholders the store writes, so every Codex chat whose
+    last turn before that deploy carried an image looked diverged once and was
+    rebuilt (logoception, 2026-09-26 09:39). Accept that shape: the newest user
+    message without placeholders, or every message without them.
+    """
+    if not any("[screenshot]" in text for _, text in entries):
+        return []
+    variants: List[List[tuple]] = []
+    for index in range(len(entries) - 1, -1, -1):
+        if entries[index][0] == "user":
+            last = list(entries)
+            last[index] = ("user", _without_screenshot_lines(entries[index][1]))
+            variants.append(last)
+            break
+    variants.append([(role, _without_screenshot_lines(text)) for role, text in entries])
+    return variants
+
+
 def _codex_resume_plan(
     *,
     thread_id: str,
@@ -315,8 +343,10 @@ def _codex_resume_plan(
         # The transcript is shorter than what the thread consumed — a rewrite
         # or compaction, not an append.
         return "", prior_entries, "transcript-shortened"
-    if _codex_history_fingerprint(prior_entries[:seen]) != str(
-        state.get("fingerprint") or ""
+    recorded = str(state.get("fingerprint") or "")
+    if _codex_history_fingerprint(prior_entries[:seen]) != recorded and not any(
+        _codex_history_fingerprint(legacy) == recorded
+        for legacy in _legacy_image_prefixes(prior_entries[:seen])
     ):
         return "", prior_entries, "transcript-diverged"
     return thread_id, list(prior_entries[seen:]), "resume"

@@ -133,6 +133,32 @@ class TestResumePlan:
         assert thread == ""
         assert reason == "thread-rebound"
 
+    def test_a_record_from_before_image_placeholders_still_resumes(self):
+        """Records written before 18e321311 hashed the turn's own image
+        message without ``[screenshot]``; the store keeps the placeholders."""
+        recorded = _entries(("user", "make the logos"), ("assistant", "Which files?"))
+        stored = _entries(
+            ("user", "make the logos\n[screenshot]\n[screenshot]"),
+            ("assistant", "Which files?"),
+            ("user", "read agents.md"),
+        )
+        thread, pending, reason = _codex_resume_plan(
+            thread_id="thread-1", state=_state(recorded), prior_entries=stored, cwd=CWD
+        )
+        assert (thread, reason) == ("thread-1", "resume")
+        assert pending == _entries(("user", "read agents.md"))
+
+    def test_a_real_edit_next_to_an_image_still_diverges(self):
+        recorded = _entries(("user", "make the logos"), ("assistant", "Which files?"))
+        stored = _entries(
+            ("user", "make the icons\n[screenshot]"),
+            ("assistant", "Which files?"),
+        )
+        thread, _, reason = _codex_resume_plan(
+            thread_id="thread-1", state=_state(recorded), prior_entries=stored, cwd=CWD
+        )
+        assert (thread, reason) == ("", "transcript-diverged")
+
     def test_unusable_seen_count_is_rejected(self):
         entries = _entries(("user", "a"))
         for bad in (None, -1, "2", True):
@@ -148,45 +174,56 @@ class TestResumePlan:
 
 class TestHandoffWindow:
     def test_budget_truncation_keeps_an_unbroken_recent_window(self):
-        """Skipping one oversized message and continuing with older, smaller
-        ones punches a hole in the middle of the transcript and discloses it
-        only as a count — which reads as 'older context omitted' when it really
-        means 'the reply you are about to see is missing'."""
-        entries = _entries(
-            ("user", "OLDEST"),
-            ("assistant", "X" * 300),
-            ("user", "NEWER"),
-            ("assistant", "NEWEST"),
-        )
-        rendered, omitted, truncated = _render_history_blocks(entries, 200)
+        """Skipping a message and continuing with older ones punches a hole in
+        the middle of the transcript and discloses it only as a count."""
+        entries = [("user", f"M{i}" + "." * 10) for i in range(6)]
+        # Each block is 18 characters, under the 20-character cap: 4 fit in 80.
+        rendered, omitted, truncated = _render_history_blocks(entries, 80)
         body = "\n\n".join(rendered)
 
-        assert "NEWEST" in body and "NEWER" in body
-        # The oversized message did not fit, so everything older stops here.
-        assert "OLDEST" not in body
+        assert all(f"M{i}" in body for i in (2, 3, 4, 5))
+        # M1 did not fit, so everything older stops there too.
+        assert "M1" not in body and "M0" not in body
         assert omitted == 2
         assert truncated is False
 
-    def test_a_single_oversized_message_is_cut_not_dropped(self):
+    def test_an_oversized_message_is_shortened_in_place(self):
+        """One huge row used to end the window: 371k characters of base64 left
+        a rebuilt thread with 3 of 9 messages and no original request."""
+        entries = _entries(
+            ("user", "ORIGINAL REQUEST"),
+            ("user", "ECHO-HEAD" + "B" * 5000 + "ECHO-TAIL"),
+            ("assistant", "REPLY"),
+        )
+        rendered, omitted, truncated = _render_history_blocks(entries, 1000)
+        body = "\n\n".join(rendered)
+        assert omitted == 0
+        assert truncated is True
+        assert "ORIGINAL REQUEST" in body and "REPLY" in body
+        assert "ECHO-HEAD" in body and "ECHO-TAIL" in body
+        assert "characters cut here to fit" in body
+        assert len(body) <= 1000
+
+    def test_a_single_oversized_message_keeps_both_ends(self):
         rendered, omitted, truncated = _render_history_blocks(
             _entries(("assistant", "HEAD" + "X" * 400 + "TAIL")), 100
         )
         body = "\n\n".join(rendered)
-        assert "TAIL" in body
-        assert "HEAD" not in body
+        assert "HEAD" in body and "TAIL" in body
         assert truncated is True
         assert omitted == 0
 
-    def test_omissions_are_disclosed_in_the_handoff(self):
-        from agent.codex_runtime import _CODEX_HISTORY_HANDOFF_MAX_CHARS
+    def test_cuts_and_omissions_are_disclosed_in_the_handoff(self):
+        from agent.codex_runtime import _CODEX_HISTORY_HANDOFF_MAX_CHARS as budget
 
-        entries = _entries(
-            ("user", "OLDEST"),
-            ("assistant", "X" * _CODEX_HISTORY_HANDOFF_MAX_CHARS),
+        entries = (
+            _entries(("user", "OLDEST"))
+            + [("assistant", f"A{i}" + "x" * (budget // 5)) for i in range(4)]
+            + [("assistant", "HUGE" + "b" * budget)]
         )
         text = _codex_history_handoff(entries, "do the thing")
-        assert "1 older messages omitted" in text
-        assert "cut at its start" in text
+        assert "older messages omitted" in text
+        assert "shortened to fit" in text
         assert "OLDEST" not in text
 
     def test_catch_up_carries_only_the_missed_messages(self):
