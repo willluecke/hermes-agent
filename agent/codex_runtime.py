@@ -151,6 +151,85 @@ def _history_text(content: Any) -> str:
     ).strip()
 
 
+def _stored_content(content: Any) -> Any:
+    """Render list content the way the session store writes it.
+
+    The flush keeps text parts and writes each image as a ``[screenshot]``
+    placeholder (``run_agent._flush_messages_to_session_db_unlocked``). The
+    in-memory message still holds the image parts, so fingerprinting it as
+    text-only reported divergence on the next turn after every image turn and
+    cost the thread (2026-09-25, logoception).
+    """
+    if not isinstance(content, list):
+        return content
+    pieces: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            pieces.append(str(part.get("text", "")))
+        elif part.get("type") in {"image", "image_url", "input_image"}:
+            pieces.append("[screenshot]")
+    return "\n".join(pieces) if pieces else None
+
+
+def _input_text(turn_input: Any) -> str:
+    """The text Codex echoes back as the ``userMessage`` item for an input."""
+    if isinstance(turn_input, str):
+        return turn_input.strip()
+    if not isinstance(turn_input, list):
+        return ""
+    # Mirrors the session's ``_prepare_turn_input_items``.
+    texts: list[str] = []
+    for part in turn_input:
+        if isinstance(part, str):
+            if part.strip():
+                texts.append(part)
+        elif isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
+            text = part.get("text") or part.get("content") or ""
+            if text:
+                texts.append(str(text))
+    return "\n".join(texts).strip()
+
+
+def _with_turn_note(turn_input: Any, note: str) -> Any:
+    """Append a per-turn note (preflight, ultracode) to the Codex input.
+
+    A list input carries image parts and must stay a list; formatting it into
+    a string sent the images to Codex as base64 text.
+    """
+    if isinstance(turn_input, list):
+        return [*turn_input, {"type": "text", "text": note}]
+    return f"{turn_input}\n\n{note}"
+
+
+def _without_input_echo(projected: List[Dict[str, Any]], turn_input: Any) -> List[Dict[str, Any]]:
+    """Drop Codex's echo of the input Hermes sent for this turn.
+
+    Codex reports every input as a ``userMessage`` item, and the projector maps
+    it to a user row. The real user message was already persisted at turn
+    start, so keeping the echo stored the turn's full input a second time —
+    handoff wrapper, preflight note and all — as a user row (51 rows across 13
+    sessions by 2026-09-25, two of them hundreds of KB of base64). Only the
+    echo of the input we sent is dropped: a mid-turn ``turn/steer`` also
+    arrives as a ``userMessage`` and is the only record of that steer.
+    """
+    expected = _input_text(turn_input)
+    kept: List[Dict[str, Any]] = []
+    dropped = False
+    for message in projected or []:
+        if (
+            not dropped
+            and isinstance(message, dict)
+            and message.get("role") == "user"
+            and str(message.get("content") or "").strip() == expected
+        ):
+            dropped = True
+            continue
+        kept.append(message)
+    return kept
+
+
 def _codex_dialogue_entries(history: List[Dict[str, Any]]) -> List[tuple]:
     """Reduce a Hermes transcript to the dialogue a native thread can hold.
 
@@ -171,7 +250,7 @@ def _codex_dialogue_entries(history: List[Dict[str, Any]]) -> List[tuple]:
         role = str(message.get("role") or "").lower()
         if role not in {"user", "assistant"}:
             continue
-        content = message.get("content")
+        content = _stored_content(message.get("content"))
         if isinstance(content, str) and sanitize_context is not None:
             # Mirror the storage layer, which sanitizes user/assistant strings
             # on load (hermes_state._rows_to_conversation). Recalled memory is
@@ -1165,6 +1244,9 @@ def _codex_hook_parity(
             logger.warning("codex pre_verify follow-up turn failed", exc_info=True)
             break
         follow_ups += 1
+        # The nudge row above is the synthetic, never-durable copy; Codex's
+        # echo of it would otherwise be stored as a real user message.
+        follow.projected_messages = _without_input_echo(follow.projected_messages, nudge)
         for message in follow.projected_messages or []:
             append_message(messages, message)
         if getattr(agent, "_session_db", None) is not None:
@@ -1826,14 +1908,12 @@ def run_codex_app_server_turn(
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the turn input here as it rides the API copy
             # of the user message on the default loop. It is not part of
-            # the durable dialogue entries, so it never replays.
-            turn_input = f"{turn_input}\n\n{plugin_user_context}"
+            # the durable dialogue entries, so it never replays. A list input
+            # carries images: formatting it into a string sent them to Codex
+            # as base64 text (2026-09-25).
+            turn_input = _with_turn_note(turn_input, plugin_user_context)
         if _codex_ultracode(agent):
-            turn_input = (
-                [*turn_input, {"type": "text", "text": CODEX_ULTRACODE_NOTE}]
-                if isinstance(turn_input, list)
-                else f"{turn_input}\n\n{CODEX_ULTRACODE_NOTE}"
-            )
+            turn_input = _with_turn_note(turn_input, CODEX_ULTRACODE_NOTE)
         # Record what this thread is about to consume before the turn runs. A
         # turn that dies mid-flight still leaves a thread holding this input,
         # and re-seeding it from scratch next time would duplicate everything.
@@ -1843,6 +1923,7 @@ def run_codex_app_server_turn(
             agent, thread_id=thread_id, cwd=codex_cwd, entries=prior_entries
         )
         turn = agent._codex_session.run_turn(user_input=turn_input)
+        turn.projected_messages = _without_input_echo(turn.projected_messages, turn_input)
         if getattr(turn, "compacted", False):
             emit_continuity(
                 agent, "codex", "compacted",

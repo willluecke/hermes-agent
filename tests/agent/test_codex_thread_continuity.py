@@ -26,6 +26,8 @@ from agent.codex_runtime import (
     _codex_resume_plan,
     _normalized_codex_cwd,
     _render_history_blocks,
+    _with_turn_note,
+    _without_input_echo,
 )
 
 
@@ -260,6 +262,45 @@ class TestFingerprintSurvivesStorage:
             _codex_dialogue_entries(live)
         ) == _codex_history_fingerprint(_codex_dialogue_entries(reloaded))
 
+    def test_image_turn_fingerprint_survives_persist_and_reload(self):
+        """The store writes each image as a ``[screenshot]`` placeholder. A
+        fingerprint of the live list that skipped images reported divergence
+        on the turn after every image turn (2026-09-25, logoception)."""
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        tmp = tempfile.mkdtemp(prefix="codex_continuity_img_")
+        db = SessionDB(Path(tmp) / "state.db")
+        sid = "sess-codex-image"
+        db.create_session(session_id=sid, source="api_server", model="codex")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://stub.invalid",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        live = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "make the glass logos"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+                ],
+            },
+            {"role": "assistant", "content": "Which vector files?"},
+        ]
+        assert agent._flush_messages_to_session_db(live) is not False
+        reloaded = db.get_messages_as_conversation(sid)
+        assert "[screenshot]" in reloaded[0]["content"]
+        assert _codex_history_fingerprint(
+            _codex_dialogue_entries(live)
+        ) == _codex_history_fingerprint(_codex_dialogue_entries(reloaded))
+
     def test_tool_rows_do_not_change_the_dialogue_fingerprint(self):
         """Tool rows are projected differently by each runtime, so including
         them would report divergence for identical dialogue."""
@@ -286,3 +327,50 @@ class TestFingerprintSurvivesStorage:
         assert _codex_history_fingerprint(
             _codex_dialogue_entries(dialogue)
         ) == _codex_history_fingerprint(_codex_dialogue_entries(with_tools))
+
+
+class TestTurnInput:
+    def test_a_note_keeps_image_parts_as_parts(self):
+        """Formatting a list into a string sent images to Codex as base64
+        text: 566k characters of it on one logoception turn."""
+        parts = [
+            {"type": "text", "text": "make the glass logos"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]
+        noted = _with_turn_note(parts, "Preflight from Jev ...")
+        assert noted[:2] == parts
+        assert noted[2] == {"type": "text", "text": "Preflight from Jev ..."}
+        assert all("base64" not in str(p.get("text", "")) for p in noted)
+
+    def test_a_note_on_text_input_stays_text(self):
+        assert _with_turn_note("hi", "note") == "hi\n\nnote"
+
+
+class TestInputEcho:
+    def test_the_echo_of_the_sent_input_is_dropped(self):
+        sent = [
+            {"type": "text", "text": "make the glass logos"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "Preflight from Jev ..."},
+        ]
+        projected = [
+            {"role": "user", "content": "make the glass logos\nPreflight from Jev ..."},
+            {"role": "assistant", "content": "On it."},
+        ]
+        assert _without_input_echo(projected, sent) == [projected[1]]
+
+    def test_a_steer_is_kept(self):
+        """A mid-turn turn/steer arrives as a userMessage too, and the echo is
+        its only record."""
+        projected = [
+            {"role": "user", "content": "read agents.md"},
+            {"role": "assistant", "content": "Reading."},
+            {"role": "user", "content": "actually skip the README"},
+            {"role": "assistant", "content": "Skipped."},
+        ]
+        kept = _without_input_echo(projected, "read agents.md")
+        assert [m["content"] for m in kept] == ["Reading.", "actually skip the README", "Skipped."]
+
+    def test_nothing_matching_leaves_rows_alone(self):
+        projected = [{"role": "user", "content": "something else"}]
+        assert _without_input_echo(projected, "read agents.md") == projected
