@@ -30516,6 +30516,27 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+def _warm_agent_runtime() -> Optional[int]:
+    """Import the agent runtime before the first request; returns the tool registry generation after.
+
+    Importing ``run_agent`` runs the built-in tool discovery, about a hundred
+    registrations, each bumping the registry generation that every runtime
+    signature includes. Left to the first request (``_create_agent`` imports
+    it lazily), that bump landed between a chat's first and second message
+    in a fresh gateway, the signature changed, and the second message dropped
+    the chat's live CLI and resumed from disk (2026-09-30 06:08 and the
+    11:31 smoke). The other imports ``_create_agent`` makes are warmed too.
+    """
+    import run_agent  # noqa: F401  (its import registers the built-in tools)
+    import agent.opus_delegation  # noqa: F401
+    import hermes_cli.tools_config  # noqa: F401
+    from tools.registry import registry
+
+    generation = getattr(registry, "_generation", None)
+    logger.info("Agent runtime warmed before the first request: tool registry generation %s", generation)
+    return generation
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -30979,6 +31000,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _loop.run_in_executor(None, discover_mcp_tools)
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
+
+    # Register every built-in tool before the first request, so the first
+    # chat's runtime signature is taken after the registry generation settles
+    # (see _warm_agent_runtime). In the executor for the same reason as above.
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _warm_agent_runtime)
+    except Exception as e:
+        logger.warning("Agent runtime warm-up failed: %s", e)
 
     # Start the gateway
     try:
