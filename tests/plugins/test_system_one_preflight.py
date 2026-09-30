@@ -65,6 +65,7 @@ def harness(tmp_path, monkeypatch):
     preflight._session_todos.clear()
     preflight._session_ledger.clear()
     preflight._session_manifest.clear()
+    preflight._session_edits.clear()
     preflight._verify_memo.clear()
     preflight._held_actions.clear()
     preflight._session_excluded.clear()
@@ -1461,7 +1462,7 @@ def test_a_build_turn_that_ran_checks_without_a_manifest_is_asked_for_one_only_w
     assert record["rule"] == "" and record["action"] == "finish" and record["manifest_registered"] is False
     feedback["jev"].guard = {"criterion_1": 0.9, "claim_1": 0.05}
     result = _verify(final="The whole suite passes on every platform now.", paths=[str(repo / "app.py")])
-    assert result is not None and "No result manifest was registered although 1 check commands ran" in result["message"] and "(ledger rows c1)" in result["message"]
+    assert result is not None and "No result manifest was registered although 1 check commands ran" in result["message"] and "(`pytest -q`)" in result["message"]
     assert 'Unsupported by the evidence: "The whole suite passes' in result["message"]
     record = feedback["records"]("verify")[-1]
     assert record["rule"] == "no_manifest" and record["ledger"] == 1 and record["manifest_registered"] is False and record["answers"]["claim_1"] == 0.05
@@ -1477,18 +1478,19 @@ def test_code_checks_each_manifest_claim_and_contradiction_and_missing_rows_are_
     _cmd("pytest -q", json.dumps({"output": "12 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
     _cmd("pytest -q tests/x.py", json.dumps({"output": "1 failed, 3 passed in 0.3s", "exit_code": 1}), cwd=str(repo))
     _manifest([
-        _item("plugin suite passes", ["c1"], id="r1"),
-        _item("12 passed", ["c1"], predicate="count", expected={"passed": 12}, id="r2"),
-        _item("x suite passes", ["c2"], id="r3"),
-        _item("lint clean", ["c7"], id="r4"),
+        _item("plugin suite passes", ["pytest -q"], id="r1"),
+        _item("12 passed", ["pytest -q"], predicate="count", expected={"passed": 12}, id="r2"),
+        _item("x suite passes", ["pytest -q tests/x.py"], id="r3"),
+        _item("lint clean", ["npm run lint"], id="r4"),
     ])
     feedback["runner"]["pytest -q"] = ("12 passed in 0.3s", 0)
     feedback["runner"]["pytest -q tests/x.py"] = ("1 failed, 3 passed in 0.3s", 1)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05, "checks_failing": 0.1}
     result = _verify(paths=[str(repo / "app.py")])
     assert result is not None
-    assert 'contradicted by the evidence ledger: "x suite passes" (reported failure: k4)' in result["message"], "the gate's own run is what contradicts"
-    assert 'cite rows that are not in the ledger: "lint clean"' in result["message"] and "Rows this turn: c1, c2" in result["message"]
+    assert 'contradicted by the evidence ledger: "x suite passes" (reported failure: the gate\'s run of `pytest -q tests/x.py`)' in result["message"], "the gate's own run is what contradicts"
+    assert 'evidence did not happen this turn: "lint clean" (no command this turn matches `npm run lint`)' in result["message"]
+    assert " c1" not in result["message"] and "k4" not in result["message"], "the model is never shown a row id"
     call = feedback["jev"].calls[-1]
     state = call["state"]
     assert state["evidence_ledger"]["items"][0] == {"id": "c1", "command": "pytest -q", "exit": 0, "status": "pass", "kind": "pytest", "source": "agent", "counts": {"passed": 12}, "fresh": True}
@@ -1524,7 +1526,7 @@ def test_a_check_that_ran_before_a_later_edit_is_stale_and_the_gate_reruns_it_it
     command = f"{_sys.executable} -m pytest --version"
     _cmd(command, "pytest 8.0.0", cwd=str(repo))
     (repo / "app.py").write_text("def greet():\n    return 'edited after the check'\n")
-    _manifest([_item("pytest is available", ["c1"], predicate="exit_zero")])
+    _manifest([_item("pytest is available", [command], predicate="exit_zero")])
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     assert _verify(paths=[str(repo / "app.py")]) is None, "the gate's own run settled the claim"
     [record] = feedback["records"]("verify")
@@ -1545,23 +1547,23 @@ def test_a_stale_or_unknown_claim_the_gate_cannot_rerun_is_reported_honestly(fee
     _cmd("curl -s http://x/health", "ok", cwd=str(repo))
     (repo / "app.py").write_text("def greet():\n    return 'edited after the check'\n")
     _manifest([
-        _item("app prints hello", ["c1"], predicate="exit_zero", id="r1"),
-        _item("service is healthy", ["c2"], predicate="ran", id="r2"),
+        _item("app prints hello", ["python3 app.py"], predicate="exit_zero", id="r1"),
+        _item("service is healthy", ["curl -s http://x/health"], predicate="ran", id="r2"),
     ])
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     result = _verify(paths=[str(repo / "app.py")])
     assert result is not None
-    assert 'rest on checks that ran before later edits and the gate could not re-run: "app prints hello" (ran before later edits: c1 (not re-run by the gate: c1: not a plain check runner)). Run them again and cite the new rows.' in result["message"]
+    assert 'rest on checks that ran before later edits and the gate could not re-run: "app prints hello" (ran before later edits: `python3 app.py` (not re-run by the gate: `python3 app.py`: not a plain check runner)). Run them again after your last edit and cite those commands; the newest run counts.' in result["message"]
     record = feedback["records"]("verify")[-1]
     assert record["reruns"] == [], "python3 app.py is not a check runner, so the gate never runs it"
     assert [(item["code"], item["basis"]) for item in record["assertions"]] == [("stale", "agent"), ("supported", "agent")], "a ran claim is not about freshness and rests on the agent's row"
     # Insufficient is not a finding: a claim with unknown status is reported, not refuted.
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix greet", conversation_history=[])
     _cmd("python3 app.py", "hello", cwd=str(repo))
-    _manifest([_item("app prints hello", ["c1"], predicate="exit_zero")])
+    _manifest([_item("app prints hello", ["python3 app.py"], predicate="exit_zero")])
     assert _verify(paths=[str(repo / "app.py")]) is None
     record = feedback["records"]("verify")[-1]
-    assert record["manifest"]["insufficient"] == 1 and record["assertions"][0]["detail"].startswith("exit code unknown on this lane (not re-run by the gate: c1: not a plain check runner)")
+    assert record["manifest"]["insufficient"] == 1 and record["assertions"][0]["detail"].startswith("exit code unknown on this lane (not re-run by the gate: `python3 app.py`: not a plain check runner)")
 
 
 def test_jev_can_still_refute_a_code_supported_claim_on_its_wording(feedback, repo, monkeypatch):
@@ -1570,7 +1572,7 @@ def test_jev_can_still_refute_a_code_supported_claim_on_its_wording(feedback, re
     feedback["jev"] = jev
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     _cmd("pytest -q tests/one.py", json.dumps({"output": "2 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
-    _manifest([_item("the whole suite passes", ["c1"])])
+    _manifest([_item("the whole suite passes", ["pytest -q tests/one.py"])])
     feedback["runner"]["pytest -q tests/one.py"] = ("2 passed in 0.1s", 0)
     jev.guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     result = _verify(paths=[str(repo / "app.py")])
@@ -1589,7 +1591,7 @@ def test_assertion_questions_are_grouped_by_criterion_under_the_question_cap_and
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix", conversation_history=[])
     preflight.on_post_tool_call(tool_name="todo", args={}, result=criteria(20), session_id="s1")
     _cmd("pytest -q", json.dumps({"output": "1 failed, 2 passed in 0.1s", "exit_code": 1}), cwd=str(repo))
-    _manifest([_item(f"claim {i}", ["c1"], predicate="ran", criterion=str(i % 3 + 1), id=f"r{i}") for i in range(16)])
+    _manifest([_item(f"claim {i}", ["pytest -q"], predicate="ran", criterion=str(i % 3 + 1), id=f"r{i}") for i in range(16)])
     feedback["jev"].guard = {**{f"criterion_{i}": 0.9 for i in range(1, 21)}, "claims_unverified": 0.05, "checks_failing": 0.1}
     _verify(paths=[str(repo / "app.py")])
     call = feedback["jev"].calls[-1]
@@ -1604,13 +1606,107 @@ def test_assertion_questions_are_grouped_by_criterion_under_the_question_cap_and
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix", conversation_history=[])
     preflight.on_post_tool_call(tool_name="todo", args={}, result=criteria(30), session_id="s1")
     _cmd("pytest -q", json.dumps({"output": "1 failed, 2 passed in 0.1s", "exit_code": 1}), cwd=str(repo))
-    _manifest([_item(f"claim {i}", ["c1"], predicate="ran", criterion=str(i % 3 + 1), id=f"r{i}") for i in range(16)])
+    _manifest([_item(f"claim {i}", ["pytest -q"], predicate="ran", criterion=str(i % 3 + 1), id=f"r{i}") for i in range(16)])
     feedback["jev"].guard = {**{f"criterion_{i}": 0.9 for i in range(1, 31)}, "claims_unverified": 0.05, "checks_failing": 0.1}
     _verify(paths=[str(repo / "app.py")])
     call = feedback["jev"].calls[-1]
     assert len(call["questions"]) == preflight.JEV_MAX_QUESTIONS and not any(key.startswith("assertion") for key in call["questions"])
     record = feedback["records"]("verify")[-1]
     assert record["assertion_grouping"] == "truncated" and record["assertions_dropped"] == 16
+
+
+def test_claims_cite_commands_so_the_re_runs_after_the_last_edit_are_what_counts(feedback, repo):
+    # 2026-09-29: after a send-back the model re-ran every check, guessed their ids as c1-c6 (the
+    # turn's first, unrelated commands) and all nine claims read as stale. Cited by command, the
+    # newest runs count; a guessed id is refused and the model is told to cite the command.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make the installer provider agnostic", conversation_history=[])
+    _cmd("curl -s https://api.anaconda.org/package/conda-forge/php", "php 8.5.9", cwd=str(repo))
+    _cmd("scripts/install.sh --check", "Jest 30.1.3", cwd=str(repo))
+    _cmd("pytest -q", json.dumps({"output": "3 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
+    (repo / "app.py").write_text("def greet():\n    return 'edited'\n")
+    preflight.on_post_tool_call(tool_name="write_file", args={"path": str(repo / "app.py"), "content": "x"}, result="ok", session_id="s1")
+    _cmd("scripts/install.sh --check", "Jest 30.2.0", cwd=str(repo))
+    _cmd("pytest -q", json.dumps({"output": "3 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
+    feedback["runner"]["pytest -q"] = ("3 passed in 0.1s", 0)
+    _manifest([
+        _item("--check ends with Jest 30.2.0", ["scripts/install.sh --check"], predicate="contains", expected={"text": "Jest 30.2.0"}, id="r1"),
+        _item("the suite passes", ["pytest -q"], id="r2"),
+        _item("the suite still passes", ["c1"], id="r3"),
+    ])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    record = feedback["records"]("verify")[-1]
+    assert [(item["id"], item["code"], item["basis"]) for item in record["assertions"]] == [
+        ("r1", "supported", "agent"), ("r2", "supported", "gate"), ("r3", "insufficient", "agent"),
+    ], "the newest runs are fresh; the guessed id counts for nothing"
+    assert record["assertions"][0]["citations"] == [{"cited": "scripts/install.sh --check", "row": "c4", "how": "exact"}]
+    assert record["reruns"][0]["row"] == "c5", "the gate re-runs the newest run of the cited command"
+    assert record["citations"] == {"exact": 2, "partial": 0, "text": 0, "row_id": 1, "unmatched": 0}
+    assert result is not None and 'Result claims cite ledger row ids, which you are never shown: "the suite still passes" (c1). Cite the command you ran instead' in result["message"]
+    state = feedback["jev"].calls[-1]["state"]
+    assert state["result_manifest"]["items"][1]["cited"] == ["pytest -q"] and state["result_manifest"]["items"][1]["evidence"] == ["c5"]
+
+
+def test_a_contains_claim_is_checked_against_the_output_that_printed_its_text(feedback, repo):
+    # 2026-09-30: eight correct claims cited each output one row too late and read as contradicted.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="dedupe the rows", conversation_history=[])
+    _cmd("node dedupe.mjs", "deployed file == commit befaf1d", cwd=str(repo))
+    _cmd("node dedupe.mjs --apply", "applied: rows changed = 1", cwd=str(repo))
+    _manifest([
+        _item("the deployed file matches the commit", ["node dedupe.mjs --apply"], predicate="contains", expected={"text": "deployed file == commit befaf1d"}, id="r1"),
+        _item("one row changed", ["c3"], predicate="contains", expected={"text": "applied: rows changed = 1"}, id="r2"),
+        _item("nothing is missing", ["node dedupe.mjs"], predicate="contains", expected={"text": "missing: []"}, id="r3"),
+        _item("the backup was taken", ["sqlite3 sync.db .backup b.db"], predicate="contains", expected={"text": "backup ok"}, id="r4"),
+    ])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    record = feedback["records"]("verify")[-1]
+    assert [(item["id"], item["code"]) for item in record["assertions"]] == [("r1", "supported"), ("r2", "supported"), ("r3", "contradicted"), ("r4", "missing")]
+    assert record["assertions"][0]["citations"][-1] == {"cited": "deployed file == commit befaf1d", "row": "c1", "how": "text"}
+    assert result is not None
+    assert "(text not in retained output of `node dedupe.mjs`: 'missing: []')" in result["message"], "the cited command ran and did not print it"
+    assert "(no command output this turn contains 'backup ok')" in result["message"]
+
+
+def test_criteria_about_earlier_work_are_judged_with_that_work(feedback, repo):
+    # 2026-09-29: four closure_verify criteria read unmet turn after turn because the code they were
+    # about was written in an earlier turn, and the judge saw only this turn's diff.
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="add closure_verify", conversation_history=[])
+    lines = ["# padding line"] * 600 + ["def closure_verify(obligation=None):", "    return run_one(obligation)"] + ["# padding line"] * 600
+    (repo / "server.py").write_text("\n".join(lines) + "\n")
+    (repo / "unrelated.py").write_text("print('nothing to see')\n")
+    notes = repo.parent / "memory" / "closure-notes.md"
+    notes.parent.mkdir()
+    notes.write_text("closure_verify accepts an optional obligation; it documents the whole project.\n")
+    for path in (repo / "server.py", repo / "unrelated.py", notes):
+        preflight.on_post_tool_call(tool_name="write_file", args={"path": str(path), "content": "x"}, result="ok", session_id="s1")
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="document it", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [
+        {"id": "1", "content": "closure_verify accepts an optional obligation", "status": "completed"},
+    ]}), session_id="s1")
+    (repo / "README.md").write_text("closure_verify docs\n")
+    preflight._session_edits.clear()  # a gateway restart: the record comes back from disk
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    _verify(paths=[str(repo / "README.md")])
+    call = feedback["jev"].calls[-1]
+    work = call["state"]["earlier_work"]
+    assert [item["path"] for item in work["items"]][:1] == ["server.py"], "the repository's code goes in before a note that mentions more of the criteria"
+    assert [item["path"] for item in work["items"]][1].endswith("memory/closure-notes.md") and len(work["items"]) == 2, "a file the criteria never mention and this turn's own diff stay out"
+    text = work["items"][0]["text"]
+    assert text.startswith("@@ lines 601-640 @@\ndef closure_verify(obligation=None):") and text.endswith("… [other lines omitted]")
+    assert len(text) < 1_000, "a long file is cut to the lines that mention the criterion"
+    assert call["questions"]["criterion_1"]["instructions"].startswith("Do the code changes and the earlier work shown, with the evidence ledger")
+    assert "earlier_work holds the current content" in call["state"]["provenance"]
+    assert list(call["state"]).index("earlier_work") == list(call["state"]).index("diff") + 1
+    record = feedback["records"]("verify")[-1]
+    assert record["earlier_work"]["files"][0] == "server.py" and record["earlier_work"]["candidates"] == 3 and record["earlier_work"]["truncated"] is True
+    # Without earlier work the question and the state are exactly what they were.
+    preflight.on_pre_llm_call(session_id="s2", turn_id="t1", user_message="fix greet", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "greet says hello world", "status": "completed"}]}), session_id="s2")
+    _verify(session="s2", paths=[str(repo / "app.py")])
+    call = feedback["jev"].calls[-1]
+    assert "earlier_work" not in call["state"] and call["questions"]["criterion_1"]["instructions"].startswith("Do the code changes, with the evidence ledger")
 
 
 def test_a_change_to_tests_or_runner_config_is_flagged_for_the_human_not_as_a_finding(feedback, repo, emitted):
@@ -1630,11 +1726,12 @@ def test_a_decisive_claim_is_supported_only_by_the_gates_own_run(feedback, repo,
     _cmd("pytest -q", json.dumps({"output": "12 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
     _cmd("pytest -q >/dev/null 2>&1; echo '12 passed in 0.1s'", json.dumps({"output": "12 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
     _cmd("bash run_tests.sh", json.dumps({"output": "all good", "exit_code": 0}), cwd=str(repo))
+    forged = "pytest -q >/dev/null 2>&1; echo '12 passed in 0.1s'"
     _manifest([
-        _item("suite passes", ["c1"], id="r1"),
-        _item("suite passes (forged)", ["c2"], id="r2"),
-        _item("wrapper passes", ["c3"], predicate="exit_zero", id="r3"),
-        _item("the run happened", ["c2"], predicate="ran", id="r4"),
+        _item("suite passes", ["pytest -q"], id="r1"),
+        _item("suite passes (forged)", [forged], id="r2"),
+        _item("wrapper passes", ["bash run_tests.sh"], predicate="exit_zero", id="r3"),
+        _item("the run happened", [forged], predicate="ran", id="r4"),
     ])
     feedback["runner"]["pytest -q"] = ("12 passed in 0.3s", 0)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
@@ -1642,8 +1739,8 @@ def test_a_decisive_claim_is_supported_only_by_the_gates_own_run(feedback, repo,
     record = feedback["records"]("verify")[-1]
     verdicts = {item["id"]: (item["code"], item["basis"], item["detail"]) for item in record["assertions"]}
     assert verdicts["r1"] == ("supported", "gate", "every cited row reports a pass"), "a fresh agent row is still re-run; only the gate's row clears it"
-    assert verdicts["r2"][0] == "insufficient" and "could not re-run it (c2: not a plain check runner)" in verdicts["r2"][2], "the forged runner row clears nothing"
-    assert verdicts["r3"][0] == "insufficient" and "c3: not a plain check runner" in verdicts["r3"][2], "a wrapper's exit 0 clears nothing"
+    assert verdicts["r2"][0] == "insufficient" and f"could not re-run it (`{forged}`: not a plain check runner)" in verdicts["r2"][2], "the forged runner row clears nothing"
+    assert verdicts["r3"][0] == "insufficient" and "`bash run_tests.sh`: not a plain check runner" in verdicts["r3"][2], "a wrapper's exit 0 clears nothing"
     assert verdicts["r4"] == ("supported", "agent", "rows exist"), "ran keeps the agent's row and says so"
     assert [(r["row"], r["controller"]) for r in record["reruns"]] == [("c1", "k4")]
     assert record["manifest"] == {"supported": 2, "contradicted": 0, "stale": 0, "insufficient": 2, "missing": 0}
@@ -1651,7 +1748,7 @@ def test_a_decisive_claim_is_supported_only_by_the_gates_own_run(feedback, repo,
     feedback["settings"]["controller_reruns"] = "off"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="fix greet", conversation_history=[])
     _cmd("pytest -q", json.dumps({"output": "12 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
-    _manifest([_item("suite passes", ["c1"])])
+    _manifest([_item("suite passes", ["pytest -q"])])
     assert _verify(paths=[str(repo / "app.py")]) is None
     record = feedback["records"]("verify")[-1]
     assert record["assertions"][0]["code"] == "insufficient" and "controller re-runs are off" in record["assertions"][0]["detail"]
@@ -1660,11 +1757,11 @@ def test_a_decisive_claim_is_supported_only_by_the_gates_own_run(feedback, repo,
 def test_the_gate_strips_output_filters_and_keeps_the_original_command(feedback, repo):
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     _cmd("pytest -q | grep -v failed", json.dumps({"output": "..\n2 passed in 0.1s", "exit_code": 0}), cwd=str(repo))
-    _manifest([_item("suite passes", ["c1"])])
+    _manifest([_item("suite passes", ["pytest -q | grep -v failed"])])
     feedback["runner"]["pytest -q"] = ("F..\n1 failed, 2 passed in 0.1s", 1)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     result = _verify(paths=[str(repo / "app.py")])
-    assert result is not None and 'contradicted by the evidence ledger: "suite passes" (reported failure: k2)' in result["message"]
+    assert result is not None and 'contradicted by the evidence ledger: "suite passes" (reported failure: the gate\'s run of `pytest -q`)' in result["message"]
     row = preflight.ledger_state("s1")["rows"][-1]
     assert row["id"] == "k2" and row["command"] == "pytest -q" and row["filtered_from"] == "pytest -q | grep -v failed" and row["status"] == "fail"
     assert feedback["records"]("verify")[-1]["reruns"][0]["command"] == "pytest -q"
@@ -1675,11 +1772,11 @@ def test_fewer_tests_than_the_earliest_run_is_a_finding_once_and_the_memo_surviv
     _cmd("pytest -q", json.dumps({"output": "5 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
     (repo / "app.py").write_text("def greet():\n    return 'edited'\n")
     _cmd("pytest -q | tail -1", json.dumps({"output": "3 passed in 0.2s", "exit_code": 0}), cwd=str(repo))
-    _manifest([_item("suite passes", ["c2"])])
+    _manifest([_item("suite passes", ["pytest -q | tail -1"])])
     feedback["runner"]["pytest -q"] = ("3 passed in 0.2s", 0)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
     result = _verify(paths=[str(repo / "app.py")])
-    assert result is not None and "Fewer tests ran than before the change: pytest -q went from 5 to 3 (rows c1 then k3). Restore the tests or state why in the answer." in result["message"]
+    assert result is not None and "Fewer tests ran than before the change: `pytest -q` went from 5 to 3. Restore the tests or state why in the answer." in result["message"]
     record = feedback["records"]("verify")[-1]
     assert record["regressions"] == [{"command": "pytest -q", "before": 5, "after": 3, "baseline": "c1", "controller": "k3"}]
     # The same answer again: the gate runs again (a new k row), but the memo ignores controller rows and the turn finishes.
@@ -1687,10 +1784,12 @@ def test_fewer_tests_than_the_earliest_run_is_a_finding_once_and_the_memo_surviv
     assert feedback["records"]("verify")[-1]["repeated"] is True
     # A run in the previous turn is the baseline when this turn ran nothing before its edits.
     preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="more", conversation_history=[])
-    _manifest([_item("suite passes", ["pc1"])])
+    _manifest([_item("suite passes", ["pytest -q"])])
     feedback["runner"]["pytest -q"] = ("2 passed in 0.2s", 0)
     result = _verify(paths=[str(repo / "app.py")])
-    assert result is not None and "went from 5 to 2 (rows pc1 then k1)" in result["message"]
+    assert result is not None and "`pytest -q` went from 5 to 2." in result["message"]
+    regression = feedback["records"]("verify")[-1]["regressions"][0]
+    assert (regression["baseline"], regression["controller"]) == ("pc1", "k1"), "the log keeps the ids; the command resolved to the previous turn's newest run"
 
 
 def test_removed_assertions_or_added_skips_in_existing_tests_are_a_finding_once(feedback, repo, emitted):
@@ -1879,7 +1978,7 @@ def test_the_verify_judge_labels_its_flags_from_the_gates_own_re_run(feedback, r
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
     _cmd("pytest -q", json.dumps({"output": "5 passed in 0.3s", "exit_code": 0}), cwd=str(repo))
     _cmd("npm run build", json.dumps({"output": "built", "exit_code": 0}), cwd=str(repo))
-    _manifest([_item("the unit tests pass", ["c1"], id="r1"), _item("the build succeeds", ["c2"], predicate="exit_zero", id="r2")])
+    _manifest([_item("the unit tests pass", ["pytest -q"], id="r1"), _item("the build succeeds", ["npm run build"], predicate="exit_zero", id="r2")])
     feedback["runner"]["pytest -q"] = ("2 failed, 3 passed in 0.3s", 1)
     feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.9, "claim_1": 0.05, "claim_2": 0.05, "claim_3": 0.05}
     draft = "The unit tests pass on every module now. The build succeeds without any warnings at all. Deployed the bundle to the staging server."
@@ -1888,7 +1987,7 @@ def test_the_verify_judge_labels_its_flags_from_the_gates_own_re_run(feedback, r
     record = feedback["records"]("verify")[-1]
     labels = {entry["sentence"]: entry for entry in record["claim_labels"]}
     assert labels["The unit tests pass on every module now."]["label"] == "overclaim" and labels["The unit tests pass on every module now."]["item"] == "r1", "the gate re-ran pytest itself and it failed"
-    assert labels["The unit tests pass on every module now."]["reason"].startswith("reported failure: k")
+    assert labels["The unit tests pass on every module now."]["reason"] == "reported failure: the gate's run of `pytest -q`"
     assert labels["The build succeeds without any warnings at all."]["label"] == "false_flag", "the gate re-ran the build itself and it held"
     assert labels["The build succeeds without any warnings at all."]["basis"] == "gate"
     assert labels["Deployed the bundle to the staging server."]["label"] == "overclaim_unregistered"

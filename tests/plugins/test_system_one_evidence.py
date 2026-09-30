@@ -337,11 +337,93 @@ def test_check_assertion_count_exit_zero_and_contains(tmp_path):
 def test_a_row_that_ran_under_another_workspace_is_stale_by_code_except_for_ran(tmp_path):
     rows = _rows(tmp_path)
     stale = evidence.check_assertion({"predicate": "passed", "evidence": ["c2"]}, rows, "w2")
-    assert stale["verdict"] == "stale" and "c2" in stale["detail"]
+    assert stale["verdict"] == "stale" and stale["detail"] == "ran before later edits: `pytest -q`", "the model reads commands, never row ids"
     assert evidence.check_assertion({"predicate": "ran", "evidence": ["c2"]}, rows, "w2")["verdict"] == "supported"
     assert evidence.check_assertion({"predicate": "passed", "evidence": ["c2"]}, rows, None)["verdict"] == "supported", "no final digest: freshness unknown, not stale"
     rows["c2"]["workspace"] = None
     assert evidence.check_assertion({"predicate": "passed", "evidence": ["c2"]}, rows, "w2")["verdict"] == "supported", "a row with no digest cannot be called stale"
+
+
+def _ledger(tmp_path, commands):
+    """Rows in run order from (command, output) pairs, each with its output retained."""
+    rows = []
+    for n, (command, output) in enumerate(commands, 1):
+        row, text = evidence.make_row(n, command, output, workspace="w1")
+        row["file"] = evidence.retain_output(tmp_path / "ev", row["id"], text)
+        rows.append(row)
+    return rows
+
+
+def _resolve(item, rows):
+    newest_first = list(reversed(rows))
+    return evidence.resolve_evidence(item, newest_first, lambda row: evidence.read_output(row.get("file")))
+
+
+def test_a_cited_command_resolves_to_its_newest_run_exact_before_partial(tmp_path):
+    rows = _ledger(tmp_path, [
+        ("cd /repo && npx vitest run test/mcp.test.ts --reporter=verbose 2>&1 | tail -20", "Tests  9 passed (10)"),
+        ("pytest -q tests/x.py", "1 passed in 0.1s"),
+        ("npx vitest run test/mcp.test.ts --reporter=verbose", "Tests  10 passed (10)"),
+        ("pytest -q", "3 passed in 0.1s"),
+    ])
+    match = _resolve({"predicate": "passed", "evidence": ["npx vitest run test/mcp.test.ts --reporter=verbose"]}, rows)
+    assert match["ids"] == ["c3"] and match["problem"] is None, "the newest run of the same command, cd prefix and output filters ignored"
+    assert match["citations"] == [{"cited": "npx vitest run test/mcp.test.ts --reporter=verbose", "row": "c3", "how": "exact"}]
+    assert _resolve({"evidence": ["pytest -q"]}, rows)["ids"] == ["c4"], "an exact match wins over a newer command that merely contains it"
+    assert _resolve({"evidence": ["`$ pytest   -q tests/x.py`"]}, rows)["ids"] == ["c2"], "backticks, a prompt and spacing are ignored"
+    partial = _resolve({"evidence": ["vitest run test/mcp"]}, rows)
+    assert partial["ids"] == ["c3"] and partial["citations"][0]["how"] == "partial", "a distinctive part matches its newest run"
+    assert _resolve({"evidence": ["tsc"]}, rows)["problem"]["verdict"] == "missing", "too short to match partially"
+    assert evidence.command_key("cd x && pytest -q | tail -3") == "pytest -q"
+
+
+def test_the_codex_shell_wrapper_is_matched_by_its_inner_command(tmp_path):
+    # The Codex lane records `/bin/bash -lc "..."` with the inner quotes escaped; the model cites the inside.
+    rows = _ledger(tmp_path, [('/bin/bash -lc "sqlite3 -readonly sync.db \\".tables\\""', "conversations"), ("/bin/bash -lc 'npm test'", "ok")])
+    assert _resolve({"evidence": ['sqlite3 -readonly sync.db ".tables"']}, rows)["ids"] == ["c1"]
+    assert _resolve({"evidence": ["npm test"]}, rows)["citations"] == [{"cited": "npm test", "row": "c2", "how": "exact"}]
+    assert evidence.unwrap_shell("bash -lc 'unbalanced") == "bash -lc 'unbalanced" and evidence.unwrap_shell("bashful -lc x") == "bashful -lc x"
+
+
+def test_row_ids_are_refused_and_a_command_that_did_not_run_is_missing(tmp_path):
+    rows = _ledger(tmp_path, [("pytest -q", "3 passed in 0.1s")])
+    guessed = _resolve({"predicate": "passed", "evidence": ["c1"]}, rows)
+    assert guessed["ids"] == [] and guessed["row_ids"] == ["c1"], "the agent never sees ids, so even a right guess is refused"
+    assert guessed["problem"]["verdict"] == "insufficient" and "row ids (c1)" in guessed["problem"]["detail"]
+    assert [evidence.is_row_id(text) for text in ("c7", "K58", "pc3", "c", "npm test", "c7 c8")] == [True, True, True, False, False, False]
+    mixed = _resolve({"predicate": "passed", "evidence": ["c9", "pytest -q"]}, rows)
+    assert mixed["ids"] == ["c1"] and mixed["problem"] is None, "a command beside a guessed id is enough"
+    absent = _resolve({"predicate": "passed", "evidence": ["pytest -q", "npm run lint"]}, rows)
+    assert absent["problem"] == {"verdict": "missing", "detail": "no command this turn matches `npm run lint`"}
+
+
+def test_a_contains_claim_finds_the_output_that_printed_its_text(tmp_path):
+    rows = _ledger(tmp_path, [
+        ("node dedupe.mjs", "deployed file == commit befaf1d"),
+        ("node dedupe.mjs --apply", "applied: rows changed = 1"),
+        ("git status --short", ""),
+    ])
+    # The 2026-09-30 turn cited each output one row too late; the text itself decides.
+    off_by_one = _resolve({"predicate": "contains", "evidence": ["c2"], "expected": {"text": "deployed file == commit befaf1d"}}, rows)
+    assert off_by_one["ids"] == ["c1"] and off_by_one["problem"] is None and off_by_one["row_ids"] == []
+    assert off_by_one["citations"][-1] == {"cited": "deployed file == commit befaf1d", "row": "c1", "how": "text"}
+    wrong_command = _resolve({"predicate": "contains", "evidence": ["node dedupe.mjs --apply"], "expected": {"text": "deployed file"}}, rows)
+    assert wrong_command["ids"] == ["c1"], "a cited command that did not print it gives way to the one that did"
+    cited_right = _resolve({"predicate": "contains", "evidence": ["node dedupe.mjs --apply"], "expected": {"text": "rows changed = 1"}}, rows)
+    assert cited_right["ids"] == ["c2"] and [entry["how"] for entry in cited_right["citations"]] == ["exact"]
+    nowhere = _resolve({"predicate": "contains", "evidence": ["c5"], "expected": {"text": "never printed"}}, rows)
+    assert nowhere["problem"] == {"verdict": "missing", "detail": "no command output this turn contains 'never printed'"}
+    ran_not_printed = _resolve({"predicate": "contains", "evidence": ["git status --short"], "expected": {"text": "never printed"}}, rows)
+    assert ran_not_printed["ids"] == ["c3"] and ran_not_printed["problem"] is None, "the cited command ran: code then finds the text absent"
+    assert evidence.check_assertion({"predicate": "contains", "evidence": ran_not_printed["ids"], "expected": {"text": "never printed"}}, {row["id"]: row for row in rows}, "w1")["verdict"] == "contradicted"
+
+
+def test_details_name_commands_and_the_gates_runs(tmp_path):
+    rows = {row["id"]: row for row in _ledger(tmp_path, [("pytest -q", "1 failed, 2 passed in 0.1s")])}
+    gate, _ = evidence.make_row(2, "pytest -q", "1 failed, 2 passed in 0.1s", workspace="w1", source="controller", prefix="k")
+    rows["k2"] = gate
+    assert evidence.check_assertion({"predicate": "passed", "evidence": ["k2"]}, rows, "w1")["detail"] == "reported failure: the gate's run of `pytest -q`"
+    assert evidence.cite({"command": "a " * 100}).endswith("…`") and len(evidence.cite({"command": "a " * 100})) <= 82
 
 
 def test_manifest_counts_and_machinery_paths():
@@ -403,6 +485,13 @@ def test_rerunnable_accepts_plain_check_runners_with_cd_and_filters(command):
 ])
 def test_rerunnable_refuses_anything_that_is_not_a_check(command):
     assert evidence.rerunnable(command) is False
+
+
+def test_the_gate_runs_checks_under_bash(tmp_path):
+    # /bin/sh is dash on Debian: no `time` keyword, and a whitelisted `time pytest` exited 127 there.
+    run = evidence.run_check("time true", str(tmp_path), 10)
+    assert run["exit_code"] == 0, run["output"]
+    assert evidence.rerunnable("time pytest -q")
 
 
 def test_run_check_captures_output_exit_and_timeouts(tmp_path):

@@ -83,10 +83,15 @@ terminal call with its exit code or ``unknown``, what the runner reported,
 a failure flag, a digest of the output and the workspace digest it ran
 under; the full output is retained on disk. It also keeps the session's
 criteria and the result manifest the model registers with
-``report_results``: each claim names the ledger rows it rests on and a
-predicate code compares exactly (supported, contradicted, stale, missing,
-insufficient). A cited check that ran before a later edit is stale by
-digest, and the gate re-runs plain check commands itself. When the model
+``report_results``: each claim names the commands it rests on, as the model
+ran them, which code matches to their newest runs (the model is never shown
+a row id, so it is never asked for one), and a predicate code compares
+exactly (supported, contradicted, stale, missing, insufficient). A cited
+check that ran before a later edit is stale by digest, and the gate re-runs
+plain check commands itself, under bash. Criteria are judged with the
+current content of files the session edited in earlier turns, cut by code
+to the parts the criteria mention, so a criterion about earlier work is
+judged against that work. When the model
 has edited files and is about to finish, the judge gathers the diff, the
 matching RecCli ``.devproject`` features, the ledger, code-selected failure
 excerpts, the manifest with its code verdicts and the draft final message;
@@ -259,20 +264,21 @@ CRITERIA_NUDGE = (
     "with the todo tool or the acceptance_criteria tool; they will be checked "
     "against your diff and the evidence ledger before you finish. Before your "
     "final message, register the results you will state with report_results, "
-    "each citing the ledger rows (c1, c2, ...) of the commands that produced it."
+    "each citing the commands that produced it, as you ran them."
 )
 VERIFY_TEMPLATE = (
     "Preflight judge (Jev, advisory) reviewed your diff, the evidence ledger and "
     "your result manifest before you finish. {findings} Fix what is unmet and run "
-    "the checks again, update report_results with the new row ids, or say "
-    "precisely why a criterion does not apply and cancel its todo, then finish."
+    "the checks again after your last edit, call report_results again citing "
+    "those commands as you ran them, or say precisely why a criterion does not "
+    "apply and retire it with a reason, then finish."
 )
 MANIFEST_REQUIRED_FINDING = (
     "No result manifest was registered although {n} check commands ran this turn "
-    "(ledger rows {ids}). Before finishing, call report_results with one item per "
-    "result your answer states: the claim as worded, the ledger row ids it rests on, "
-    "and the predicate (passed, count, exit_zero, contains or ran); an empty list "
-    "means the answer claims no check result."
+    "({commands}). Before finishing, call report_results with one item per "
+    "result your answer states: the claim as worded, the commands it rests on as "
+    "you ran them, and the predicate (passed, count, exit_zero, contains or ran); "
+    "an empty list means the answer claims no check result."
 )
 CHECKS_FAILING_QUESTION = (
     "Do the failure excerpts show a failing test, an error, or a lint or type "
@@ -329,8 +335,8 @@ ASSERTION_CRITERIA = {
 # distinction between "shown by the diff" and "claimed in the message" is
 # spelled out rather than implied.
 CRITERION_CRITERIA = {
-    "true": "The diff, and the check outputs where relevant, show the criterion is met in full.",
-    "false": "The criterion is not shown by the diff, is only partly met, or is only claimed in the message.",
+    "true": "The diff or the earlier work shown, and the check outputs where relevant, show the criterion is met in full.",
+    "false": "The criterion is not shown by the diff or the earlier work, is only partly met, or is only claimed in the message.",
 }
 CLAIMS_CRITERIA = {
     "true": "The message asserts a result, a passing check, or completed work that no manifest item marked supported, no ledger row and no part of the diff shows.",
@@ -342,6 +348,28 @@ VERIFY_TIMEOUT_SECONDS = 4.0
 BUILD_THRESHOLD = 0.7
 MAX_DIFF_CHARS = 60_000
 MAX_FILE_DIFF_CHARS = 20_000
+# Earlier work: files the session edited in earlier turns, shown with the
+# criteria under their own budget. This turn's diff can fill its cap alone
+# (54,548 of 60,000 characters on 2026-09-29, with none of the code four
+# criteria were about in it), so earlier files never fit in that one.
+MAX_EARLIER_WORK_CHARS = 30_000
+MAX_EARLIER_FILE_CHARS = 10_000
+MAX_EARLIER_FILES = 8
+MAX_EARLIER_CANDIDATES = 40
+MAX_EARLIER_READ_CHARS = 200_000
+EARLIER_WINDOW_LINES = 40
+MAX_SESSION_EDITS = 200
+# Words too common in criteria to tie a file to one.
+_WORK_STOPWORDS = frozenset(
+    "about after also been before being both code could does done each every file files from have into just like "
+    "made make more most must need only other same should some such than that their them then there these they "
+    "this those through under until when where which while will with without would your".split()
+)
+ROW_ID_FINDING = (
+    "Result claims cite ledger row ids, which you are never shown: {items}. Cite the "
+    "command you ran instead, as you ran it; a distinctive part of it is enough, and "
+    "its newest run counts."
+)
 MAX_CHECK_CHARS = 2_000
 CHECK_COMMAND_RE = evidence.CHECK_COMMAND_RE
 GUARD_FEEDBACK_TEMPLATE = (
@@ -372,6 +400,9 @@ _session_todos: Dict[str, List[Dict[str, str]]] = {}
 # known repository roots, the latest workspace digest) and the result manifest.
 _session_ledger: Dict[str, Dict[str, Any]] = {}
 _session_manifest: Dict[str, List[Dict[str, Any]]] = {}
+# Files each session edited (real path -> time of the last edit), kept on
+# disk beside the ledger so a gateway restart does not forget earlier work.
+_session_edits: Dict[str, Dict[str, float]] = {}
 _verify_memo: Dict[str, str] = {}
 _session_drift: Dict[str, Dict[str, Any]] = {}
 _pending_drift: Dict[str, Dict[str, str]] = {}
@@ -395,9 +426,10 @@ _session_nudged: set = set()
 LINGER_REQUESTS = 3
 LINGERING_NOTE = (
     "Preflight: {n} acceptance criteria from earlier requests are still open after "
-    "{requests}+ requests: {items}. Either finish them this turn, or retire them with "
-    "the acceptance_criteria tool (retire: [{{content, reason}}]) giving a reason the "
-    "user will see. Do not leave them open silently."
+    "{requests}+ requests: {items}. Either finish them this turn (the judge sees the "
+    "earlier work and retires one it rates met; do not register them again), or "
+    "retire them with the acceptance_criteria tool (retire: [{{content, reason}}]) "
+    "giving a reason the user will see. Do not leave them open silently."
 )
 RETIRE_REFUSED_NOTE = (
     "Retire refused for {items}: no such carried or registered criterion. Use the "
@@ -1787,10 +1819,148 @@ def note_file_change(session_id: str, args: Dict[str, Any], *, cwd: str = "") ->
             if not os.path.isabs(path) and cwd:
                 path = os.path.join(cwd, path)
             _note_root(state, path)
+            note_session_edits(session_id, [path])
             break
     if cwd:
         _note_root(state, cwd)
     return _refresh_workspace(state)
+
+
+def _edits_file(session_id: str) -> Path:
+    return ledger_dir(session_id) / "edits.json"
+
+
+def session_edits(session_id: str) -> Dict[str, float]:
+    """Files this session edited, real path -> time of the last edit; read from disk once per process."""
+    edits = _session_edits.get(session_id)
+    if edits is None:
+        edits = {}
+        try:
+            data = json.loads(_edits_file(session_id).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                edits = {str(path): float(at) for path, at in data.items() if isinstance(at, (int, float)) and not isinstance(at, bool)}
+        except (OSError, ValueError):
+            pass
+        _session_edits[session_id] = edits
+        _bound(_session_edits)
+    return edits
+
+
+def note_session_edits(session_id: str, paths: List[str]) -> None:
+    """Record edited files for the session, newest last, and keep the record on disk."""
+    if not session_id:
+        return
+    edits = session_edits(session_id)
+    now = time.time()
+    for path in paths:
+        if path:
+            edits[os.path.realpath(os.path.expanduser(str(path)))] = now
+    for path in sorted(edits, key=edits.__getitem__)[: max(0, len(edits) - MAX_SESSION_EDITS)]:
+        edits.pop(path, None)
+    try:
+        target = _edits_file(session_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(edits, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        logger.debug("system-one-preflight: session edits not saved", exc_info=True)
+
+
+def _work_tokens(texts: List[str]) -> frozenset:
+    """The distinctive tokens of the texts being judged: identifiers and paths,
+    their path parts, and words of four letters or more that are not common."""
+    tokens = set()
+    for text in texts:
+        for token in _claim_tokens(text):
+            parts = [token] + ([part for part in token.split("/") if part] if "/" in token else [])
+            for part in parts:
+                if part not in _WORK_STOPWORDS and (len(part) >= 4 or any(mark in part for mark in "._-")):
+                    tokens.add(part)
+    return frozenset(tokens)
+
+
+def _mentions(tokens: frozenset, text: str) -> set:
+    lowered = text.lower()
+    return {token for token in tokens if token in lowered}
+
+
+def relevant_excerpt(text: str, tokens: frozenset, limit: int) -> str:
+    """The text whole when it fits; else the windows of lines that mention the
+    most tokens, in file order, each headed by its line numbers."""
+    if len(text) <= limit:
+        return text
+    lines = text.splitlines()
+    windows = []
+    for start in range(0, len(lines), EARLIER_WINDOW_LINES):
+        chunk = "\n".join(lines[start : start + EARLIER_WINDOW_LINES])
+        hits = len(_mentions(tokens, chunk))
+        if hits:
+            end = min(start + EARLIER_WINDOW_LINES, len(lines))
+            windows.append((hits, start, f"@@ lines {start + 1}-{end} @@\n{chunk}"))
+    chosen: List[Tuple[int, str]] = []
+    used = 0
+    for _hits, start, piece in sorted(windows, key=lambda window: (-window[0], window[1])):
+        if used + len(piece) + 1 > limit:
+            if not chosen:
+                chosen.append((start, piece[:limit]))
+                used = limit
+            continue
+        chosen.append((start, piece))
+        used += len(piece) + 1
+    if not chosen:
+        return text[:limit] + "\n… [truncated]"
+    return "\n".join(piece for _start, piece in sorted(chosen)) + "\n… [other lines omitted]"
+
+
+def _read_text(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(MAX_EARLIER_READ_CHARS)
+    except OSError:
+        return None
+    return None if "\x00" in text[:8_000] else text
+
+
+def earlier_work(session_id: str, changed: List[str], texts: List[str], root: Optional[str]) -> Dict[str, Any]:
+    """Current content of files this session edited in earlier turns that the judged texts mention.
+
+    The diff shows this turn's edits only, so a criterion about work an
+    earlier turn did was judged against none of it and could never be rated
+    met. The candidates are the session's other edited files, newest first;
+    each is scored by how many distinct tokens of the criteria and the
+    request it mentions. Files in this turn's repository go in first (a
+    memory note that summarises the project mentions more of the criteria
+    than the code does), then the best scored, under their own budget, and
+    a long file is cut to the windows of lines that mention them.
+    """
+    tokens = _work_tokens(texts)
+    this_turn = {os.path.realpath(path) for path in changed}
+    edits = session_edits(session_id)
+    candidates = [path for path in sorted(edits, key=edits.__getitem__, reverse=True) if path not in this_turn][:MAX_EARLIER_CANDIDATES]
+    scored = []
+    for path in candidates if tokens else []:
+        text = _read_text(path)
+        if text and text.strip():
+            # The path as the repository names it: a home or checkout directory
+            # in an absolute path would read as a mention of every file under it.
+            inside = bool(root) and path.startswith(f"{root}{os.sep}")
+            hits = _mentions(tokens, f"{os.path.relpath(path, root) if inside else os.path.basename(path)}\n{text}")
+            if hits:
+                home = os.path.expanduser("~")
+                shown = os.path.relpath(path, root) if inside else ("~" + path[len(home):] if path.startswith(f"{home}{os.sep}") else path)
+                scored.append((inside, len(hits), edits[path], shown, text))
+    items: List[Dict[str, Any]] = []
+    used = 0
+    truncated = False
+    for _inside, hits, _at, shown, text in sorted(scored, key=lambda entry: (not entry[0], -entry[1], -entry[2])):
+        room = MAX_EARLIER_WORK_CHARS - used
+        if len(items) >= MAX_EARLIER_FILES or room < 500:
+            truncated = True
+            break
+        excerpt = relevant_excerpt(text, tokens, min(MAX_EARLIER_FILE_CHARS, room))
+        items.append({"path": shown, "mentions": hits, "text": excerpt})
+        used += len(excerpt)
+        truncated = truncated or len(excerpt) < len(text)
+    return {"items": items, "chars": used, "candidates": len(candidates), "truncated": truncated}
 
 
 # The gate's runner, a seam so tests can answer for it.
@@ -2555,6 +2725,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     request = (_session_scope.get(session_id) or [""])[-1]
     bundle = collect_evidence(changed)
     started = time.monotonic()
+    note_session_edits(session_id, changed)
 
     # The ledger as it stands at the end of the turn, with freshness decided
     # by the workspace digest, never by judgment.
@@ -2589,6 +2760,26 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         )
         return None
 
+    # Code matches each item's citations to rows first: a command as the
+    # agent ran it resolves to its newest run, this turn before the previous
+    # one; a row id is refused, since the agent is never shown one; a
+    # contains claim takes the output that shows its text
+    # (evidence.resolve_evidence). The gate's own rows are never cited.
+    search_rows = [row for row in reversed(rows_this_turn) if row.get("source") != "controller"]
+    search_rows += [row for row in reversed(ledger["previous"]) if row.get("source") != "controller"]
+    outputs: Dict[str, Optional[str]] = {}
+
+    def read(row: Dict[str, Any]) -> Optional[str]:
+        path = str(row.get("file") or "")
+        if path not in outputs:
+            outputs[path] = evidence.read_output(path) if path else None
+        return outputs[path]
+
+    resolved: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for item in manifest or []:
+        match = evidence.resolve_evidence(item, search_rows, read)
+        resolved.append(({**item, "cited": list(item.get("evidence") or []), "evidence": match["ids"]}, match))
+
     # Code decides each manifest item. A decisive claim (passed, count,
     # exit_zero) is supported only by a row the gate produced itself: every
     # cited agent row on the whitelist is re-run, filters stripped, whatever
@@ -2600,8 +2791,11 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     regressions: List[Dict[str, Any]] = []
     budget_left = rerun_budget_seconds()
     reran_rows: Dict[str, str] = {}  # agent row id -> controller row id, one gate run per cited row
-    for item in manifest or []:
+    for item, match in resolved:
         predicate = str(item.get("predicate") or "passed")
+        if match["problem"] is not None:
+            verdicts.append({**item, **match["problem"], "rows": item["evidence"], "basis": "agent", "citations": match["citations"]})
+            continue
         replaced: Dict[str, str] = {}
         skipped: List[str] = []
         if predicate in evidence.DECISIVE and not controller_reruns_enabled():
@@ -2616,13 +2810,13 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
                     continue
                 cwd = row.get("cwd") or (ledger["roots"][0] if ledger["roots"] else "")
                 if not cwd:
-                    skipped.append(f"{row_id}: working directory unknown")
+                    skipped.append(f"{evidence.cite(row)}: working directory unknown")
                     continue
                 if not evidence.rerunnable(row["command"]):
-                    skipped.append(f"{row_id}: not a plain check runner")
+                    skipped.append(f"{evidence.cite(row)}: not a plain check runner")
                     continue
                 if budget_left <= 0:
-                    skipped.append(f"{row_id}: re-run budget exhausted")
+                    skipped.append(f"{evidence.cite(row)}: re-run budget exhausted")
                     continue
                 new_row, record = _controller_rerun(session_id, ledger, row, final_digest, min(rerun_timeout_seconds(), budget_left))
                 budget_left -= record["seconds"]
@@ -2641,7 +2835,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             verdict = {**verdict, "verdict": "insufficient", "detail": "supported only by the agent's own row; the gate could not re-run it (" + "; ".join(skipped) + ")"}
         elif skipped and verdict["verdict"] in ("insufficient", "stale"):
             verdict = {**verdict, "detail": verdict["detail"] + " (not re-run by the gate: " + "; ".join(skipped) + ")"}
-        verdicts.append({**item, **verdict})
+        verdicts.append({**item, **verdict, "citations": match["citations"]})
     weakening = evidence.weakening_signals(bundle["root"], changed)
     workspace_after = _refresh_workspace(ledger) if reruns else final_digest
     counts = evidence.manifest_counts(verdicts)
@@ -2651,18 +2845,23 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         {"row": row["id"], "command": row["command"], "status": row["status"], "excerpt": evidence.failure_excerpt(evidence.read_output(row.get("file")) or "")}
         for row in failing
     ]
-    cited_previous = sorted({row_id for item in manifest or [] for row_id in item.get("evidence") or [] if row_id.startswith("p") and row_id in rows_by_id})
+    cited_previous = sorted({row_id for item, _match in resolved for row_id in item["evidence"] if row_id.startswith("p") and row_id in rows_by_id})
     ledger_items = [evidence.row_summary(rows_by_id[row_id]) for row_id in cited_previous]
     ledger_items += [evidence.row_summary(row) for row in ledger["rows"][-MAX_LEDGER_ROWS_FOR_JEV:]]
     dropped_rows = max(0, len(ledger["rows"]) - MAX_LEDGER_ROWS_FOR_JEV)
     manifest_items = [
         {
-            "id": item["id"], "criterion": item.get("criterion") or "", "claim": item["claim"], "evidence": item["evidence"],
+            "id": item["id"], "criterion": item.get("criterion") or "", "claim": item["claim"],
+            "cited": [_clip(str(cited), 120) for cited in item.get("cited") or []], "evidence": item["evidence"],
             "predicate": item["predicate"], "expected": item.get("expected") or {}, "code_verdict": item["verdict"], "detail": item["detail"],
             "basis": item.get("basis", "agent"),
         }
         for item in verdicts
     ]
+    # Earlier work goes in beside the diff under its own budget, and the
+    # criterion question names it only when there is some.
+    earlier = earlier_work(session_id, changed, [item["content"] for item in criteria] + ([request] if request else []), bundle["root"])
+    judged_work = "the code changes and the earlier work shown" if earlier["items"] else "the code changes"
 
     labels: Dict[str, str] = {}
     questions: Dict[str, Dict[str, Any]] = {}
@@ -2672,7 +2871,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             labels[key] = item["content"]
             questions[key] = {
                 "type": "noul",
-                "instructions": f"Do the code changes, with the evidence ledger where a check is relevant, fully satisfy this acceptance criterion: {item['content']}",
+                "instructions": f"Do {judged_work}, with the evidence ledger where a check is relevant, fully satisfy this acceptance criterion: {item['content']}",
                 "criteria": CRITERION_CRITERIA,
             }
     elif request:
@@ -2739,15 +2938,25 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "diff is from git. evidence_ledger was built by code from every command this turn (ids c*; controller re-runs "
             "by the gate k*; the previous turn p*), with the runner's own summary where one was recognised and exit "
             "'unknown' where the lane gives none. failure_excerpts were selected by code from the retained output. "
-            "result_manifest was written by the agent; its code_verdict was decided by code against the ledger. A passed, count "
+            "result_manifest was written by the agent, citing commands (cited); code matched each to its newest run (evidence "
+            "holds the matched row ids), and its code_verdict was decided by code against the ledger. A passed, count "
             "or exit_zero claim is supported only when the gate re-ran the check itself (basis gate, rows k*); contains and ran "
             "rest on the agent's own rows (basis agent). final_message is what the agent is about to say."
+            + (
+                " earlier_work holds the current content of files this session edited in earlier turns, cut by code to the "
+                "lines that mention the criteria or the request: work done before this turn, not part of this turn's diff."
+                if earlier["items"] else ""
+            )
         ),
         "request": {"source": "user", "text": _clip(request, 1_500)},
         "acceptance_criteria": {"source": "agent todo list", "items": [{"id": key, "text": text} for key, text in labels.items()]},
         "still_pending_todos": {"source": "agent todo list", "items": [_clip(item["content"], 200) for item in pending]},
         "features": {"source": "project map", "items": bundle["features"]},
         "diff": {"source": "git", "text": bundle["diff"], "truncated": bundle["truncated"]},
+        **(
+            {"earlier_work": {"source": "files, selected by code", "items": [{"path": entry["path"], "text": entry["text"]} for entry in earlier["items"]], "truncated": earlier["truncated"]}}
+            if earlier["items"] else {}
+        ),
         "evidence_ledger": {"source": "tool, built by code", "items": ledger_items, "dropped": dropped_rows, "workspace_known": final_digest is not None},
         "failure_excerpts": {"source": "tool, selected by code", "items": excerpts},
         "result_manifest": {"source": "agent, checked by code", "registered": manifest is not None, "items": manifest_items},
@@ -2787,20 +2996,27 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         )
     if missing:
         findings.append(
-            "Result claims cite rows that are not in the ledger: "
+            "Result claims whose evidence did not happen this turn: "
             + "; ".join(f'"{_clip(item["claim"], 100)}" ({item["detail"]})' for item in missing)
-            + f". Rows this turn: {', '.join(row['id'] for row in rows_this_turn[-12:]) or 'none'}."
+            + ". Cite each command as you ran it (a distinctive part is enough), and quote contains text exactly as it was printed."
         )
     if stale:
         findings.append(
             "Result claims rest on checks that ran before later edits and the gate could not re-run: "
             + "; ".join(f'"{_clip(item["claim"], 100)}" ({item["detail"]})' for item in stale)
-            + ". Run them again and cite the new rows."
+            + ". Run them again after your last edit and cite those commands; the newest run counts."
         )
+    by_row_id = [
+        (item, [entry["cited"] for entry in item.get("citations") or [] if entry.get("how") == "row_id"])
+        for item in verdicts if item["verdict"] == "insufficient" and not item["evidence"]
+    ]
+    by_row_id = [(item, cited) for item, cited in by_row_id if cited]
+    if by_row_id:
+        findings.append(ROW_ID_FINDING.format(items="; ".join(f'"{_clip(item["claim"], 100)}" ({", ".join(cited)})' for item, cited in by_row_id)))
     if regressions:
         findings.append(
             "Fewer tests ran than before the change: "
-            + "; ".join(f"{_clip(item['command'], 80)} went from {item['before']} to {item['after']} (rows {item['baseline']} then {item['controller']})" for item in regressions)
+            + "; ".join(f"`{_clip(item['command'], 80)}` went from {item['before']} to {item['after']}" for item in regressions)
             + ". Restore the tests or state why in the answer."
         )
     if weakening["removed"] or weakening["skips"]:
@@ -2859,7 +3075,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     rule = ""
     if flagged and manifest is None and manifest_required() and build and checks_ran:
         rule = "no_manifest"
-        findings.append(MANIFEST_REQUIRED_FINDING.format(n=len(checks_ran), ids=", ".join(row["id"] for row in checks_ran[-6:])))
+        findings.append(MANIFEST_REQUIRED_FINDING.format(n=len(checks_ran), commands=", ".join(evidence.cite(row) for row in checks_ran[-3:])))
     claim_labels, claim_misses = label_claims([sentence for sentence, _value in flagged], verdicts, manifest is not None)
     # One record per manifest item, in manifest order, with Jev's read where one was asked.
     assertion_records: List[Dict[str, Any]] = []
@@ -2870,7 +3086,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         probabilities = (assertion_answers.get(key) or {}) if key else {}
         assertion_records.append({
             "id": item["id"], "claim": item["claim"], "code": item["verdict"], "detail": item["detail"], "basis": item.get("basis", "agent"),
-            "jev": probabilities, "grouped": bool(key and len(assertion_keys[key]) > 1),
+            "jev": probabilities, "grouped": bool(key and len(assertion_keys[key]) > 1), "citations": item.get("citations") or [],
         })
         p_contradicted = probabilities.get("contradicted")
         if p_contradicted is not None and p_contradicted >= claims_flag_threshold():
@@ -2914,6 +3130,11 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "assertions_dropped": dropped_assertions,
             "features": len(bundle["features"]),
             "diff_chars": len(bundle["diff"]),
+            "earlier_work": {"files": [entry["path"] for entry in earlier["items"]], "chars": earlier["chars"], "candidates": earlier["candidates"], "truncated": earlier["truncated"]},
+            "citations": {
+                how: sum(1 for item in verdicts for entry in item.get("citations") or [] if entry.get("how") == how)
+                for how in ("exact", "partial", "text", "row_id", "unmatched")
+            },
             "state_chars": len(json.dumps(state, ensure_ascii=False)),
             "answers": answers,
             "assertions": assertion_records,

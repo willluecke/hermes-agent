@@ -7,8 +7,9 @@ call, built by code from the tool result (see
 cannot be matched against that ledger honestly: the number may describe
 one suite, an earlier attempt, or an expectation. This tool is the
 structured form. Each item names the claim as it will appear in the
-answer, the ledger rows it rests on, and a predicate code compares
-exactly:
+answer, the commands it rests on as the model ran them (code matches each
+to its newest run; the model is never shown row ids, so it never cites
+one), and a predicate code compares exactly:
 
 * ``passed``: every cited row reports a pass;
 * ``count``: the cited rows' counts equal ``expected`` (for example
@@ -26,6 +27,7 @@ to the plugin on every lane.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List
 
 from tools.registry import registry
@@ -33,7 +35,11 @@ from tools.registry import registry
 MAX_ITEMS = 16
 MAX_CLAIM_CHARS = 300
 MAX_EVIDENCE = 8
+MAX_CITED_CHARS = 2_000
 PREDICATES = ("passed", "count", "exit_zero", "contains", "ran")
+# A ledger row id (c7, k58, pc3). The model is never shown one, so a cited id
+# is a guess; the tool says so at once, on every lane, and the gate refuses it.
+ROW_ID_RE = re.compile(r"p?[ck]\d+", re.IGNORECASE)
 
 
 def report_results(args: Dict[str, Any]) -> str:
@@ -42,6 +48,7 @@ def report_results(args: Dict[str, Any]) -> str:
         return json.dumps({"error": "results must be a list of {claim, evidence, predicate} objects (an empty list means no result is claimed)"})
     items: List[Dict[str, Any]] = []
     problems: List[str] = []
+    warnings: List[str] = []
     for index, value in enumerate(raw, 1):
         if not isinstance(value, dict):
             problems.append(f"item {index}: not an object")
@@ -53,7 +60,13 @@ def report_results(args: Dict[str, Any]) -> str:
         evidence_raw = value.get("evidence")
         if isinstance(evidence_raw, str):
             evidence_raw = [evidence_raw]
-        evidence = [str(item).strip() for item in (evidence_raw or []) if str(item).strip()] if isinstance(evidence_raw, list) else []
+        evidence = [str(item).strip()[:MAX_CITED_CHARS] for item in (evidence_raw or []) if str(item).strip()] if isinstance(evidence_raw, list) else []
+        guessed = [value for value in evidence if ROW_ID_RE.fullmatch(value)]
+        if guessed:
+            warnings.append(
+                f"item {index} cites {', '.join(guessed)}: row ids are never shown to you and are not accepted; "
+                "cite the command as you ran it"
+            )
         predicate = str(value.get("predicate") or "passed").strip().lower()
         if predicate not in PREDICATES:
             problems.append(f"item {index}: predicate must be one of {', '.join(PREDICATES)}")
@@ -80,14 +93,17 @@ def report_results(args: Dict[str, Any]) -> str:
     if problems and not items and raw:
         return json.dumps({"error": "; ".join(problems)})
     note = (
-        f"{len(items)} result claim{'s' if len(items) != 1 else ''} registered. Code checks each against the "
-        "evidence ledger before this turn finishes; a claim whose rows are stale is re-run by the gate."
+        f"{len(items)} result claim{'s' if len(items) != 1 else ''} registered. Before this turn finishes, code "
+        "matches each cited command to its newest run and checks the claim against it; a check that ran before a "
+        "later edit is re-run by the gate where it can be."
     )
     if not items:
         note = "No result claims registered: the answer claims no check result, so it must not state one."
     payload: Dict[str, Any] = {"manifest": items, "note": note}
     if problems:
         payload["skipped"] = problems
+    if warnings:
+        payload["warnings"] = warnings
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -95,18 +111,21 @@ REPORT_RESULTS_SCHEMA = {
     "name": "report_results",
     "description": (
         "Register the result claims your answer will make, before finishing a change. "
-        "Each item names one claim as it will appear in the answer, the evidence ledger "
-        "rows it rests on (row ids like c7, shown to you in the drift and verify notes; "
-        "every terminal command this turn is a row, in order), and a predicate code checks "
-        "exactly: passed (every cited row reports a pass), count (the rows' counts equal "
-        "expected, e.g. {passed: 98, failed: 0}), exit_zero, contains (expected.text is in "
-        "the retained output), or ran. Cite the row of the command that produced the "
-        "result. Every passed, count or exit_zero claim is re-run by the gate itself before "
-        "it counts, so cite plain check commands (pytest, npm test, node --test, tsc, eslint, "
-        "ruff and the like; no wrapper scripts, no '|| echo', output filters are stripped); "
-        "a claim the gate cannot re-run is reported as unverified. Call once before your "
-        "final message; call again to replace the list. An empty list means the answer "
-        "claims no check result."
+        "Each item names one claim as it will appear in the answer, the commands it rests "
+        "on, and a predicate code checks exactly: passed (every cited command reports a "
+        "pass), count (their counts equal expected, e.g. {passed: 98, failed: 0}), "
+        "exit_zero, contains (expected.text is in the output), or ran. Cite each command "
+        "as you ran it in the terminal this turn; a distinctive part of a long command is "
+        "enough, and the newest run of a matching command is the one that counts, so run "
+        "a check again after your last edit and cite it the same way. Never cite a row id "
+        "such as c7: you are not shown them. For contains, quote expected.text exactly as "
+        "it was printed; the gate also finds the newest output that printed it. Every "
+        "passed, count or exit_zero claim is re-run by the gate itself before it counts, so "
+        "cite plain check commands (pytest, npm test, node --test, tsc, eslint, ruff and "
+        "the like; no wrapper scripts, no '|| echo', output filters are stripped); a claim "
+        "the gate cannot re-run is reported as unverified. Call once before your final "
+        "message; call again to replace the list. An empty list means the answer claims no "
+        "check result."
     ),
     "parameters": {
         "type": "object",
@@ -122,7 +141,7 @@ REPORT_RESULTS_SCHEMA = {
                         "evidence": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Ledger row ids the claim rests on, for example [\"c7\"].",
+                            "description": "The commands the claim rests on, as you ran them, for example [\"npx vitest run test/mcp.test.ts\"]. A distinctive part of a long command is enough. Not row ids.",
                         },
                         "predicate": {"type": "string", "enum": list(PREDICATES)},
                         "expected": {

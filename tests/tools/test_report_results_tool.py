@@ -21,16 +21,30 @@ def test_registered_in_the_typesafe_toolset_without_env_requirements():
 
 def test_returns_a_manifest_with_ids_in_order_and_defaults():
     result = json.loads(module.report_results({"results": [
-        {"claim": "Plugin suite passes", "evidence": ["c7"], "criterion": "1"},
-        {"claim": "98 passed", "evidence": "c7", "predicate": "count", "expected": {"passed": 98, "failed": 0}},
-        {"claim": "Deployed", "evidence": ["c9"], "predicate": "contains", "expected": {"text": "success"}},
+        {"claim": "Plugin suite passes", "evidence": ["pytest -q tests/plugins"], "criterion": "1"},
+        {"claim": "98 passed", "evidence": "pytest -q tests/plugins", "predicate": "count", "expected": {"passed": 98, "failed": 0}},
+        {"claim": "Deployed", "evidence": ["./deploy.sh staging"], "predicate": "contains", "expected": {"text": "success"}},
     ]}))
     assert result["manifest"] == [
-        {"id": "r1", "criterion": "1", "claim": "Plugin suite passes", "evidence": ["c7"], "predicate": "passed", "expected": {}},
-        {"id": "r2", "criterion": "", "claim": "98 passed", "evidence": ["c7"], "predicate": "count", "expected": {"passed": 98, "failed": 0}},
-        {"id": "r3", "criterion": "", "claim": "Deployed", "evidence": ["c9"], "predicate": "contains", "expected": {"text": "success"}},
+        {"id": "r1", "criterion": "1", "claim": "Plugin suite passes", "evidence": ["pytest -q tests/plugins"], "predicate": "passed", "expected": {}},
+        {"id": "r2", "criterion": "", "claim": "98 passed", "evidence": ["pytest -q tests/plugins"], "predicate": "count", "expected": {"passed": 98, "failed": 0}},
+        {"id": "r3", "criterion": "", "claim": "Deployed", "evidence": ["./deploy.sh staging"], "predicate": "contains", "expected": {"text": "success"}},
     ]
-    assert "3 result claims registered" in result["note"] and "skipped" not in result
+    assert "3 result claims registered" in result["note"] and "newest run" in result["note"]
+    assert "skipped" not in result and "warnings" not in result
+
+
+def test_a_cited_row_id_is_registered_but_flagged_at_once():
+    # The model is never shown row ids; a cited one is a guess, said so in the tool's own reply on every lane.
+    result = json.loads(module.report_results({"results": [
+        {"claim": "MCP tests pass", "evidence": ["c5"]},
+        {"claim": "Suite passes", "evidence": ["npm test", "PC12"]},
+    ]}))
+    assert [item["evidence"] for item in result["manifest"]] == [["c5"], ["npm test", "PC12"]]
+    assert result["warnings"] == [
+        "item 1 cites c5: row ids are never shown to you and are not accepted; cite the command as you ran it",
+        "item 2 cites PC12: row ids are never shown to you and are not accepted; cite the command as you ran it",
+    ]
 
 
 def test_an_empty_list_means_no_result_is_claimed():
@@ -62,4 +76,10 @@ def test_bounds_on_items_claim_length_and_evidence():
     schema = module.REPORT_RESULTS_SCHEMA["parameters"]["properties"]["results"]["items"]
     assert schema["properties"]["predicate"]["enum"] == list(module.PREDICATES)
     assert schema["required"] == ["claim", "evidence"]
-    assert "re-run by the gate" in module.REPORT_RESULTS_SCHEMA["description"] and "wrapper scripts" in module.REPORT_RESULTS_SCHEMA["description"]
+    description = module.REPORT_RESULTS_SCHEMA["description"]
+    assert "re-run by the gate" in description and "wrapper scripts" in description
+    assert "as you ran it" in description and "newest run" in description and "Never cite a row id" in description
+    assert "shown to you in the drift" not in description, "the ids were never shown; the description must not say they were"
+    assert "Not row ids" in schema["properties"]["evidence"]["description"]
+    long = json.loads(module.report_results({"results": [{"claim": "heredoc", "evidence": ["x" * 5_000], "predicate": "ran"}]}))
+    assert len(long["manifest"][0]["evidence"][0]) == module.MAX_CITED_CHARS

@@ -16,8 +16,10 @@ so it would fit. This module replaces the window with a ledger:
   changed path, so a check that ran before a later edit is stale by code
   rather than by judgment;
 * the result manifest the model registers with ``report_results``: each
-  claim names the rows it rests on and a predicate code can compare
-  exactly, and the verdict is ``supported``, ``contradicted``, ``stale``,
+  claim names the commands it rests on, as the model ran them, and a
+  predicate code can compare exactly; code matches each cited command to
+  its newest run (the model never sees a row id, so it is never asked for
+  one), and the verdict is ``supported``, ``contradicted``, ``stale``,
   ``insufficient`` or ``missing``;
 * controller re-runs: a cited check that is stale or whose exit is unknown
   is run again by the gate itself, never by the model, when the command is
@@ -29,14 +31,16 @@ and every limit is stated as a constant.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 PARSER_VERSION = 1
 MAX_ROWS = 200
@@ -47,6 +51,11 @@ EXCERPT_BEFORE = 400
 MAX_EXCERPTS = 4
 MAX_MANIFEST_ITEMS = 16
 MAX_CLAIM_CHARS = 300
+# A cited command is matched, not run, so a pasted heredoc is kept whole
+# only up to this bound; a partial citation shorter than the minimum could
+# match almost any command, so it must match exactly.
+MAX_CITED_CHARS = 2_000
+MIN_PARTIAL_CITATION_CHARS = 8
 # The judge's state carries a preview of each command; the row keeps the
 # whole command so the gate re-runs what the agent ran, not a prefix of it
 # (a 500-character pytest clipped at 300 re-ran as "0 tests").
@@ -527,7 +536,7 @@ def parse_manifest(text: str) -> Optional[List[Dict[str, Any]]]:
                 "id": str(item.get("id") or f"r{len(manifest) + 1}"),
                 "criterion": str(item.get("criterion") or ""),
                 "claim": _clip(claim, MAX_CLAIM_CHARS),
-                "evidence": [str(value) for value in evidence if str(value).strip()][:8],
+                "evidence": [str(value).strip()[:MAX_CITED_CHARS] for value in evidence if str(value).strip()][:8],
                 "predicate": str(item.get("predicate") or "passed"),
                 "expected": expected,
             }
@@ -535,6 +544,134 @@ def parse_manifest(text: str) -> Optional[List[Dict[str, Any]]]:
         if len(manifest) >= MAX_MANIFEST_ITEMS:
             break
     return manifest
+
+
+# ---------------------------------------------------------------------------
+# Citations: the commands a claim rests on, matched to ledger rows by code
+# ---------------------------------------------------------------------------
+
+_WHITESPACE_RE = re.compile(r"\s+")
+_ROW_ID_RE = re.compile(r"p?[ck]\d+", re.IGNORECASE)
+_PROMPT_RE = re.compile(r"^\$\s+")
+_SHELL_WRAPPER_RE = re.compile(r"^(?:\S*/)?(?:ba|z|da)?sh\s+-l?c\s")
+
+
+def cite(row: Dict[str, Any]) -> str:
+    """How a row is named in text the model reads: by its command, never by
+    its id, because the model is never shown ids and cites what it reads."""
+    command = " ".join(str(row.get("command_preview") or row.get("command") or "").split())
+    named = f"`{_clip(command, 80)}`" if command else "a command with no text"
+    return f"the gate's run of {named}" if row.get("source") == "controller" else named
+
+
+def unwrap_shell(command: str) -> str:
+    """The inner command of a ``/bin/bash -lc "..."`` wrapper, else the command.
+
+    The Codex lane records every command in that wrapper with the inner
+    quotes escaped, while the model cites what it wrote inside it.
+    """
+    text = (command or "").strip()
+    if not _SHELL_WRAPPER_RE.match(text):
+        return text
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return text
+    return parts[2] if len(parts) == 3 else text
+
+
+@functools.lru_cache(maxsize=4096)
+def command_key(command: str) -> str:
+    """The form commands are matched in: a shell wrapper unwrapped, whitespace
+    collapsed, a leading ``cd X &&`` and trailing output filters dropped."""
+    text = _WHITESPACE_RE.sub(" ", unwrap_shell(command)).strip()
+    prefix = _CD_PREFIX_RE.match(text)
+    if prefix:
+        text = text[prefix.end():].strip()
+    return strip_filters(text)
+
+
+def is_row_id(text: str) -> bool:
+    """Whether a citation is a ledger row id (c7, k58, pc3) rather than a command."""
+    return bool(_ROW_ID_RE.fullmatch((text or "").strip()))
+
+
+def match_command(cited: str, rows: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """(row, how) for one cited command, searching ``rows`` in order (newest first).
+
+    An exact match of the matching form wins wherever it is; failing that,
+    the first row whose command contains the citation, when the citation is
+    long enough to be distinctive. Backticks and a ``$ `` prompt around the
+    citation are ignored. ``how`` is ``exact``, ``partial`` or ``unmatched``.
+    """
+    key = command_key(_PROMPT_RE.sub("", (cited or "").strip().strip("`").strip()))
+    if not key:
+        return None, "unmatched"
+    keyed = [(row, command_key(str(row.get("command") or ""))) for row in rows]
+    for row, candidate in keyed:
+        if candidate == key:
+            return row, "exact"
+    if len(key) >= MIN_PARTIAL_CITATION_CHARS:
+        for row, candidate in keyed:
+            if key in candidate:
+                return row, "partial"
+    return None, "unmatched"
+
+
+def resolve_evidence(
+    item: Dict[str, Any], rows: List[Dict[str, Any]], read: Callable[[Dict[str, Any]], Optional[str]],
+) -> Dict[str, Any]:
+    """The rows one manifest item rests on: ``{"ids", "citations", "problem", "row_ids"}``.
+
+    ``rows`` is the search order, newest first: this turn's rows, then the
+    previous turn's, with the gate's own rows left out. Each citation is a
+    command as the agent ran it, or a distinctive part of one
+    (``match_command``), so the newest run of a re-run check is the one
+    that counts. A row id is refused: the agent is never shown one, so an
+    id it cites is a guess, and guesses one row off made correct claims
+    read as contradicted (2026-09-30). A ``contains`` claim whose text is in
+    no matched row's output takes the newest row that printed it, because
+    the quoted text is the evidence itself. ``problem`` is the verdict when
+    no row can be judged: ``missing`` for a command that did not run or a
+    text no output shows, ``insufficient`` for row ids alone.
+    """
+    ids: List[str] = []
+    citations: List[Dict[str, Any]] = []
+    unmatched: List[str] = []
+    row_ids: List[str] = []
+    for cited in item.get("evidence") or []:
+        cited = str(cited).strip()
+        if is_row_id(cited):
+            row_ids.append(cited)
+            citations.append({"cited": cited, "row": None, "how": "row_id"})
+            continue
+        row, how = match_command(cited, rows)
+        citations.append({"cited": _clip(cited, 120), "row": row["id"] if row else None, "how": how})
+        if row is None:
+            unmatched.append(cited)
+        elif row["id"] not in ids:
+            ids.append(row["id"])
+    needle = str((item.get("expected") or {}).get("text") or "").strip()
+    if str(item.get("predicate") or "passed") == "contains" and needle:
+        by_id = {row["id"]: row for row in rows}
+        showing = [row_id for row_id in ids if needle in (read(by_id[row_id]) or "")]
+        if not showing:
+            located = next((row for row in rows if needle in (read(row) or "")), None)
+            if located is not None:
+                showing = [located["id"]]
+                citations.append({"cited": _clip(needle, 120), "row": located["id"], "how": "text"})
+            elif not ids:
+                missing = {"verdict": "missing", "detail": f"no command output this turn contains {_clip(needle, 80)!r}"}
+                return {"ids": [], "citations": citations, "problem": missing, "row_ids": row_ids}
+        if showing:
+            # The text is shown: a citation that missed does not matter.
+            ids, unmatched, row_ids = showing, [], []
+    problem: Optional[Dict[str, str]] = None
+    if unmatched:
+        problem = {"verdict": "missing", "detail": "no command this turn matches " + ", ".join(f"`{_clip(' '.join(text.split()), 80)}`" for text in unmatched)}
+    elif row_ids and not ids:
+        problem = {"verdict": "insufficient", "detail": f"cites ledger row ids ({', '.join(row_ids)}), which are never shown to the agent, instead of commands"}
+    return {"ids": ids, "citations": citations, "problem": problem, "row_ids": row_ids}
 
 
 def check_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str]) -> Dict[str, Any]:
@@ -561,39 +698,37 @@ def _decide_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], fin
     if predicate not in PREDICATES:
         return {"verdict": "insufficient", "detail": f"unknown predicate {predicate!r}", "rows": ids}
     if not ids:
-        return {"verdict": "insufficient", "detail": "no evidence rows cited", "rows": []}
+        return {"verdict": "insufficient", "detail": "no command cited", "rows": []}
     missing = [row_id for row_id in ids if row_id not in rows]
     if missing:
         return {"verdict": "missing", "detail": f"cited rows not in this turn's ledger: {', '.join(missing)}", "rows": ids}
     cited = [rows[row_id] for row_id in ids]
     if predicate != "ran" and final_digest:
-        stale = [row["id"] for row in cited if row.get("workspace") and row["workspace"] != final_digest]
+        stale = [row for row in cited if row.get("workspace") and row["workspace"] != final_digest]
         if stale:
-            return {"verdict": "stale", "detail": f"ran before later edits: {', '.join(stale)}", "rows": ids}
+            return {"verdict": "stale", "detail": f"ran before later edits: {', '.join(cite(row) for row in stale)}", "rows": ids}
     if predicate == "ran":
         return {"verdict": "supported", "detail": "rows exist", "rows": ids}
     if predicate in ("passed", "count"):
-        not_checks = [row["id"] for row in cited if not row.get("check")]
+        not_checks = [row for row in cited if not row.get("check")]
         if not_checks:
-            return {"verdict": "insufficient", "detail": f"not a check runner: {', '.join(not_checks)}", "rows": ids}
+            return {"verdict": "insufficient", "detail": f"not a check runner: {', '.join(cite(row) for row in not_checks)}", "rows": ids}
     if predicate == "passed":
-        statuses = {row["id"]: row["status"] for row in cited}
-        if any(status == "fail" for status in statuses.values()):
-            failed = [row_id for row_id, status in statuses.items() if status == "fail"]
-            return {"verdict": "contradicted", "detail": f"reported failure: {', '.join(failed)}", "rows": ids}
-        if all(status == "pass" for status in statuses.values()):
-            unrecognized = [row["id"] for row in cited if not row.get("recognized")]
+        failed = [row for row in cited if row["status"] == "fail"]
+        if failed:
+            return {"verdict": "contradicted", "detail": f"reported failure: {', '.join(cite(row) for row in failed)}", "rows": ids}
+        if all(row["status"] == "pass" for row in cited):
+            unrecognized = [row for row in cited if not row.get("recognized")]
             if unrecognized:
-                return {"verdict": "insufficient", "detail": f"no runner summary recognised: {', '.join(unrecognized)}", "rows": ids}
+                return {"verdict": "insufficient", "detail": f"no runner summary recognised: {', '.join(cite(row) for row in unrecognized)}", "rows": ids}
             return {"verdict": "supported", "detail": "every cited row reports a pass", "rows": ids}
-        unknown = [row_id for row_id, status in statuses.items() if status == "unknown"]
-        return {"verdict": "insufficient", "detail": f"status unknown: {', '.join(unknown)}", "rows": ids}
+        unknown = [row for row in cited if row["status"] == "unknown"]
+        return {"verdict": "insufficient", "detail": f"status unknown: {', '.join(cite(row) for row in unknown)}", "rows": ids}
     if predicate == "exit_zero":
-        codes = {row["id"]: row.get("exit") for row in cited}
-        if any(code not in (0, None) for code in codes.values()):
-            bad = [f"{row_id}={code}" for row_id, code in codes.items() if code not in (0, None)]
+        bad = [f"{cite(row)} exited {row.get('exit')}" for row in cited if row.get("exit") not in (0, None)]
+        if bad:
             return {"verdict": "contradicted", "detail": f"non-zero exit: {', '.join(bad)}", "rows": ids}
-        if all(code == 0 for code in codes.values()):
+        if all(row.get("exit") == 0 for row in cited):
             return {"verdict": "supported", "detail": "exit 0", "rows": ids}
         return {"verdict": "insufficient", "detail": "exit code unknown on this lane", "rows": ids}
     if predicate == "count":
@@ -619,7 +754,7 @@ def _decide_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], fin
             return {"verdict": "insufficient", "detail": "retained output unavailable", "rows": ids}
         if any(needle in (output or "") for output in outputs):
             return {"verdict": "supported", "detail": "text found in retained output", "rows": ids}
-        return {"verdict": "contradicted", "detail": f"text not in retained output: {_clip(needle, 80)!r}", "rows": ids}
+        return {"verdict": "contradicted", "detail": f"text not in retained output of {', '.join(cite(row) for row in cited)}: {_clip(needle, 80)!r}", "rows": ids}
     return {"verdict": "insufficient", "detail": "not checked", "rows": ids}
 
 
@@ -751,13 +886,20 @@ def rerunnable(command: str) -> bool:
     return all(_SAFE_SEGMENT_RE.match(segment) for segment in segments)
 
 
+# The agent's commands ran under bash, so the gate re-runs them under bash
+# too. /bin/sh is dash on Debian: it has no ``time`` keyword, and with no
+# /usr/bin/time a whitelisted ``time pytest`` exited 127 there, which the
+# ledger would have read as a failing check.
+GATE_SHELL: Optional[str] = "/bin/bash" if os.path.exists("/bin/bash") else None
+
+
 def run_check(command: str, cwd: str, timeout: float) -> Dict[str, Any]:
     """Run one check for the gate: ``{"output", "exit_code", "timed_out", "seconds"}``."""
     started = time.monotonic()
     try:
         completed = subprocess.run(
-            command, shell=True, cwd=cwd or None, capture_output=True, text=True, timeout=timeout, check=False,
-            env={**os.environ, "HERMES_CONTROLLER_RERUN": "1"},
+            command, shell=True, executable=GATE_SHELL, cwd=cwd or None, capture_output=True, text=True, timeout=timeout,
+            check=False, env={**os.environ, "HERMES_CONTROLLER_RERUN": "1"},
         )
         output = (completed.stdout or "") + ("\n" + completed.stderr if completed.stderr else "")
         return {"output": output, "exit_code": completed.returncode, "timed_out": False, "seconds": time.monotonic() - started}

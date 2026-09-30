@@ -52,7 +52,10 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    = log only, never hold.
 3. **`post_tool_call` / `transform_tool_result`: ledger and criteria.** Every
    terminal call becomes a ledger row (`c1, c2, …`: exit code, runner counts,
-   workspace digest, full output kept on disk). A criteria registration
+   workspace digest, full output kept on disk). The ids are internal: the
+   model is never shown one, so it never has to cite one. Every Edit/Write
+   path is also recorded per session in `edits.json` beside the retained
+   output, which survives a restart. A criteria registration
    gets the fidelity check: one noul per criterion, "does the user's request
    entail this"; under 0.4 it is excluded from judging and named back. The
    coverage steer ("add more criteria") is **disabled** by config. Criteria
@@ -64,16 +67,26 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    answer asks:
    - one noul per **this turn's** criterion (unmet below 0.2 → finding; a
      carried criterion rated met is retired, one still unmet stays open but
-     never sends back);
+     never sends back). Criteria are judged with `earlier_work` beside the
+     diff: the current content of files the session edited in earlier
+     turns that the criteria or request mention, cut to the 40-line windows
+     that mention them, under its own 30k budget (this turn's diff can fill
+     its 60k cap alone);
    - "do the excerpts show a failure not fixed afterwards";
    - one noul per sentence of the draft answer (≤ 12 sentences, ≥ 6 words),
      "is this supported by the evidence shown"; ≤ 0.25 → quoted back as
      `Unsupported by the evidence: "…"`;
    - whether the changes satisfy the request as a whole.
-   The **manifest** (`report_results`: claim, ledger rows, predicate) is
-   checked by code, not Jev (`evidence.check_assertion`): supported /
+   The **manifest** (`report_results`: claim, the commands it rests on as
+   the model ran them, predicate) is checked by code, not Jev.
+   `evidence.resolve_evidence` matches each cited command to its newest run
+   (exact form first, `cd X &&` and output filters ignored, then a distinctive
+   part of 8+ characters); a cited row id is refused, with a finding telling
+   the model to cite the command; a `contains` claim takes the newest output
+   that printed its text. Then `evidence.check_assertion`: supported /
    contradicted / stale (ran before a later edit) / missing / insufficient.
-   Stale plain check commands (pytest, tsc, npm test…) are re-run by the gate.
+   Plain check commands (pytest, tsc, npm test…) are re-run by the gate,
+   under bash (`/bin/sh` is dash here, which has no `time`).
 5. **Send-back.** At most `verify_max_send_backs` (1) per turn, and only if
    the *evidence* (diff + commands + outputs) changed since the last attempt.
    Rewording the answer does not buy another round. After that the answer
@@ -123,7 +136,10 @@ live runs: use `~/coding-projects/command-center/bin/gateway-idle-restart`.
 - Log: `~/.hermes/logs/system-one-preflight.jsonl`, one JSON line per event
   (`preflight`, `verify`, `manifest`, `criteria`, `fidelity`, `tool_guard`,
   `turn_end`, `tune`).
-  Newest verdict: `tail -n 50 … | jq 'select(.event=="verify")'`.
+  Newest verdict: `tail -n 50 … | jq 'select(.event=="verify")'`. Its
+  `citations` counts how claims were matched (exact / partial / text /
+  row_id / unmatched), each assertion carries its own `citations`, and
+  `earlier_work` names the earlier files the judge saw.
 - In the chat: `Jev budget: …` and `Jev verify (attempt N): …` rows.
 - Calibration: `/management/judge/calibration` on the sync store, or the
   sidebar Jev calibration dialog.
