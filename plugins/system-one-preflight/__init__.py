@@ -2651,17 +2651,32 @@ def collect_evidence(changed_paths: List[str], bases: Optional[Dict[str, str]] =
     diff (two characters, 2026-09-30) and its criteria read unmet.
     """
     paths = [str(path) for path in changed_paths if path]
-    root = _git_root(paths[0]) if paths else None
-    base = ((bases or {}).get(root) if root else None) or "HEAD"
+    # Each path is diffed in its own repository. With the repository taken
+    # from the first path alone, a turn whose first changed path (sorted) was a
+    # scratch file outside git showed the judge the top 20k characters of every
+    # file instead of the change, and its criteria read unmet (2026-09-30).
+    roots: Dict[str, Optional[str]] = {}
+
+    def root_of(path: str) -> Optional[str]:
+        directory = path if os.path.isdir(path) else os.path.dirname(path) or "."
+        if directory not in roots:
+            roots[directory] = _git_root(path)
+        root = roots[directory]
+        return root if root and os.path.abspath(path).startswith(root + os.sep) else None
+
+    # Repository files first: a file outside git is shown whole and must not
+    # use up the budget before the diffs.
+    ordered = sorted(paths[:40], key=lambda path: root_of(path) is None)
+    relative_by_root: Dict[str, List[str]] = {}
     parts: List[str] = []
     total = 0
     truncated = False
-    relative: List[str] = []
-    for path in paths[:40]:
-        if root and os.path.abspath(path).startswith(root + os.sep):
+    for path in ordered:
+        root = root_of(path)
+        if root:
             rel = os.path.relpath(path, root)
-            relative.append(rel)
-            diff = _git(root, ["diff", base, "--", rel]) or ""
+            relative_by_root.setdefault(root, []).append(rel)
+            diff = _git(root, ["diff", (bases or {}).get(root) or "HEAD", "--", rel]) or ""
             if not diff.strip() and _git(root, ["ls-files", "--error-unmatch", rel]) is None:
                 diff = f"+++ new file: {rel}\n" + _read_file(path, MAX_FILE_DIFF_CHARS)
         else:
@@ -2674,12 +2689,15 @@ def collect_evidence(changed_paths: List[str], bases: Optional[Dict[str, str]] =
             break
         total += len(diff)
         parts.append(diff)
+    # The repository with the most changed files is the one the weakening
+    # check, the machinery flag and earlier work are read against.
+    primary = max(relative_by_root, key=lambda root: len(relative_by_root[root])) if relative_by_root else None
     return {
-        "root": root,
-        "base": base,
+        "root": primary,
+        "base": ((bases or {}).get(primary) if primary else None) or "HEAD",
         "diff": "\n".join(parts),
         "truncated": truncated,
-        "features": matching_features(root, relative),
+        "features": matching_features(primary, relative_by_root.get(primary, []) if primary else []),
     }
 
 

@@ -1682,6 +1682,27 @@ def test_criteria_about_earlier_work_are_judged_with_that_work(feedback, repo):
     assert "earlier_work" not in call["state"] and call["questions"]["criterion_1"]["instructions"].startswith("Do the code changes, with the evidence ledger")
 
 
+def test_each_changed_path_is_diffed_in_its_own_repository(feedback, repo, tmp_path):
+    # 2026-09-30: the first changed path (sorted) was a scratch file outside git, so every
+    # file was shown as its first 20k characters and the judge never saw the change.
+    scratch = tmp_path / "aaa-scratch" / "smoke.py"
+    scratch.parent.mkdir()
+    scratch.write_text("print('scratch')\n")
+    padding = "\n".join(f"# line {n}" for n in range(3_000))
+    (repo / "app.py").write_text(padding + "\ndef greet():\n    return 'hi'\n")
+    _subprocess.run(["git", "-C", str(repo), "commit", "-qam", "a long file"], check=True, capture_output=True)
+    (repo / "app.py").write_text(padding + "\ndef greet():\n    return 'deep in a long file'\n")
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    _verify(paths=sorted([str(scratch), str(repo / "app.py")]))
+    diff = feedback["jev"].calls[-1]["state"]["diff"]["text"]
+    assert "+    return 'deep in a long file'" in diff, "the repository file is a diff, however long it is"
+    assert diff.index("app.py") < diff.index("+++ file:"), "repository diffs come before files outside git"
+    assert "print('scratch')" in diff, "the file outside git is still shown whole"
+    assert feedback["records"]("verify")[-1]["diff_base"], "the repository's base is still recorded"
+
+
 def test_the_diff_shows_work_the_turn_committed_before_finishing(feedback, repo):
     # 2026-09-30: a turn that committed its change before finishing showed the judge a two-character diff.
     def commit(message):
