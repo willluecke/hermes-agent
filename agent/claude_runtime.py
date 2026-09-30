@@ -194,6 +194,19 @@ def _claude_history_continues(
     return True, rows[count:]
 
 
+def _claude_history_shortfall(recorded: Optional[str], messages: list[dict[str, Any]]) -> bool:
+    """Whether the session saw more rows than the stored transcript holds.
+
+    That is a turn whose rows never reached the store (stopped, or failed to
+    persist), not an edit, and the row the user sees should say so.
+    """
+    try:
+        count = int(str(recorded).split(":", 2)[1])
+    except (IndexError, ValueError):
+        return False
+    return count > len(_fingerprint_rows(messages))
+
+
 def _history_prefix_restored(agent: Any) -> int:
     """Messages the gateway just prepended to this conversation's history:
     the part of the chat that happened before its first Hermes turn."""
@@ -1004,6 +1017,16 @@ def _claude_hook_parity(
         append_message(
             messages, {"role": "user", "content": nudge, "_pre_verify_synthetic": True}
         )
+        # Store the draft now, as the codex lane does. Only the final answer
+        # was flushed after the loop, so a follow-up the user stopped left the
+        # draft out of the transcript while the session's fingerprint counted
+        # it, and the next turn read a stop as "edited or rolled back"
+        # (2026-09-30). The flush skips the synthetic nudge.
+        if getattr(agent, "_session_db", None) is not None:
+            try:
+                agent._flush_messages_to_session_db(messages)
+            except Exception:
+                logger.warning("Claude pre_verify draft persistence failed", exc_info=True)
         try:
             follow = session.run_turn(nudge)
         except Exception:
@@ -1219,6 +1242,10 @@ def run_claude_code_turn(
             if prior_state.get("cwd") != cwd
             else _restored_prefix_reason(agent)
             if not durable_continues and _history_prefix_restored(agent)
+            else "the stored transcript is missing messages this session saw, "
+            "from a turn that was stopped or not saved"
+            if not durable_continues
+            and _claude_history_shortfall(prior_state.get("history_fingerprint"), prior_messages)
             else "the transcript was edited or rolled back since its last turn"
             if not durable_continues
             else "its transcript file is gone from Claude Code's session store"

@@ -206,3 +206,47 @@ def test_claude_turn_gets_the_live_hook_channel_and_skips_the_replay_once_it_del
     finally:
         claude_hooks.set_hook_endpoint(None)
         claude_hooks._bindings.clear()
+
+
+def test_a_stopped_follow_up_keeps_the_draft_and_the_session(hooks, monkeypatch, tmp_path):
+    """The judge sent the turn back and the user stopped the follow-up. The
+    draft was only in memory, the session's fingerprint counted it, and the
+    next turn read the stop as "edited or rolled back" (2026-09-30)."""
+    from hermes_state import SessionDB
+    from agent.claude_runtime import (
+        _CLAUDE_SESSION_STATE_KEY,
+        _claude_history_continues,
+    )
+
+    changed = tmp_path / "app.py"
+    changed.write_text("print('x')\n")
+    prompts = []
+
+    def fake_run_turn(self, prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            _tool_use(self, "c1", "Edit", {"file_path": str(changed), "old_string": "x", "new_string": "y"})
+            _tool_result(self, "c1", "The file has been updated.")
+            return ClaudeCodeTurnResult(final_text="Applied the fix.", session_id="sess-1", usage={}, tool_iterations=1, session_confirmed=True)
+        return ClaudeCodeTurnResult(final_text="", session_id="sess-1", usage={}, tool_iterations=0, session_confirmed=True, interrupted=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    db = SessionDB(tmp_path / "state.db")
+    sid = "sess-stopped-follow-up"
+    db.create_session(session_id=sid, source="api_server", model="claude-fable-5")
+    agent = _agent()
+    agent._session_db = db
+    agent.session_id = sid
+    agent._session_db_created = True
+
+    agent.run_conversation("apply the fix")
+
+    assert len(prompts) == 2, "the follow-up ran and was stopped"
+    stored = db.get_messages_as_conversation(sid)
+    assert [m["role"] for m in stored] == ["user", "assistant"]
+    assert stored[1]["content"] == "Applied the fix."
+    assert all("Fix criterion 2" not in str(m.get("content")) for m in stored), "the nudge stays out"
+
+    state = db.get_session_model_config_value(sid, _CLAUDE_SESSION_STATE_KEY)
+    continues, delta = _claude_history_continues(state["history_fingerprint"], stored)
+    assert continues and delta == [], "the next turn continues the session"
