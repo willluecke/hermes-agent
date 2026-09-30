@@ -1692,7 +1692,7 @@ MAX_LEDGER_ROWS_FOR_JEV = 120
 def ledger_state(session_id: str) -> Dict[str, Any]:
     state = _session_ledger.get(session_id)
     if state is None:
-        state = {"rows": [], "previous": [], "roots": [], "bases": {}, "seq": 0, "workspace": None, "turn": 0}
+        state = {"rows": [], "previous": [], "roots": [], "bases": {}, "seq": 0, "workspace": None, "workspaces": {}, "turn": 0}
         _session_ledger[session_id] = state
         _bound(_session_ledger)
     return state
@@ -1748,9 +1748,11 @@ def _note_root(state: Dict[str, Any], path: str) -> Optional[str]:
 
 
 def _refresh_workspace(state: Dict[str, Any]) -> Optional[str]:
-    digest = evidence.workspace_digest(state["roots"]) if state["roots"] else None
-    state["workspace"] = digest
-    return digest
+    """The per-repository digests now (kept on the state) and their combined digest."""
+    digests = evidence.workspace_digests(state["roots"]) if state["roots"] else {}
+    state["workspaces"] = digests
+    state["workspace"] = evidence.combine_digests(digests)
+    return state["workspace"]
 
 
 def record_command(session_id: str, command: str, result_text: str, *, cwd: str = "") -> Dict[str, Any]:
@@ -1765,6 +1767,9 @@ def record_command(session_id: str, command: str, result_text: str, *, cwd: str 
     state["seq"] += 1
     workspace = _refresh_workspace(state)
     row, output = evidence.make_row(state["seq"], command, result_text, cwd=cwd, workspace=workspace)
+    # The repositories this command ran under, each with its digest: freshness
+    # compares these only (evidence.row_is_stale).
+    row["workspaces"] = dict(state["workspaces"])
     row["file"] = evidence.retain_output(ledger_dir(session_id), f"{state['turn']}-{row['id']}", output)
     state["rows"].append(row)
     del state["rows"][:-evidence.MAX_ROWS]
@@ -1945,6 +1950,7 @@ def _controller_rerun(session_id: str, ledger: Dict[str, Any], row: Dict[str, An
         new_row["status"] = "unknown"
         new_row["timed_out"] = True
     new_row["file"] = evidence.retain_output(ledger_dir(session_id), f"{ledger['turn']}-{new_row['id']}", output)
+    new_row["workspaces"] = dict(ledger.get("workspaces") or {})
     new_row["fresh"] = True
     new_row["for"] = row["id"]
     ledger["rows"].append(new_row)
@@ -2703,11 +2709,20 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     # The ledger as it stands at the end of the turn, with freshness decided
     # by the workspace digest, never by judgment.
     final_digest = _refresh_workspace(ledger)
+    final_digests = dict(ledger.get("workspaces") or {})
     rows_this_turn = list(ledger["rows"])
     rows_by_id: Dict[str, Dict[str, Any]] = {row["id"]: row for row in ledger["previous"]}
     rows_by_id.update({row["id"]: row for row in rows_this_turn})
+    stale_ids: set = set()
     for row in rows_by_id.values():
-        row["fresh"] = (row["workspace"] == final_digest) if (row.get("workspace") and final_digest) else None
+        # Each row is compared on the repositories it ran under; a row from
+        # before per-repository maps falls back to the combined digest.
+        stale = evidence.row_is_stale(row, final_digests)
+        if stale is None and row.get("workspace") and final_digest:
+            stale = row["workspace"] != final_digest
+        row["fresh"] = None if stale is None else not stale
+        if stale:
+            stale_ids.add(row["id"])
     manifest = _session_manifest.get(session_id)
     build = bool(drift_state(session_id).get("build")) or bool(kwargs.get("coding"))
     checks_ran = [row for row in rows_this_turn if row.get("check")]
@@ -2798,7 +2813,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
                 if regression:
                     regressions.append(regression)
         check_item = dict(item, evidence=[replaced.get(row_id, row_id) for row_id in item.get("evidence") or []]) if replaced else item
-        verdict = evidence.check_assertion(check_item, rows_by_id, final_digest)
+        verdict = evidence.check_assertion(check_item, rows_by_id, final_digest, stale_ids)
         if replaced:
             verdict["reran"] = replaced
         if predicate in evidence.DECISIVE and verdict["verdict"] == "supported" and verdict.get("basis") != "gate":

@@ -1708,6 +1708,30 @@ def test_the_diff_shows_work_the_turn_committed_before_finishing(feedback, repo)
     assert "+    return 'SHOUTED'" in diff and "-    return 'committed this turn'" in diff, "only this turn's commit, from its own base"
 
 
+def test_first_touching_another_repository_does_not_make_earlier_checks_stale(feedback, repo, tmp_path):
+    # 2026-09-30: a turn read a log, then ran one command in a second repository; with one digest over
+    # every repository touched, the first row read "ran before later edits" with nothing edited.
+    other = tmp_path / "other"
+    other.mkdir()
+    _subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="check the restart", conversation_history=[])
+    _cmd("tail -4 gateway.log", "06:51:37 restarting\n06:51:42 healthy", cwd=str(repo))
+    _cmd(f"cd {other} && git log -1", "fatal: no commits yet", cwd=str(repo))
+    assert preflight.ledger_state("s1")["roots"] == [str(repo), str(other)]
+    _manifest([_item("the gateway restarted at 06:51:37", ["tail -4 gateway.log"], predicate="contains", expected={"text": "06:51:37 restarting"})])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    assert _verify(paths=[str(repo / "app.py")]) is None, "nothing changed in the repository the check ran under"
+    record = feedback["records"]("verify")[-1]
+    assert record["manifest"]["supported"] == 1 and record["manifest"]["stale"] == 0
+    assert preflight.ledger_state("s1")["rows"][0]["fresh"] is True
+    # An edit in the repository the check ran under still makes it stale.
+    (repo / "app.py").write_text("def greet():\n    return 'changed after the check'\n")
+    _verify(attempt=1, paths=[str(repo / "app.py")])
+    record = feedback["records"]("verify")[-1]
+    assert record["manifest"]["stale"] == 1 and record["assertions"][0]["detail"] == "ran before later edits: `tail -4 gateway.log`"
+
+
 def test_a_change_to_tests_or_runner_config_is_flagged_for_the_human_not_as_a_finding(feedback, repo, emitted):
     (repo / "tests").mkdir()
     (repo / "tests" / "test_app.py").write_text("def test_x():\n    pass\n")

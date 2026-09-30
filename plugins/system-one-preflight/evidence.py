@@ -12,9 +12,11 @@ so it would fit. This module replaces the window with a ledger:
   output and the workspace digest the command ran under;
 * the full output retained on disk per row, so the judge gets the excerpt
   around the first failure instead of a tail;
-* a workspace digest, from ``git status`` plus the size and mtime of every
-  changed path, so a check that ran before a later edit is stale by code
-  rather than by judgment;
+* a workspace digest per repository, from ``git status`` plus the size and
+  mtime of every changed path, so a check that ran before a later edit is
+  stale by code rather than by judgment; a row is compared only on the
+  repositories it ran under, so first touching another repository later in
+  the turn does not make it stale;
 * the result manifest the model registers with ``report_results``: each
   claim names the commands it rests on, as the model ran them, and a
   predicate code can compare exactly; code matches each cited command to
@@ -333,6 +335,41 @@ def cd_prefix(command: str) -> Optional[str]:
     if not match:
         return None
     return match.group(1).strip("\"'")
+
+
+def workspace_digests(roots: List[str]) -> Dict[str, str]:
+    """One ``workspace_digest`` per repository, for the repositories git can read."""
+    digests: Dict[str, str] = {}
+    for root in sorted({root for root in roots if root}):
+        digest = workspace_digest([root])
+        if digest:
+            digests[root] = digest
+    return digests
+
+
+def combine_digests(digests: Dict[str, str]) -> Optional[str]:
+    """One digest for a whole per-repository map, or None when it is empty."""
+    if not digests:
+        return None
+    return hashlib.sha256(json.dumps(sorted(digests.items())).encode("utf-8")).hexdigest()[:16]
+
+
+def row_is_stale(row: Dict[str, Any], final: Dict[str, str]) -> Optional[bool]:
+    """Whether a repository the row ran under changed after it ran; None when unknown.
+
+    Only the repositories in the row's own map count. With one digest over
+    every repository the turn had touched, a command run in a second
+    repository made every earlier row read "ran before later edits" with
+    nothing edited (2026-09-30). A repository missing from ``final`` (no
+    longer readable, or past the root cap) is not evidence of a change.
+    """
+    mine = row.get("workspaces")
+    if not isinstance(mine, dict) or not mine or not final:
+        return None
+    shared = [root for root in mine if root in final]
+    if not shared:
+        return None
+    return any(final[root] != mine[root] for root in shared)
 
 
 def workspace_digest(roots: List[str]) -> Optional[str]:
@@ -680,7 +717,9 @@ def resolve_evidence(
     return {"ids": ids, "citations": citations, "problem": problem, "row_ids": row_ids}
 
 
-def check_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str]) -> Dict[str, Any]:
+def check_assertion(
+    item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str], stale_ids: Optional[set] = None,
+) -> Dict[str, Any]:
     """Compare one manifest item with its cited rows: ``{"verdict", "detail", "rows", "basis"}``.
 
     Missing rows and stale rows are decided before the predicate, because
@@ -692,13 +731,15 @@ def check_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final
     insufficient, never supported. ``basis`` is ``gate`` when every cited
     row was produced by the gate's own re-run, else ``agent``.
     """
-    verdict = _decide_assertion(item, rows, final_digest)
+    verdict = _decide_assertion(item, rows, final_digest, stale_ids)
     ids = [row_id for row_id in verdict.get("rows") or [] if row_id in rows]
     verdict["basis"] = "gate" if ids and all(rows[row_id].get("source") == "controller" for row_id in ids) else "agent"
     return verdict
 
 
-def _decide_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str]) -> Dict[str, Any]:
+def _decide_assertion(
+    item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], final_digest: Optional[str], stale_ids: Optional[set] = None,
+) -> Dict[str, Any]:
     ids = list(item.get("evidence") or [])
     predicate = str(item.get("predicate") or "passed")
     if predicate not in PREDICATES:
@@ -709,8 +750,13 @@ def _decide_assertion(item: Dict[str, Any], rows: Dict[str, Dict[str, Any]], fin
     if missing:
         return {"verdict": "missing", "detail": f"cited rows not in this turn's ledger: {', '.join(missing)}", "rows": ids}
     cited = [rows[row_id] for row_id in ids]
-    if predicate != "ran" and final_digest:
-        stale = [row for row in cited if row.get("workspace") and row["workspace"] != final_digest]
+    if predicate != "ran" and (stale_ids is not None or final_digest):
+        # The caller decides per row (row_is_stale) when it can; a single
+        # combined digest is the fallback for rows without a per-repository map.
+        if stale_ids is not None:
+            stale = [row for row in cited if row["id"] in stale_ids]
+        else:
+            stale = [row for row in cited if row.get("workspace") and row["workspace"] != final_digest]
         if stale:
             return {"verdict": "stale", "detail": f"ran before later edits: {', '.join(cite(row) for row in stale)}", "rows": ids}
     if predicate == "ran":

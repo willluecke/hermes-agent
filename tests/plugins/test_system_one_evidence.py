@@ -494,6 +494,25 @@ def test_the_gate_runs_checks_under_bash(tmp_path):
     assert evidence.rerunnable("time pytest -q")
 
 
+def test_a_row_is_stale_only_when_a_repository_it_ran_under_changed(tmp_path):
+    roots = []
+    for name in ("a", "b"):
+        root = tmp_path / name
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+        roots.append(str(root))
+    first = evidence.workspace_digests(roots[:1])
+    row = {"id": "c1", "workspaces": first}
+    both = evidence.workspace_digests(roots)
+    assert set(both) == set(roots) and both[roots[0]] == first[roots[0]]
+    assert evidence.row_is_stale(row, both) is False, "a repository first touched later is no change to the row"
+    assert evidence.combine_digests(first) != evidence.combine_digests(both), "the combined digest alone would have called it stale"
+    (tmp_path / "a" / "new.py").write_text("x = 1\n")
+    assert evidence.row_is_stale(row, evidence.workspace_digests(roots)) is True
+    assert evidence.row_is_stale({"id": "c2"}, both) is None and evidence.row_is_stale(row, {}) is None
+    assert evidence.combine_digests({}) is None
+
+
 def test_a_weakening_committed_during_the_turn_counts_from_the_turn_base(tmp_path):
     root = tmp_path / "repo"
     (root / "tests").mkdir(parents=True)
