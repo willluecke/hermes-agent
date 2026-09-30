@@ -48,8 +48,10 @@ import hashlib
 import hmac
 import itertools
 import json
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
+from datetime import datetime
 from functools import wraps
 import logging
 import os
@@ -334,6 +336,30 @@ def _get_scoped_secret(name, default=None):
 
 
 logger = logging.getLogger(__name__)
+
+# When this gateway process started: a chat whose newest message is older
+# lost its live CLI to a restart, not to an eviction (agent-cache log).
+_GATEWAY_PROCESS_STARTED_AT = time.time()
+# Per-input digests of recent runtime signatures, newest last, so a changed
+# signature can be logged with the inputs that changed. Digests only, never
+# the values: the inputs include the system prompt and the config snapshot.
+_SIGNATURE_INPUTS: "OrderedDict[str, Dict[str, str]]" = OrderedDict()
+_SIGNATURE_INPUTS_MAX = 256
+
+
+def _changed_signature_inputs(old: Optional[str], new: Optional[str]) -> List[str]:
+    """The inputs whose digests differ between two runtime signatures, or [] when either is unknown."""
+    before = _SIGNATURE_INPUTS.get(old or "")
+    after = _SIGNATURE_INPUTS.get(new or "")
+    if not before or not after:
+        return []
+    return sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+
+
+def _local_time(epoch: Optional[float]) -> str:
+    if not isinstance(epoch, (int, float)):
+        return "unknown"
+    return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
 
 
 def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
@@ -3392,7 +3418,19 @@ class APIServerAdapter(BasePlatformAdapter):
             default=str,
             separators=(",", ":"),
         )
-        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+        signature = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+        # A short digest per input, so an agent dropped for a changed
+        # signature can be logged with the inputs that changed.
+        _SIGNATURE_INPUTS[signature] = {
+            key: hashlib.sha256(
+                json.dumps(value, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:12]
+            for key, value in payload.items()
+        }
+        _SIGNATURE_INPUTS.move_to_end(signature)
+        while len(_SIGNATURE_INPUTS) > _SIGNATURE_INPUTS_MAX:
+            _SIGNATURE_INPUTS.popitem(last=False)
+        return signature
 
     def _create_or_reuse_runtime_agent(
         self,
@@ -3416,12 +3454,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return agent, False
 
         current_count = None
+        newest_message_at = None
         if session_id:
             try:
                 row = self._ensure_session_db().get_session(session_id)
                 current_count = row.get("message_count", 0) if row else None
             except Exception:
                 current_count = None
+            try:
+                newest = getattr(self._ensure_session_db(), "newest_message_time", None)
+                newest_message_at = newest(session_id) if callable(newest) else None
+            except Exception:
+                newest_message_at = None
 
         # Rows past the checkpoint that are all late answers leave the agent
         # coherent. Checked outside the cache lock (it reads the session DB),
@@ -3442,6 +3486,11 @@ class APIServerAdapter(BasePlatformAdapter):
         agent = None
         deferred_switch = False
         stopped_work = False
+        # Why this turn gets a new agent (and so a new CLI) instead of the live
+        # one. Logged at INFO: the runtime only sees that no CLI is running,
+        # and a chat's CLI was dropped between two messages on 2026-09-30 with
+        # no restart, interrupt or settings change to explain it.
+        miss: Optional[str] = None
         with cache_lock:
             entry = cache.get(cache_key)
             if isinstance(entry, tuple) and entry:
@@ -3501,6 +3550,49 @@ class APIServerAdapter(BasePlatformAdapter):
                     if isinstance(evicted, tuple) and evicted:
                         evicted_agent = evicted[0]
                         stopped_work = busy
+                    reasons = []
+                    if cached_signature != signature:
+                        changed = _changed_signature_inputs(cached_signature, signature)
+                        reasons.append(
+                            "settings signature changed"
+                            + (f" ({', '.join(changed)})" if changed else "")
+                        )
+                    if not same_session:
+                        reasons.append("the cached agent belongs to another session")
+                    if not (transcript_current or busy):
+                        reasons.append(
+                            f"message count moved from {cached_count} to {current_count}"
+                        )
+                    miss = "; ".join(reasons) or "no failing check recorded"
+                    if busy:
+                        miss += "; its background work was stopped"
+            elif not current_count:
+                miss = "new chat"
+            elif (
+                isinstance(newest_message_at, (int, float))
+                and newest_message_at < _GATEWAY_PROCESS_STARTED_AT
+            ):
+                miss = (
+                    f"no cached agent: the gateway started at "
+                    f"{_local_time(_GATEWAY_PROCESS_STARTED_AT)}, after this chat's "
+                    f"newest message at {_local_time(newest_message_at)}"
+                )
+            else:
+                miss = (
+                    f"no cached agent although the gateway has run since "
+                    f"{_local_time(_GATEWAY_PROCESS_STARTED_AT)} and this chat's newest "
+                    f"message is from {_local_time(newest_message_at)} (released: idle, "
+                    f"memory pressure, cache cap, or a failed run)"
+                )
+
+        if miss is not None and session_id:
+            logger.info(
+                "API runtime agent not reused: session=%s cached_count=%s current_count=%s reason=%s",
+                session_id,
+                entry[2] if isinstance(entry, tuple) and len(entry) > 2 else None,
+                current_count,
+                miss,
+            )
 
         if evicted_agent is not None:
             try:
@@ -3654,13 +3746,25 @@ class APIServerAdapter(BasePlatformAdapter):
             return
         with cache_lock:
             entry = cache.get(cache_key)
-            if isinstance(entry, tuple) and entry and entry[0] is agent:
+            previous = entry[2] if isinstance(entry, tuple) and len(entry) > 2 else None
+            updated = bool(isinstance(entry, tuple) and entry and entry[0] is agent)
+            if updated:
                 cache[cache_key] = (
                     agent,
                     signature,
                     message_count,
                     session_id,
                 )
+        # The count the next turn is compared with. If the turn's own rows
+        # land after this read, the next turn sees the count move and drops
+        # the live CLI; this line and the not-reused line show it.
+        logger.info(
+            "API runtime cache checkpoint: session=%s message_count=%s previous=%s%s",
+            session_id,
+            message_count,
+            previous,
+            "" if updated else " (not recorded: the cached agent was replaced)",
+        )
 
     def _runtime_conversation_history(
         self,

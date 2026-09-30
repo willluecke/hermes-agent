@@ -544,6 +544,85 @@ def test_a_genuine_transcript_change_still_replaces_the_resident_agent(resident_
     cli.close.assert_called_once()
 
 
+# --- Why a turn did not get the live agent is logged -------------------------
+#
+# 2026-09-30: a chat's CLI was dropped between two messages with no restart,
+# interrupt or settings change, and the only record was the runtime's guess,
+# "the CLI process was not running". The gateway now logs which check failed.
+
+
+def _not_reused(caplog):
+    return [record.getMessage() for record in caplog.records if "agent not reused" in record.getMessage()]
+
+
+def test_each_miss_logs_its_reason_and_a_reused_agent_logs_nothing(resident_cache, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+    session_id = resident_cache.session_id
+    agent, reused = resident_cache.acquire()
+    [line] = _not_reused(caplog)
+    assert reused is False and f"session={session_id}" in line
+    assert "reason=no cached agent although the gateway has run since" in line, "the messages are newer than the process: released, not restarted"
+    caplog.clear()
+    key = f"api_server:default:{session_id}"
+    resident_cache.adapter._refresh_runtime_cache_checkpoint(key, "sig", agent)
+    count = resident_cache.db.get_session(session_id)["message_count"]
+    assert any(
+        f"cache checkpoint: session={session_id} message_count={count} previous=" in record.getMessage()
+        for record in caplog.records
+    )
+    caplog.clear()
+    again, reused = resident_cache.acquire()
+    assert reused is True and again is agent and _not_reused(caplog) == []
+    resident_cache.db.append_message(session_id, "user", "Ship it")  # a second writer
+    replacement, reused = resident_cache.acquire()
+    [line] = _not_reused(caplog)
+    assert reused is False and f"cached_count={count} current_count={count + 1}" in line
+    assert f"reason=message count moved from {count} to {count + 1}" in line
+
+
+def test_a_restart_and_a_new_chat_are_named_as_such(resident_cache, caplog, monkeypatch):
+    import logging
+
+    from gateway.platforms import api_server
+
+    caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+    monkeypatch.setattr(api_server, "_GATEWAY_PROCESS_STARTED_AT", time.time() + 60)
+    resident_cache.acquire()
+    [line] = _not_reused(caplog)
+    assert "reason=no cached agent: the gateway started at" in line and "after this chat's newest message at" in line
+    caplog.clear()
+    fresh = resident_cache.db.create_session("hermes-chat-c_new", "api_server")
+    resident_cache.adapter._create_or_reuse_runtime_agent(cache_key=f"api_server:default:{fresh}", signature="sig", session_id=fresh)
+    [line] = _not_reused(caplog)
+    assert line.endswith("reason=new chat")
+
+
+def test_a_changed_signature_is_logged_with_the_inputs_that_changed(resident_cache, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+
+    def signature(effort):
+        return APIServerAdapter._runtime_request_signature(
+            profile=None, ephemeral_system_prompt="instructions", requested_model="claude-opus-5-5",
+            requested_provider="claude-code", model_options={"reasoning_effort": effort}, route=None,
+            session_model=None, confirmed_runtime_lock=True, single_model=True, cwd="/work", project="p",
+        )
+
+    high, top = signature("high"), signature("max")
+    session_id = resident_cache.session_id
+    acquire = lambda sig: resident_cache.adapter._create_or_reuse_runtime_agent(
+        cache_key=f"api_server:default:{session_id}", signature=sig, session_id=session_id,
+    )
+    acquire(high)
+    caplog.clear()
+    _, reused = acquire(top)
+    [line] = _not_reused(caplog)
+    assert reused is False and "reason=settings signature changed (model_options)" in line
+
+
 def test_concurrent_registry_writes_never_tear_the_file(tmp_path):
     import concurrent.futures
 

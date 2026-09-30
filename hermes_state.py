@@ -10390,6 +10390,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
+    def newest_message_time(self, session_id: str) -> Optional[float]:
+        """Epoch seconds of the session's newest active message, or ``None``.
+
+        The API server's agent-cache log compares it with the gateway's start
+        time: a chat whose last message is older than the process lost its
+        live CLI to a restart, not to an eviction.
+        """
+        if not session_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(timestamp) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def latest_user_message_row_id(self, session_id: str) -> Optional[int]:
         """Row id of the most recent active user message, or ``None``.
 
