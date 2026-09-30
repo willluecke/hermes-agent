@@ -262,23 +262,17 @@ def test_register_wires_the_hooks_and_the_settings_reader(monkeypatch):
 
 
 class _FeedbackJev(_FakeJev):
-    def __init__(self, p=0.1, ambiguous=0.1, hard=0.1, checkable=0.1, kind="answer", outcome=("worked", 0.9), guard=None, raise_exc=None):
+    def __init__(self, p=0.1, ambiguous=0.1, hard=0.1, checkable=0.1, kind="answer", guard=None, raise_exc=None):
         super().__init__(p=p, guard=guard, raise_exc=raise_exc)
         self.ambiguous = ambiguous
         self.hard = hard
         self.checkable = checkable
         self.kind = kind
-        self.outcome = outcome
 
     def __call__(self, state, questions, timeout=None):
         body = super().__call__(state, questions, timeout=timeout)
         if "ambiguous" in questions:
             body["answers"]["ambiguous"] = {"type": "noul", "noul": self.ambiguous}
-        if "previous_outcome" in questions:
-            choice, p = self.outcome
-            rest = round((1 - p) / 3, 4)
-            probabilities = {key: (p if key == choice else rest) for key in questions["previous_outcome"]["criteria"]}
-            body["answers"]["previous_outcome"] = {"type": "choice", "choice": choice, "confidence": 0.9, "probabilities": probabilities}
         if "difficulty" in questions:
             # Real score shape: per-level probabilities keyed by level number.
             easy = round(1 - self.hard, 4)
@@ -731,7 +725,7 @@ def test_the_runtimes_shared_consumer_sees_one_send_back_then_a_ship(feedback, r
 
 
 # ---------------------------------------------------------------------------
-# Closing the loop: implicit outcomes from the follow-up, and self-tuning
+# Closing the loop: self-tuning (the follow-up is no longer read as an outcome)
 # ---------------------------------------------------------------------------
 
 PRIOR = [
@@ -740,36 +734,15 @@ PRIOR = [
 ]
 
 
-def test_implicit_outcome_is_read_from_the_follow_up_and_emitted(feedback, emitted):
-    feedback["jev"].outcome = ("partly", 0.86)
+def test_the_follow_up_is_not_read_as_an_outcome_of_the_previous_turn(feedback, emitted):
+    # The worked / partly / failed labels this read produced went unused, and were removed on 2026-09-30.
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="It prints, but the output is not valid JSON.", conversation_history=PRIOR)
     call = feedback["jev"].calls[0]
-    question = call["questions"]["previous_outcome"]
-    assert question["type"] == "choice" and set(question["criteria"]) == {"worked", "partly", "failed", "unrelated"}
-    assert call["state"]["previous_answer"] == {"source": "agent", "text": "Added --json; the tests pass."}
+    assert "previous_outcome" not in call["questions"]
+    assert call["state"]["previous_answer"] == {"source": "agent", "text": "Added --json; the tests pass."}, "the answer a follow-up refers to still frames the budget read"
     record = feedback["records"]("preflight")[-1]
-    assert record["implicit_outcome"] == "partly" and record["p_implicit"] == 0.86
-    outcome_events = [event for event in emitted if event["event"] == "judge.outcome"]
-    assert len(outcome_events) == 1
-    event = outcome_events[0]
-    assert event["stage"] == "implicit" and event["judge"] == "jev"
-    assert event["decision"] == {"outcome": "partly", "about": "previous_run", "p": 0.86}
-    assert event["answers"]["partly"] == 0.86 and "partly 0.86" in event["text"]
-
-    # Unrelated, or below the bar: still asked and emitted with the numbers, but not recorded.
-    feedback["jev"].outcome = ("unrelated", 0.9)
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="Different topic now.", conversation_history=PRIOR)
-    assert feedback["records"]("preflight")[-1]["implicit_outcome"] is None
-    assert emitted[-1]["event"] == "judge.outcome" and emitted[-1]["decision"]["outcome"] is None and "not recorded" in emitted[-1]["text"]
-    feedback["jev"].outcome = ("failed", 0.5)
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="hmm", conversation_history=PRIOR)
-    assert feedback["records"]("preflight")[-1]["implicit_outcome"] is None and feedback["records"]("preflight")[-1]["p_implicit"] == 0.5
-
-    # No previous answer to judge: the question is not asked and nothing is emitted.
-    before = len(emitted)
-    preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="first message", conversation_history=[])
-    assert "previous_outcome" not in feedback["jev"].calls[-1]["questions"]
-    assert [event["event"] for event in emitted[before:]] == ["judge.verdict"]
+    assert "implicit_outcome" not in record and "p_implicit" not in record
+    assert [event["event"] for event in emitted] == ["judge.verdict"], "the budget row only; no judge.outcome"
 
 
 @pytest.fixture
@@ -1707,6 +1680,32 @@ def test_criteria_about_earlier_work_are_judged_with_that_work(feedback, repo):
     _verify(session="s2", paths=[str(repo / "app.py")])
     call = feedback["jev"].calls[-1]
     assert "earlier_work" not in call["state"] and call["questions"]["criterion_1"]["instructions"].startswith("Do the code changes, with the evidence ledger")
+
+
+def test_the_diff_shows_work_the_turn_committed_before_finishing(feedback, repo):
+    # 2026-09-30: a turn that committed its change before finishing showed the judge a two-character diff.
+    def commit(message):
+        _subprocess.run(["git", "-C", str(repo), "commit", "-qam", message], check=True, capture_output=True)
+
+    base = _subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    (repo / "app.py").write_text("def greet():\n    return 'committed this turn'\n")
+    preflight.on_post_tool_call(tool_name="write_file", args={"path": str(repo / "app.py"), "content": "x"}, result="ok", session_id="s1")
+    commit("fix greet")
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    _verify(paths=[str(repo / "app.py")])
+    assert "+    return 'committed this turn'" in feedback["jev"].calls[-1]["state"]["diff"]["text"], "the base is the commit before the edit"
+    assert feedback["records"]("verify")[-1]["diff_base"] == base
+    # The next turn starts from the commit the repository is at then, known from the previous turn.
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="now shout", conversation_history=[])
+    turn_base = preflight.ledger_state("s1")["bases"][str(repo)]
+    assert turn_base != base
+    (repo / "app.py").write_text("def greet():\n    return 'SHOUTED'\n")
+    commit("shout")
+    _verify(paths=[str(repo / "app.py")])
+    diff = feedback["jev"].calls[-1]["state"]["diff"]["text"]
+    assert "+    return 'SHOUTED'" in diff and "-    return 'committed this turn'" in diff, "only this turn's commit, from its own base"
 
 
 def test_a_change_to_tests_or_runner_config_is_flagged_for_the_human_not_as_a_finding(feedback, repo, emitted):

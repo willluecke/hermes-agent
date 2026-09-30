@@ -236,20 +236,6 @@ PLAN_ASK = (
     "If the ambiguity is real, ask the user one focused clarifying question "
     "before acting. Otherwise proceed and state the assumption you made."
 )
-# Implicit outcome: the user's follow-up is the cheapest honest signal of how
-# the previous turn went. Judged as a choice with a rejection option, recorded
-# only above OUTCOME_MIN_P, and always overridden by an explicit user label.
-OUTCOME_QUESTION = (
-    "Judging only from the user's follow-up message, how did the assistant's "
-    "previous answer work out?"
-)
-OUTCOME_CRITERIA = {
-    "worked": "The follow-up moves on, thanks the assistant, or builds on the previous result without asking for a correction.",
-    "partly": "The follow-up accepts part of the previous result but asks for a fix, a missed piece, or a correction.",
-    "failed": "The follow-up says the previous result was wrong, broken, or not done, or repeats the same request.",
-    "unrelated": "The follow-up is a new topic or gives no signal about the previous result.",
-}
-OUTCOME_MIN_P = 0.6
 # Self-tuning: the sync store recommends thresholds from labelled turns; the
 # plugin applies them only within these bounds, only above a label count,
 # and only when the move is larger than noise. Every change is logged,
@@ -1109,19 +1095,6 @@ def _previous_answer(history: List[Any]) -> str:
     return ""
 
 
-def implicit_outcome(answers: Dict[str, Any]) -> Dict[str, Any]:
-    """Jev's read of the previous turn from the follow-up, or nothing usable."""
-    answer = answers.get("previous_outcome")
-    if not isinstance(answer, dict):
-        return {"outcome": None, "p": None, "probabilities": {}}
-    probabilities = answer.get("probabilities") if isinstance(answer.get("probabilities"), dict) else {}
-    choice = answer.get("choice") if isinstance(answer.get("choice"), str) else None
-    p = probabilities.get(choice) if choice else None
-    p = float(p) if isinstance(p, (int, float)) else None
-    usable = choice in ("worked", "partly", "failed") and p is not None and p >= OUTCOME_MIN_P
-    return {"outcome": choice if usable else None, "p": p, "probabilities": probabilities, "choice": choice}
-
-
 # ---------------------------------------------------------------------------
 # Self-tuning: labelled outcomes -> calibration -> bounded threshold moves
 # ---------------------------------------------------------------------------
@@ -1305,9 +1278,10 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         _session_previous_answer.pop(session_id, None)
     _bound(_session_previous_answer)
     if arm == "feedback" and previous:
+        # A follow-up such as "yes, do it" is read with the answer it refers
+        # to. Jev no longer rates that answer from the follow-up: the worked /
+        # partly / failed labels it produced went unused (removed 2026-09-30).
         state["previous_answer"] = {"source": "agent", "text": _clip(previous, 1_500)}
-        questions["previous_outcome"] = {"type": "choice", "instructions": OUTCOME_QUESTION, "criteria": OUTCOME_CRITERIA}
-    outcome: Dict[str, Any] = {"outcome": None, "p": None, "probabilities": {}}
     try:
         body = _ask_jev(state, questions)
         answers = body.get("answers") or {}
@@ -1318,7 +1292,6 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         p_hard = _level_mass(answers, "difficulty", (2, 3))
         p_checkable = _noul(answers, "checkable")
         kind = _choice(answers, "kind")
-        outcome = implicit_outcome(answers)
         if p_missing is None:
             error = "no noul in answer"
     except Exception as exc:
@@ -1379,8 +1352,6 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "p_checkable": p_checkable,
             "kind": kind,
             "k": plan["k"],
-            "implicit_outcome": outcome.get("outcome"),
-            "p_implicit": outcome.get("p"),
             "threshold": threshold(),
             "injected": injected,
             "note_reason": note_reason,
@@ -1413,25 +1384,6 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             model=jev_model,
             latency_ms=latency_ms,
         )
-        if "previous_outcome" in questions:
-            choice = outcome.get("choice") or "unknown"
-            try:
-                from hermes_cli.turn_events import emit_turn_event
-
-                emit_turn_event(
-                    session_id,
-                    "judge.outcome",
-                    text=f"Jev read of the previous turn from this follow-up: {choice} {_fmt(outcome.get('p'))}"
-                    + ("" if outcome.get("outcome") else " · not recorded"),
-                    source="jev",
-                    stage="implicit",
-                    answers=outcome.get("probabilities") or {},
-                    decision={"outcome": outcome.get("outcome"), "about": "previous_run", "p": outcome.get("p")},
-                    model=jev_model,
-                    latency_ms=latency_ms,
-                )
-            except Exception:
-                logger.debug("system-one-preflight: outcome event not emitted", exc_info=True)
         maybe_tune(session_id)
     if turn_id:
         _turn_memo[memo_key] = {
@@ -1740,7 +1692,7 @@ MAX_LEDGER_ROWS_FOR_JEV = 120
 def ledger_state(session_id: str) -> Dict[str, Any]:
     state = _session_ledger.get(session_id)
     if state is None:
-        state = {"rows": [], "previous": [], "roots": [], "seq": 0, "workspace": None, "turn": 0}
+        state = {"rows": [], "previous": [], "roots": [], "bases": {}, "seq": 0, "workspace": None, "turn": 0}
         _session_ledger[session_id] = state
         _bound(_session_ledger)
     return state
@@ -1774,6 +1726,9 @@ def reset_ledger(session_id: str) -> None:
     state["rows"] = []
     state["seq"] = 0
     state["turn"] += 1
+    # The commit each known repository is at as the turn begins is the verify
+    # judge's diff base, so a commit the turn makes does not hide its work.
+    state["bases"] = {root: head for root in state["roots"] if (head := evidence.git_head(root))}
     _session_manifest.pop(session_id, None)
 
 
@@ -1782,6 +1737,13 @@ def _note_root(state: Dict[str, Any], path: str) -> Optional[str]:
     if root and root not in state["roots"]:
         state["roots"].append(root)
         del state["roots"][:-8]
+    bases = state.setdefault("bases", {})
+    if root and root not in bases:
+        # A repository this turn touches for the first time: its diff base is
+        # the commit it is at now, before any commit the turn goes on to make.
+        head = evidence.git_head(root)
+        if head:
+            bases[root] = head
     return root
 
 
@@ -2674,10 +2636,17 @@ def matching_features(root: Optional[str], relative_paths: List[str]) -> List[Di
     return found
 
 
-def collect_evidence(changed_paths: List[str]) -> Dict[str, Any]:
-    """The diff for the changed paths (git when possible), bounded, plus feature context."""
+def collect_evidence(changed_paths: List[str], bases: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """The diff for the changed paths (git when possible), bounded, plus feature context.
+
+    The diff runs from ``bases[root]``, the commit the repository was at when
+    the turn began or first touched it, else from HEAD. Against HEAD alone, a
+    turn that committed its work before finishing showed the judge an empty
+    diff (two characters, 2026-09-30) and its criteria read unmet.
+    """
     paths = [str(path) for path in changed_paths if path]
     root = _git_root(paths[0]) if paths else None
+    base = ((bases or {}).get(root) if root else None) or "HEAD"
     parts: List[str] = []
     total = 0
     truncated = False
@@ -2686,7 +2655,7 @@ def collect_evidence(changed_paths: List[str]) -> Dict[str, Any]:
         if root and os.path.abspath(path).startswith(root + os.sep):
             rel = os.path.relpath(path, root)
             relative.append(rel)
-            diff = _git(root, ["diff", "HEAD", "--", rel]) or ""
+            diff = _git(root, ["diff", base, "--", rel]) or ""
             if not diff.strip() and _git(root, ["ls-files", "--error-unmatch", rel]) is None:
                 diff = f"+++ new file: {rel}\n" + _read_file(path, MAX_FILE_DIFF_CHARS)
         else:
@@ -2701,6 +2670,7 @@ def collect_evidence(changed_paths: List[str]) -> Dict[str, Any]:
         parts.append(diff)
     return {
         "root": root,
+        "base": base,
         "diff": "\n".join(parts),
         "truncated": truncated,
         "features": matching_features(root, relative),
@@ -2723,15 +2693,15 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     criteria = [item for item in todos if item.get("status") in ("completed", "in_progress")]
     pending = [item for item in fresh if item.get("status") == "pending"]
     request = (_session_scope.get(session_id) or [""])[-1]
-    bundle = collect_evidence(changed)
+    ledger = ledger_state(session_id)
+    for path in changed[:40]:
+        _note_root(ledger, path)
+    bundle = collect_evidence(changed, ledger.get("bases"))
     started = time.monotonic()
     note_session_edits(session_id, changed)
 
     # The ledger as it stands at the end of the turn, with freshness decided
     # by the workspace digest, never by judgment.
-    ledger = ledger_state(session_id)
-    for path in changed[:40]:
-        _note_root(ledger, path)
     final_digest = _refresh_workspace(ledger)
     rows_this_turn = list(ledger["rows"])
     rows_by_id: Dict[str, Dict[str, Any]] = {row["id"]: row for row in ledger["previous"]}
@@ -2836,7 +2806,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         elif skipped and verdict["verdict"] in ("insufficient", "stale"):
             verdict = {**verdict, "detail": verdict["detail"] + " (not re-run by the gate: " + "; ".join(skipped) + ")"}
         verdicts.append({**item, **verdict, "citations": match["citations"]})
-    weakening = evidence.weakening_signals(bundle["root"], changed)
+    weakening = evidence.weakening_signals(bundle["root"], changed, bundle["base"])
     workspace_after = _refresh_workspace(ledger) if reruns else final_digest
     counts = evidence.manifest_counts(verdicts)
 
@@ -3130,6 +3100,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "assertions_dropped": dropped_assertions,
             "features": len(bundle["features"]),
             "diff_chars": len(bundle["diff"]),
+            "diff_base": bundle["base"],
             "earlier_work": {"files": [entry["path"] for entry in earlier["items"]], "chars": earlier["chars"], "candidates": earlier["candidates"], "truncated": earlier["truncated"]},
             "citations": {
                 how: sum(1 for item in verdicts for entry in item.get("citations") or [] if entry.get("how") == how)

@@ -31,8 +31,8 @@ A slow or failed call fails **open**: the turn proceeds without advice.
 | Codex lane parity | `agent/codex_runtime.py` (`_codex_hook_parity`, `_with_turn_note`) |
 | Tools exposed to native CLIs | `agent/transports/hermes_tools_mcp_server.py` |
 | Verdicts onto the run stream | `hermes_cli/turn_events.py` → `judge.verdict` events |
-| Chat rows, outcome buttons, calibration | hermes-chat `src/lib/run-events.ts`, `src/components/TurnOutcome.tsx`, `src/components/JevCalibration.tsx`, `src/lib/judge.ts` |
-| Outcome store + `/management/judge/calibration` | hermes-chat `command-center/judge-store.mjs` (deployed copy in `~/hermes-sync/`) |
+| Chat rows | hermes-chat `src/lib/run-events.ts`, `src/lib/run-replay.ts` |
+| Outcome store + `/management/judge/calibration` (no new labels since 2026-09-30) | hermes-chat `command-center/judge-store.mjs` (deployed copy in `~/hermes-sync/`) |
 
 ## One turn, hook by hook
 
@@ -45,8 +45,11 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    criteria nudge. Otherwise the row says `note withheld`. The row also shows
    the injection rate over the last 50 turns. Carried criteria open for 3+
    requests are raised here as a fixed line (finish or retire with a reason).
-   The same call reads the user's new message as an implicit worked / partly
-   / failed label for the previous turn.
+   The previous answer rides along in the state, so a follow-up such as "yes,
+   do it" is read with what it refers to. (Until 2026-09-30 the same call also
+   rated that answer worked / partly / failed from the follow-up; the labels
+   went unused and the read, the chat buttons and the calibration dialog were
+   removed.)
 2. **`pre_tool_call`: tool guard.** For `terminal`, `write_file`, `patch`, it
    asks about destructive / out-of-scope consequences. `tool_guard: shadow`
    = log only, never hold.
@@ -64,7 +67,10 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    Skipped (`Jev verify: skipped · not a build turn`) when the preflight read
    was not a build, no check ran, and no criteria or manifest exist. Otherwise
    one Jev call over the diff, ledger, failure excerpts, manifest and draft
-   answer asks:
+   answer asks the questions below. The diff runs from the commit each
+   repository was at when the turn began (or first touched it), so work the
+   turn committed before finishing still shows; `diff_base` in the verify
+   record names it:
    - one noul per **this turn's** criterion (unmet below 0.2 → finding; a
      carried criterion rated met is retired, one still unmet stays open but
      never sends back). Criteria are judged with `earlier_work` beside the
@@ -106,7 +112,9 @@ days = real / (real + false) and shows on the verify row. `maybe_tune` runs
 hourly and moves `verify_fail_threshold` / `claims_flag_threshold` within
 bounds only when that threshold's own basis reaches 50 labels; it writes
 `~/.hermes/system-one-preflight.tuning.json` only when a threshold moves.
-Each pass is a `tune` log record with the basis counts and `changes`.
+Each pass is a `tune` log record with the basis counts and `changes`. The
+basis is outcome labels, and none arrive since 2026-09-30 (it stood at 18),
+so the tuning cannot move a threshold unless labels come back.
 
 ## Settings (`plugins.entries.system-one-preflight.settings` in `~/.hermes/config.yaml`)
 
@@ -141,8 +149,8 @@ live runs: use `~/coding-projects/command-center/bin/gateway-idle-restart`.
   row_id / unmatched), each assertion carries its own `citations`, and
   `earlier_work` names the earlier files the judge saw.
 - In the chat: `Jev budget: …` and `Jev verify (attempt N): …` rows.
-- Calibration: `/management/judge/calibration` on the sync store, or the
-  sidebar Jev calibration dialog.
+- Calibration: `/management/judge/calibration` on the sync store (labels
+  recorded before 2026-09-30 only).
 - Tests: `tests/plugins/test_system_one_preflight.py`,
   `tests/plugins/test_system_one_evidence.py`, `tests/agent/test_verify_hooks.py`,
   `tests/gateway/test_claude_hook_endpoint.py`,

@@ -321,6 +321,12 @@ def git_root(path: str) -> Optional[str]:
     return root
 
 
+def git_head(root: str) -> Optional[str]:
+    """The commit a repository is at, or None (no repository, or no commit yet)."""
+    head = _git(root, ["rev-parse", "HEAD"])
+    return head.strip() if head and head.strip() else None
+
+
 def cd_prefix(command: str) -> Optional[str]:
     """The directory a ``cd X && ...`` command starts in, or None."""
     match = _CD_PREFIX_RE.match(command or "")
@@ -841,8 +847,11 @@ def _git_ok(root: str, args: List[str]) -> bool:
         return False
 
 
-def weakening_signals(root: Optional[str], changed_paths: List[str]) -> Dict[str, Any]:
-    """Removed assertion or test lines, and added skip markers, in test files that existed at HEAD.
+def weakening_signals(root: Optional[str], changed_paths: List[str], base: str = "HEAD") -> Dict[str, Any]:
+    """Removed assertion or test lines, and added skip markers, in test files that existed at ``base``.
+
+    ``base`` is the commit the turn started from, so a weakening the turn
+    committed before finishing is still counted; HEAD when it is unknown.
 
     Deterministic and coarse: it catches a deleted assertion and a skipped
     test, not a loosened expected value. The count is the net loss of
@@ -858,9 +867,9 @@ def weakening_signals(root: Optional[str], changed_paths: List[str]) -> Dict[str
         rel = os.path.relpath(path, root)
         if not _TEST_FILE_RE.search(rel.replace(os.sep, "/")):
             continue
-        if not _git_ok(root, ["cat-file", "-e", f"HEAD:{rel}"]):
+        if not _git_ok(root, ["cat-file", "-e", f"{base}:{rel}"]):
             continue
-        diff = _git(root, ["diff", "HEAD", "--", rel]) or ""
+        diff = _git(root, ["diff", base, "--", rel]) or ""
         lines = diff.splitlines()
         # Net loss: a line the diff algorithm removes and re-adds (a moved
         # test) is not a weakening, so added assertion lines cancel removed ones.

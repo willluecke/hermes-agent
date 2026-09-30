@@ -494,14 +494,38 @@ def test_the_gate_runs_checks_under_bash(tmp_path):
     assert evidence.rerunnable("time pytest -q")
 
 
+def test_a_weakening_committed_during_the_turn_counts_from_the_turn_base(tmp_path):
+    root = tmp_path / "repo"
+    (root / "tests").mkdir(parents=True)
+    git = lambda *args: subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    test_file = root / "tests" / "test_app.py"
+    test_file.write_text("def test_a():\n    assert 1 == 1\n    assert 2 == 2\n")
+    git("add", ".")
+    git("commit", "-qm", "init")
+    base = git("rev-parse", "HEAD")
+    test_file.write_text("def test_a():\n    assert 1 == 1\n")
+    git("commit", "-qam", "drop an assertion")
+    assert evidence.weakening_signals(str(root), [str(test_file)])["removed"] == 0, "against HEAD the commit hides it"
+    assert evidence.weakening_signals(str(root), [str(test_file)], base)["removed"] == 1
+    assert evidence.git_head(str(root)) != base and evidence.git_head(str(tmp_path / "nowhere")) is None
+
+
 def test_run_check_captures_output_exit_and_timeouts(tmp_path):
+    # Compared with the value before, not with None: when the gate re-runs this suite, this process
+    # is the gate's child and already carries the marker (the gate read that as a failure on 2026-09-30).
+    marker = os.environ.get("HERMES_CONTROLLER_RERUN")
     run = evidence.run_check(f"{sys.executable} -c \"print('7 passed in 0.1s'); import sys; sys.exit(0)\"", str(tmp_path), 10)
     assert run["exit_code"] == 0 and "7 passed" in run["output"] and run["timed_out"] is False and run["seconds"] >= 0
     run = evidence.run_check(f"{sys.executable} -c \"import sys; sys.stderr.write('boom'); sys.exit(3)\"", str(tmp_path), 10)
     assert run["exit_code"] == 3 and "boom" in run["output"]
     run = evidence.run_check(f"{sys.executable} -c \"import time; time.sleep(5)\"", str(tmp_path), 0.3)
     assert run["timed_out"] is True and run["exit_code"] is None
-    assert os.environ.get("HERMES_CONTROLLER_RERUN") is None, "the marker is set for the child only"
+    run = evidence.run_check(f"{sys.executable} -c \"import os; print(os.environ.get('HERMES_CONTROLLER_RERUN'))\"", str(tmp_path), 10)
+    assert run["output"].strip() == "1", "the child sees the marker"
+    assert os.environ.get("HERMES_CONTROLLER_RERUN") == marker, "the marker is set for the child only"
 
 
 def test_a_passed_claim_needs_a_runner_shaped_recognised_row(tmp_path):
