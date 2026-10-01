@@ -492,6 +492,62 @@ def test_appended_rows_resume_the_same_session_with_a_delta(monkeypatch):
     db.close()
 
 
+def test_the_resumed_row_names_the_reason_the_api_server_gave(monkeypatch):
+    # 2026-09-30: every resume said "the CLI process was not running". The
+    # API server knows why an agent is new and hands the reason over.
+    calls = []
+
+    def _run_turn(session, prompt):
+        calls.append((session.session_id, session.resume, prompt))
+        session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
+        return ClaudeCodeTurnResult(final_text=f"answer {len(calls)}", session_id=session.session_id, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-reason-{uuid4()}"
+    _make_agent(session_id=outer_session_id, session_db=db).run_conversation("First message.")
+    events = []
+    second = _make_agent(session_id=outer_session_id, session_db=db)
+    second._resume_reason = "after the gateway restarted at 17:12"
+    second.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
+    second.run_conversation("Second message.", conversation_history=db.get_messages_as_conversation(outer_session_id))
+    rows = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert [kw["mode"] for _, kw in rows] == ["resumed"]
+    assert rows[0][0] == f"Session resumed from disk: Claude session {calls[0][0][:8]} (after the gateway restarted at 17:12)."
+    assert rows[0][1]["cause"] == "after the gateway restarted at 17:12"
+    assert second._resume_reason is None, "told once"
+    db.close()
+
+
+def test_a_stopped_turn_names_itself_on_the_next_turns_row(monkeypatch):
+    calls = []
+    results = iter([
+        {"final_text": "", "interrupted": True, "should_retire": True},
+        {"final_text": "second answer"},
+    ])
+
+    def _run_turn(session, prompt):
+        calls.append((session.session_id, session.resume, prompt))
+        session.on_session_id(session.session_id)
+        _write_transcript(session.session_id)
+        return ClaudeCodeTurnResult(session_id=session.session_id, session_confirmed=True, **next(results))
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    db = SessionDB()
+    outer_session_id = f"claude-stopped-{uuid4()}"
+    agent = _make_agent(session_id=outer_session_id, session_db=db)
+    agent.run_conversation("Run the long job.")
+    assert agent._claude_code_session is None, "the stopped turn's CLI was closed"
+    events = []
+    agent.tool_progress_callback = lambda event, name, preview, args, **kw: events.append((event, preview, kw))
+    agent.run_conversation("Try again.", conversation_history=db.get_messages_as_conversation(outer_session_id))
+    rows = [(preview, kw) for event, preview, kw in events if event == "session.continuity"]
+    assert rows and rows[0][1]["mode"] == "resumed"
+    assert "(after the previous turn was stopped)" in rows[0][0]
+    db.close()
+
+
 def test_missing_transcript_file_rebuilds_instead_of_resuming(monkeypatch, _claude_config_dir):
     calls = []
 

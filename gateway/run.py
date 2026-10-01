@@ -80,6 +80,24 @@ from hermes_cli.fallback_config import get_fallback_chain
 # _sweep_agent_cache_under_pressure() adds the missing memory-pressure valve
 # (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
+
+
+def _clock_time(timestamp: float) -> str:
+    """Local "17:12", or "Sep 29 17:12" when it was not today."""
+    moment = datetime.fromtimestamp(timestamp)
+    if moment.date() == datetime.now().date():
+        return moment.strftime("%H:%M")
+    return f"{moment.strftime('%b')} {moment.day} {moment.strftime('%H:%M')}"
+
+
+def _idle_span(seconds: float) -> str:
+    """How long something sat idle, in the largest whole unit: "3 days", "5 h", "40 min"."""
+    seconds = max(0.0, float(seconds))
+    if seconds >= 2 * 86400:
+        return f"{int(seconds // 86400)} days"
+    if seconds >= 2 * 3600:
+        return f"{int(seconds // 3600)} h"
+    return f"{max(1, int(seconds // 60))} min"
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 # A resident Claude Code CLI keeps its background work (workflows, background
 # agents and shells) running between turns, and evicting the agent kills that
@@ -27343,6 +27361,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._commit_memory_before_soft_evict(agent, key)
         self._release_evicted_agent_soft(agent)
 
+    def _note_agent_release(self, session_key: str, reason: str) -> None:
+        """Remember why a cached agent left the cache.
+
+        The chat's next turn starts a new CLI and says so ("Session resumed
+        from disk"); this is where it learns the reason. Phrased to follow
+        "after": "after 3 days idle (the gateway released it at 09:12)".
+        """
+        reasons = getattr(self, "_agent_release_reasons", None)
+        if reasons is None:
+            reasons = self._agent_release_reasons = OrderedDict()
+        reasons[session_key] = (reason, time.time())
+        reasons.move_to_end(session_key)
+        while len(reasons) > 512:
+            reasons.popitem(last=False)
+
+    def _take_agent_release(self, session_key: str) -> Optional[tuple]:
+        """The (reason, released_at) recorded for a session's last release, once."""
+        reasons = getattr(self, "_agent_release_reasons", None)
+        return reasons.pop(session_key, None) if reasons else None
+
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
 
@@ -27629,6 +27667,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for key, _ in evict_plan:
             _cache.pop(key, None)
+            self._note_agent_release(
+                key, f"the gateway's session cache filled up (released at {_clock_time(time.time())})"
+            )
 
         remaining_over_cap = len(_cache) - cap
         if remaining_over_cap > 0:
@@ -27757,8 +27798,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         continue  # keep agent — finite session hasn't expired
                     to_evict.append((key, agent))
-            for key, _ in to_evict:
+            for key, agent in to_evict:
                 _cache.pop(key, None)
+                idle = now - (getattr(agent, "_last_activity_ts", None) or now)
+                self._note_agent_release(
+                    key, f"{_idle_span(idle)} idle (the gateway released it at {_clock_time(now)})"
+                )
         for key, agent in to_evict:
             logger.info(
                 "Agent cache idle-TTL evict: session=%s (idle=%.0fs)",

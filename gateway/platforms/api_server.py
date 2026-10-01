@@ -362,6 +362,42 @@ def _local_time(epoch: Optional[float]) -> str:
     return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
 
 
+# What each signature input means to a person, for the "Session resumed from
+# disk" row: "after the effort changed".
+_SIGNATURE_INPUT_WORDS = {
+    "model_options": "the effort",
+    "requested_model": "the model",
+    "requested_provider": "the model",
+    "route": "the model",
+    "session_model": "the model",
+    "single_model": "the model",
+    "confirmed_runtime_lock": "the model",
+    "cwd": "the project",
+    "project": "the project",
+    "ephemeral_system_prompt": "the turn instructions",
+    "cache_busting_config": "the gateway's tool setup",
+    "config": "the gateway configuration",
+    "profile": "the profile",
+}
+
+
+def _settings_change_reason(changed: List[str]) -> str:
+    words: List[str] = []
+    for name in changed:
+        word = _SIGNATURE_INPUT_WORDS.get(name, "the runtime settings")
+        if word not in words:
+            words.append(word)
+    return "after " + (" and ".join(words) if words else "the runtime settings") + " changed"
+
+
+def _clock_time(timestamp: float) -> str:
+    """Local "17:12", or "Sep 29 17:12" when it was not today."""
+    moment = datetime.fromtimestamp(timestamp)
+    if moment.date() == datetime.now().date():
+        return moment.strftime("%H:%M")
+    return f"{moment.strftime('%b')} {moment.day} {moment.strftime('%H:%M')}"
+
+
 def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
     """Return a loop-aware broker sender for one aiohttp controller socket.
 
@@ -3491,6 +3527,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # and a chat's CLI was dropped between two messages on 2026-09-30 with
         # no restart, interrupt or settings change to explain it.
         miss: Optional[str] = None
+        # The same reason for the person reading the chat: the runtime's
+        # "Session resumed from disk" row shows it ("after the gateway
+        # restarted at 17:12"). None when this process cannot tell.
+        resume_reason: Optional[str] = None
         with cache_lock:
             entry = cache.get(cache_key)
             if isinstance(entry, tuple) and entry:
@@ -3557,12 +3597,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             "settings signature changed"
                             + (f" ({', '.join(changed)})" if changed else "")
                         )
+                        resume_reason = _settings_change_reason(changed)
                     if not same_session:
                         reasons.append("the cached agent belongs to another session")
                     if not (transcript_current or busy):
                         reasons.append(
                             f"message count moved from {cached_count} to {current_count}"
                         )
+                        resume_reason = resume_reason or "after the conversation's history changed"
                     miss = "; ".join(reasons) or "no failing check recorded"
                     if busy:
                         miss += "; its background work was stopped"
@@ -3577,6 +3619,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     f"{_local_time(_GATEWAY_PROCESS_STARTED_AT)}, after this chat's "
                     f"newest message at {_local_time(newest_message_at)}"
                 )
+                resume_reason = f"after the gateway restarted at {_clock_time(_GATEWAY_PROCESS_STARTED_AT)}"
             else:
                 miss = (
                     f"no cached agent although the gateway has run since "
@@ -3584,6 +3627,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     f"message is from {_local_time(newest_message_at)} (released: idle, "
                     f"memory pressure, cache cap, or a failed run)"
                 )
+                take_release = getattr(runner, "_take_agent_release", None)
+                released = take_release(cache_key) if callable(take_release) else None
+                if released:
+                    miss += f"; recorded: {released[0]}"
+                    resume_reason = f"after {released[0]}"
 
         if miss is not None and session_id:
             logger.info(
@@ -3605,6 +3653,8 @@ class APIServerAdapter(BasePlatformAdapter):
         reused = agent is not None
         if agent is None:
             agent = self._create_agent(session_id=session_id, **agent_kwargs)
+            if resume_reason:
+                agent._resume_reason = resume_reason
             if cwd:
                 agent.session_cwd = cwd
             agent.session_project = project or ""

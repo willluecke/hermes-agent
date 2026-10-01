@@ -589,14 +589,17 @@ def test_a_restart_and_a_new_chat_are_named_as_such(resident_cache, caplog, monk
 
     caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
     monkeypatch.setattr(api_server, "_GATEWAY_PROCESS_STARTED_AT", time.time() + 60)
-    resident_cache.acquire()
+    agent, _ = resident_cache.acquire()
     [line] = _not_reused(caplog)
     assert "reason=no cached agent: the gateway started at" in line and "after this chat's newest message at" in line
+    # The chat's "Session resumed from disk" row says so (2026-09-30).
+    assert agent._resume_reason == f"after the gateway restarted at {api_server._clock_time(api_server._GATEWAY_PROCESS_STARTED_AT)}"
     caplog.clear()
     fresh = resident_cache.db.create_session("hermes-chat-c_new", "api_server")
-    resident_cache.adapter._create_or_reuse_runtime_agent(cache_key=f"api_server:default:{fresh}", signature="sig", session_id=fresh)
+    new_agent, _ = resident_cache.adapter._create_or_reuse_runtime_agent(cache_key=f"api_server:default:{fresh}", signature="sig", session_id=fresh)
     [line] = _not_reused(caplog)
     assert line.endswith("reason=new chat")
+    assert not hasattr(new_agent, "_resume_reason"), "a new chat resumes nothing"
 
 
 def test_a_changed_signature_is_logged_with_the_inputs_that_changed(resident_cache, caplog):
@@ -618,9 +621,43 @@ def test_a_changed_signature_is_logged_with_the_inputs_that_changed(resident_cac
     )
     acquire(high)
     caplog.clear()
-    _, reused = acquire(top)
+    replacement, reused = acquire(top)
     [line] = _not_reused(caplog)
     assert reused is False and "reason=settings signature changed (model_options)" in line
+    assert replacement._resume_reason == "after the effort changed"
+
+
+def test_a_released_agent_records_why_and_the_chats_next_turn_is_told_once(resident_cache, caplog, monkeypatch):
+    import logging
+
+    from gateway import run as gw_run
+
+    caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+    agent, _ = resident_cache.acquire()
+    runner = resident_cache.adapter.gateway_runner
+    monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+    agent._last_activity_ts = time.time() - 3 * 86400 - 60
+    assert runner._sweep_idle_cached_agents() == 1
+    caplog.clear()
+    replacement, reused = resident_cache.acquire()
+    assert reused is False
+    assert replacement._resume_reason.startswith("after 3 days idle (the gateway released it at ")
+    [line] = _not_reused(caplog)
+    assert "; recorded: 3 days idle (the gateway released it at " in line
+    assert runner._take_agent_release(f"api_server:default:{resident_cache.session_id}") is None, "told once"
+
+
+def test_a_full_cache_records_why_it_released_an_agent(monkeypatch):
+    from gateway import run as gw_run
+
+    monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 1)
+    runner = _runner()
+    runner._agent_cache["older"] = (_agent(), "sig")
+    runner._agent_cache["newer"] = (_agent(), "sig")
+    runner._enforce_agent_cache_cap()
+    reason, _ = runner._take_agent_release("older")
+    assert reason.startswith("the gateway's session cache filled up (released at ")
+    assert runner._take_agent_release("newer") is None
 
 
 def test_concurrent_registry_writes_never_tear_the_file(tmp_path):

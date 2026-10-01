@@ -1212,10 +1212,27 @@ def run_claude_code_turn(
         )
         and resident_continues
     )
+    # Why this turn has no live CLI, from whoever ended it: the API server for
+    # a new agent (a restart, an idle release, a settings change) or the
+    # previous turn when it closed the CLI (a stop, a failure). The runtime
+    # alone only sees that no process is running, which said nothing useful.
+    known_cause = next(
+        (
+            cause
+            for cause in (
+                getattr(agent, "_resume_reason", None),
+                getattr(agent, "_claude_session_retired_reason", None),
+            )
+            if isinstance(cause, str) and cause
+        ),
+        None,
+    )
+    agent._resume_reason = None
+    agent._claude_session_retired_reason = None
     resume_cause = (
         "the model or effort changed"
         if session is not None and resident_continues and not resident_continuity
-        else "the CLI process was not running"
+        else known_cause or "the CLI process was not running"
     )
     if session is not None and not resident_continuity:
         # A project/model/transcript switch is a real continuity boundary. Do
@@ -1475,6 +1492,14 @@ def run_claude_code_turn(
         )
 
     if turn.should_retire:
+        # The next turn starts a new CLI and says why.
+        agent._claude_session_retired_reason = (
+            "after the previous turn was stopped"
+            if turn.interrupted
+            else "after the previous turn failed"
+            if turn.error
+            else "after the previous turn closed its CLI"
+        )
         if getattr(agent, "_claude_code_session", None) is session:
             agent._claude_code_session = None
         try:

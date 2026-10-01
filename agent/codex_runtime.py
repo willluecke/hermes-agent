@@ -467,7 +467,12 @@ def _announce_codex_continuity(
         )
         return
     if resumed:
-        text = f"Session resumed from disk: Codex thread {thread}" + (
+        # The API server knows why this agent is new (a restart, an idle
+        # release, a settings change); the row says so when it does.
+        cause = getattr(agent, "_resume_reason", None)
+        cause = cause if isinstance(cause, str) and cause else None
+        agent._resume_reason = None
+        text = f"Session resumed from disk: Codex thread {thread}" + (f" ({cause})" if cause else "") + (
             f", plus the {plural(len(entries), 'message')} added since its last turn."
             if entries else "."
         )
