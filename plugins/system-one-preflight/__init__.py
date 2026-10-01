@@ -2537,8 +2537,11 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             _bound(_session_manifest)
             write_log({"event": "manifest", "session_id": session_id, "items": len(manifest), "replay": bool(kwargs.get("replay"))})
             # Said now, before the final message: a send-back after it makes
-            # the follow-up the only answer the user sees.
-            if not kwargs.get("replay") and verify_judge_enabled():
+            # the follow-up the only answer the user sees. Only a process that
+            # saw the turn start holds its ledger: on the Claude lane the
+            # hermes-tools MCP server runs this hook too, with no session and
+            # no ledger, and called all 9 claims unmatched (2026-09-30).
+            if not kwargs.get("replay") and verify_judge_enabled() and _session_scope.get(session_id):
                 try:
                     preview_note = manifest_preview_note(session_id)
                 except Exception:

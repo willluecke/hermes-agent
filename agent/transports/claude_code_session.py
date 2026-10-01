@@ -30,6 +30,12 @@ DEFAULT_INACTIVITY_TIMEOUT = 10 * 60.0
 DEFAULT_ABSOLUTE_TIMEOUT = 2 * 60 * 60.0
 DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT = 30.0
 DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT = 60.0
+# How long a stopped turn waits for the CLI to confirm its stream-json
+# interrupt before the process is retired the old way.
+DEFAULT_INTERRUPT_GRACE_SECONDS = 10.0
+# Once the CLI has confirmed, how long to wait for the stopped turn's own
+# result record (none comes when no query was running).
+INTERRUPT_SETTLE_SECONDS = 3.0
 _DEBUG_LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 _ASYNC_AGENT_LAUNCH_MARKER = "async agent launched successfully"
@@ -855,6 +861,12 @@ class ClaudeCodeSession:
         self.resident_first_event_timeout = resident_first_event_timeout
         self.startup_first_event_timeout = startup_first_event_timeout
         self._interrupt = threading.Event()
+        # The stream-json interrupt sent for the current turn, if any.
+        self._interrupt_request_id: Optional[str] = None
+        self.interrupt_grace_seconds = DEFAULT_INTERRUPT_GRACE_SECONDS
+        # The turn thread writes prompts and a stop writes the interrupt
+        # request from another thread: one line at a time on stdin.
+        self._stdin_lock = threading.Lock()
         self._process: Optional[subprocess.Popen[str]] = None
         self._output_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=40)
@@ -916,8 +928,38 @@ class ClaudeCodeSession:
         )
 
     def request_interrupt(self) -> None:
+        """Stop the current turn and keep the session.
+
+        A stop ends one turn, not the conversation's CLI. Until 2026-09-30 a
+        stop sent SIGINT and the turn then retired the process, so the next
+        message had to resume from disk ("the CLI process was not running").
+        Claude Code's own stream-json interrupt request ends the running turn
+        with a result record and keeps serving the same session. A signal,
+        and retiring the process, remain for when the request cannot be
+        written or the CLI does not confirm it.
+        """
+        self._interrupt_request_id = self._send_control_interrupt()
         self._interrupt.set()
-        self._terminate_process(signal.SIGINT)
+        if self._interrupt_request_id is None:
+            self._terminate_process(signal.SIGINT)
+
+    def _send_control_interrupt(self) -> Optional[str]:
+        """Write Claude Code's stream-json interrupt request; its id, or None when it could not be sent."""
+        process = self._process
+        if process is None or process.poll() is not None or process.stdin is None:
+            return None
+        request_id = f"hermes_interrupt_{uuid4().hex[:12]}"
+        record = json.dumps(
+            {"type": "control_request", "request_id": request_id, "request": {"subtype": "interrupt"}},
+            separators=(",", ":"),
+        )
+        try:
+            with self._stdin_lock:
+                process.stdin.write(record + "\n")
+                process.stdin.flush()
+        except (OSError, ValueError):
+            return None
+        return request_id
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -1296,8 +1338,8 @@ class ClaudeCodeSession:
         """Hand stdout to late capture once a turn stops reading it.
 
         Anything the CLI writes from here on belongs to a later, autonomous
-        turn. A turn that ended in an error, an interrupt, or a retirement
-        leaves no trustworthy stream to capture from.
+        turn. A turn that ended in an error or a retirement (including a stop
+        the CLI never confirmed) leaves no trustworthy stream to capture from.
         """
         with self._route_lock:
             self._turn_reading = False
@@ -1324,17 +1366,19 @@ class ClaudeCodeSession:
                 result = self._run_turn_locked(prompt)
                 return result
             finally:
+                # A stop the CLI confirmed leaves the stream in step, so later
+                # output is captured like after any finished turn.
                 self._end_turn_reading(
                     capture=bool(
                         result is not None
                         and not result.error
-                        and not result.interrupted
                         and not result.should_retire
                     )
                 )
 
     def _run_turn_locked(self, prompt: str) -> ClaudeCodeTurnResult:
         self._interrupt.clear()
+        self._interrupt_request_id = None
         resident_candidate = self._process if self.is_alive() else None
         if resident_candidate is not None and self._auth_generation:
             if not claude_subscription_auth_available(
@@ -1489,8 +1533,9 @@ class ClaudeCodeSession:
         def _write_prompt(target: subprocess.Popen[str]) -> None:
             assert target.stdin is not None
             try:
-                target.stdin.write(self._user_record(prompt) + "\n")
-                target.stdin.flush()
+                with self._stdin_lock:
+                    target.stdin.write(self._user_record(prompt) + "\n")
+                    target.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
                 if self._process is target:
                     self._process = None
@@ -1572,13 +1617,44 @@ class ClaudeCodeSession:
         attempt_started_at, last_activity, first_event_timeout = _dispatch(
             process, resident=resident_process
         )
+        # A stop asked the CLI to end this turn (request_interrupt): until it
+        # does, keep reading; past the deadline, retire the process as before.
+        interrupt_deadline: Optional[float] = None
+        interrupt_acknowledged = False
+
+        def _note_interrupt() -> bool:
+            """Begin handling the stop once; False when the process must go now.
+
+            Called wherever the stop is first seen: the CLI's confirmation or
+            result can be read before the loop's next pass notices the flag.
+            """
+            nonlocal interrupt_deadline
+            if interrupt_deadline is None:
+                result.interrupted = True
+                if self._interrupt_request_id is None:
+                    result.should_retire = True
+                    return False
+                interrupt_deadline = time.monotonic() + self.interrupt_grace_seconds
+            return True
 
         while True:
-            if self._interrupt.is_set():
-                result.interrupted = True
-                result.should_retire = True
+            if self._interrupt.is_set() and not _note_interrupt():
                 break
             now = time.monotonic()
+            if interrupt_deadline is not None and now >= interrupt_deadline:
+                # Confirmed but no turn to end (it had handed back already):
+                # the stream is in step and the process stays. Unconfirmed:
+                # the CLI is not answering, so it goes.
+                result.should_retire = not interrupt_acknowledged
+                if result.should_retire:
+                    logger.info(
+                        "Claude Code did not confirm the interrupt within %.0fs; "
+                        "retiring the process: session=%s pid=%s",
+                        self.interrupt_grace_seconds,
+                        result.session_id,
+                        process.pid,
+                    )
+                break
             if now - started_at > self.absolute_timeout:
                 result.error = f"Claude Code exceeded the {self.absolute_timeout:g}-second turn limit"
                 result.should_retire = True
@@ -1718,6 +1794,23 @@ class ClaudeCodeSession:
                 continue
             _observe_session_id(event.get("session_id"))
             event_type = event.get("type")
+            if event_type == "control_response":
+                response = event.get("response") if isinstance(event.get("response"), dict) else {}
+                if (
+                    self._interrupt.is_set()
+                    and self._interrupt_request_id
+                    and response.get("request_id") == self._interrupt_request_id
+                    and _note_interrupt()
+                ):
+                    interrupt_acknowledged = True
+                    if _waiting_for_autonomous_work() and not drain_active:
+                        # The model had handed back and only background work
+                        # remained: there is no running turn to end.
+                        break
+                    interrupt_deadline = min(
+                        interrupt_deadline, time.monotonic() + INTERRUPT_SETTLE_SECONDS
+                    )
+                continue
             auth_failure = _auth_failure_detail(event)
             if auth_failure:
                 result.prompt_acknowledged = True
@@ -1858,6 +1951,15 @@ class ClaudeCodeSession:
                             shell_task_by_tool_id[tool_use_id] = shell_task_id
             if event_type != "result":
                 continue
+            if self._interrupt.is_set() and self._interrupt_request_id and _note_interrupt():
+                # The turn the stop asked to end has ended; the session stays
+                # resident for the next message.
+                _observe_session_id(event.get("session_id"))
+                _publish_session_id()
+                result.usage = _merge_usage(result.usage, dict(event.get("usage") or {}))
+                if not event.get("is_error"):
+                    result.final_text = str(event.get("result") or "").strip()
+                break
             result.final_text = str(event.get("result") or "").strip()
             _observe_session_id(event.get("session_id"))
             _publish_session_id()

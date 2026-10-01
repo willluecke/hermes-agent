@@ -1797,6 +1797,17 @@ def test_on_the_default_loop_the_registration_note_rides_in_report_results_own_r
     assert preflight.on_transform_tool_result(tool_name="report_results", result=payload, session_id="s1") is None, "said once"
 
 
+def test_a_process_that_never_saw_the_turn_does_not_judge_its_claims(feedback, repo):
+    # The hermes-tools MCP server runs the hooks for the Claude lane's
+    # report_results with no session and no ledger: every claim looked
+    # unmatched there, and that note reached the model (2026-09-30).
+    items = [_item("the tests pass", ["pytest -q"], predicate="passed")]
+    assert _manifest_live(items, session="") is None
+    payload = json.dumps({"manifest": items, "note": "n"})
+    assert preflight.on_transform_tool_result(tool_name="report_results", result=payload, session_id="") is None
+    assert feedback["records"]("manifest_preview") == []
+
+
 def test_a_send_back_asks_for_the_complete_answer_again(feedback, repo):
     feedback["settings"]["controller_reruns"] = "on"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])

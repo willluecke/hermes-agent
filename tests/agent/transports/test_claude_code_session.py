@@ -1867,3 +1867,118 @@ def test_the_newest_work_bounds_the_protection_not_the_oldest():
     # a late turn is fresh work too
     _pump(session, process, {"type": "user", "session_id": SID, "message": {"content": "notification"}})
     assert _gateway_protects(session) is True
+
+
+# --- A stop ends the turn, not the session (2026-09-30) ----------------------
+#
+# A stop used to SIGINT the CLI and retire it, so the conversation's next
+# message resumed from disk ("the CLI process was not running"). Claude Code's
+# stream-json interrupt ends the running turn with its own result record and
+# keeps serving the session (claude 2.1.280, probed live the same day).
+
+STOP_SID = "00000000-0000-4000-8000-000000000301"
+
+
+def _busy_frames(prompt="long job"):
+    return [
+        {"type": "user", "session_id": STOP_SID, "message": {"role": "user", "content": prompt}},
+        {"type": "assistant", "session_id": STOP_SID, "message": {"content": [
+            {"type": "tool_use", "id": "toolu_sleep", "name": "Bash", "input": {"command": "sleep 60"}}]}},
+    ]
+
+
+def _start_turn(session, prompt):
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("result", session.run_turn(prompt)), daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not session._output_queue.empty():
+        time.sleep(0.01)
+    time.sleep(0.1)  # the turn has read its frames and is waiting
+    return worker, outcome
+
+
+def _interrupt_request(process):
+    [request] = [json.loads(line) for line in process.stdin.getvalue().splitlines() if '"control_request"' in line]
+    return request
+
+
+def _put(session, *events):
+    for event in events:
+        session._output_queue.put(json.dumps(event) + "\n")
+
+
+def test_a_stop_ends_the_turn_through_the_cli_and_keeps_its_process_for_the_next_message():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=STOP_SID, resume=True)
+    session.late_drain_interval_seconds = 60.0  # the next turn starts first
+    process = _install_fake_process(session, _fake_process(30101), _busy_frames())
+    signals = []
+    with patch.object(session, "_terminate_process", side_effect=signals.append):
+        worker, outcome = _start_turn(session, "long job")
+        session.request_interrupt()
+        request = _interrupt_request(process)
+        assert request["request"] == {"subtype": "interrupt"}
+        _put(session,
+             {"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"], "response": {"still_queued": []}}},
+             {"type": "result", "subtype": "error_during_execution", "is_error": True, "result": None, "session_id": STOP_SID})
+        worker.join(timeout=10)
+    result = outcome["result"]
+    assert result.interrupted is True
+    assert result.should_retire is False
+    assert result.error is None
+    assert signals == [], "no signal: the CLI ended the turn itself"
+    assert session.is_alive() and session._process is process, "the session keeps its CLI process"
+
+    with patch.object(session, "_start_process", side_effect=AssertionError("the next message must not start a new CLI")):
+        worker, outcome = _start_turn(session, "next")
+        _put(session,
+             {"type": "user", "session_id": STOP_SID, "message": {"role": "user", "content": "next"}},
+             {"type": "result", "session_id": STOP_SID, "result": "still here"})
+        worker.join(timeout=10)
+    assert outcome["result"].final_text == "still here"
+    assert [json.loads(line).get("type") for line in process.stdin.getvalue().splitlines()] == ["user", "control_request", "user"]
+
+
+def test_a_stop_the_cli_never_confirms_retires_the_process_as_before():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=STOP_SID, resume=True)
+    session.interrupt_grace_seconds = 0.3
+    _install_fake_process(session, _fake_process(30102), _busy_frames())
+    retired = []
+    with patch.object(session, "_terminate_process"), patch.object(session, "_retire_process", side_effect=lambda process, **_: retired.append(process) or True):
+        worker, outcome = _start_turn(session, "long job")
+        session.request_interrupt()
+        worker.join(timeout=10)
+    result = outcome["result"]
+    assert result.interrupted is True and result.should_retire is True
+    assert len(retired) == 1, "an unanswered stop still ends the CLI"
+    assert not session.is_alive()
+
+
+def test_a_stop_that_cannot_reach_the_cli_signals_it_and_retires_it():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=STOP_SID, resume=True)
+    process = _install_fake_process(session, _fake_process(30103), _busy_frames())
+    signals = []
+    with patch.object(session, "_terminate_process", side_effect=signals.append), patch.object(session, "_retire_process", return_value=True):
+        worker, outcome = _start_turn(session, "long job")
+        process.stdin.close()  # the request cannot be written
+        session.request_interrupt()
+        worker.join(timeout=10)
+    assert signals and signals[0] == __import__("signal").SIGINT
+    assert outcome["result"].interrupted is True and outcome["result"].should_retire is True
+
+
+def test_a_stop_while_only_background_work_runs_ends_the_turn_and_keeps_the_process():
+    session = _shell_session()
+    process = _install_fake_process(session, _fake_process(30104), _shell_frames())
+    signals = []
+    with patch.object(session, "_terminate_process", side_effect=signals.append):
+        worker, outcome = _start_turn(session, "Continue")
+        session.request_interrupt()
+        request = _interrupt_request(process)
+        # No turn is running in the CLI: it confirms and writes no result.
+        _put(session, {"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"]}})
+        worker.join(timeout=10)
+    result = outcome["result"]
+    assert result.interrupted is True and result.should_retire is False and result.error is None
+    assert signals == []
+    assert session.is_alive()
