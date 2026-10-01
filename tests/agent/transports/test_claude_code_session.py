@@ -309,9 +309,9 @@ def test_rotated_oauth_generation_recycles_resident_process():
     ) as started:
         result = session.run_turn("continue")
 
-    auth_available.assert_called_once_with(
-        min_validity_seconds=session.absolute_timeout + 10 * 60
-    )
+    # The 12-hour turn cap does not raise what the auth preflight demands:
+    # it still asks for 2 hours 10 minutes, as before the cap moved.
+    auth_available.assert_called_once_with(min_validity_seconds=2 * 60 * 60 + 10 * 60)
     retired.assert_called_once_with(stale_process)
     started.assert_called_once_with()
     assert stale_process.stdin.getvalue() == ""
@@ -1982,3 +1982,99 @@ def test_a_stop_while_only_background_work_runs_ends_the_turn_and_keeps_the_proc
     assert result.interrupted is True and result.should_retire is False and result.error is None
     assert signals == []
     assert session.is_alive()
+
+
+# ---- The turn time limit (agent.turn_time_limit_hours), 2026-10-01 ----
+
+
+class _ClockedLines:
+    """An output queue whose lines arrive at scheduled clock times."""
+
+    def __init__(self, clock: dict, timed_lines: list) -> None:
+        self._clock = clock
+        self._lines = list(timed_lines)
+
+    def get(self, timeout=None):
+        if self._lines:
+            at, line = self._lines.pop(0)
+            self._clock["now"] = at
+            return line
+        self._clock["now"] += float(timeout or 0.5)
+        raise queue.Empty
+
+    def put(self, item) -> None:
+        self._lines.append((self._clock["now"], item))
+
+
+def _long_claude_turn(prompt: str) -> list:
+    """A Claude turn that reads a file every 5 minutes for 130 minutes."""
+    timed = [(1.0, {"type": "user", "session_id": SID,
+                    "message": {"role": "user", "content": prompt}})]
+    for n, minute in enumerate(range(5, 130, 5), start=1):
+        timed.append((minute * 60.0, {
+            "type": "assistant", "session_id": SID,
+            "message": {"content": [{"type": "tool_use", "id": f"toolu_{n}",
+                                     "name": "Read", "input": {"file_path": f"/tmp/f{n}"}}]},
+        }))
+        timed.append((minute * 60.0 + 1, {
+            "type": "user", "session_id": SID,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": f"toolu_{n}",
+                                     "content": "ok"}]},
+        }))
+    timed.append((130 * 60.0, {"type": "assistant", "session_id": SID,
+                               "message": {"content": [{"type": "text", "text": "long work finished"}]}}))
+    timed.append((130 * 60.0, {"type": "result", "session_id": SID, "result": "long work finished",
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}))
+    return [(at, json.dumps(event) + "\n") for at, event in timed]
+
+
+def _clocked_session(clock: dict, prompt: str, **kwargs) -> ClaudeCodeSession:
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", session_id=SID,
+                                resume=True, **kwargs)
+    _install_fake_process(session, _fake_process(20301), [])
+    session._output_queue = _ClockedLines(clock, _long_claude_turn(prompt))
+    return session
+
+
+def test_default_claude_turn_cap_is_twelve_hours():
+    import agent.transports.claude_code_session as claude_session_mod
+
+    assert claude_session_mod.DEFAULT_ABSOLUTE_TIMEOUT == 12 * 60 * 60
+    assert ClaudeCodeSession(cwd="/tmp", model="claude-fable-5").absolute_timeout == 12 * 60 * 60
+
+
+def test_a_working_claude_turn_runs_past_two_hours():
+    import agent.transports.claude_code_session as claude_session_mod
+
+    clock = {"now": 0.0}
+    session = _clocked_session(clock, "keep going")
+    with patch.object(claude_session_mod.time, "monotonic", side_effect=lambda: clock["now"]):
+        result = session.run_turn("keep going")
+
+    assert clock["now"] >= 130 * 60
+    assert result.final_text == "long work finished"
+    assert result.error is None and result.error_code is None
+    assert result.should_retire is False
+
+
+def test_the_old_two_hour_cap_cut_the_same_claude_turn():
+    import agent.transports.claude_code_session as claude_session_mod
+
+    clock = {"now": 0.0}
+    session = _clocked_session(clock, "keep going", absolute_timeout=2 * 60 * 60)
+    with patch.object(claude_session_mod.time, "monotonic", side_effect=lambda: clock["now"]), \
+            patch.object(session, "close") as closed:
+        result = session.run_turn("keep going")
+
+    assert 2 * 60 * 60 < clock["now"] < 130 * 60
+    assert result.error_code == claude_session_mod.TURN_TIME_LIMIT_ERROR_CODE
+    assert result.error == "Claude Code exceeded the 7200-second turn limit"
+    assert result.should_retire is True
+    closed.assert_called_once_with()
+
+
+def test_a_short_cap_keeps_its_short_auth_window():
+    session = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", absolute_timeout=300.0)
+    assert session._auth_min_validity_seconds() == 300.0 + 10 * 60
+    uncapped = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", absolute_timeout=float("inf"))
+    assert uncapped._auth_min_validity_seconds() == 2 * 60 * 60 + 10 * 60

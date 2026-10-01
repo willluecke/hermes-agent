@@ -672,3 +672,66 @@ def test_restored_prefix_rebuild_names_the_reason(monkeypatch):
         "before this chat's first Hermes turn were restored to its history."
     )
     db.close()
+
+
+def test_claude_turn_ended_by_the_time_limit_leaves_a_row(monkeypatch):
+    """The configured cap reaches the session, and a cut turn keeps its reason."""
+    import hermes_cli.config
+    from agent.transports.claude_code_session import TURN_TIME_LIMIT_ERROR_CODE
+
+    monkeypatch.setattr(
+        hermes_cli.config, "load_config", lambda: {"agent": {"turn_time_limit_hours": 4}}
+    )
+    seen = {}
+
+    def _run_turn(session, prompt):
+        seen["limit"] = session.absolute_timeout
+        return ClaudeCodeTurnResult(
+            error="Claude Code exceeded the 14400-second turn limit",
+            error_code=TURN_TIME_LIMIT_ERROR_CODE,
+            should_retire=True,
+        )
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    monkeypatch.setattr(ClaudeCodeSession, "close", lambda self: None)
+    rows = []
+    agent = _make_agent()
+    agent.tool_progress_callback = (
+        lambda event, *args, **kwargs: rows.append((kwargs.get("mode"), args[1]))
+        if event == "session.continuity"
+        else None
+    )
+
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        result = agent.run_conversation("continue")
+
+    assert seen["limit"] == 4 * 60 * 60
+    assert rows[-1] == (
+        "stopped",
+        "Claude stopped this turn at the 4-hour turn limit while it was still "
+        "working. Send a message to have it continue.",
+    )
+    assert result["completed"] is False
+    assert result["error_code"] == TURN_TIME_LIMIT_ERROR_CODE
+
+
+def test_claude_no_cap_setting_means_no_wall_clock_limit(monkeypatch):
+    import math
+
+    import hermes_cli.config
+
+    monkeypatch.setattr(
+        hermes_cli.config, "load_config", lambda: {"agent": {"turn_time_limit_hours": 0}}
+    )
+    seen = {}
+
+    def _run_turn(session, prompt):
+        seen["limit"] = session.absolute_timeout
+        return ClaudeCodeTurnResult(final_text="done")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    agent = _make_agent()
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        agent.run_conversation("continue")
+
+    assert seen["limit"] == math.inf

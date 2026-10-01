@@ -26,6 +26,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.continuity import emit_continuity, handoff_disclosure, plural, render_history_blocks
+from agent.turn_time_limit import (
+    STOPPED_MODE,
+    inactivity_stop_text,
+    time_limit_stop_text,
+    turn_time_limit_seconds,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from agent.transports.codex_coordination import COORDINATION_ITEM_TYPES, coordination_item
 
@@ -711,6 +717,54 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+CODEX_COMPACTED_TEXT = (
+    "Codex compacted this thread's context to make room. The full "
+    "thread stays on disk; the transcript here is unchanged."
+)
+
+
+def _announce_codex_compaction(agent, *, thread_id: str = "") -> None:
+    """Show a finished Codex compaction on the run stream as it happens.
+
+    This row and the "Compacting context" status were emitted only after the
+    turn returned. On 2026-10-01 a talos turn compacted at 48 and 103 minutes,
+    kept working, and was cut by the then 2-hour cap; both notices then came
+    last, so compaction looked like what stopped it.
+    """
+    agent._codex_compactions_announced = (
+        int(getattr(agent, "_codex_compactions_announced", 0) or 0) + 1
+    )
+    emit_continuity(
+        agent, "codex", "compacted", CODEX_COMPACTED_TEXT,
+        thread_id=str(thread_id or ""),
+    )
+
+
+def _announce_codex_limit_stop(agent, turn, *, limit_seconds: float) -> bool:
+    """Leave a row naming the limit that ended this turn.
+
+    A failed run's error reaches the app only as a banner that a reload
+    clears, so without this row the chat kept no reason at all.
+    """
+    from agent.transports.codex_app_server_session import (
+        _DEFAULT_TURN_INACTIVITY_TIMEOUT,
+        TURN_INACTIVITY_ERROR_CODE,
+        TURN_TIME_LIMIT_ERROR_CODE,
+    )
+
+    code = getattr(turn, "error_code", None)
+    if code == TURN_TIME_LIMIT_ERROR_CODE and limit_seconds > 0:
+        text = time_limit_stop_text("Codex", limit_seconds)
+    elif code == TURN_INACTIVITY_ERROR_CODE:
+        text = inactivity_stop_text("Codex", _DEFAULT_TURN_INACTIVITY_TIMEOUT)
+    else:
+        return False
+    return emit_continuity(
+        agent, "codex", STOPPED_MODE, text,
+        thread_id=str(getattr(turn, "thread_id", None) or ""),
+    )
+
+
 def _record_codex_app_server_compaction(
     agent,
     turn,
@@ -736,13 +790,10 @@ def _record_codex_app_server_compaction(
         turn_id,
         force,
     )
-    if not force:
-        try:
-            from agent.conversation_compression import COMPACTION_STATUS
-
-            agent._emit_status(COMPACTION_STATUS)
-        except Exception:
-            pass
+    # No status line here: this runs after the turn has returned, and a
+    # "summarizing ... so I can continue" line printed then made a turn that
+    # ended for another reason look killed by compaction (2026-10-01). The
+    # event bridge shows each compaction while the turn runs.
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
@@ -1273,11 +1324,15 @@ def _codex_hook_parity(
             messages,
             {"role": "user", "content": nudge, "_pre_verify_synthetic": True},
         )
+        follow_limit = turn_time_limit_seconds()
         try:
-            follow = agent._codex_session.run_turn(user_input=nudge)
+            follow = agent._codex_session.run_turn(
+                user_input=nudge, absolute_turn_timeout=follow_limit
+            )
         except Exception:
             logger.warning("codex pre_verify follow-up turn failed", exc_info=True)
             break
+        _announce_codex_limit_stop(agent, follow, limit_seconds=follow_limit)
         follow_ups += 1
         # The nudge row above is the synthetic, never-durable copy; Codex's
         # echo of it would otherwise be stored as a real user message.
@@ -1364,6 +1419,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     agent_message_phases: dict[str, str] = {}
     buffered_agent_deltas: dict[str, list[str]] = {}
     active_agent_paths: dict[str, str] = {}
+    # A build that sends contextCompaction items is announced from those; the
+    # deprecated thread/compacted note then only covers older builds. The
+    # second flag drops the item for a compaction a note already announced.
+    compaction_notes = {"items_seen": False, "announced_by_note": False}
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -1566,10 +1625,38 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)
             return
+        if method == "thread/compacted":
+            if not compaction_notes["items_seen"]:
+                _announce_codex_compaction(
+                    agent, thread_id=params.get("threadId") or ""
+                )
+                compaction_notes["announced_by_note"] = True
+            return
         item = params.get("item")
         if not isinstance(item, dict):
             return
         item_type = item.get("type") or ""
+        if item_type == "contextCompaction":
+            compaction_notes["items_seen"] = True
+            if method == "item/started":
+                emit_status = getattr(agent, "_emit_status", None)
+                if emit_status is not None and not getattr(
+                    agent, "_codex_manual_compaction", False
+                ):
+                    try:
+                        from agent.conversation_compression import COMPACTION_STATUS
+
+                        emit_status(COMPACTION_STATUS)
+                    except Exception:
+                        logger.debug("compaction status raised", exc_info=True)
+            elif method == "item/completed":
+                if compaction_notes["announced_by_note"]:
+                    compaction_notes["announced_by_note"] = False
+                else:
+                    _announce_codex_compaction(
+                        agent, thread_id=params.get("threadId") or ""
+                    )
+            return
         if item_type == "subAgentActivity" and method in {"item/started", "item/completed"}:
             agent_id = item.get("agentThreadId") or ""
             if item.get("kind") == "started" and agent_id:
@@ -1957,15 +2044,22 @@ def run_codex_app_server_turn(
         _persist_codex_thread_state(
             agent, thread_id=thread_id, cwd=codex_cwd, entries=prior_entries
         )
-        turn = agent._codex_session.run_turn(user_input=turn_input)
+        agent._codex_compactions_announced = 0
+        turn_limit = turn_time_limit_seconds()
+        turn = agent._codex_session.run_turn(
+            user_input=turn_input, absolute_turn_timeout=turn_limit
+        )
         turn.projected_messages = _without_input_echo(turn.projected_messages, turn_input)
-        if getattr(turn, "compacted", False):
+        if getattr(turn, "compacted", False) and not getattr(
+            agent, "_codex_compactions_announced", 0
+        ):
+            # The bridge announces compactions live; this covers one whose
+            # notification was only read at the deadline check.
             emit_continuity(
-                agent, "codex", "compacted",
-                "Codex compacted this thread's context to make room. The full "
-                "thread stays on disk; the transcript here is unchanged.",
+                agent, "codex", "compacted", CODEX_COMPACTED_TEXT,
                 thread_id=str(thread_id or ""),
             )
+        _announce_codex_limit_stop(agent, turn, limit_seconds=turn_limit)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

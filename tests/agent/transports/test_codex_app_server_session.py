@@ -2159,3 +2159,130 @@ class TestUltracodeEffort:
         session = make_session(client, model="gpt-5.5", effort="max", ultracode=True, require_exact=True)
         # max is not advertised for gpt-5.5, but Ultracode resolves to xhigh, which is
         assert _run_one_turn(client, session)["effort"] == "xhigh"
+
+
+# ---- The turn time limit (agent.turn_time_limit_hours), 2026-10-01 ----
+#
+# A talos turn ran 22:27:52 to 00:27:52. Codex compacted at 48 and 103
+# minutes and kept working both times; the then fixed 2-hour cap cut it 21 s
+# after its last reasoning item. These replays drive the real turn loop on a
+# clock that advances with each notification.
+
+
+class _TimedClient(FakeClient):
+    """FakeClient whose notifications arrive at scheduled clock times."""
+
+    def __init__(self, clock: dict, *, idle_step: float = 60.0) -> None:
+        super().__init__()
+        self._clock = clock
+        self._arrivals: list[float] = []
+        self._idle_step = idle_step
+
+    def queue_at(self, at: float, method: str, **params) -> None:
+        self.queue_notification(method, **params)
+        self._arrivals.append(at)
+
+    def take_notification(self, timeout: float = 0.0):
+        if self._notifications:
+            self._clock["now"] = self._arrivals.pop(0)
+            return self._notifications.pop(0)
+        # Nothing queued: time passes while the loop waits.
+        self._clock["now"] += self._idle_step
+        return None
+
+
+def _command_done(n: int) -> dict:
+    return {
+        "type": "commandExecution", "id": f"cmd-{n}", "command": f"step {n}",
+        "status": "completed", "aggregatedOutput": "ok", "exitCode": 0,
+    }
+
+
+def _talos_replay(clock: dict) -> _TimedClient:
+    client = _TimedClient(clock)
+    client.queue_at(1, "item/started", threadId="t", turnId="tu1",
+                    item={"type": "reasoning", "id": "r-0"})
+    minute = 60.0
+    for n, at in enumerate(range(5, 130, 5), start=1):
+        if at == 50:
+            client.queue_at(47.5 * minute, "item/started", threadId="t", turnId="tu1",
+                            item={"type": "contextCompaction", "id": "compact-1"})
+            client.queue_at(48 * minute, "item/completed", threadId="t", turnId="tu1",
+                            item={"type": "contextCompaction", "id": "compact-1"})
+        if at == 105:
+            client.queue_at(102.5 * minute, "item/started", threadId="t", turnId="tu1",
+                            item={"type": "contextCompaction", "id": "compact-2"})
+            client.queue_at(103 * minute, "item/completed", threadId="t", turnId="tu1",
+                            item={"type": "contextCompaction", "id": "compact-2"})
+        client.queue_at(at * minute, "item/completed", threadId="t", turnId="tu1",
+                        item=_command_done(n))
+    client.queue_at(130 * minute, "item/completed", threadId="t", turnId="tu1",
+                    item={"type": "agentMessage", "id": "answer",
+                          "text": "talos work finished", "phase": "final_answer"})
+    client.queue_at(130 * minute, "turn/completed", threadId="t",
+                    turn={"id": "tu1", "status": "completed"})
+    return client
+
+
+def test_default_turn_cap_is_twelve_hours():
+    import inspect
+
+    assert session_mod._DEFAULT_ABSOLUTE_TURN_TIMEOUT == 12 * 60 * 60
+    default = inspect.signature(CodexAppServerSession.run_turn).parameters[
+        "absolute_turn_timeout"
+    ].default
+    assert default == 12 * 60 * 60
+
+
+def test_working_turn_runs_past_two_hours_through_two_compactions():
+    clock = {"now": 0.0}
+    client = _talos_replay(clock)
+    session = make_session(client)
+    with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock["now"]):
+        result = session.run_turn("keep building talos", notification_poll_timeout=0)
+
+    assert clock["now"] >= 130 * 60
+    assert result.compacted
+    assert result.final_text == "talos work finished"
+    assert result.error is None and result.error_code is None
+    assert not result.interrupted and not result.should_retire
+    assert result.tool_iterations == 25
+    assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+
+def test_the_old_two_hour_cap_cut_the_same_replay():
+    """The same timeline under the old cap ends at 2 hours with a named limit."""
+    clock = {"now": 0.0}
+    client = _talos_replay(clock)
+    client.set_stderr_tail(["WARN codex_core::responses_retry stream disconnected"])
+    session = make_session(client)
+    with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock["now"]):
+        result = session.run_turn(
+            "keep building talos",
+            notification_poll_timeout=0,
+            absolute_turn_timeout=2 * 60 * 60,
+        )
+
+    assert 2 * 60 * 60 <= clock["now"] < 130 * 60
+    assert result.compacted and result.final_text == ""
+    assert result.error_code == session_mod.TURN_TIME_LIMIT_ERROR_CODE
+    assert "time limit" in result.error and "absolute timeout of 7200s" in result.error
+    # The stderr tail goes to the log, not into the error the user sees.
+    assert "stream disconnected" not in result.error
+    assert result.interrupted and result.should_retire
+    assert any(method == "turn/interrupt" for method, _ in client.requests)
+
+
+def test_a_silent_turn_is_still_stopped_by_the_inactivity_watchdog():
+    clock = {"now": 0.0}
+    client = _TimedClient(clock)
+    client.queue_at(1, "item/completed", threadId="t", turnId="tu1", item=_command_done(1))
+    session = make_session(client)
+    with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock["now"]):
+        result = session.run_turn("then silence", notification_poll_timeout=0)
+
+    # Stopped ten minutes after the last notification, not at the cap.
+    assert 600 <= clock["now"] < 2 * 600
+    assert result.error_code == session_mod.TURN_INACTIVITY_ERROR_CODE
+    assert "without activity" in result.error
+    assert result.interrupted and result.should_retire

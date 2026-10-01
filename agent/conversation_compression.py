@@ -4064,6 +4064,9 @@ def _compress_context_via_codex_app_server(
         _emit_compaction_done(agent)
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
+    # This path owns the compaction status lines; the Codex event bridge,
+    # which announces compactions Codex starts on its own, skips its status.
+    agent._codex_manual_compaction = True
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
         result = codex_session.compact_thread()
@@ -4072,6 +4075,8 @@ def _compress_context_via_codex_app_server(
             _activity_heartbeat.stop("context compression failed")
         _complete_compaction_lifecycle()
         raise
+    finally:
+        agent._codex_manual_compaction = False
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
         _activity_heartbeat.stop("context compression failed")

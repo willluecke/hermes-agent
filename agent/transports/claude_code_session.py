@@ -25,9 +25,18 @@ import time
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from agent.turn_time_limit import DEFAULT_TURN_TIME_LIMIT_SECONDS
+
 
 DEFAULT_INACTIVITY_TIMEOUT = 10 * 60.0
-DEFAULT_ABSOLUTE_TIMEOUT = 2 * 60 * 60.0
+# The wall-clock cap, agent.turn_time_limit_hours (a fixed 2 hours until
+# 2026-10-01). math.inf means no cap.
+DEFAULT_ABSOLUTE_TIMEOUT = DEFAULT_TURN_TIME_LIMIT_SECONDS
+# The auth preflight asks the login to stay valid this long past a turn's
+# start, at most. It followed the cap and stays at its old 2 hours: a 12-hour
+# demand could fail a lease whose refresh is perfectly healthy.
+AUTH_VALIDITY_HORIZON_SECONDS = 2 * 60 * 60.0
+TURN_TIME_LIMIT_ERROR_CODE = "claude_turn_time_limit"
 DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT = 30.0
 DEFAULT_STARTUP_FIRST_EVENT_TIMEOUT = 60.0
 # How long a stopped turn waits for the CLI to confirm its stream-json
@@ -1040,12 +1049,15 @@ class ClaudeCodeSession:
         self._debug_file = str(directory / f"{self.session_id or 'session'}-{stamp}.log")
         return self._debug_file
 
+    def _auth_min_validity_seconds(self) -> float:
+        return min(self.absolute_timeout, AUTH_VALIDITY_HORIZON_SECONDS) + 10 * 60
+
     def _start_process(self) -> subprocess.Popen[str]:
         if self._closed:
             raise ClaudeCodeError("Claude Code session is closed")
         binary = find_claude_binary()
         if not claude_subscription_auth_available(
-            min_validity_seconds=self.absolute_timeout + 10 * 60
+            min_validity_seconds=self._auth_min_validity_seconds()
         ):
             raise ClaudeCodeError(
                 f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
@@ -1382,7 +1394,7 @@ class ClaudeCodeSession:
         resident_candidate = self._process if self.is_alive() else None
         if resident_candidate is not None and self._auth_generation:
             if not claude_subscription_auth_available(
-                min_validity_seconds=self.absolute_timeout + 10 * 60
+                min_validity_seconds=self._auth_min_validity_seconds()
             ):
                 raise ClaudeCodeError(
                     f"Claude Max authentication is unavailable. {CLAUDE_AUTH_REMEDIATION}",
@@ -1657,6 +1669,7 @@ class ClaudeCodeSession:
                 break
             if now - started_at > self.absolute_timeout:
                 result.error = f"Claude Code exceeded the {self.absolute_timeout:g}-second turn limit"
+                result.error_code = TURN_TIME_LIMIT_ERROR_CODE
                 result.should_retire = True
                 break
             if not prompt_accepted and transcript_probe.acknowledged():

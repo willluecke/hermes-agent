@@ -431,3 +431,70 @@ class TestBridgeWiredInRuntime:
         agent.tool_progress_callback.assert_called_once()
         assert agent.tool_progress_callback.call_args.args[0] == "tool.started"
         assert agent.tool_progress_callback.call_args.args[1] == "exec_command"
+
+
+# ---------- compaction is shown while the turn runs (2026-10-01) ----------
+
+
+def _compaction_agent() -> SimpleNamespace:
+    agent = _make_stub_agent()
+    agent._emit_status = MagicMock(name="_emit_status")
+    return agent
+
+
+def _rows(agent) -> list:
+    return [
+        call for call in agent.tool_progress_callback.call_args_list
+        if call.args and call.args[0] == "session.continuity"
+    ]
+
+
+class TestCompactionAnnouncedLive:
+    def test_start_shows_the_status_and_completion_the_row(self):
+        from agent.conversation_compression import COMPACTION_STATUS
+
+        agent = _compaction_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({"type": "contextCompaction", "id": "c1"}))
+        agent._emit_status.assert_called_once_with(COMPACTION_STATUS)
+        assert _rows(agent) == []
+
+        bridge(_item_completed({"type": "contextCompaction", "id": "c1"}))
+        rows = _rows(agent)
+        assert len(rows) == 1
+        assert rows[0].kwargs["mode"] == "compacted"
+        assert rows[0].args[2].startswith("Codex compacted this thread's context")
+        assert agent._codex_compactions_announced == 1
+
+    def test_the_deprecated_note_does_not_repeat_an_item_announcement(self):
+        agent = _compaction_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({"type": "contextCompaction", "id": "c1"}))
+        bridge(_item_completed({"type": "contextCompaction", "id": "c1"}))
+        bridge({"method": "thread/compacted", "params": {"threadId": "t", "turnId": "u"}})
+        assert len(_rows(agent)) == 1
+
+    def test_a_note_before_the_item_is_not_announced_twice(self):
+        agent = _compaction_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge({"method": "thread/compacted", "params": {"threadId": "t", "turnId": "u"}})
+        bridge(_item_completed({"type": "contextCompaction", "id": "c1"}))
+        assert len(_rows(agent)) == 1
+        # The next compaction is announced again.
+        bridge(_item_completed({"type": "contextCompaction", "id": "c2"}))
+        assert len(_rows(agent)) == 2
+
+    def test_an_older_build_with_only_the_note_gets_a_row_each_time(self):
+        agent = _compaction_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        for _ in range(2):
+            bridge({"method": "thread/compacted", "params": {"threadId": "t", "turnId": "u"}})
+        assert len(_rows(agent)) == 2
+        agent._emit_status.assert_not_called()
+
+    def test_a_hermes_driven_compaction_keeps_its_own_status_line(self):
+        agent = _compaction_agent()
+        agent._codex_manual_compaction = True
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({"type": "contextCompaction", "id": "c1"}))
+        agent._emit_status.assert_not_called()

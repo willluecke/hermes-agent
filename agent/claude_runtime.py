@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -24,7 +25,13 @@ from agent.continuity import (
     render_history_blocks,
 )
 from agent.redact import redact_sensitive_text
+from agent.turn_time_limit import (
+    STOPPED_MODE,
+    time_limit_stop_text,
+    turn_time_limit_seconds,
+)
 from agent.transports.claude_code_session import (
+    TURN_TIME_LIMIT_ERROR_CODE as CLAUDE_TURN_TIME_LIMIT_ERROR_CODE,
     HERMES_MONITOR_NOTE,
     HERMES_RESULT_DEFERRED,
 )
@@ -1032,6 +1039,11 @@ def _claude_hook_parity(
         except Exception:
             logger.warning("Claude pre_verify follow-up turn failed", exc_info=True)
             break
+        if getattr(follow, "error_code", None) == CLAUDE_TURN_TIME_LIMIT_ERROR_CODE:
+            emit_continuity(
+                agent, "claude-code", STOPPED_MODE,
+                time_limit_stop_text("Claude", session.absolute_timeout),
+            )
         follow_ups += 1
         emit_tool_hooks()
         turn.final_text = follow.final_text
@@ -1389,8 +1401,11 @@ def run_claude_code_turn(
             save_claude_late_answer(agent, record)
 
         late_context = {"hermes_session_id": str(getattr(agent, "session_id", "") or "")}
+        # agent.turn_time_limit_hours, read every turn; 0 means no cap.
+        turn_limit = turn_time_limit_seconds() or math.inf
         if session is None:
             session = ClaudeCodeSession(
+                absolute_timeout=turn_limit,
                 cwd=cwd,
                 model=model,
                 session_id=prior_session_id if durable_resume else None,
@@ -1420,8 +1435,16 @@ def run_claude_code_turn(
             session.late_answer_context = late_context
             session.resident_first_event_timeout = resident_first_event_timeout
             session.startup_first_event_timeout = startup_first_event_timeout
+            session.absolute_timeout = turn_limit
         try:
             turn = session.run_turn(prompt)
+            if getattr(turn, "error_code", None) == CLAUDE_TURN_TIME_LIMIT_ERROR_CODE:
+                # The run's error is only a banner a reload clears; this row
+                # keeps the reason in the chat.
+                emit_continuity(
+                    agent, "claude-code", STOPPED_MODE,
+                    time_limit_stop_text("Claude", session.absolute_timeout),
+                )
         except Exception as exc:
             logger.exception("Claude Code turn failed")
             turn = None

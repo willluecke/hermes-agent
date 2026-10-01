@@ -1055,6 +1055,17 @@ When a budget is set, two things happen:
 
 The budget is per `run_conversation` turn (it resets on each user message) and the feature is completely dormant when unset — no clock reads, no injection, no timeout changes.
 
+## Native CLI Turn Limit
+
+Turns that run on a native CLI (the Codex app-server and Claude Code runtimes) have one wall-clock cap:
+
+```yaml
+agent:
+  turn_time_limit_hours: 12    # default; 0 = no cap
+```
+
+A turn that is still working runs until it finishes or reaches this cap. Compacting its context doesn't affect the cap. A turn that goes silent is stopped much sooner, by each runtime's 10-minute inactivity watchdog. When a limit ends a turn, the chat gets a row naming the limit, and the next message continues the work. The value is read on every turn, so an edit takes effect without a restart. Before this setting existed, the cap was a fixed 2 hours.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.

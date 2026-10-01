@@ -76,6 +76,12 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Wall-clock cap on one native CLI turn (Codex app-server, Claude
+        # Code), in hours. A turn still working runs until it finishes or
+        # reaches this cap; a silent one is stopped much sooner by each
+        # runtime's inactivity watchdog. 0 = no cap. Read every turn, so an
+        # edit applies without a restart (agent/turn_time_limit.py).
+        "turn_time_limit_hours": 12,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

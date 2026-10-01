@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
+from agent.turn_time_limit import DEFAULT_TURN_TIME_LIMIT_SECONDS
 from agent.opus_delegation import parent_runtime_env
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
@@ -119,8 +120,13 @@ _MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024
 # several minutes after consuming a large tool result. Treat silence uniformly
 # across the whole turn instead of imposing a shorter post-tool deadline.
 _DEFAULT_TURN_INACTIVITY_TIMEOUT = 10 * 60.0
-_DEFAULT_ABSOLUTE_TURN_TIMEOUT = 2 * 60 * 60.0
+# The wall-clock cap, agent.turn_time_limit_hours. It was a fixed 2 hours
+# until it cut off a working turn after two compactions (2026-10-01).
+_DEFAULT_ABSOLUTE_TURN_TIMEOUT = DEFAULT_TURN_TIME_LIMIT_SECONDS
 DEFAULT_FIRST_EVENT_TIMEOUT = 60.0
+# error_code values for a turn a limit ended, so the runtime can say which.
+TURN_TIME_LIMIT_ERROR_CODE = "codex_turn_time_limit"
+TURN_INACTIVITY_ERROR_CODE = "codex_turn_inactivity"
 
 
 @dataclass
@@ -1198,10 +1204,24 @@ class CodexAppServerSession:
                     post_compaction_grace,
                 )
                 if now >= grace_deadline:
-                    result.error = self._format_error_with_stderr(
-                        f"turn exceeded absolute timeout of {absolute_turn_timeout:g}s"
+                    # The turn was still active (the inactivity check below
+                    # had not fired), so the cause is the cap itself. The
+                    # stderr tail goes to the log, not into the user's error.
+                    result.error_code = TURN_TIME_LIMIT_ERROR_CODE
+                    result.error = (
+                        "turn reached its time limit (absolute timeout of "
+                        f"{absolute_turn_timeout:g}s"
                         + (" including bounded post-compaction continuation grace"
                            if grace_deadline > turn_started_at + absolute_timeout else "")
+                        + ")"
+                    )
+                    logger.warning(
+                        "codex app-server turn reached its time limit: "
+                        "thread=%s turn=%s limit=%gs\n%s",
+                        result.thread_id,
+                        result.turn_id,
+                        absolute_turn_timeout,
+                        "\n".join(self._client.stderr_tail(20)),
                     )
                     break
             if (
@@ -1421,6 +1441,7 @@ class CodexAppServerSession:
             self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
+                result.error_code = TURN_INACTIVITY_ERROR_CODE
                 result.error = self._format_error_with_stderr(
                     f"turn timed out after {turn_timeout}s without activity"
                 )
@@ -1434,6 +1455,11 @@ class CodexAppServerSession:
             # this Codex build omits its terminal notification and the adapter
             # subsequently hits the inactivity fallback.
             result.error = self._last_policy_block_reason
+            if result.error_code in {
+                TURN_TIME_LIMIT_ERROR_CODE,
+                TURN_INACTIVITY_ERROR_CODE,
+            }:
+                result.error_code = None
 
         with self._active_turn_lock:
             self._active_turn_id = None
