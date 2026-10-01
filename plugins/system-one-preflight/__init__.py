@@ -252,13 +252,30 @@ CRITERIA_NUDGE = (
     "final message, register the results you will state with report_results, "
     "each citing the commands that produced it, as you ran them."
 )
+# The chat shows the user only a turn's last message: the answer the model
+# just wrote is folded into the run's events once the gate sends it back. On
+# 2026-09-30 the follow-up said "the live results from my previous message
+# stand", and that was all the user saw of a finished piece of work.
 VERIFY_TEMPLATE = (
     "Preflight judge (Jev, advisory) reviewed your diff, the evidence ledger and "
     "your result manifest before you finish. {findings} Fix what is unmet and run "
     "the checks again after your last edit, call report_results again citing "
     "those commands as you ran them, or say precisely why a criterion does not "
-    "apply and retire it with a reason, then finish."
+    "apply and retire it with a reason, then finish. The user sees only your last "
+    "message: the one you just wrote is now folded into the run's events, so your "
+    "next message must be the complete answer again, updated with what changed, "
+    "and never point back to an earlier message."
 )
+# Said when report_results is called, before the final message is written:
+# the mechanical findings the gate would send back afterwards.
+MANIFEST_PREVIEW_NOTE = (
+    "Checked by code as you registered them, before your final message: {count} of "
+    "{total} result claims would not hold at the end as they stand. {items} Run those "
+    "checks again after your last edit, each as the plain check (no ';', '&&', "
+    "redirect or echo around it), call report_results again citing them as you ran "
+    "them, and only then write your final message."
+)
+MANIFEST_PREVIEW_ITEMS = 8
 MANIFEST_REQUIRED_FINDING = (
     "No result manifest was registered although {n} check commands ran this turn "
     "({commands}). Before finishing, call report_results with one item per "
@@ -403,6 +420,7 @@ _session_fidelity: Dict[str, Dict[str, Any]] = {}
 _session_previous_answer: Dict[str, str] = {}
 _pending_fidelity: Dict[str, Dict[str, str]] = {}
 _pending_fidelity_note: Dict[str, str] = {}
+_pending_manifest_note: Dict[str, str] = {}
 # Running means of the budget reads per session, so a turn's note is sent
 # when its read stands out from the session's usual, not on every turn.
 _injection_window: List[bool] = []
@@ -2149,6 +2167,7 @@ def reset_drift(session_id: str) -> None:
     _pending_drift.pop(session_id, None)
     _pending_fidelity.pop(session_id, None)
     _pending_fidelity_note.pop(session_id, None)
+    _pending_manifest_note.pop(session_id, None)
     _bound(_session_drift)
     reset_ledger(session_id)
 
@@ -2490,6 +2509,7 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             text = str(result)
     cwd = str(kwargs.get("cwd") or args.get("workdir") or "")
     fidelity: Optional[Dict[str, str]] = None
+    preview_note: Optional[str] = None
     if tool_name in ("todo", "acceptance_criteria"):
         # `acceptance_criteria` is the bridge's stateless stand-in for the todo
         # tool on the Codex and Claude lanes; it answers in the same shape.
@@ -2516,6 +2536,14 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             _session_manifest[session_id] = manifest
             _bound(_session_manifest)
             write_log({"event": "manifest", "session_id": session_id, "items": len(manifest), "replay": bool(kwargs.get("replay"))})
+            # Said now, before the final message: a send-back after it makes
+            # the follow-up the only answer the user sees.
+            if not kwargs.get("replay") and verify_judge_enabled():
+                try:
+                    preview_note = manifest_preview_note(session_id)
+                except Exception:
+                    logger.debug("system-one-preflight: manifest preview failed", exc_info=True)
+                    preview_note = None
     elif tool_name in _MUTATING_FILE_TOOLS:
         try:
             note_file_change(session_id, args, cwd=cwd)
@@ -2528,6 +2556,13 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception:
         logger.debug("system-one-preflight: drift check failed", exc_info=True)
         steer = None
+    if preview_note is not None:
+        if kwargs.get("steerable"):
+            fidelity = {"message": preview_note}
+        else:
+            # The default loop: into report_results' own result (transform_tool_result).
+            _pending_manifest_note[session_id] = preview_note
+            _bound(_pending_manifest_note)
     if fidelity is None and steer is None:
         return None
     if kwargs.get("steerable"):
@@ -2561,10 +2596,12 @@ def on_transform_tool_result(**kwargs: Any) -> Optional[str]:
     """
     if current_mode() == "off":
         return None
-    if str(kwargs.get("tool_name") or "") not in ("todo", "acceptance_criteria"):
+    tool_name = str(kwargs.get("tool_name") or "")
+    if tool_name not in ("todo", "acceptance_criteria", "report_results"):
         return None
     session_id = str(kwargs.get("session_id") or "")
-    note = _pending_fidelity_note.pop(session_id, None)
+    pending = _pending_manifest_note if tool_name == "report_results" else _pending_fidelity_note
+    note = pending.pop(session_id, None)
     result = kwargs.get("result")
     if not note or not isinstance(result, str):
         return None
@@ -2701,6 +2738,96 @@ def collect_evidence(changed_paths: List[str], bases: Optional[Dict[str, str]] =
     }
 
 
+def _ledger_view(ledger: Dict[str, Any]) -> Tuple[Optional[str], List[Dict[str, Any]], Dict[str, Dict[str, Any]], set]:
+    """The ledger as it stands now: (combined digest, this turn's rows, rows by id, stale row ids).
+
+    Freshness is decided by the workspace digest, never by judgment. Each row
+    is compared on the repositories it ran under; a row from before
+    per-repository maps falls back to the combined digest.
+    """
+    final_digest = _refresh_workspace(ledger)
+    final_digests = dict(ledger.get("workspaces") or {})
+    rows_this_turn = list(ledger["rows"])
+    rows_by_id: Dict[str, Dict[str, Any]] = {row["id"]: row for row in ledger["previous"]}
+    rows_by_id.update({row["id"]: row for row in rows_this_turn})
+    stale_ids: set = set()
+    for row in rows_by_id.values():
+        stale = evidence.row_is_stale(row, final_digests)
+        if stale is None and row.get("workspace") and final_digest:
+            stale = row["workspace"] != final_digest
+        row["fresh"] = None if stale is None else not stale
+        if stale:
+            stale_ids.add(row["id"])
+    return final_digest, rows_this_turn, rows_by_id, stale_ids
+
+
+def manifest_preview(session_id: str) -> Optional[Dict[str, Any]]:
+    """Which registered result claims the gate would not accept as things stand, by code alone.
+
+    The gate runs once the final message is written, so a claim it cannot
+    verify sends the model back and the answer the user sees becomes the
+    follow-up. The usual findings are mechanical and already true when the
+    manifest is registered: a check that ran before a later edit, a decisive
+    claim resting on a command the gate cannot re-run, a citation that
+    matches no command. A decisive claim on a plain check is not flagged for
+    freshness: the gate re-runs it itself. No Jev call, no re-run.
+    """
+    manifest = _session_manifest.get(session_id)
+    if not manifest:
+        return None
+    ledger = ledger_state(session_id)
+    final_digest, rows_this_turn, rows_by_id, stale_ids = _ledger_view(ledger)
+    search_rows = [row for row in reversed(rows_this_turn) if row.get("source") != "controller"]
+    search_rows += [row for row in reversed(ledger["previous"]) if row.get("source") != "controller"]
+    outputs: Dict[str, Optional[str]] = {}
+
+    def read(row: Dict[str, Any]) -> Optional[str]:
+        path = str(row.get("file") or "")
+        if path not in outputs:
+            outputs[path] = evidence.read_output(path) if path else None
+        return outputs[path]
+
+    reruns = controller_reruns_enabled()
+    problems: List[Dict[str, str]] = []
+    for item in manifest:
+        match = evidence.resolve_evidence(item, search_rows, read)
+        if match["problem"] is not None:
+            problems.append({"claim": item["claim"], "detail": match["problem"]["detail"]})
+            continue
+        if reruns and str(item.get("predicate") or "passed") in evidence.DECISIVE:
+            blocked = []
+            for row_id in match["ids"]:
+                row = rows_by_id.get(row_id)
+                if row is None or row.get("source") == "controller":
+                    continue
+                if not evidence.rerunnable(row["command"]):
+                    blocked.append(f"{evidence.cite(row)} is not a plain check")
+                elif not (row.get("cwd") or ledger["roots"]):
+                    blocked.append(f"{evidence.cite(row)} has no known working directory")
+            if blocked:
+                problems.append({"claim": item["claim"], "detail": "the gate cannot re-run it, so it would count as unverified: " + "; ".join(blocked)})
+            continue
+        verdict = evidence.check_assertion(dict(item, evidence=match["ids"]), rows_by_id, final_digest, stale_ids)
+        if verdict["verdict"] != "supported":
+            problems.append({"claim": item["claim"], "detail": verdict["detail"]})
+    return {"total": len(manifest), "problems": problems}
+
+
+def manifest_preview_note(session_id: str) -> Optional[str]:
+    """The registration-time note for the model, or None when every claim would hold."""
+    preview = manifest_preview(session_id)
+    if not preview:
+        return None
+    problems = preview["problems"]
+    write_log({"event": "manifest_preview", "session_id": session_id, "items": preview["total"], "problems": problems})
+    if not problems:
+        return None
+    items = " ".join(f'"{_clip(problem["claim"], 120)}": {problem["detail"]}.' for problem in problems[:MANIFEST_PREVIEW_ITEMS])
+    if len(problems) > MANIFEST_PREVIEW_ITEMS:
+        items += f" And {len(problems) - MANIFEST_PREVIEW_ITEMS} more."
+    return MANIFEST_PREVIEW_NOTE.format(count=len(problems), total=preview["total"], items=items)
+
+
 def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Judge the finished change against its criteria, the evidence ledger and the result manifest."""
     if current_mode() == "off" or not verify_judge_enabled():
@@ -2726,21 +2853,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
 
     # The ledger as it stands at the end of the turn, with freshness decided
     # by the workspace digest, never by judgment.
-    final_digest = _refresh_workspace(ledger)
-    final_digests = dict(ledger.get("workspaces") or {})
-    rows_this_turn = list(ledger["rows"])
-    rows_by_id: Dict[str, Dict[str, Any]] = {row["id"]: row for row in ledger["previous"]}
-    rows_by_id.update({row["id"]: row for row in rows_this_turn})
-    stale_ids: set = set()
-    for row in rows_by_id.values():
-        # Each row is compared on the repositories it ran under; a row from
-        # before per-repository maps falls back to the combined digest.
-        stale = evidence.row_is_stale(row, final_digests)
-        if stale is None and row.get("workspace") and final_digest:
-            stale = row["workspace"] != final_digest
-        row["fresh"] = None if stale is None else not stale
-        if stale:
-            stale_ids.add(row["id"])
+    final_digest, rows_this_turn, rows_by_id, stale_ids = _ledger_view(ledger)
     manifest = _session_manifest.get(session_id)
     build = bool(drift_state(session_id).get("build")) or bool(kwargs.get("coding"))
     checks_ran = [row for row in rows_this_turn if row.get("check")]

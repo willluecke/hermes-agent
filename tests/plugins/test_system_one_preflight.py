@@ -73,6 +73,7 @@ def harness(tmp_path, monkeypatch):
     preflight._session_previous_answer.clear()
     preflight._pending_fidelity.clear()
     preflight._pending_fidelity_note.clear()
+    preflight._pending_manifest_note.clear()
     preflight._injection_window.clear()
     preflight._session_nudged.clear()
 
@@ -1075,6 +1076,7 @@ def fidelity(drift, monkeypatch):
     preflight._session_fidelity.clear()
     preflight._pending_fidelity.clear()
     preflight._pending_fidelity_note.clear()
+    preflight._pending_manifest_note.clear()
     return drift
 
 
@@ -1233,6 +1235,7 @@ def test_fidelity_reuses_the_verdict_for_a_status_only_update_and_rejudges_a_cha
     _register_criteria(C1, C2)
     assert len(_fidelity_calls(fidelity)) == 1 and preflight._session_excluded["s1"] == ["2"]
     preflight._pending_fidelity_note.clear()
+    preflight._pending_manifest_note.clear()
     preflight.on_post_tool_call(session_id="s1", tool_name="acceptance_criteria", args={}, result=_criteria_result(C1, C2, status="completed"))
     assert len(_fidelity_calls(fidelity)) == 1, "the same statements are not asked about twice"
     assert preflight._session_excluded["s1"] == ["2"] and preflight._pending_fidelity_note == {}
@@ -1727,6 +1730,85 @@ def test_the_diff_shows_work_the_turn_committed_before_finishing(feedback, repo)
     _verify(paths=[str(repo / "app.py")])
     diff = feedback["jev"].calls[-1]["state"]["diff"]["text"]
     assert "+    return 'SHOUTED'" in diff and "-    return 'committed this turn'" in diff, "only this turn's commit, from its own base"
+
+
+def _manifest_live(items, session="s1", **kwargs):
+    payload = json.dumps({"manifest": items, "note": "n"})
+    return preflight.on_post_tool_call(tool_name="report_results", args={}, result=payload, session_id=session, **kwargs)
+
+
+def _edit(repo, text="def greet():\n    return 'edited'\n"):
+    (repo / "app.py").write_text(text)
+    preflight.on_post_tool_call(tool_name="write_file", args={"path": str(repo / "app.py"), "content": text}, result="ok", session_id="s1")
+
+
+def test_report_results_says_at_once_which_claims_the_gate_would_refuse(feedback, repo):
+    # 2026-09-30: the gate found these only after the final message, sent the
+    # turn back, and the user saw nothing but the follow-up.
+    feedback["settings"]["controller_reruns"] = "on"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("pytest -q > /tmp/out.log 2>&1; echo done", json.dumps({"output": "done", "exit_code": 0}), cwd=str(repo))
+    _cmd("curl -s http://x/health", "status ok", cwd=str(repo))
+    _cmd("pytest -q", "3 passed in 0.1s", cwd=str(repo))
+    _edit(repo)
+    result = _manifest_live([
+        _item("the suite passes", ["pytest -q > /tmp/out.log"], predicate="exit_zero", id="r1"),
+        _item("the service is healthy", ["curl -s http://x/health"], predicate="contains", expected={"text": "status ok"}, id="r2"),
+        _item("the tests pass", ["pytest -q"], predicate="passed", id="r3"),
+        _item("the docs build", ["mkdocs build"], predicate="exit_zero", id="r4"),
+    ], steerable=True)
+    message = result["message"]
+    assert message.startswith("Checked by code as you registered them, before your final message: 3 of 4 result claims would not hold")
+    assert '"the suite passes": the gate cannot re-run it, so it would count as unverified: `pytest -q > /tmp/out.log 2>&1; echo done` is not a plain check.' in message
+    assert '"the service is healthy": ran before later edits: `curl -s http://x/health`.' in message
+    assert '"the docs build": no command this turn matches `mkdocs build`.' in message
+    assert '"the tests pass"' not in message, "the gate re-runs a plain check itself, whatever its freshness"
+    assert message.endswith("and only then write your final message.")
+    [logged] = feedback["records"]("manifest_preview")
+    assert logged["items"] == 4 and [problem["claim"] for problem in logged["problems"]] == ["the suite passes", "the service is healthy", "the docs build"]
+
+
+def test_report_results_is_quiet_when_every_claim_would_hold(feedback, repo):
+    feedback["settings"]["controller_reruns"] = "on"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _edit(repo)
+    _cmd("pytest -q", "3 passed in 0.1s", cwd=str(repo))
+    _cmd("curl -s http://x/health", "status ok", cwd=str(repo))
+    assert _manifest_live([
+        _item("the tests pass", ["pytest -q"], predicate="passed", id="r1"),
+        _item("the service is healthy", ["curl -s http://x/health"], predicate="contains", expected={"text": "status ok"}, id="r2"),
+    ], steerable=True) is None
+    [logged] = feedback["records"]("manifest_preview")
+    assert logged["problems"] == []
+
+
+def test_on_the_default_loop_the_registration_note_rides_in_report_results_own_result(feedback, repo):
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("curl -s http://x/health", "status ok", cwd=str(repo))
+    _edit(repo)
+    items = [_item("the service is healthy", ["curl -s http://x/health"], predicate="contains", expected={"text": "status ok"})]
+    assert _manifest_live(items, replay=True) is None
+    assert feedback["records"]("manifest_preview") == [], "a replayed turn is over: nothing to say"
+    payload = json.dumps({"manifest": items, "note": "n"})
+    assert _manifest_live(items) is None
+    transformed = json.loads(preflight.on_transform_tool_result(tool_name="report_results", result=payload, session_id="s1"))
+    assert transformed["manifest"] == items
+    assert transformed["preflight"].startswith("Checked by code as you registered them, before your final message: 1 of 1")
+    assert preflight.on_transform_tool_result(tool_name="report_results", result=payload, session_id="s1") is None, "said once"
+
+
+def test_a_send_back_asks_for_the_complete_answer_again(feedback, repo):
+    feedback["settings"]["controller_reruns"] = "on"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix greet", conversation_history=[])
+    _cmd("python3 app.py", json.dumps({"output": "hello", "exit_code": 0}), cwd=str(repo))
+    (repo / "app.py").write_text("def greet():\n    return 'edited after the check'\n")
+    _manifest([_item("app prints hello", ["python3 app.py"], predicate="exit_zero")])
+    feedback["jev"].guard = {"criterion_1": 0.9, "claims_unverified": 0.05}
+    result = _verify(paths=[str(repo / "app.py")])
+    assert result["message"].endswith(
+        "The user sees only your last message: the one you just wrote is now folded into the run's events, so your "
+        "next message must be the complete answer again, updated with what changed, and never point back to an earlier message."
+    )
 
 
 def test_first_touching_another_repository_does_not_make_earlier_checks_stale(feedback, repo, tmp_path):
