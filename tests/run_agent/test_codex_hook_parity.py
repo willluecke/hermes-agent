@@ -38,6 +38,10 @@ def hooks(monkeypatch):
 
     def continue_message(**kwargs):
         seen["pre_verify"].append(kwargs)
+        if not kwargs["changed_paths"] and not seen.get("judge_command_edits"):
+            # The plugin's own reading: no edit paths and git shows no
+            # change in the repositories the commands ran in.
+            return None
         return "Fix criterion 2, then finish." if kwargs["attempt"] == 0 else None
 
     import hermes_cli.lifecycle as lifecycle
@@ -126,7 +130,43 @@ def test_codex_turn_without_file_changes_finishes_without_a_verify_gate(hooks, m
     with patch.object(agent, "_spawn_background_review", return_value=None):
         result = agent.run_conversation("what is here?")
     assert len(inputs) == 1
-    assert hooks["pre_verify"] == []
+    # A command ran, so the gate is consulted with no edit paths; it reads
+    # git and finds nothing, and the turn finishes.
+    assert len(hooks["pre_verify"]) == 1 and hooks["pre_verify"][0]["changed_paths"] == []
     assert [call["tool_name"] for call in hooks["post_tool_call"]] == ["terminal"]
     assert len(hooks["post_llm_call"]) == 1
     assert result["api_calls"] == 1
+
+
+def test_codex_turn_that_edited_through_a_shell_command_reaches_the_verify_gate(hooks, monkeypatch):
+    """2026-10-01: a turn whose edits were heredocs and sed never reached the judge."""
+    hooks["judge_command_edits"] = True
+    inputs = []
+
+    def fake_run_turn(self, user_input, **kwargs):
+        inputs.append(user_input)
+        if len(inputs) == 1:
+            return _turn("Edited app.py.", command="sed -i s/x/y/ app.py")
+        return _turn("Fixed criterion 2.")
+
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+    agent = _agent()
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        result = agent.run_conversation("edit app.py")
+    assert len(inputs) == 2, "the gate saw the turn and sent it back once"
+    assert hooks["pre_verify"][0]["changed_paths"] == []
+    assert result["final_response"] == "Fixed criterion 2."
+
+
+def test_codex_turn_with_no_command_and_no_edit_skips_the_verify_gate(hooks, monkeypatch):
+    inputs = []
+
+    def fake_run_turn(self, user_input, **kwargs):
+        inputs.append(user_input)
+        return _turn("Just an answer.")
+
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+    agent = _agent()
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        agent.run_conversation("what is two plus two?")
+    assert len(inputs) == 1 and hooks["pre_verify"] == []

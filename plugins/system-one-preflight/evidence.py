@@ -412,6 +412,65 @@ def workspace_digest(roots: List[str]) -> Optional[str]:
     return hasher.hexdigest()[:16] if seen else None
 
 
+def _status_path(line: str) -> Optional[Tuple[str, str]]:
+    """``(kind, relative path)`` from one ``git status --porcelain=v2`` line: kind is ``tracked`` or ``untracked``."""
+    parts = line.split(" ")
+    if not parts:
+        return None
+    if parts[0] == "1" and len(parts) >= 9:
+        return "tracked", " ".join(parts[8:])
+    if parts[0] == "u" and len(parts) >= 11:
+        return "tracked", " ".join(parts[10:])
+    if parts[0] == "?" and len(parts) >= 2:
+        return "untracked", " ".join(parts[1:])
+    return None
+
+
+MAX_DERIVED_PATHS = 200
+
+
+def changed_paths_since(root: str, base: Optional[str], since: float) -> List[str]:
+    """The files a turn changed in ``root``, read from git rather than from file-change tool calls.
+
+    A model that edits through shell commands (a Python heredoc, ``sed -i``,
+    ``git apply``) makes no Edit, Write or apply_patch call, so the lanes
+    handed the verify judge no changed paths and it never ran: 28 of the 54
+    build turns of the week to 2026-10-01 went unjudged that way, and their
+    criteria were never retired. Tracked files are those that differ from
+    ``base``, the commit the repository was at when the turn began, so a
+    commit the turn made still shows; without a base, the working tree's
+    modified files. Untracked files count when written at or after
+    ``since``, the turn's start: a scratch file left from an earlier turn is
+    not this turn's change. Ignored files never appear. Absolute paths,
+    sorted, at most ``MAX_DERIVED_PATHS``; empty when git cannot read the
+    repository.
+    """
+    status = _git(root, ["status", "--porcelain=v2", "--untracked-files=all", "--no-renames"])
+    if status is None:
+        return []
+    tracked: set = set()
+    untracked: set = set()
+    for line in status.splitlines():
+        entry = _status_path(line)
+        if entry is None:
+            continue
+        kind, rel = entry
+        (tracked if kind == "tracked" else untracked).add(rel)
+    if base:
+        diffed = _git(root, ["diff", "--name-only", base, "--"])
+        if diffed is not None:
+            tracked = {rel for rel in diffed.splitlines() if rel.strip()}
+    changed: List[str] = [os.path.join(root, rel) for rel in tracked]
+    for rel in untracked:
+        path = os.path.join(root, rel)
+        try:
+            if os.stat(path).st_mtime >= since:
+                changed.append(path)
+        except OSError:
+            continue
+    return sorted(set(changed))[:MAX_DERIVED_PATHS]
+
+
 # ---------------------------------------------------------------------------
 # Ledger rows and retained output
 # ---------------------------------------------------------------------------

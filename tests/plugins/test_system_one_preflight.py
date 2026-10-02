@@ -540,7 +540,8 @@ def test_verify_judge_fails_open_and_respects_its_switches(feedback, repo):
     assert "down" in record["error"]
     feedback["jev"].raise_exc = None
     calls_before = len(feedback["jev"].calls)
-    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="x", changed_paths=[]) is None
+    # No edit paths and no repository the session's commands ran in: nothing to judge.
+    assert preflight.on_pre_verify(session_id="s_nothing", attempt=0, final_response="x", changed_paths=[]) is None
     feedback["settings"]["verify_judge"] = "off"
     assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="x", changed_paths=[str(repo / "app.py")]) is None
     assert len(feedback["jev"].calls) == calls_before
@@ -1338,6 +1339,7 @@ def test_failed_mcp_criteria_result_does_not_replace_registered_criteria(feedbac
 # Evidence ledger and result manifest
 # ---------------------------------------------------------------------------
 
+import os  # noqa: E402
 import subprocess as _subprocess  # noqa: E402
 import sys as _sys  # noqa: E402
 import time as _time  # noqa: E402
@@ -2281,21 +2283,99 @@ def test_a_cancelled_criterion_is_a_row_with_its_reason_or_the_lack_of_one(feedb
     assert row["text"] == 'Criteria cancelled by the model: "Docs updated" -- reason: no reason given; "Changelog entry" -- reason: no changelog in this repo', "the plain todo tool's cancel still surfaces"
 
 
-def test_a_criterion_open_for_three_requests_is_raised_to_the_user_and_the_model(feedback, emitted):
+def test_a_criterion_open_for_three_build_requests_is_raised_once_to_the_user_and_each_time_to_the_model(feedback, emitted):
+    feedback["jev"].kind = "build"
     preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="Add a --json flag", conversation_history=[])
     preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "Docs updated", "status": "in_progress"}]}), session_id="s1")
+    # Two questions in between count for nothing: nothing could be finished in them.
+    feedback["jev"].kind = "answer"
+    for turn in ("q1", "q2"):
+        assert preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="what does the flag do?", conversation_history=[]) is None
+    assert [item["carried_requests"] for item in preflight.active_criteria("s1")] == [0]
+    feedback["jev"].kind = "build"
     for turn in ("t2", "t3"):
-        result = preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="something else", conversation_history=[])
-        assert result is None and _criteria_rows(emitted) == []
-    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="and another thing", conversation_history=[])
-    assert result is not None and '1 acceptance criteria from earlier requests are still open after 3+ requests: "Docs updated" (3 requests)' in result["context"]
+        result = preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="something else to build", conversation_history=[])
+        assert "still open" not in (result or {}).get("context", "") and _criteria_rows(emitted) == []
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="and another thing to build", conversation_history=[])
+    assert result is not None and '1 acceptance criteria from earlier requests are still open after 3+ build requests: "Docs updated" (3 build requests)' in result["context"]
     assert "retire them with the acceptance_criteria tool" in result["context"]
     record = feedback["records"]("preflight")[-1]
     assert record["injected"] is True and record["note_reason"] == "lingering"
     [row] = _criteria_rows(emitted)
-    assert row["text"] == 'Criteria still open after 3+ requests: "Docs updated" (3) · raised to the model: finish or retire with a reason'
+    assert row["text"] == "1 acceptance criterion from earlier requests still open after 3+ build requests · the model was asked to finish or retire them with a reason"
+    assert "Docs updated" not in row["text"], "the row is one line; the texts show when the criteria are retired"
     assert feedback["records"]("criteria")[-1] == {**feedback["records"]("criteria")[-1], "action": "lingering", "items": ["Docs updated"], "requests": [3]}
-    # Retiring it with a reason ends the raise.
-    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [], "retire": [{"target": "Docs updated", "reason": "user never asked for docs"}]}))
+    # The next build request: the model is told again, the user is not.
+    result = preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="one more build", conversation_history=[])
+    assert '"Docs updated" (4 build requests)' in result["context"]
+    assert len(_criteria_rows(emitted)) == 1
+    # A second criterion joining the set is a new set: one more row.
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "Changelog entry", "status": "in_progress"}]}), session_id="s1")
+    for turn in ("t6", "t7", "t8"):
+        preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="build more", conversation_history=[])
+    assert len(_criteria_rows(emitted)) == 2
+    assert _criteria_rows(emitted)[-1]["text"].startswith("2 acceptance criteria from earlier requests still open after 3+ build requests")
+    # Retiring them with a reason ends the raise.
+    preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, session_id="s1", result=json.dumps({"todos": [], "retire": [
+        {"target": "Docs updated", "reason": "user never asked for docs"}, {"target": "Changelog entry", "reason": "no changelog in this repo"}]}))
     assert preflight.active_criteria("s1") == []
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="next", conversation_history=[]) is None
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t9", user_message="next", conversation_history=[]) is None
+
+
+def _edit_through_a_command(repo, path, text):
+    """What a model does with a Python heredoc or sed -i: the file changes, no Edit or Write call is made."""
+    (repo / path).write_text(text)
+
+
+def test_verify_judge_reads_command_made_edits_from_git_when_no_edit_tool_was_used(feedback, repo, emitted):
+    """2026-10-01: a model that edited only through shell commands was never judged, and its criteria never retired."""
+    an_hour_ago = _time.time() - 3600
+    for name in ("new_module.py", "demo.devproject"):
+        os.utime(repo / name, (an_hour_ago, an_hour_ago))
+    subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "hello world"], check=True, capture_output=True)
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make greet return hello there", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "greet returns hello there", "status": "completed"}]}), session_id="s1")
+    _time.sleep(0.02)
+    _edit_through_a_command(repo, "app.py", "def greet():\n    return 'hello there'\n")
+    _edit_through_a_command(repo, "fresh.py", "print('fresh')\n")
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "python3 - <<'EOF'\nfrom pathlib import Path\nPath('app.py').write_text(...)\nEOF", "workdir": str(repo)}, result="", session_id="s1")
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "pytest -q", "workdir": str(repo)}, result="3 passed", session_id="s1")
+    feedback["jev"].guard = {"criterion_1": 0.93, "claims_unverified": 0.05}
+
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="greet now returns hello there.", changed_paths=[]) is None
+
+    record = feedback["records"]("verify")[-1]
+    assert record["action"] != "skipped", record
+    assert record["changed_source"] == "git" and record["changed_paths"] == 2
+    call = feedback["jev"].calls[-1]
+    assert "hello there" in call["state"]["diff"]["text"], "the heredoc edit reaches the judge as a diff"
+    assert "fresh.py" in call["state"]["diff"]["text"], "the new file written during the turn does too"
+    assert "new_module.py" not in call["state"]["diff"]["text"], "an untracked file from before the turn is not this turn's change"
+    assert [e for e in emitted if e["stage"] == "verify"][-1]["text"].startswith("Jev verify (attempt 1)")
+
+
+def test_a_build_turn_that_ran_commands_but_changed_nothing_is_not_judged(feedback, repo, emitted):
+    feedback["jev"].kind = "build"
+    preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make greet return hello there", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="todo", args={}, result=json.dumps({"todos": [{"id": "1", "content": "greet returns hello there", "status": "completed"}]}), session_id="s1")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "everything"], check=True, capture_output=True)
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "ls", "workdir": str(repo)}, result="app.py", session_id="s1")
+    calls_before = len(feedback["jev"].calls)
+
+    assert preflight.on_pre_verify(session_id="s1", attempt=0, final_response="Done.", changed_paths=[]) is None
+
+    assert len(feedback["jev"].calls) == calls_before, "nothing changed: the judge is not asked"
+    record = feedback["records"]("verify")[-1]
+    assert record["action"] == "skipped" and record["skipped"] == "nothing changed"
+    [row] = [e for e in emitted if e["stage"] == "verify"]
+    assert row["text"] == "Jev verify: skipped · no file changed in any repository this turn's commands ran in"
+    # A question turn that ran a command and changed nothing says nothing at all.
+    emitted.clear()
+    feedback["jev"].kind = "answer"
+    preflight.on_pre_llm_call(session_id="s2", turn_id="t1", user_message="what is in the repo?", conversation_history=[])
+    preflight.on_post_tool_call(tool_name="terminal", args={"command": "ls", "workdir": str(repo)}, result="app.py", session_id="s2")
+    assert preflight.on_pre_verify(session_id="s2", attempt=0, final_response="app.py.", changed_paths=[]) is None
+    assert [e for e in emitted if e["stage"] == "verify"] == []

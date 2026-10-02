@@ -44,7 +44,10 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    typesafe_decide") or `criteria_only`, or as the once-per-session build
    criteria nudge. Otherwise the row says `note withheld`. The row also shows
    the injection rate over the last 50 turns. Carried criteria open for 3+
-   requests are raised here as a fixed line (finish or retire with a reason).
+   **build** requests (a question between builds does not count) are raised
+   here as a fixed line (finish or retire with a reason) on every build
+   request they linger; the user sees one one-line `Jev criteria` row per
+   set of lingering criteria, not the texts, which the retirements show.
    The previous answer rides along in the state, so a follow-up such as "yes,
    do it" is read with what it refers to. (Until 2026-09-30 the same call also
    rated that answer worked / partly / failed from the follow-up; the labels
@@ -65,7 +68,16 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    entail this"; under 0.4 it is excluded from judging and named back. The
    coverage steer ("add more criteria") is **disabled** by config. Criteria
    retirements (`retire: [{content, reason}]`) each become a visible row.
-4. **`pre_verify`: verify judge**, before a turn that edited files finishes.
+4. **`pre_verify`: verify judge**, before a turn that edited files, or ran a
+   command, finishes. The changed paths are those of the turn's Edit, Write
+   and apply_patch calls; when there are none, the edits came through
+   commands (a Python heredoc, `sed -i`) and the judge reads them from git in
+   the repositories the turn's commands ran in: tracked files that differ
+   from the turn's base commit, untracked files written since the turn
+   began (`changed_source: git` in the verify record). Until 2026-10-01 such
+   turns were never judged: 28 of that week's 54 build turns, whose criteria
+   therefore never retired. A turn that changed nothing is not judged (a row
+   says so when it had registered work).
    Skipped (`Jev verify: skipped · not a build turn`) when the preflight read
    was not a build, no check ran, and no criteria or manifest exist. Otherwise
    one Jev call over the diff, ledger, failure excerpts, manifest and draft

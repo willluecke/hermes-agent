@@ -425,12 +425,14 @@ _pending_manifest_note: Dict[str, str] = {}
 # when its read stands out from the session's usual, not on every turn.
 _injection_window: List[bool] = []
 _session_nudged: set = set()
-# A carried criterion open this many requests is raised: a row for the user,
-# a line for the model to finish it or retire it with a reason.
+# A carried criterion open this many build requests is raised: one row for
+# the user per set, a line for the model to finish it or retire it with a
+# reason on every build request it lingers.
 LINGER_REQUESTS = 3
+_session_lingered: Dict[str, str] = {}
 LINGERING_NOTE = (
     "Preflight: {n} acceptance criteria from earlier requests are still open after "
-    "{requests}+ requests: {items}. Either finish them this turn (the judge sees the "
+    "{requests}+ build requests: {items}. Either finish them this turn (the judge sees the "
     "earlier work and retires one it rates met; do not register them again), or "
     "retire them with the acceptance_criteria tool (retire: [{{content, reason}}]) "
     "giving a reason the user will see. Do not leave them open silently."
@@ -1335,20 +1337,33 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             _session_nudged.add(session_id)
             context = f"{context}\n\n{CRITERIA_NUDGE}" if context else CRITERIA_NUDGE
             note_reason = note_reason or "criteria_nudge"
-        lingering = [item for item in _session_todos.get(session_id, []) if item.get("carried") and int(item.get("carried_requests") or 0) >= LINGER_REQUESTS]
+        if drift_state(session_id)["build"]:
+            count_build_request(session_id)
+        lingering = lingering_criteria(session_id)
         if lingering:
             line = LINGERING_NOTE.format(
                 n=len(lingering), requests=LINGER_REQUESTS,
-                items="; ".join(f'"{_clip(item["content"], 100)}" ({item["carried_requests"]} requests)' for item in lingering),
+                items="; ".join(f'"{_clip(item["content"], 100)}" ({item["carried_requests"]} build requests)' for item in lingering),
             )
             context = f"{context}\n\n{line}" if context else line
             note_reason = note_reason or "lingering"
             write_log({"event": "criteria", "session_id": session_id, "action": "lingering", "items": [item["content"] for item in lingering], "requests": [item["carried_requests"] for item in lingering]})
-            emit_verdict(
-                session_id, "criteria",
-                f"Criteria still open after {LINGER_REQUESTS}+ requests: " + "; ".join(f'"{_clip(item["content"], 100)}" ({item["carried_requests"]})' for item in lingering) + " · raised to the model: finish or retire with a reason",
-                answers={}, decision={"lingering": [item["content"] for item in lingering]},
-            )
+            # One row per set of lingering criteria, one line long. The same
+            # set raised again on every request, each criterion quoted in
+            # full, was a wall of text at the top of every run (2026-10-01).
+            # The retirements, when they come, show each criterion with its
+            # reason.
+            key = _criteria_key(lingering)
+            if _session_lingered.get(session_id) != key:
+                _session_lingered[session_id] = key
+                _bound(_session_lingered)
+                noun = "acceptance criterion" if len(lingering) == 1 else "acceptance criteria"
+                emit_verdict(
+                    session_id, "criteria",
+                    f"{len(lingering)} {noun} from earlier requests still open after "
+                    f"{LINGER_REQUESTS}+ build requests · the model was asked to finish or retire them with a reason",
+                    answers={}, decision={"lingering": [item["content"] for item in lingering]},
+                )
         injected = context is not None
         injection_rate = record_injection(injected)
     else:
@@ -1710,7 +1725,7 @@ MAX_LEDGER_ROWS_FOR_JEV = 120
 def ledger_state(session_id: str) -> Dict[str, Any]:
     state = _session_ledger.get(session_id)
     if state is None:
-        state = {"rows": [], "previous": [], "roots": [], "bases": {}, "seq": 0, "workspace": None, "workspaces": {}, "turn": 0}
+        state = {"rows": [], "previous": [], "roots": [], "bases": {}, "seq": 0, "workspace": None, "workspaces": {}, "turn": 0, "turn_started_at": time.time()}
         _session_ledger[session_id] = state
         _bound(_session_ledger)
     return state
@@ -1744,6 +1759,8 @@ def reset_ledger(session_id: str) -> None:
     state["rows"] = []
     state["seq"] = 0
     state["turn"] += 1
+    # When the turn began: an untracked file written after this is the turn's.
+    state["turn_started_at"] = time.time()
     # The commit each known repository is at as the turn begins is the verify
     # judge's diff base, so a commit the turn makes does not hide its work.
     state["bases"] = {root: head for root in state["roots"] if (head := evidence.git_head(root))}
@@ -1763,6 +1780,23 @@ def _note_root(state: Dict[str, Any], path: str) -> Optional[str]:
         if head:
             bases[root] = head
     return root
+
+
+def command_made_changes(state: Dict[str, Any]) -> List[str]:
+    """The files this turn changed through commands, read from git in the repositories it ran in.
+
+    The lanes hand the verify judge only the paths of Edit, Write and
+    apply_patch calls. A model that edits with a Python heredoc or ``sed -i``
+    makes none, so the judge never ran on such turns (28 of the week's 54
+    build turns to 2026-10-01) and their criteria were never retired. The
+    ledger knows every repository the turn's commands ran in and the commit
+    each was at when the turn began; this is what changed there since.
+    """
+    changed: List[str] = []
+    since = float(state.get("turn_started_at") or 0.0)
+    for root in list(state.get("roots") or []):
+        changed.extend(evidence.changed_paths_since(root, (state.get("bases") or {}).get(root), since))
+    return sorted(set(changed))[: evidence.MAX_DERIVED_PATHS]
 
 
 def _refresh_workspace(state: Dict[str, Any]) -> Optional[str]:
@@ -2217,11 +2251,29 @@ def carry_criteria(session_id: str) -> None:
     # Re-keyed p1..pN every turn so carried ids never collide with the ids
     # the new turn registers, or with each other across several carries.
     _session_todos[session_id] = [
-        {**item, "id": f"p{index}", "carried": True, "carried_requests": int(item.get("carried_requests") or 0) + 1}
+        {**item, "id": f"p{index}", "carried": True, "carried_requests": int(item.get("carried_requests") or 0)}
         for index, item in enumerate(todos, 1)
     ]
     _session_excluded.pop(session_id, None)
     _session_fidelity.pop(session_id, None)
+
+
+def count_build_request(session_id: str) -> None:
+    """A build request began: the carried criteria have waited one more.
+
+    Only build requests count. A question between two builds cannot finish
+    or retire anything, yet it moved the count: in one chat six criteria
+    were raised after three requests of which two were questions
+    (2026-10-01).
+    """
+    _session_todos[session_id] = [
+        {**item, "carried_requests": int(item.get("carried_requests") or 0) + 1} if item.get("carried") else item
+        for item in _session_todos.get(session_id, [])
+    ]
+
+
+def lingering_criteria(session_id: str) -> List[Dict[str, Any]]:
+    return [item for item in _session_todos.get(session_id, []) if item.get("carried") and int(item.get("carried_requests") or 0) >= LINGER_REQUESTS]
 
 
 def merge_criteria(session_id: str, todos: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -2837,7 +2889,24 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
         return None
     session_id = str(kwargs.get("session_id") or "")
     changed = [str(path) for path in (kwargs.get("changed_paths") or []) if path]
+    ledger = ledger_state(session_id)
+    changed_source = "edits"
     if not changed:
+        # No file-change tool call: the edits, if any, came through commands,
+        # and git in the repositories those commands ran in shows them.
+        changed = command_made_changes(ledger)
+        changed_source = "git"
+    if not changed:
+        if drift_state(session_id).get("build") and (_session_manifest.get(session_id) is not None or any(not item.get("carried") for item in active_criteria(session_id))):
+            # The model registered work for a build turn and git shows no
+            # change anywhere its commands ran: say so instead of judging
+            # nothing, or silently judging nothing.
+            write_log({"event": "verify", "session_id": session_id, "attempt": int(kwargs.get("attempt") or 0), "skipped": "nothing changed", "changed_paths": 0, "action": "skipped", "error": ""})
+            emit_verdict(
+                session_id, "verify",
+                "Jev verify: skipped · no file changed in any repository this turn's commands ran in",
+                answers={}, decision={"action": "skipped", "reason": "nothing changed", "changed_paths": 0}, attempt=int(kwargs.get("attempt") or 0),
+            )
         return None
     attempt = int(kwargs.get("attempt") or 0)
     final_response = str(kwargs.get("final_response") or "")
@@ -2847,7 +2916,6 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     criteria = [item for item in todos if item.get("status") in ("completed", "in_progress")]
     pending = [item for item in fresh if item.get("status") == "pending"]
     request = (_session_scope.get(session_id) or [""])[-1]
-    ledger = ledger_state(session_id)
     for path in changed[:40]:
         _note_root(ledger, path)
     bundle = collect_evidence(changed, ledger.get("bases"))
@@ -2869,7 +2937,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
     if not drift_state(session_id).get("build") and not checks_ran and manifest is None and not fresh:
         write_log({
             "event": "verify", "session_id": session_id, "attempt": attempt, "skipped": "not a build turn",
-            "changed_paths": len(changed), "ledger": len(rows_this_turn), "ledger_checks": 0, "criteria": 0,
+            "changed_paths": len(changed), "changed_source": changed_source, "ledger": len(rows_this_turn), "ledger_checks": 0, "criteria": 0,
             "manifest_registered": False, "findings": [], "action": "skipped", "latency_ms": int((time.monotonic() - started) * 1000), "error": "",
         })
         emit_verdict(
@@ -3230,6 +3298,7 @@ def on_pre_verify(**kwargs: Any) -> Optional[Dict[str, str]]:
             "attempt": attempt,
             "repeated": repeated,
             "changed_paths": len(changed),
+            "changed_source": changed_source,
             "criteria": len(labels),
             "excluded": len(excluded),
             "pending": len(pending),

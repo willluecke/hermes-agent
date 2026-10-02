@@ -933,6 +933,10 @@ def _claude_hook_parity(
     platform = getattr(agent, "platform", "") or ""
     model = getattr(agent, "model", "") or ""
     changed: set[str] = set()
+    # Commands the turn ran. A shell command can edit files too (a Python
+    # heredoc, sed -i), so a turn that ran one is offered to the verify gate
+    # even with no Edit or Write call; the gate reads such edits from git.
+    commands_run: list[str] = []
     replayed = 0
 
     def emit_tool_hooks() -> None:
@@ -951,6 +955,8 @@ def _claude_hook_parity(
                 path = _claude_file_change_path(agent, changed_path)
                 if path is not None:
                     changed.add(str(path))
+            if raw_name == "Bash":
+                commands_run.append(str(hermes_args.get("command") or ""))
             if live or not has_hook("post_tool_call"):
                 continue
             try:
@@ -985,7 +991,7 @@ def _claude_hook_parity(
         limit = 0
     attempt = int(getattr(agent, "_pre_verify_nudges", 0) or 0)
     while (
-        changed
+        (changed or commands_run)
         and attempt < limit
         and session is not None
         and isinstance(turn.final_text, str)

@@ -6292,7 +6292,9 @@ def get_pre_verify_continue_message(
 ) -> Optional[str]:
     """Check user ``pre_verify`` hooks for a directive to keep the agent going.
 
-    Fired once per turn when the agent edited code and is about to verify/finish.
+    Fired once per turn when the agent edited code, or ran a command that may
+    have (``changed_paths`` is then empty and the hook reads git), and is
+    about to verify/finish.
     A hook keeps the turn going (run a check, defer it, tidy the diff) by
     returning::
 

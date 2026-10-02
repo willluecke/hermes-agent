@@ -610,3 +610,30 @@ def test_weakening_signals_read_removed_assertions_and_added_skips_in_existing_t
     assert found["removed"] == 3 and found["skips"] == 1
     assert evidence.weakening_signals(None, [str(tests / "test_app.py")]) == {"files": [], "removed": 0, "skips": 0}
     assert evidence.weakening_signals(str(repo), [str(repo / "app.py")]) == {"files": [], "removed": 0, "skips": 0}
+
+
+def test_changed_paths_since_reads_command_made_edits_from_git(repo):
+    """Tracked edits since the base commit, untracked files written since the turn began; nothing older or ignored."""
+    base = evidence.git_head(str(repo))
+    an_hour_ago = time.time() - 3600
+    (repo / "leftover.py").write_text("x = 1\n")
+    os.utime(repo / "leftover.py", (an_hour_ago, an_hour_ago))
+    since = time.time()
+    time.sleep(0.02)
+    (repo / "app.py").write_text("print('edited by a heredoc')\n")
+    (repo / "fresh.py").write_text("y = 2\n")
+    cache = repo / ".cache"
+    cache.mkdir()
+    (cache / "junk").write_text("z")
+
+    changed = evidence.changed_paths_since(str(repo), base, since)
+    assert changed == sorted([str(repo / "app.py"), str(repo / "fresh.py")])
+
+    # A commit the turn made does not hide the edit: it still differs from the base.
+    subprocess.run(["git", "-C", str(repo), "add", "app.py"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "edit"], check=True, capture_output=True)
+    assert str(repo / "app.py") in evidence.changed_paths_since(str(repo), base, since)
+    # Without a base, the working tree's own modifications are the tracked set.
+    (repo / "app.py").write_text("print('again')\n")
+    assert str(repo / "app.py") in evidence.changed_paths_since(str(repo), None, since)
+    assert evidence.changed_paths_since("/definitely/not/a/repo", None, since) == []

@@ -40,6 +40,10 @@ def hooks(monkeypatch):
 
     def continue_message(**kwargs):
         seen["pre_verify"].append(kwargs)
+        if not kwargs["changed_paths"] and not seen.get("judge_command_edits"):
+            # The plugin's own reading: no edit paths and git shows no
+            # change in the repositories the commands ran in.
+            return None
         return "Fix criterion 2, then finish." if kwargs["attempt"] == 0 else None
 
     import agent.verify_hooks as verify_hooks
@@ -132,10 +136,48 @@ def test_claude_turn_without_file_changes_finishes_without_a_verify_gate(hooks, 
     agent = _agent()
     result = agent.run_conversation("what is here?")
     assert len(prompts) == 1
-    assert hooks["pre_verify"] == []
+    # A command ran, so the gate is consulted with no edit paths; it reads
+    # git and finds nothing, and the turn finishes.
+    assert len(hooks["pre_verify"]) == 1 and hooks["pre_verify"][0]["changed_paths"] == []
     assert [call["tool_name"] for call in hooks["post_tool_call"]] == ["terminal", "read_file"]
     assert len(hooks["post_llm_call"]) == 1
     assert result["api_calls"] == 1
+
+
+def test_claude_turn_that_edited_through_a_shell_command_reaches_the_verify_gate(hooks, monkeypatch):
+    """2026-10-01: a turn whose edits were heredocs and sed never reached the judge."""
+    hooks["judge_command_edits"] = True
+    prompts = []
+
+    def fake_run_turn(self, prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            _tool_use(self, "c1", "Bash", {"command": "python3 - <<'EOF'\nfrom pathlib import Path\nPath('app.py').write_text('y')\nEOF"})
+            _tool_result(self, "c1", "")
+            return ClaudeCodeTurnResult(final_text="Edited app.py.", session_id="sess-1", tool_iterations=1, session_confirmed=True)
+        return ClaudeCodeTurnResult(final_text="Fixed criterion 2.", session_id="sess-1", tool_iterations=0, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    agent = _agent()
+    result = agent.run_conversation("edit app.py")
+    assert len(prompts) == 2, "the gate saw the turn and sent it back once"
+    assert hooks["pre_verify"][0]["changed_paths"] == [] and hooks["pre_verify"][0]["coding"] is True
+    assert result["final_response"] == "Fixed criterion 2."
+
+
+def test_claude_turn_with_no_command_and_no_edit_skips_the_verify_gate(hooks, monkeypatch):
+    prompts = []
+
+    def fake_run_turn(self, prompt):
+        prompts.append(prompt)
+        _tool_use(self, "c1", "Read", {"file_path": "/tmp/app.py"})
+        _tool_result(self, "c1", "print('x')")
+        return ClaudeCodeTurnResult(final_text="It prints x.", session_id="sess-1", tool_iterations=1, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    agent = _agent()
+    agent.run_conversation("what does it print?")
+    assert len(prompts) == 1 and hooks["pre_verify"] == []
 
 
 def test_claude_turn_binds_the_turn_emitter_so_a_hook_can_reach_the_run_stream(hooks, monkeypatch):

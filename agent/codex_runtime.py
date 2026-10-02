@@ -1247,6 +1247,10 @@ def _codex_hook_parity(
     platform = getattr(agent, "platform", "") or ""
     model = getattr(agent, "model", "") or ""
     changed: set = set()
+    # Commands the turn ran. A shell command can edit files too, so a turn
+    # that ran one is offered to the verify gate even without an apply_patch;
+    # the gate reads such edits from git.
+    commands_run: list = []
 
     def emit_tool_hooks(projected: list) -> None:
         for name, args, result, call_id in _codex_projected_tool_calls(projected):
@@ -1257,6 +1261,8 @@ def _codex_hook_parity(
                     )
                     if path is not None:
                         changed.add(str(path))
+            if name == "terminal":
+                commands_run.append(str(args.get("command") or ""))
             if not has_hook("post_tool_call"):
                 continue
             try:
@@ -1292,7 +1298,7 @@ def _codex_hook_parity(
         limit = 0
     attempt = int(getattr(agent, "_pre_verify_nudges", 0) or 0)
     while (
-        changed
+        (changed or commands_run)
         and attempt < limit
         and isinstance(turn.final_text, str)
         and turn.final_text.strip()
