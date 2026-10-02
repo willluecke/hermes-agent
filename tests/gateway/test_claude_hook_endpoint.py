@@ -109,6 +109,30 @@ async def test_post_tool_use_feeds_the_observers_live_and_returns_their_steer(bo
     assert claude_hooks.live_calls(token) == 2, "the parity replay will know the observers already saw these"
 
 
+FAILED = {
+    "event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "pytest -q tests/x.py", "description": "tests"},
+    "error": "Exit code 1\n1 failed, 3 passed\nFAILED tests/x.py::test_a", "tool_use_id": "toolu_3", "cwd": "/work",
+}
+
+
+async def test_a_failed_call_reaches_the_observers_as_a_failed_check_with_its_output(bound, monkeypatch):
+    """Until 2026-10-02 a failing check never reached the evidence ledger: Claude Code runs PostToolUse only for calls that succeeded."""
+    token, _agent = bound
+    calls = []
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "post_tool_call")
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda name, **kwargs: calls.append((name, kwargs)) or [{"message": "never shown"}])
+    async with TestClient(TestServer(_app())) as cli:
+        resp = await cli.post("/v1/hooks/claude", json=FAILED, headers=_bearer(token))
+        assert resp.status == 200 and await resp.json() == {}, "a failure is recorded, never steered"
+    [(name, call)] = calls
+    assert name == "post_tool_call"
+    assert call["tool_name"] == "terminal" and call["args"] == {"command": "pytest -q tests/x.py"}
+    assert json.loads(call["result"]) == {"output": "1 failed, 3 passed\nFAILED tests/x.py::test_a", "exit_code": 1}, "the shape the ledger reads: output and exit code"
+    assert call["status"] == "error" and call["error_type"] == "tool_error" and call["error_message"] == "exit code 1"
+    assert call["steerable"] is False and call["cwd"] == "/work" and call["tool_call_id"] == "toolu_3"
+    assert claude_hooks.live_calls(token) == 1, "the parity replay counts it as delivered"
+
+
 async def test_a_dispatch_failure_lets_the_call_proceed(bound, monkeypatch):
     token, _agent = bound
 

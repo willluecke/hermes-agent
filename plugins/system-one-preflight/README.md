@@ -58,7 +58,10 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    = log only, never hold.
 3. **`post_tool_call` / `transform_tool_result`: ledger and criteria.** Every
    terminal call becomes a ledger row (`c1, c2, …`: exit code, runner counts,
-   a digest of each repository it ran under, full output kept on disk). A row
+   a digest of each repository it ran under, full output kept on disk). A
+   command that failed is a row too: on the Claude lane it arrives through
+   Claude Code's `PostToolUseFailure` hook (until 2026-10-02 only successful
+   calls were reported, so a failing check could not be cited). A row
    is stale only when one of those repositories changed after it; first
    touching another repository later does not count. The ids are internal: the
    model is never shown one, so it never has to cite one. Every Edit/Write

@@ -476,7 +476,7 @@ def _claude_tool_preview(raw_name: str, args: dict[str, Any], cwd: Optional[str]
 
 def make_claude_code_event_bridge(
     agent: Any,
-    record: Optional[Callable[[str, str, dict[str, Any], str, str], None]] = None,
+    record: Optional[Callable[..., None]] = None,
     *,
     cwd: Optional[str] = None,
 ) -> Callable[[dict[str, Any]], None]:
@@ -538,7 +538,7 @@ def make_claude_code_event_bridge(
         is_error = bool(block.get("is_error"))
         if record is not None:
             try:
-                record(raw_name, name, args, result, call_id)
+                record(raw_name, name, args, result, call_id, is_error)
             except Exception:
                 logger.debug("Claude tool record failed", exc_info=True)
         edit_diff: dict[str, Any] = {}
@@ -776,6 +776,29 @@ def _claude_file_change_path(agent: Any, value: str) -> Optional[Path]:
         return None
 
 
+_CLAUDE_EXIT_CODE_RE = re.compile(r"^Exit code:?\s*(-?\d+)\s*\n?")
+
+
+def _claude_failure_result(raw_name: str, error_text: str) -> tuple[str, Optional[int]]:
+    """A failed call's result text, and the exit code when Claude Code reported one.
+
+    Claude Code describes a failed Bash call as ``Exit code N`` followed by
+    the command's output. The default loop's terminal tool answers with JSON
+    carrying ``output`` and ``exit_code``, which is what the evidence ledger
+    reads, so a Bash failure is put in that shape: the ledger then records a
+    failed check with its output instead of nothing (2026-10-02).
+    """
+    text = str(error_text or "")
+    match = _CLAUDE_EXIT_CODE_RE.match(text) if raw_name == "Bash" else None
+    if match is None:
+        return text, None
+    try:
+        code = int(match.group(1))
+    except ValueError:
+        return text, None
+    return json.dumps({"output": text[match.end():], "exit_code": code}, ensure_ascii=False), code
+
+
 def _hook_result_text(value: Any) -> str:
     """The text of a Claude Code hook's ``tool_response`` in the shape the observer hooks read."""
     if value is None:
@@ -818,6 +841,39 @@ def handle_claude_hook_event(binding: dict[str, Any], body: dict[str, Any]) -> d
     session_id = str(binding.get("session_id") or "")
     turn_id = str(binding.get("turn_id") or "")
     try:
+        if event == "PostToolUseFailure":
+            # A call that failed (a non-zero exit, a refused edit). Claude Code
+            # runs PostToolUse only for calls that succeeded, so until this
+            # event was taken (2026-10-02) a failing check never reached the
+            # evidence ledger and could not be cited or judged.
+            from hermes_cli import claude_hooks
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            claude_hooks.note_live_call(str(binding.get("token") or ""))
+            error_text = redact_sensitive_text(_hook_result_text(body.get("error")), force=True)
+            result, exit_code = _claude_failure_result(raw_name, error_text)
+            name, args, result, _changed = _claude_hermes_call(raw_name, dict(tool_input), result)
+            if not has_hook("post_tool_call"):
+                return {}
+            invoke_hook(
+                "post_tool_call",
+                tool_name=name,
+                args=args,
+                result=result,
+                task_id="",
+                session_id=session_id,
+                tool_call_id=call_id,
+                turn_id=turn_id,
+                api_request_id="",
+                duration_ms=0,
+                status="error",
+                error_type="tool_error",
+                error_message=(f"exit code {exit_code}" if exit_code is not None else error_text.splitlines()[0] if error_text else "tool failed"),
+                middleware_trace=[],
+                steerable=False,
+                cwd=cwd,
+            )
+            return {}
         if event == "PreToolUse":
             name, args, _result, _changed = _claude_hermes_call(raw_name, dict(tool_input), "")
             from hermes_cli.plugins import get_pre_tool_call_directive
@@ -946,8 +1002,16 @@ def _claude_hook_parity(
         # When the process's own hooks delivered the calls live through the
         # gateway (hermes_cli.claude_hooks), the observers already saw them;
         # only the changed paths are still needed here for the verify gate.
-        live = _live_hook_calls(hook_token) > 0
-        for raw_name, _name, args, result, call_id in pending:
+        live_count = _live_hook_calls(hook_token)
+        live = live_count > 0
+        # Hooks that delivered every call leave nothing to replay. A claude
+        # without the PostToolUseFailure hook delivers only the calls that
+        # succeeded, so when fewer arrived than the turn made, the errored
+        # ones are replayed here, before the verify gate reads the ledger.
+        delivered_all = live_count >= len(calls)
+        for raw_name, _name, args, result, call_id, is_error in pending:
+            if is_error:
+                result, _exit_code = _claude_failure_result(raw_name, result)
             name, hermes_args, hermes_result, changed_path = _claude_hermes_call(
                 raw_name, args if isinstance(args, dict) else {}, result
             )
@@ -957,7 +1021,7 @@ def _claude_hook_parity(
                     changed.add(str(path))
             if raw_name == "Bash":
                 commands_run.append(str(hermes_args.get("command") or ""))
-            if live or not has_hook("post_tool_call"):
+            if (live and (delivered_all or not is_error)) or not has_hook("post_tool_call"):
                 continue
             try:
                 invoke_hook(
@@ -971,9 +1035,9 @@ def _claude_hook_parity(
                     turn_id=turn_id,
                     api_request_id="",
                     duration_ms=0,
-                    status="ok",
-                    error_type=None,
-                    error_message=None,
+                    status="error" if is_error else "ok",
+                    error_type="tool_error" if is_error else None,
+                    error_message="tool failed" if is_error else None,
                     middleware_trace=[],
                     replay=True,
                 )
@@ -1395,10 +1459,12 @@ def run_claude_code_turn(
                         exc_info=True,
                     )
 
-        calls: list[tuple[str, str, dict[str, Any], str, str]] = []
+        calls: list[tuple[str, str, dict[str, Any], str, str, bool]] = []
 
-        def _record(raw_name: str, name: str, args: dict[str, Any], result: str, call_id: str) -> None:
-            calls.append((raw_name, name, args, result, call_id))
+        def _record(
+            raw_name: str, name: str, args: dict[str, Any], result: str, call_id: str, is_error: bool = False
+        ) -> None:
+            calls.append((raw_name, name, args, result, call_id, is_error))
 
         bridge = make_claude_code_event_bridge(agent, record=_record, cwd=cwd)
         hook_token, hook_env, hook_settings = _claude_hook_binding(agent, read_only=read_only)

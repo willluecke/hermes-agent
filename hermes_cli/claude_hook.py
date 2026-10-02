@@ -48,7 +48,7 @@ def build_request(payload):
     if not isinstance(payload, dict):
         return None
     event = str(payload.get("hook_event_name") or "")
-    if event not in ("PreToolUse", "PostToolUse"):
+    if event not in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
         return None
     tool_input = payload.get("tool_input")
     return {
@@ -56,6 +56,8 @@ def build_request(payload):
         "tool_name": str(payload.get("tool_name") or ""),
         "tool_input": _clip(tool_input) if isinstance(tool_input, dict) else {},
         "tool_response": _clip(payload.get("tool_response")),
+        # PostToolUseFailure: "Exit code N" and the command's output.
+        **({"error": _clip(payload.get("error"))} if event == "PostToolUseFailure" else {}),
         "tool_use_id": str(payload.get("tool_use_id") or ""),
         "claude_session_id": str(payload.get("session_id") or ""),
         # The working directory the call ran in: the evidence ledger keys its
@@ -72,6 +74,9 @@ def feedback(event, answer):
         if answer.get("action") == "block":
             message = str(answer.get("message") or "").strip()
             return message or "The Hermes gateway blocked this tool call."
+        return None
+    if event == "PostToolUseFailure":
+        # Recorded for the ledger only; the model already sees the failure.
         return None
     message = answer.get("message")
     return str(message).strip() if isinstance(message, str) and message.strip() else None

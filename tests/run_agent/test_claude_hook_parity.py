@@ -61,8 +61,8 @@ def _tool_use(session, call_id, name, args):
     session.on_event({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": call_id, "name": name, "input": args}]}})
 
 
-def _tool_result(session, call_id, text):
-    session.on_event({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": call_id, "content": text}]}})
+def _tool_result(session, call_id, text, is_error=False):
+    session.on_event({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": call_id, "content": text, **({"is_error": True} if is_error else {})}]}})
 
 
 def test_claude_turn_replays_tool_hooks_runs_the_verify_gate_and_continues_once(hooks, monkeypatch, tmp_path):
@@ -234,7 +234,7 @@ def test_claude_turn_gets_the_live_hook_channel_and_skips_the_replay_once_it_del
         assert token == agent._claude_hook_token
         assert session.extra_env["HERMES_HOOK_URL"] == "http://127.0.0.1:8642/v1/hooks/claude"
         settings = json.loads(session.settings_json)
-        assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse"}
+        assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
         assert "claude_hook.py" in settings["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
         binding = claude_hooks.resolve_hook_token(token)
         assert binding["agent"] is agent and binding["session_id"] == agent.session_id
@@ -292,3 +292,54 @@ def test_a_stopped_follow_up_keeps_the_draft_and_the_session(hooks, monkeypatch,
     state = db.get_session_model_config_value(sid, _CLAUDE_SESSION_STATE_KEY)
     continues, delta = _claude_history_continues(state["history_fingerprint"], stored)
     assert continues and delta == [], "the next turn continues the session"
+
+
+def _three_calls_one_failing(session):
+    _tool_use(session, "c1", "Bash", {"command": "pytest -q"})
+    _tool_result(session, "c1", "Exit code 1\n1 failed, 3 passed", is_error=True)
+    _tool_use(session, "c2", "Read", {"file_path": "/tmp/app.py"})
+    _tool_result(session, "c2", "print('x')")
+    _tool_use(session, "c3", "Bash", {"command": "echo done"})
+    _tool_result(session, "c3", "done")
+
+
+def test_a_failed_call_the_live_hooks_did_not_deliver_is_replayed_as_a_failed_check(hooks, monkeypatch):
+    """An older claude runs no PostToolUseFailure hook: its failures are replayed at the end of the turn (2026-10-02)."""
+    import agent.claude_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_live_hook_calls", lambda token: 2)
+
+    def fake_run_turn(self, prompt):
+        _three_calls_one_failing(self)
+        return ClaudeCodeTurnResult(final_text="Tests fail.", session_id="sess-1", tool_iterations=3, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    _agent().run_conversation("run the tests")
+    replayed = hooks["post_tool_call"]
+    assert [call["tool_name"] for call in replayed] == ["terminal"], "only the failed call, which the hooks could not have delivered"
+    [call] = replayed
+    assert json.loads(call["result"]) == {"output": "1 failed, 3 passed", "exit_code": 1}
+    assert call["status"] == "error" and call["error_type"] == "tool_error" and call["replay"] is True
+
+
+def test_nothing_is_replayed_when_the_live_hooks_delivered_every_call(hooks, monkeypatch):
+    import agent.claude_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_live_hook_calls", lambda token: 3)
+
+    def fake_run_turn(self, prompt):
+        _three_calls_one_failing(self)
+        return ClaudeCodeTurnResult(final_text="Tests fail.", session_id="sess-1", tool_iterations=3, session_confirmed=True)
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", fake_run_turn)
+    _agent().run_conversation("run the tests")
+    assert hooks["post_tool_call"] == [], "a failure the failure hook delivered is not recorded twice"
+
+
+def test_failure_results_take_the_shape_the_ledger_reads():
+    from agent.claude_runtime import _claude_failure_result
+
+    assert _claude_failure_result("Bash", "Exit code 3\nout\nerr") == ('{"output": "out\\nerr", "exit_code": 3}', 3)
+    assert _claude_failure_result("Bash", "Exit code: 2") == ('{"output": "", "exit_code": 2}', 2)
+    assert _claude_failure_result("Bash", "Command timed out") == ("Command timed out", None)
+    assert _claude_failure_result("Edit", "Exit code 1\nnot a shell") == ("Exit code 1\nnot a shell", None)

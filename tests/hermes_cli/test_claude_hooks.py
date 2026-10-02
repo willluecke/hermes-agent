@@ -68,7 +68,7 @@ def test_a_dead_agent_retires_its_token():
 
 def test_settings_wire_both_hooks_to_the_script_and_the_environment_carries_the_endpoint():
     settings = claude_hooks.hook_settings(python="/venv/bin/python")
-    assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse"}
+    assert set(settings["hooks"]) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}, "failed calls are reported too"
     [entry] = settings["hooks"]["PreToolUse"]
     [hook] = entry["hooks"]
     assert hook["type"] == "command" and hook["timeout"] == claude_hooks.HOOK_TIMEOUT_SECONDS
@@ -148,6 +148,17 @@ def test_a_post_message_is_the_json_block_decision_claude_puts_in_front_of_the_m
     assert code == 0 and err == ""
     assert json.loads(out) == {"decision": "block", "reason": "Drift check: back to criterion 1."}
     assert _Gateway.seen[-1][2]["tool_response"] == {"stdout": "hi", "stderr": "", "interrupted": False}
+
+
+def test_a_failed_call_is_forwarded_with_its_error_and_never_answered(gateway):
+    """Claude Code runs PostToolUseFailure, not PostToolUse, for a call that failed (2026-10-02)."""
+    failure = {**PRE, "hook_event_name": "PostToolUseFailure", "error": "Exit code 3\nprobe-stdout\nprobe-stderr", "is_interrupt": False}
+    _Gateway.answers = {"PostToolUseFailure": (200, {"message": "never shown"})}
+    assert _run(failure, gateway) == (0, "", ""), "nothing goes back to the model for a failure"
+    (_path, _auth, body) = _Gateway.seen[-1]
+    assert body["event"] == "PostToolUseFailure" and body["tool_name"] == "Bash"
+    assert body["error"] == "Exit code 3\nprobe-stdout\nprobe-stderr"
+    assert body["tool_input"] == {"command": "rm -rf build", "description": "clean"} and body["tool_use_id"] == "toolu_1"
 
 
 def test_everything_else_lets_the_call_proceed_silently(gateway):

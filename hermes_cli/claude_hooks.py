@@ -18,6 +18,10 @@ per-session bearer token, and the gateway dispatches the plugin hooks:
 * ``PostToolUse`` runs ``post_tool_call`` with ``steerable=True``; a hook
   result carrying ``message`` comes back the same way, so the model sees
   it right after the call it was triggered by.
+* ``PostToolUseFailure`` (a call that failed: a non-zero exit, a refused
+  edit) runs ``post_tool_call`` with ``status="error"`` and the failure's
+  output as the result, so the evidence ledger holds failing checks too;
+  nothing is sent back to the model from it.
 
 The endpoint is not the API key's surface. Each managed process gets a
 random token bound here to its Hermes session and agent; an unknown or
@@ -147,10 +151,16 @@ def hook_script_path() -> Path:
 
 
 def hook_settings(python: Optional[str] = None, script: Optional[Path] = None) -> Dict[str, Any]:
-    """The ``--settings`` document that wires both hooks to the script."""
+    """The ``--settings`` document that wires the three hooks to the script.
+
+    ``PostToolUseFailure`` is the one Claude Code runs for a call that
+    failed (a non-zero exit); ``PostToolUse`` covers only calls that
+    succeeded, so without it a failing check never reached the evidence
+    ledger (2026-10-02).
+    """
     command = f'"{python or sys.executable}" "{script or hook_script_path()}"'
     entry = [{"hooks": [{"type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECONDS}]}]
-    return {"hooks": {"PreToolUse": entry, "PostToolUse": entry}}
+    return {"hooks": {"PreToolUse": entry, "PostToolUse": entry, "PostToolUseFailure": entry}}
 
 
 def hook_environment(token: str, url: Optional[str] = None) -> Dict[str, str]:
