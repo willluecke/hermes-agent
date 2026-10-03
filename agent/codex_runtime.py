@@ -2276,6 +2276,12 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    if not _user_interrupted and getattr(agent, "_interrupt_requested", False):
+        # The stop arrived after the Codex turn had ended (during hook replay
+        # or persistence above); the run is already finishing. Left in place
+        # it would end the next message's turn before Codex saw it.
+        logger.info("codex turn: discarding a stop that arrived after the turn ended")
+        agent.discard_stale_interrupt()
     return {
         "final_response": turn.final_text,
         "messages": messages,

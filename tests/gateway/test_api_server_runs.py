@@ -2565,3 +2565,58 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+class TestStaleStopDiscard:
+    """A stop that lands after a run's turn has ended must not reach the next run (2026-10-02)."""
+
+    @pytest.mark.asyncio
+    async def test_a_new_run_discards_a_stop_left_on_the_cached_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.discard_stale_interrupt = MagicMock(return_value=True)
+                order = []
+                mock_agent.discard_stale_interrupt.side_effect = lambda: order.append("discard") or True
+
+                def run_conversation(**_kwargs):
+                    order.append("run")
+                    return {"final_response": "ok", "messages": []}
+
+                mock_agent.run_conversation = run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(50):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                assert status["status"] == "completed"
+        assert order == ["discard", "run"], "leftover interrupt state is dropped before the turn starts"
+
+    @pytest.mark.asyncio
+    async def test_a_stop_for_a_finished_run_does_not_interrupt_the_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            mock_agent = MagicMock()
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            adapter._active_run_agents["run_done"] = mock_agent
+            adapter._active_run_tasks["run_done"] = done
+            try:
+                resp = await cli.post("/v1/runs/run_done/stop")
+                assert resp.status == 200
+                assert (await resp.json()) == {"run_id": "run_done", "status": "stopping"}
+                mock_agent.interrupt.assert_not_called()
+                mock_agent.hard_interrupt.assert_not_called()
+                assert "run_done" not in adapter._stopping_run_ids
+            finally:
+                adapter._active_run_agents.pop("run_done", None)
+                adapter._active_run_tasks.pop("run_done", None)

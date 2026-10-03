@@ -910,6 +910,22 @@ class CodexAppServerSession:
         and unwind. Called by AIAgent's _interrupt_requested path."""
         self._interrupt_event.set()
 
+    def clear_pending_interrupt(self) -> bool:
+        """Drop an interrupt that arrived while no turn was running.
+
+        ``run_turn`` honours a signal set before it starts, so a stop can land
+        during spawn. The same rule turned a stop that arrived just after a
+        turn had unwound into a poison pill: the next message's turn ended at
+        entry, before Codex saw it (2026-10-02, 3dcarparts). Returns whether
+        anything was pending. A no-op while a turn is active.
+        """
+        with self._active_turn_lock:
+            if self._active_turn_id is not None:
+                return False
+        pending = self._interrupt_event.is_set()
+        self._interrupt_event.clear()
+        return pending
+
     def request_steer(self, text: str) -> bool:
         """Append user guidance to the active Codex turn via ``turn/steer``."""
         cleaned = str(text or "").strip()

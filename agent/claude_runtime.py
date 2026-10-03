@@ -1612,6 +1612,11 @@ def run_claude_code_turn(
     interrupt_message = getattr(agent, "_interrupt_message", None) if user_interrupted else None
     if user_interrupted:
         agent.clear_interrupt()
+    elif getattr(agent, "_interrupt_requested", False):
+        # A stop that arrived after the turn ended would otherwise abort the
+        # next message's turn-lease wait on this cached agent.
+        logger.info("claude turn: discarding a stop that arrived after the turn ended")
+        agent.discard_stale_interrupt()
     return {
         "final_response": turn.final_text,
         "messages": messages,

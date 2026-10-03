@@ -952,6 +952,25 @@ class ClaudeCodeSession:
         if self._interrupt_request_id is None:
             self._terminate_process(signal.SIGINT)
 
+    def clear_pending_interrupt(self) -> bool:
+        """Drop an interrupt that arrived while no turn was running.
+
+        ``_run_turn_locked`` already clears the event at entry, so a stale
+        signal cannot end a Claude turn; this keeps the session's record in
+        step with the agent's when the API server discards a late stop.
+        Returns whether anything was pending. A no-op while a turn holds the
+        turn lock.
+        """
+        if not self._turn_lock.acquire(blocking=False):
+            return False
+        try:
+            pending = self._interrupt.is_set()
+            self._interrupt.clear()
+            self._interrupt_request_id = None
+            return pending
+        finally:
+            self._turn_lock.release()
+
     def _send_control_interrupt(self) -> Optional[str]:
         """Write Claude Code's stream-json interrupt request; its id, or None when it could not be sent."""
         process = self._process

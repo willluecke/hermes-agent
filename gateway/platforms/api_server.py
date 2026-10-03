@@ -9680,6 +9680,18 @@ class APIServerAdapter(BasePlatformAdapter):
                                     # user actually entered.
                                     run_kwargs["persist_user_message"] = user_message
 
+                                # A cached agent may still carry a stop aimed
+                                # at an earlier run (one that landed after
+                                # that run's turn had unwound). Only a stop
+                                # for this run may survive into it.
+                                if run_id not in self._stopping_run_ids:
+                                    discard = getattr(agent, "discard_stale_interrupt", None)
+                                    if callable(discard) and discard():
+                                        logger.info(
+                                            "Discarded a stop left on the cached agent before run %s (session=%s)",
+                                            run_id,
+                                            session_id,
+                                        )
                                 r = agent.run_conversation(**run_kwargs)
                                 agent._history_prefix_restored = 0
                                 if not isinstance(r, dict) or (
@@ -10409,6 +10421,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        if task is not None and task.done():
+            # The run is finishing; interrupting its agent now would only
+            # leave a stop for the next run to trip over.
+            return web.json_response({"run_id": run_id, "status": "stopping"})
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)

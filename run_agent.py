@@ -3412,6 +3412,29 @@ class AIAgent:
         # newer keyword-only hard_cancel argument.
         AIAgent.interrupt(self, message, hard_cancel=True)
 
+    def discard_stale_interrupt(self) -> bool:
+        """Drop a stop that no turn can consume, on this agent and its native session.
+
+        A stop that lands after a turn has unwound but before its run is
+        finalized sets the interrupt flag (and the Codex session's event) with
+        nothing left running to clear them. A cached agent then carried that
+        stop into the user's next message: the turn-lease wait aborted on it
+        ("Stopped waiting for another Hermes process"), and the message after
+        that ended inside the Codex session before Codex saw it (2026-10-02,
+        3dcarparts). Returns whether anything was discarded.
+        """
+        pending = bool(getattr(self, "_interrupt_requested", False))
+        self.clear_interrupt()
+        for attr in ("_codex_session", "_claude_code_session"):
+            session = getattr(self, attr, None)
+            clear = getattr(session, "clear_pending_interrupt", None)
+            if callable(clear):
+                try:
+                    pending = bool(clear()) or pending
+                except Exception:
+                    logger.debug("clear_pending_interrupt failed on %s", attr, exc_info=True)
+        return pending
+
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
 
