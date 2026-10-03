@@ -62,6 +62,28 @@ def test_gpt6_astra_requires_account_and_app_server_catalog_agreement(monkeypatc
     )
 
 
+def test_gpt6_1_sol_family_is_client_gated_like_astra(monkeypatch):
+    """The backend serves GPT-6.1 Sol, GPT-6 Sol and GPT-6 Luna only to Codex 0.160+ (2026-10-02)."""
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_api",
+        lambda access_token: ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-5.6-sol"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._read_cache_models",
+        lambda codex_home: ["gpt-6-astra", "gpt-5.6-sol"],
+    )
+    model_ids = get_codex_model_ids(access_token="codex-access-token")
+    assert "gpt-6-astra" in model_ids and "gpt-5.6-sol" in model_ids
+    assert not {"gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"} & set(model_ids), "an older app-server cannot run them"
+
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._read_cache_models",
+        lambda codex_home: ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-5.6-sol"],
+    )
+    model_ids = get_codex_model_ids(access_token="codex-access-token")
+    assert model_ids[:4] == ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"], "surfaced once the installed app-server confirms them"
+
+
 def test_app_server_catalog_refreshes_after_cli_upgrade(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.codex_models._read_cache_catalog",
