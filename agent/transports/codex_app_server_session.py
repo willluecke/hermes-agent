@@ -429,8 +429,14 @@ def _prepare_turn_input_items(
                 prepared.append({"type": "localImage", "path": path})
             elif image_url.lower().startswith(("https://", "http://")):
                 prepared.append({"type": "image", "url": image_url})
+            elif image_url.lower().startswith("file://"):
+                # An upload the sync store wrote to this host; Codex reads it
+                # in place (agent/local_images.py decides which paths count).
+                from agent.local_images import local_image_path
+
+                prepared.append({"type": "localImage", "path": local_image_path(image_url)})
             else:
-                raise ValueError("image URL must use http(s) or data:image/...;base64")
+                raise ValueError("image URL must use http(s), file:// under the local image roots, or data:image/...;base64")
 
         if not prepared:
             prepared.append({"type": "text", "text": "What do you see in this image?"})

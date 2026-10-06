@@ -210,6 +210,21 @@ class TestTurnInputCoercion:
             temp_dir.cleanup()
         assert not path.exists()
 
+    def test_local_upload_is_passed_as_a_local_image_in_place(self, tmp_path):
+        root = tmp_path / "conversation-images"
+        root.mkdir()
+        (root / "site.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        with patch("agent.local_images.local_image_roots", return_value=[str(root)]):
+            items, temp_dir = _prepare_turn_input_items([
+                {"type": "image_url", "image_url": {"url": f"file://{root}/site.png"}},
+            ])
+            assert items == [{"type": "localImage", "path": str(root / "site.png")}]
+            assert temp_dir is None
+            with pytest.raises(ValueError, match="outside the configured image roots"):
+                _prepare_turn_input_items([
+                    {"type": "image_url", "image_url": {"url": f"file://{tmp_path}/site.png"}},
+                ])
+
     def test_remote_image_keeps_native_url(self):
         items, temp_dir = _prepare_turn_input_items([
             {"type": "input_image", "image_url": "https://example.com/shot.png"},

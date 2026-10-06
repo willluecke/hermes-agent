@@ -1055,6 +1055,18 @@ When a budget is set, two things happen:
 
 The budget is per `run_conversation` turn (it resets on each user message) and the feature is completely dormant when unset — no clock reads, no injection, no timeout changes.
 
+## Local Image Roots
+
+A run request's image part may name a file on the gateway's host instead of carrying base64:
+
+```yaml
+agent:
+  local_image_roots:
+    - ~/.hermes/conversation-images   # default
+```
+
+A `file://` image URL is accepted only when its real path is under one of these directories, exists, is a PNG, JPEG, WebP or GIF of at most 10 MB, and its bytes match its suffix. Hermes Chat uploads a user's image straight to the sync store, which writes it there, so the model reads the original file in place and no request carries the bytes. Anything else is refused as an invalid image URL.
+
 ## Native CLI Turn Limit
 
 Turns that run on a native CLI (the Codex app-server and Claude Code runtimes) have one wall-clock cap:

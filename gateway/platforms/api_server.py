@@ -1018,9 +1018,19 @@ def _normalize_multimodal_content(content: Any) -> Any:
                         "unsupported_content_type:Only image data URLs are supported. "
                         "Non-image data payloads are not supported."
                     )
+            elif lowered.startswith("file://"):
+                # An image the sync store wrote to this host: accepted only
+                # under the configured image roots (agent/local_images.py).
+                from agent.local_images import local_image_path
+
+                try:
+                    local_image_path(url_value)
+                except ValueError as exc:
+                    raise ValueError(f"invalid_image_url:{exc}") from exc
             elif not (lowered.startswith("http://") or lowered.startswith("https://")):
                 raise ValueError(
-                    "invalid_image_url:Image inputs must use http(s) URLs or data:image/... URLs."
+                    "invalid_image_url:Image inputs must use http(s) URLs, data:image/... URLs, "
+                    "or file:// URLs under the configured local image roots."
                 )
             image_part: Dict[str, Any] = {"type": "image_url", "image_url": {"url": url_value}}
             if detail is not None:

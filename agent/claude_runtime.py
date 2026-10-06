@@ -694,6 +694,18 @@ def _materialize_images(
             continue
         image_url = part.get("image_url")
         value = image_url.get("url") if isinstance(image_url, dict) else image_url
+        if isinstance(value, str) and value.lower().startswith("file://"):
+            # Already on this host (the sync store wrote the upload there):
+            # the model reads the file where it is, nothing is copied.
+            from agent.local_images import local_image_path
+
+            try:
+                local_path = local_image_path(value)
+            except ValueError:
+                logger.warning("Claude turn: local image refused: %s", value[:200])
+                continue
+            (referenced if after_note else attached).append(local_path)
+            continue
         if not isinstance(value, str) or not value.startswith("data:image/"):
             continue
         try:

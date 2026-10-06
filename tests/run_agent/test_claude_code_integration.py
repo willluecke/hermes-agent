@@ -281,6 +281,33 @@ def test_materialize_images_splits_new_uploads_from_reattached_history(tmp_path)
     assert [Path(path).name for path in referenced] == ["hermes-image-3.png"]
 
 
+def test_materialize_images_lists_a_local_upload_in_place_and_refuses_paths_outside_the_roots(tmp_path):
+    """Hermes Chat uploads land on this host; the model reads them where they are (2026-10-01)."""
+    from unittest.mock import patch
+
+    from agent.claude_runtime import _materialize_images
+
+    root = tmp_path / "conversation-images"
+    root.mkdir()
+    (root / "c1").mkdir()
+    (root / "c1" / "site.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    (tmp_path / "outside.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    with patch("agent.local_images.local_image_roots", return_value=[str(root)]):
+        attached, referenced = _materialize_images(
+            [
+                {"type": "text", "text": "Look at the site."},
+                {"type": "image_url", "image_url": {"url": f"file://{root}/c1/site.png"}},
+                {"type": "image_url", "image_url": {"url": f"file://{tmp_path}/outside.png"}},
+                {"type": "text", "text": "(Re-attached for reference — image the user shared earlier in this conversation: old.png.)"},
+                {"type": "image_url", "image_url": {"url": f"file://{root}/c1/site.png"}},
+            ],
+            str(tmp_path / "scratch"),
+        )
+    assert attached == [str(root / "c1" / "site.png")], "the upload is named in place, not copied"
+    assert referenced == [str(root / "c1" / "site.png")]
+    assert not (tmp_path / "scratch").exists(), "nothing was written for local images"
+
+
 def test_history_handoff_drops_reattach_notes_and_their_placeholders():
     from agent.claude_runtime import claude_history_handoff
 

@@ -56,6 +56,36 @@ class TestNormalizeMultimodalContent:
         ]
 
 
+class TestLocalImageParts:
+    """A file:// image part is kept only when it names a real image under the configured roots."""
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+    def test_file_url_under_a_root_is_kept(self, tmp_path):
+        root = tmp_path / "conversation-images"
+        root.mkdir()
+        (root / "shot.png").write_bytes(self.PNG)
+        with patch("agent.local_images.local_image_roots", return_value=[str(root)]):
+            out = _normalize_multimodal_content([
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": f"file://{root}/shot.png"}},
+            ])
+        assert out == [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": f"file://{root}/shot.png"}},
+        ]
+
+    def test_file_url_outside_the_roots_is_an_invalid_image_url(self, tmp_path):
+        root = tmp_path / "conversation-images"
+        root.mkdir()
+        (tmp_path / "etc.png").write_bytes(self.PNG)
+        with patch("agent.local_images.local_image_roots", return_value=[str(root)]):
+            with pytest.raises(ValueError, match="invalid_image_url:.*outside the configured image roots"):
+                _normalize_multimodal_content([
+                    {"type": "image_url", "image_url": {"url": f"file://{tmp_path}/etc.png"}},
+                ])
+
+
 class TestContentHasVisiblePayload:
 
 

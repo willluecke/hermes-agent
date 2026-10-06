@@ -82,6 +82,11 @@ DEFAULT_CONFIG = {
         # runtime's inactivity watchdog. 0 = no cap. Read every turn, so an
         # edit applies without a restart (agent/turn_time_limit.py).
         "turn_time_limit_hours": 12,
+        # Directories a file:// image part in a run request may point into.
+        # Hermes Chat uploads a user's image to the sync store, which writes
+        # it under ~/.hermes/conversation-images, and the request names that
+        # file instead of carrying up to 13 MB of base64 (agent/local_images.py).
+        "local_image_roots": ["~/.hermes/conversation-images"],
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
