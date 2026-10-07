@@ -1403,8 +1403,9 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             f"Jev budget: hard {_fmt(p_hard)} · checkable {_fmt(p_checkable)} · kind {kind or 'unknown'} · "
             f"ambiguous {_fmt(p_ambiguous)} · build {_fmt(p_build)} · k={plan['k']}"
             + (" · note sent" if injected else " · note withheld")
-            + (f" ({note_reason})" if injected and note_reason else "")
-            + f" · {injection_rate['injected']} of last {injection_rate['n']} sent",
+            + (f" ({note_reason})" if injected and note_reason else ""),
+            # The injection rate stays in the record and the decision below;
+            # on the row it was gateway-wide monitoring noise on every turn.
             answers={
                 "hard": p_hard,
                 "checkable": p_checkable,

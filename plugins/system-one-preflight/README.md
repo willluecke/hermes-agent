@@ -42,8 +42,10 @@ A slow or failed call fails **open**: the turn proceeds without advice.
    to the user message **only** when P(ambiguous) ≥ 0.6, the plan is
    `candidates` (hard + checkable → "make 3 candidates, pick with
    typesafe_decide") or `criteria_only`, or as the once-per-session build
-   criteria nudge. Otherwise the row says `note withheld`. The row also shows
-   the injection rate over the last 50 turns. Carried criteria open for 3+
+   criteria nudge. Otherwise the row says `note withheld`. The injection
+   rate over the last 50 judged turns (gateway-wide, in memory, reset by a
+   restart) is in each `preflight` log record as `injection_rate`, not on
+   the row. Carried criteria open for 3+
    **build** requests (a question between builds does not count) are raised
    here as a fixed line (finish or retire with a reason) on every build
    request they linger; the user sees one one-line `Jev criteria` row per

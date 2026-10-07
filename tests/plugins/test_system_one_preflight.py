@@ -329,7 +329,7 @@ def test_feedback_mode_asks_the_budget_questions_and_stays_quiet_when_jev_sees_n
     [event] = emitted
     assert event["event"] == "judge.verdict" and event["stage"] == "budget" and event["judge"] == "jev"
     assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False, "note_reason": "", "injection_rate": {"n": 1, "injected": 0}}
-    assert event["text"].endswith("· note withheld · 0 of last 1 sent")
+    assert event["text"].endswith("· note withheld") and "of last" not in event["text"]
     assert event["answers"]["hard"] == pytest.approx(0.1) and event["answers"]["kind"] == "answer"
     assert event["model"] == "jev-1.13.0" and "k=1" in event["text"]
 
@@ -360,7 +360,7 @@ def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedba
     assert record["k"] == 3 and record["kind"] == "build" and record["p_hard"] == pytest.approx(0.8)
     [event] = emitted
     assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True, "note_reason": "candidates", "injection_rate": {"n": 1, "injected": 1}}
-    assert event["text"].endswith("· note sent (candidates) · 1 of last 1 sent")
+    assert event["text"].endswith("· note sent (candidates)")
     # Hard but not checkable: one candidate, no finish loop, and no note.
     feedback["jev"].checkable = 0.2
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[]) is None
@@ -2017,14 +2017,14 @@ def test_the_budget_note_follows_the_thresholds_alone_and_reports_its_rate(feedb
     for turn in ("t1", "t2", "t3", "t4"):
         assert preflight.on_pre_llm_call(session_id="s1", turn_id=turn, user_message="x", conversation_history=[]) is not None
         assert feedback["records"]("preflight")[-1]["note_reason"] == "ambiguous"
-    assert emitted[-1]["text"].endswith("· note sent (ambiguous) · 4 of last 4 sent")
+    assert emitted[-1]["text"].endswith("· note sent (ambiguous)")
     # Below it, nothing else sends it, however the session has been reading.
     feedback["jev"].ambiguous = 0.55
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="x", conversation_history=[]) is None
     record = feedback["records"]("preflight")[-1]
     assert record["injected"] is False and record["note_reason"] == "" and record["injection_rate"] == {"n": 5, "injected": 4}
     assert "baseline_n" not in record
-    assert emitted[-1]["stage"] == "budget" and emitted[-1]["text"].endswith("· note withheld · 4 of last 5 sent")
+    assert emitted[-1]["stage"] == "budget" and emitted[-1]["text"].endswith("· note withheld")
     # Hard but not checkable is logged as the criteria-first plan and sends nothing: criteria Jev cannot check are process.
     feedback["jev"].ambiguous = 0.1
     feedback["jev"].hard = 0.8
