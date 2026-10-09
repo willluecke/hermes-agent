@@ -36,7 +36,9 @@ WRITE_ACTIONS = {
     "control": ("/api/tasks/control", ("id", "version", "action", "reason")),
     "routine_create": ("/api/routines/create", ("project_id", "id", "body")),
     "grant_revoke": ("/api/grants/revoke", ("id",)),
+    "hold": ("/api/hold", ("action",)),
 }
+MANDATE_FIELDS = ("name", "objective", "success_measure", "milestone", "allowed_paths", "daily_calls", "authority", "task_templates", "planning_contract", "facts")
 
 
 def _base_url() -> str:
@@ -103,6 +105,47 @@ def _compact_state(state: dict) -> dict:
     }
 
 
+def _project(project_id: str) -> dict:
+    if not project_id:
+        raise ValueError("mandate requires a project id")
+    state = _call("/api/state")
+    for project in state.get("projects", []):
+        if project.get("id") == project_id:
+            return {
+                "id": project["id"], "repo": project.get("repo"), "mode": project.get("mode"),
+                "priority": project.get("priority"), "version": project.get("version"),
+                "mandate": {k: (project.get("body") or {}).get(k) for k in MANDATE_FIELDS},
+                "held": bool((state.get("holds") or {}).get(project_id) or (state.get("holds") or {}).get("*")),
+            }
+    raise ValueError(f"Unknown Talos project '{project_id}'")
+
+
+def _mandate_save(kwargs: dict) -> Any:
+    """Merge the given mandate fields onto the current mandate and save with its version.
+
+    The model never has to resend the whole body, and a concurrent edit is
+    refused by Talos's compare-and-swap rather than silently overwritten.
+    """
+    project_id = str(kwargs.get("id") or "")
+    current = _project(project_id)
+    expected = kwargs.get("version", current["version"])
+    if expected != current["version"]:
+        raise ValueError(f"Mandate version changed (now {current['version']}); read it again before saving")
+    state = _call("/api/state")
+    body = next(p for p in state["projects"] if p["id"] == project_id).get("body") or {}
+    fields = kwargs.get("mandate") if isinstance(kwargs.get("mandate"), dict) else {}
+    fields = {**fields, **{k: kwargs[k] for k in MANDATE_FIELDS if k in kwargs and kwargs[k] is not None}}
+    unknown = [k for k in fields if k not in MANDATE_FIELDS]
+    if unknown:
+        raise ValueError(f"Unknown mandate fields: {', '.join(unknown)}")
+    if not fields and not any(k in kwargs for k in ("mode", "priority")):
+        raise ValueError("mandate_save needs at least one mandate field, mode or priority")
+    body = {**body, **fields, "authority": fields.get("authority") or f"steward:{kwargs.get('actor') or 'talos-thread'}"}
+    payload = {"id": project_id, "repo": kwargs.get("repo") or current["repo"], "version": current["version"],
+               "mode": kwargs.get("mode") or current["mode"], "priority": kwargs.get("priority", current["priority"]), "body": body}
+    return _call("/api/projects/save", payload)
+
+
 def talos_tool(action: str, **kwargs: Any) -> str:
     action = str(action or "").strip().lower()
     try:
@@ -111,6 +154,11 @@ def talos_tool(action: str, **kwargs: Any) -> str:
             if action == "state":
                 result = _compact_state(result)
             return json.dumps({"ok": True, "action": action, "result": result})
+        if action == "mandate":
+            project = _project(str(kwargs.get("id") or ""))
+            return json.dumps({"ok": True, "action": action, "result": project})
+        if action == "mandate_save":
+            return json.dumps({"ok": True, "action": action, "result": _mandate_save(kwargs)})
         if action == "task":
             task_id = str(kwargs.get("id") or "").strip()
             if not task_id or "/" in task_id:
@@ -128,8 +176,8 @@ def talos_tool(action: str, **kwargs: Any) -> str:
                 raise ValueError(f"{action} requires {', '.join(missing)}")
             return json.dumps({"ok": True, "action": action, "result": _call(path, payload)})
         raise ValueError(
-            "Unknown action; use state, live, sessions, task, admit, project_save, decision_answer, "
-            "commitment_action, control, routine_create or grant_revoke"
+            "Unknown action; use state, live, sessions, task, mandate, mandate_save, hold, admit, "
+            "project_save, decision_answer, commitment_action, control, routine_create or grant_revoke"
         )
     except ValueError as exc:
         return json.dumps({"ok": False, "action": action, "error": str(exc)})
@@ -138,7 +186,10 @@ def talos_tool(action: str, **kwargs: Any) -> str:
 TALOS_SCHEMA = {
     "name": "talos",
     "description": (
-        "Talos, the autonomous project runtime on Command Center. Reads: state (projects, tasks, "
+        "Talos, the autonomous project runtime on Command Center. mandate reads a project's current "
+        "mandate (outcome, success measure, milestone, allowed paths, mode, priority, hold); mandate_save "
+        "merges changed fields onto it with a version check; hold pauses (verb=pause) or resumes "
+        "(verb=resume) all projects or one (scope). Reads: state (projects, tasks, "
         "decisions, commitments, routines, health), live (open work per project with stages and "
         "call summaries), sessions (observed Hermes chats), task (one task's findings, reviews and "
         "verification receipts). Writes: admit a task contract, project_save a mandate, "
@@ -151,8 +202,8 @@ TALOS_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["state", "live", "sessions", "task", "admit", "project_save", "decision_answer",
-                         "commitment_action", "control", "routine_create", "grant_revoke"],
+                "enum": ["state", "live", "sessions", "task", "mandate", "mandate_save", "hold", "admit",
+                         "project_save", "decision_answer", "commitment_action", "control", "routine_create", "grant_revoke"],
             },
             "id": {"type": "string", "description": "Task, project, decision, commitment, routine or grant id, depending on the action."},
             "version": {"type": "integer", "description": "Current record version for decision_answer and control (compare-and-swap)."},
@@ -171,6 +222,8 @@ TALOS_SCHEMA = {
             "evidence": {"type": "string"},
             "defer_until": {"type": "number"},
             "owner": {"type": "string", "enum": ["agent", "human"]},
+            "mandate": {"type": "object", "description": "For mandate_save: the fields to change (objective, success_measure, milestone, allowed_paths, daily_calls, name). Unchanged fields are kept."},
+            "scope": {"type": "string", "description": "For hold: a project id, or omit for all projects."},
         },
         "required": ["action"],
     },

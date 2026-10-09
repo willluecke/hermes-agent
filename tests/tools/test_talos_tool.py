@@ -34,7 +34,8 @@ def talos_server(monkeypatch, tmp_path):
                 return self._reply(401, {"error": "Sign in through Hermes to open this operator view."})
             if self.path == "/api/state":
                 return self._reply(200, {"at": 1, "timezone": "UTC", "health": {"stale": False}, "models": {},
-                    "projects": [{"id": "p", "repo": "/r", "mode": "paused", "priority": 1, "version": 1, "body": {"name": "P", "objective": "O", "secret_blob": "x"}}],
+                    "holds": {"p": {"actor": "Will", "reason": "stop"}},
+                    "projects": [{"id": "p", "repo": "/r", "mode": "paused", "priority": 1, "version": 1, "body": {"name": "P", "objective": "O", "allowed_paths": ["src/**"], "secret_blob": "x"}}],
                     "tasks": [{"id": "t", "project_id": "p", "state": "QUEUED", "waiting": None, "detail": None, "generation": 0, "updated": 1, "version": 1, "progress": {}, "body": {"contract": {"artifact": "A", "obligations": [{"id": "OB"}]}}}],
                     "decisions": [], "commitments": [], "routines": [], "budgets": [], "events": [{"kind": "scheduler.tick"}]})
             if self.path == "/api/live":
@@ -50,7 +51,9 @@ def talos_server(monkeypatch, tmp_path):
             if self.path == "/api/decisions/answer":
                 return self._reply(409, {"error": "Decision version is stale"})
             if self.path == "/api/projects/save":
-                return self._reply(200, {"id": payload["id"], "version": 2})
+                return self._reply(200, {"id": payload["id"], "version": 2, "body": payload["body"], "mode": payload["mode"]})
+            if self.path == "/api/hold":
+                return self._reply(200, {"hold": {"scope": payload.get("scope") or "*", "actor": "x"}} if payload["action"] == "pause" else {"cleared": True})
             return self._reply(404, {"error": "Unknown operator action"})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -119,3 +122,31 @@ def test_handler_maps_verb_onto_the_upstream_action_field(talos_server):
     talos._handler({"action": "commitment_action", "id": "c", "verb": "done", "evidence": "shipped"})
     assert seen[-1][1] == "/api/commitments/action"
     assert seen[-1][3] == {"id": "c", "action": "done", "evidence": "shipped"}
+
+
+def test_mandate_read_and_merged_save_with_version_check(talos_server):
+    seen, _ = talos_server
+    read = json.loads(talos.talos_tool("mandate", id="p"))
+    assert read["ok"] is True
+    assert read["result"]["mandate"]["objective"] == "O" and read["result"]["held"] is True
+    assert "secret_blob" not in json.dumps(read)
+    saved = json.loads(talos.talos_tool("mandate_save", id="p", mandate={"objective": "Ship X", "milestone": "M1"}, mode="active", priority=70))
+    assert saved["ok"] is True
+    sent = seen[-1][3]
+    assert sent["version"] == 1 and sent["mode"] == "active" and sent["priority"] == 70
+    assert sent["body"]["objective"] == "Ship X" and sent["body"]["milestone"] == "M1"
+    assert sent["body"]["allowed_paths"] == ["src/**"], "unchanged fields are kept"
+    assert sent["body"]["authority"].startswith("steward:")
+    stale = json.loads(talos.talos_tool("mandate_save", id="p", version=9, mandate={"objective": "Z"}))
+    assert stale["ok"] is False and "version" in stale["error"]
+    bad = json.loads(talos.talos_tool("mandate_save", id="p", mandate={"obligations": []}))
+    assert bad["ok"] is False and "Unknown mandate fields" in bad["error"]
+
+
+def test_hold_pause_and_resume(talos_server):
+    seen, _ = talos_server
+    paused = json.loads(talos.talos_tool("hold", verb="pause", scope="p", reason="Will asked"))
+    assert paused["ok"] is True and seen[-1][3] == {"action": "pause", "scope": "p", "reason": "Will asked"}
+    resumed = json.loads(talos.talos_tool("hold", verb="resume"))
+    assert resumed["ok"] is True and seen[-1][3] == {"action": "resume"}
+
