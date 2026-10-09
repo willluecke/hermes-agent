@@ -37,6 +37,8 @@ MAX_CLAIM_CHARS = 300
 MAX_EVIDENCE = 8
 MAX_CITED_CHARS = 2_000
 PREDICATES = ("passed", "count", "exit_zero", "contains", "ran")
+# ``evidence`` is the documented key; the others are what models write for it.
+EVIDENCE_KEYS = ("evidence", "commands", "command", "rows", "citations")
 # A ledger row id (c7, k58, pc3). The model is never shown one, so a cited id
 # is a guess; the tool says so at once, on every lane, and the gate refuses it.
 ROW_ID_RE = re.compile(r"p?[ck]\d+", re.IGNORECASE)
@@ -57,7 +59,15 @@ def report_results(args: Dict[str, Any]) -> str:
         if not claim:
             problems.append(f"item {index}: claim is empty")
             continue
-        evidence_raw = value.get("evidence")
+        # The description says "the commands it rests on", so models reach for
+        # ``commands`` (803 of 1,289 items in the week to 2026-10-09; 33 used
+        # ``rows``). A silently dropped key voided the manifest and the gate
+        # flagged true claims. Every spelling lands in ``evidence``.
+        evidence_raw = None
+        for key in EVIDENCE_KEYS:
+            if value.get(key) not in (None, "", []):
+                evidence_raw = value.get(key)
+                break
         if isinstance(evidence_raw, str):
             evidence_raw = [evidence_raw]
         evidence = [str(item).strip()[:MAX_CITED_CHARS] for item in (evidence_raw or []) if str(item).strip()] if isinstance(evidence_raw, list) else []
@@ -77,6 +87,14 @@ def report_results(args: Dict[str, Any]) -> str:
             continue
         if predicate == "contains" and not str(expected.get("text") or "").strip():
             problems.append(f"item {index}: contains needs expected.text")
+            continue
+        if predicate != "contains" and not evidence:
+            # Without a command the gate can only mark the claim insufficient
+            # and flag the sentence; refusing here lets the model fix it now.
+            problems.append(
+                f"item {index} ({claim[:60]!r}): name the command it rests on under evidence, "
+                "as you ran it, for example [\"npx tsc --noEmit -p .\"]"
+            )
             continue
         items.append(
             {
@@ -112,7 +130,9 @@ REPORT_RESULTS_SCHEMA = {
     "description": (
         "Register the result claims your answer will make, before finishing a change. "
         "Each item names one claim as it will appear in the answer, the commands it rests "
-        "on, and a predicate code checks exactly: passed (every cited command reports a "
+        "on under the key evidence (for example {\"claim\": \"Hermes Chat lint passes\", "
+        "\"evidence\": [\"npx next lint\"], \"predicate\": \"exit_zero\"}), and a predicate code "
+        "checks exactly: passed (every cited command reports a "
         "pass), count (their counts equal expected, e.g. {passed: 98, failed: 0}), "
         "exit_zero, contains (expected.text is in the output), or ran. Cite each command "
         "as you ran it in the terminal this turn; a distinctive part of a long command is "
@@ -141,7 +161,7 @@ REPORT_RESULTS_SCHEMA = {
                         "evidence": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "The commands the claim rests on, as you ran them, for example [\"npx vitest run test/mcp.test.ts\"]. A distinctive part of a long command is enough. Not row ids.",
+                            "description": "Required for passed, count, exit_zero and ran: the commands the claim rests on, as you ran them, for example [\"npx vitest run test/mcp.test.ts\"]. A distinctive part of a long command is enough. Not row ids. (Also read from commands, command or rows.)",
                         },
                         "predicate": {"type": "string", "enum": list(PREDICATES)},
                         "expected": {

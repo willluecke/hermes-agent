@@ -2066,6 +2066,11 @@ def test_match_claim_joins_by_token_containment_and_prefers_the_longest_claim():
     assert preflight.match_claim("Exporter writes JSON", verdicts)["id"] == "r3", "a sentence inside the claim also joins"
     assert preflight.match_claim("The deploy to staging succeeded.", verdicts) is None
     assert preflight.match_claim("", verdicts) is None
+    # A table row restating "Hermes Chat lint passes" has no "passes" in it (2026-10-09, Talos).
+    table = [{"id": "t1", "claim": "Hermes Chat lint passes"}, {"id": "t2", "claim": "Hermes Chat production build passes"}]
+    assert preflight.match_claim("| Hermes Chat lint | exit 0, three pre-existing dashboard warnings |", table)["id"] == "t1"
+    assert preflight.match_claim("| Hermes Chat production build | compiled, all routes generated |", table)["id"] == "t2"
+    assert preflight.match_claim("Everything passes and is green.", table) is None, "function words alone join nothing"
     assert preflight._claim_tokens("Ran 14 tests, 14 passed!") == frozenset({"ran", "tests", "passed"}), "bare numbers are not tokens"
     assert preflight._claim_tokens("edited src/app.py with --json.") == frozenset({"edited", "src/app.py", "with", "json"})
 
@@ -2379,3 +2384,17 @@ def test_a_build_turn_that_ran_commands_but_changed_nothing_is_not_judged(feedba
     preflight.on_post_tool_call(tool_name="terminal", args={"command": "ls", "workdir": str(repo)}, result="app.py", session_id="s2")
     assert preflight.on_pre_verify(session_id="s2", attempt=0, final_response="app.py.", changed_paths=[]) is None
     assert [e for e in emitted if e["stage"] == "verify"] == []
+
+
+def test_a_hook_call_without_a_session_is_ignored(feedback, emitted):
+    """A second hook pass with no session refused a retire the attributed pass had
+    honoured, and the refusal reached the model (2026-10-09)."""
+    _carry_three(feedback)
+    before = len(feedback["records"]("criteria"))
+    result = preflight.on_post_tool_call(tool_name="acceptance_criteria", args={}, steerable=True, session_id="", result=json.dumps({
+        "todos": [], "retire": [{"target": "p1", "reason": "done"}],
+    }))
+    assert result is None
+    assert len(feedback["records"]("criteria")) == before, "nothing is logged under an empty session"
+    assert [item["id"] for item in preflight.active_criteria("s1")] == ["p1", "p2", "p3"], "the real session's list is untouched"
+    assert preflight.on_transform_tool_result(tool_name="acceptance_criteria", session_id="", result="{}") is None

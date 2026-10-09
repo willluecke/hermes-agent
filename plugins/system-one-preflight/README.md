@@ -103,7 +103,12 @@ A slow or failed call fails **open**: the turn proceeds without advice.
      `Unsupported by the evidence: "…"`;
    - whether the changes satisfy the request as a whole.
    The **manifest** (`report_results`: claim, the commands it rests on as
-   the model ran them, predicate) is checked by code, not Jev.
+   the model ran them under `evidence`, predicate) is checked by code, not
+   Jev. The tool also reads `commands`, `command` and `rows` as that key
+   (models wrote `commands` on 803 of 1,289 items in the week to
+   2026-10-09, and a dropped key voided the claim), and it refuses a
+   `passed`/`count`/`exit_zero`/`ran` item that names no command, so the
+   model fixes it at call time; `contains` may search output uncited.
    `evidence.resolve_evidence` matches each cited command to its newest run
    (exact form first, `cd X &&` and output filters ignored, then a distinctive
    part of 8+ characters); a cited row id is refused, with a finding telling
@@ -122,7 +127,8 @@ A slow or failed call fails **open**: the turn proceeds without advice.
 
 ## Labels, precision, tuning
 
-A flagged sentence is joined to a manifest item by token containment and
+A flagged sentence is joined to a manifest item by content-word containment
+(function words such as "passes" or "is" on either side do not count) and
 labelled from **execution**, never from Jev or a human: `false_flag` (gate
 re-ran it and it held), `overclaim` (contradicted / stale / missing),
 `overclaim_unregistered` (manifest exists, nothing covers the sentence),

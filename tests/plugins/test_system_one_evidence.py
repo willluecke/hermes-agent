@@ -245,6 +245,13 @@ def test_parse_manifest_reads_the_raw_and_the_bridge_wrapped_result():
     assert evidence.parse_manifest("not json") is None
     assert evidence.parse_manifest(json.dumps({"todos": []})) is None
     assert evidence.parse_manifest(json.dumps({"manifest": []})) == []
+    aliased = evidence.parse_manifest(json.dumps({"manifest": [
+        {"claim": "lint", "commands": ["npx next lint"]},
+        {"claim": "build", "command": ["npx next build"]},
+        {"claim": "suite", "rows": ["npm test"]},
+        {"claim": "types", "evidence": "npx tsc --noEmit -p ."},
+    ]}))
+    assert [item["evidence"] for item in aliased] == [["npx next lint"], ["npx next build"], ["npm test"], ["npx tsc --noEmit -p ."]], "a model's spelling of the key still cites"
     many = evidence.parse_manifest(json.dumps({"manifest": [{"claim": f"c{i}", "evidence": ["c1"]} for i in range(40)]}))
     assert len(many) == evidence.MAX_MANIFEST_ITEMS
     assert many[0]["id"] == "r1" and many[0]["predicate"] == "passed"

@@ -631,7 +631,15 @@ def parse_manifest(text: str) -> Optional[List[Dict[str, Any]]]:
         claim = str(item.get("claim") or "").strip()
         if not claim:
             continue
-        evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+        # The tool normalizes the key, but a registration from an older tool
+        # build (or a bridge that passed the raw call through) may still carry
+        # the model's spelling.
+        evidence = next(
+            (item[key] for key in ("evidence", "commands", "command", "rows") if isinstance(item.get(key), list) and item[key]),
+            [],
+        )
+        if isinstance(item.get("evidence"), str):
+            evidence = [item["evidence"]]
         expected = item.get("expected") if isinstance(item.get("expected"), dict) else {}
         manifest.append(
             {

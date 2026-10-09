@@ -2078,17 +2078,32 @@ def _claim_tokens(text: str) -> frozenset:
     return frozenset(token for token in _CLAIM_TOKEN_RE.findall((text or "").lower()) if not token.isdigit())
 
 
+# Words a claim and the sentence that restates it need not share: a manifest
+# says "Hermes Chat lint passes", the answer's table row says "| Hermes Chat
+# lint | exit 0 |". Content words decide the join; these do not.
+_CLAIM_FUNCTION_WORDS = frozenset(
+    "pass passes passed passing succeed succeeds succeeded ok clean green is are was were be been "
+    "the a an and or with all every each still now no not to of in on for at by as it its this that "
+    "now again also".split()
+)
+
+
+def _claim_content(text: str) -> frozenset:
+    return _claim_tokens(text) - _CLAIM_FUNCTION_WORDS
+
+
 def match_claim(sentence: str, verdicts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """The manifest item a flagged sentence resolves to, by token containment
     (the item's claim inside the sentence, or the sentence inside the claim),
-    the longest claim winning a tie. Deterministic; no judgment."""
-    tokens = _claim_tokens(sentence)
+    the longest claim winning a tie. Deterministic; no judgment. Function
+    words such as "passes" are not required on either side."""
+    tokens = _claim_content(sentence)
     if not tokens:
         return None
     best: Optional[Dict[str, Any]] = None
     best_size = 0
     for item in verdicts:
-        claim_tokens = _claim_tokens(str(item.get("claim") or ""))
+        claim_tokens = _claim_content(str(item.get("claim") or ""))
         if not claim_tokens:
             continue
         if claim_tokens <= tokens or tokens <= claim_tokens:
@@ -2548,6 +2563,13 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if current_mode() == "off":
         return None
     session_id = str(kwargs.get("session_id") or "")
+    if not session_id:
+        # A call with no session cannot be attributed: its ledger rows,
+        # criteria and retirements would land under "" and a retire would be
+        # refused for a list that is not there (2026-10-09, a second hook
+        # pass without a session answered "no such criterion" for criteria
+        # the session had carried and the attributed pass retired).
+        return None
     tool_name = str(kwargs.get("tool_name") or "")
     args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
     result = kwargs.get("result")
@@ -2656,6 +2678,8 @@ def on_transform_tool_result(**kwargs: Any) -> Optional[str]:
     if tool_name not in ("todo", "acceptance_criteria", "report_results"):
         return None
     session_id = str(kwargs.get("session_id") or "")
+    if not session_id:
+        return None
     pending = _pending_manifest_note if tool_name == "report_results" else _pending_fidelity_note
     note = pending.pop(session_id, None)
     result = kwargs.get("result")
