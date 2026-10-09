@@ -145,6 +145,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "text_to_speech",
     "decision_log",
     "model_consult",
+    "talos",
     "typesafe_decide",
     # Stateless stand-in for `todo` on the Codex and Claude lanes: returns the
     # criteria in the todo result shape so the verify judge can use them.
