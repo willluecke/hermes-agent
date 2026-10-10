@@ -39,12 +39,28 @@ def sync_server(monkeypatch):
                 return self._reply(200, {"conversations": {"c_regwatch": state["conversation"], "c_other": state["other"]}})
             if self.path == "/conversations/c_regwatch":
                 return self._reply(200, {"conversation": state["conversation"], "window": {}, "activityCounts": {}})
+            if self.path == "/conversations/c_regwatch/goal":
+                return self._reply(200, {"goal": state.get("goal")})
             return self._reply(404, {"error": "not found"})
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             seen.append(("POST", self.path, payload))
+            if self.path == "/conversations/c_regwatch/runtime":
+                state["conversation"].update({k: v for k, v in payload.items() if k in ("model", "effort")})
+                return self._reply(200, {"id": "c_regwatch", "model": state["conversation"]["model"], "effort": state["conversation"]["effort"]})
+            if self.path == "/conversations/c_regwatch/goal":
+                state.setdefault("goal", {"status": "none"})
+                if payload["action"] == "set":
+                    state["goal"] = {"goal": payload["text"], "status": "active", "max_turns": payload.get("max_turns", 50), "turns_used": 0, "actor": payload.get("actor")}
+                    return self._reply(200, {"goal": {**state["goal"], "queued": {"id": "goal_1", "state": "queued"}}})
+                if payload["action"] in ("pause", "resume"):
+                    state["goal"]["status"] = "paused" if payload["action"] == "pause" else "active"
+                    return self._reply(200, {"goal": state["goal"]})
+                if payload["action"] == "clear":
+                    state["goal"]["status"] = "cleared"
+                    return self._reply(200, {"cleared": True})
             if self.path == "/queued-turns":
                 # The store anchors the user message and the assistant slot; the
                 # reply fills in once the resumed session answers.
@@ -110,3 +126,39 @@ def test_registered_everywhere():
     assert "hermes_conversation" in toolsets.TOOLSETS["hermes_conversation"]["tools"]
     from agent.transports import hermes_tools_mcp_server as mcp
     assert "hermes_conversation" in mcp.EXPOSED_TOOLS
+
+
+def test_send_overrides_effort_and_model_within_the_harness(sync_server):
+    seen, _ = sync_server
+    ok = json.loads(convo.hermes_conversation_tool("send", id="c_regwatch", text="think harder", effort="max", model="claude-code::claude-fable-5-1"))
+    assert ok["ok"] is True
+    post = [call for call in seen if call[0] == "POST" and call[1] == "/queued-turns"][-1]
+    assert post[2]["runtime"] == {"model": "claude-code::claude-fable-5-1", "effort": "max", "project": "reg-watch"}
+    bad_effort = json.loads(convo.hermes_conversation_tool("send", id="c_regwatch", text="x", effort="turbo"))
+    assert bad_effort["ok"] is False and "effort must be one of" in bad_effort["error"]
+    cross = json.loads(convo.hermes_conversation_tool("send", id="c_regwatch", text="x", model="openai-codex::gpt-6-astra"))
+    assert cross["ok"] is False and "different harness" in cross["error"]
+
+
+def test_set_runtime_changes_the_saved_selectors(sync_server):
+    seen, state = sync_server
+    result = json.loads(convo.hermes_conversation_tool("set_runtime", id="c_regwatch", model="claude-code::claude-fable-5-1", effort="high"))
+    assert result["ok"] is True and result["result"] == {"id": "c_regwatch", "model": "claude-code::claude-fable-5-1", "effort": "high"}
+    assert seen[-1][1] == "/conversations/c_regwatch/runtime" and seen[-1][2] == {"model": "claude-code::claude-fable-5-1", "effort": "high"}
+    assert state["conversation"]["effort"] == "high"
+    empty = json.loads(convo.hermes_conversation_tool("set_runtime", id="c_regwatch"))
+    assert empty["ok"] is False
+
+
+def test_goal_set_status_pause_resume_clear(sync_server):
+    seen, _ = sync_server
+    unset = json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="set", text="   "))
+    assert unset["ok"] is False
+    set_result = json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="set", text="All crawl pages pass", max_turns=12))
+    assert set_result["ok"] is True and set_result["result"]["goal"]["status"] == "active"
+    assert seen[-1][2] == {"action": "set", "text": "All crawl pages pass", "actor": "Talos", "max_turns": 12}
+    assert json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch"))["result"]["goal"]["goal"] == "All crawl pages pass"
+    assert json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="pause"))["result"]["goal"]["status"] == "paused"
+    assert json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="resume"))["result"]["goal"]["status"] == "active"
+    assert json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="clear"))["result"]["cleared"] is True
+

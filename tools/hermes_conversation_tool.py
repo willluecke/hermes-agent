@@ -28,6 +28,7 @@ MAX_TEXT_CHARS = 12_000
 MAX_REPLY_CHARS = 16_000
 MAX_WAIT_SECONDS = 600
 POLL_SECONDS = 3
+EFFORTS = ("default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode")
 
 
 def _base_url() -> str:
@@ -137,7 +138,62 @@ def _reply_after(conversation_id: str, turn_id: str) -> dict | None:
     return None
 
 
-def _send(conversation_id: str, text: str, wait_seconds: int = 0, actor: str = "") -> dict:
+def _runtime_for(conversation: dict, model: str = "", effort: str = "") -> dict:
+    """The thread's saved runtime, with optional one-turn overrides.
+
+    An override stays inside the thread's harness (the part before '::'):
+    moving a Claude thread onto a Codex model changes which native session
+    resumes, which is a deliberate act, not a per-turn tweak.
+    """
+    runtime = {k: conversation.get(k) for k in ("model", "effort", "project")}
+    if not all(runtime.values()):
+        raise ValueError("the conversation has no saved model, effort and project to resume with")
+    if effort:
+        if effort not in EFFORTS:
+            raise ValueError(f"effort must be one of {', '.join(EFFORTS)}")
+        runtime["effort"] = effort
+    if model:
+        model = model.strip()
+        if not model or any(ch.isspace() for ch in model) or len(model) > 260:
+            raise ValueError("model must be a single selector such as claude-code::claude-fable-5-1")
+        saved = str(runtime["model"])
+        if "::" in saved and "::" in model and saved.split("::", 1)[0] != model.split("::", 1)[0]:
+            raise ValueError(
+                f"model {model} is on a different harness than this thread's {saved}; "
+                "use set_runtime to move the thread deliberately"
+            )
+        runtime["model"] = model
+    return runtime
+
+
+def _set_runtime(conversation_id: str, model: str = "", effort: str = "") -> dict:
+    if not model and not effort:
+        raise ValueError("set_runtime needs a model, an effort, or both")
+    if effort and effort not in EFFORTS:
+        raise ValueError(f"effort must be one of {', '.join(EFFORTS)}")
+    _conversation(conversation_id)
+    payload = {k: v for k, v in (("model", model.strip() if model else ""), ("effort", effort)) if v}
+    return _call("/conversations/" + parse.quote(conversation_id, safe="") + "/runtime", payload)
+
+
+def _goal(conversation_id: str, verb: str, text: str = "", max_turns: Any = None, actor: str = "") -> dict:
+    verb = (verb or "status").strip().lower()
+    path = "/conversations/" + parse.quote(conversation_id, safe="") + "/goal"
+    if verb == "status":
+        return _call(path)
+    if verb == "set":
+        if not (text or "").strip():
+            raise ValueError("goal set needs text")
+        body = {"action": "set", "text": text.strip(), "actor": actor or "Talos"}
+        if max_turns is not None:
+            body["max_turns"] = int(max_turns)
+        return _call(path, body)
+    if verb in ("pause", "resume", "clear"):
+        return _call(path, {"action": verb})
+    raise ValueError("goal verb must be set, status, pause, resume or clear")
+
+
+def _send(conversation_id: str, text: str, wait_seconds: int = 0, actor: str = "", model: str = "", effort: str = "") -> dict:
     text = (text or "").strip()
     if not text:
         raise ValueError("send requires text")
@@ -146,9 +202,7 @@ def _send(conversation_id: str, text: str, wait_seconds: int = 0, actor: str = "
     conversation = _conversation(conversation_id)
     if conversation.get("automation"):
         raise ValueError("this conversation is an automation console; it queues replies on the device")
-    runtime = {k: conversation.get(k) for k in ("model", "effort", "project")}
-    if not all(runtime.values()):
-        raise ValueError("the conversation has no saved model, effort and project to resume with")
+    runtime = _runtime_for(conversation, model, effort)
     turn_id = "agent_" + secrets.token_hex(8)
     prefix = f"[{actor.strip()}] " if actor and actor.strip() else ""
     queued = _call("/queued-turns", {
@@ -184,8 +238,16 @@ def hermes_conversation_tool(action: str, **kwargs: Any) -> str:
         if action == "send":
             return json.dumps({"ok": True, "action": action, "result": _send(
                 str(kwargs.get("id") or ""), str(kwargs.get("text") or ""),
-                kwargs.get("wait_seconds") or 0, str(kwargs.get("actor") or ""))})
-        raise ValueError("Unknown action; use list, read or send")
+                kwargs.get("wait_seconds") or 0, str(kwargs.get("actor") or ""),
+                str(kwargs.get("model") or ""), str(kwargs.get("effort") or ""))})
+        if action == "set_runtime":
+            return json.dumps({"ok": True, "action": action, "result": _set_runtime(
+                str(kwargs.get("id") or ""), str(kwargs.get("model") or ""), str(kwargs.get("effort") or ""))})
+        if action == "goal":
+            return json.dumps({"ok": True, "action": action, "result": _goal(
+                str(kwargs.get("id") or ""), str(kwargs.get("verb") or "status"), str(kwargs.get("text") or ""),
+                kwargs.get("max_turns"), str(kwargs.get("actor") or ""))})
+        raise ValueError("Unknown action; use list, read, send, set_runtime or goal")
     except ValueError as exc:
         return json.dumps({"ok": False, "action": action, "error": str(exc)})
 
@@ -197,12 +259,21 @@ HERMES_CONVERSATION_SCHEMA = {
         "for one project (ids, titles, models). read: a conversation's last messages. send: queue a "
         "message into an existing conversation; the gateway resumes that session with its full "
         "context, the message lands in the thread as a real turn, and the reply is archived there. "
-        "A thread needs no live process to be messaged. Set wait_seconds to wait for the reply."
+        "A thread needs no live process to be messaged. Set wait_seconds to wait for the reply. "
+        "send accepts model and effort overrides for that one turn (same harness as the thread). "
+        "set_runtime changes the thread's saved model and effort persistently. goal sets a standing "
+        "goal on the thread (verb=set with text and max_turns): a typed judge checks every final answer "
+        "and the thread keeps taking visible continuation turns until the goal is met or the cap is "
+        "hit; verbs status, pause, resume, clear manage it."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list", "read", "send"]},
+            "action": {"type": "string", "enum": ["list", "read", "send", "set_runtime", "goal"]},
+            "model": {"type": "string", "description": "Model selector, e.g. claude-code::claude-fable-5-1 or openai-codex::gpt-6-astra."},
+            "effort": {"type": "string", "enum": list(EFFORTS)},
+            "verb": {"type": "string", "enum": ["set", "status", "pause", "resume", "clear"], "description": "For goal."},
+            "max_turns": {"type": "integer", "minimum": 1, "maximum": 500, "description": "For goal set: turn cap (default 50)."},
             "id": {"type": "string", "description": "Conversation id, e.g. c_mt9bcwww_ah7ikn (from list)."},
             "project": {"type": "string", "description": "For list: only this project's conversations."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
