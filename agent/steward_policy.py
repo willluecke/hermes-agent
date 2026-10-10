@@ -1,4 +1,5 @@
 """Talos is a tool-only orchestrator. This policy is not model advice."""
+import os
 from pathlib import Path
 import sys
 import threading
@@ -73,8 +74,25 @@ class StewardTools:
             self.dispatched=True
 
 
+PROFILE_LIMIT = 8000  # characters of Will's profile; USER.md is ~2.3 KB today
+
+
 def instructions():
-    return (Path.home()/'.hermes/talos-steward/docs/steward-instructions.md').read_text()
+    """Jim's runtime contract: the steward instructions plus Will's Hermes
+    profile, read fresh each turn so the project manager knows who he works
+    for and what matters to him. A missing profile only drops that section."""
+    text = (Path.home()/'.hermes/talos-steward/docs/steward-instructions.md').read_text()
+    hermes_home = Path(os.environ.get('HERMES_HOME') or Path.home()/'.hermes')
+    try:
+        profile = (hermes_home/'memories'/'USER.md').read_text().strip()
+    except OSError:
+        profile = ''
+    if profile:
+        # USER.md separates entries with lone '§' markers.
+        entries = [entry.strip() for entry in profile.split('§') if entry.strip()]
+        text += ('\n\n## About Will (Hermes profile, read fresh each turn)\n\n'
+                 + '\n\n'.join(entries)[:PROFILE_LIMIT])
+    return text
 
 
 def require_steward_runtime(agent):

@@ -86,3 +86,35 @@ def test_parallel_dispatches_cannot_pass_the_same_fence():
         results=list(pool.map(lambda _:invoke(),range(2)))
     assert calls==['one']
     assert results.count('refused')==1
+
+
+def _steward_home(tmp_path, profile=None):
+    docs = tmp_path/'.hermes'/'talos-steward'/'docs'
+    docs.mkdir(parents=True)
+    (docs/'steward-instructions.md').write_text('You are Jim, Will\'s project manager.')
+    if profile is not None:
+        (tmp_path/'.hermes'/'memories').mkdir(parents=True)
+        (tmp_path/'.hermes'/'memories'/'USER.md').write_text(profile)
+    return tmp_path
+
+
+def test_instructions_append_wills_profile_fresh_each_turn(tmp_path, monkeypatch):
+    from agent import steward_policy
+    home = _steward_home(tmp_path, 'Will targets ~$10k/mo.\n§\nPriority: revenue this week.')
+    monkeypatch.setattr(steward_policy.Path, 'home', classmethod(lambda cls: home))
+    monkeypatch.delenv('HERMES_HOME', raising=False)
+    text = steward_policy.instructions()
+    assert text.startswith("You are Jim, Will's project manager.")
+    assert '## About Will' in text
+    assert 'Will targets ~$10k/mo.\n\nPriority: revenue this week.' in text
+    assert '§' not in text
+    (home/'.hermes'/'memories'/'USER.md').write_text('Will now targets $20k/mo.')
+    assert 'Will now targets $20k/mo.' in steward_policy.instructions()
+
+
+def test_instructions_survive_a_missing_profile(tmp_path, monkeypatch):
+    from agent import steward_policy
+    home = _steward_home(tmp_path)
+    monkeypatch.setattr(steward_policy.Path, 'home', classmethod(lambda cls: home))
+    monkeypatch.delenv('HERMES_HOME', raising=False)
+    assert steward_policy.instructions() == "You are Jim, Will's project manager."
