@@ -47,7 +47,9 @@ def managed_owner(session_id=None, run_id=None):
         conversation_id=session_id[len('hermes-chat-'):]
         row=db.execute('SELECT data FROM conversation_goals WHERE conversation_id=?',(conversation_id,)).fetchone()
         goal=json.loads(row[0]) if row else {}
-        if goal.get('delegation_id') and goal.get('status') in {'active','paused'}: return observed(True)
+        # Only active managed work owns the thread; a paused goal (blocked on
+        # Will, capped, held or user-paused) must never lock him out of it.
+        if goal.get('delegation_id') and goal.get('status')=='active': return observed(True)
         return observed(bool('goal_turns' in tables and db.execute("SELECT 1 FROM goal_turns WHERE conversation_id=? AND state IN ('launching','running','judging') AND json_extract(data,'$.delegation_id') IS NOT NULL",(conversation_id,)).fetchone()))
     except (OSError,sqlite3.Error,ValueError):
         # Ordinary human chat never depends on a successful observation.

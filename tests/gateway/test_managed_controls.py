@@ -119,3 +119,14 @@ def test_failed_observation_allows_ordinary_chat_but_preserves_known_owner(manag
     assert start_allowed({}, {'session_id':'hermes-chat-delegate'})
     with patch('gateway.managed_controls.sqlite3.connect',side_effect=sqlite3.OperationalError('locked')):
         assert start_allowed({}, {'session_id':'hermes-chat-delegate'})
+
+
+def test_paused_goal_lets_will_reply_but_in_flight_turn_still_fences(managed):
+    headers={'Authorization':'Bearer ordinary-key'}
+    with sqlite3.connect(managed/'sync.db') as db:
+        db.execute('INSERT INTO conversation_goals VALUES(?,?)',('blocked',json.dumps({'status':'paused','pause_reason':'blocked','delegation_id':'d2'})))
+        db.execute('INSERT INTO goal_turns VALUES(?,?,?,?)',('blocked','run_blocked','settled',json.dumps({'delegation_id':'d2'})))
+    assert start_allowed(headers,{'session_id':'hermes-chat-blocked'})
+    with sqlite3.connect(managed/'sync.db') as db:
+        db.execute("UPDATE goal_turns SET state='running' WHERE conversation_id='blocked'")
+    assert not start_allowed(headers,{'session_id':'hermes-chat-blocked'})
