@@ -2620,3 +2620,108 @@ class TestStaleStopDiscard:
             finally:
                 adapter._active_run_agents.pop("run_done", None)
                 adapter._active_run_tasks.pop("run_done", None)
+
+
+def test_managed_goal_exclusion_never_reads_or_judges_native_goal():
+    from gateway.platforms.api_server import _evaluate_api_goal_turn
+    with patch('gateway.platforms.api_server._api_goal_manager') as manager:
+        assert _evaluate_api_goal_turn('managed', 'final', user_initiated=True, native_goal=False) is None
+        manager.assert_not_called()
+        manager.return_value.is_active.return_value = False
+        assert _evaluate_api_goal_turn('ordinary', 'final', user_initiated=True) is None
+        manager.assert_called_once_with('ordinary')
+
+
+@pytest.mark.asyncio
+async def test_managed_run_rejects_native_goal_command(adapter):
+    async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+        with patch('gateway.platforms.api_server._prepare_api_goal_command') as prepare:
+            response = await cli.post('/v1/runs', json={'input': '/goal resume', 'session_id': 'managed', 'native_goal': False})
+            assert response.status == 409
+            prepare.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_managed_run_stops_after_one_turn_with_saved_native_goal(adapter):
+    agent = MagicMock()
+    agent.run_conversation.return_value = {'final_response': 'one bounded turn'}
+    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+    async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+        with patch.object(adapter, '_create_agent', return_value=agent), patch('gateway.platforms.api_server._api_goal_manager') as manager:
+            response = await cli.post('/v1/runs', json={'input': 'work', 'session_id': 'managed', 'native_goal': False})
+            assert response.status == 202
+            run_id = (await response.json())['run_id']
+            await (await cli.get(f'/v1/runs/{run_id}/events')).text()
+            result = await (await cli.get(f'/v1/runs/{run_id}')).json()
+    assert result['status'] == 'completed'
+    assert agent.run_conversation.call_count == 1
+    manager.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_request_lookup_recovers_durable_identity_without_launching(adapter, tmp_path):
+    from types import SimpleNamespace
+    adapter._response_store.close()
+    adapter._response_store = ResponseStore(db_path=str(tmp_path/'lookup.db'))
+    request = SimpleNamespace(headers={'Idempotency-Key':'original-turn'})
+    with patch.object(adapter, '_create_agent') as create:
+        assert (await adapter._handle_run_request(request)).status == 404
+        adapter._response_store.claim_run_idempotency('api_server.runs:default','original-turn','fp','run-original')
+        response = await adapter._handle_run_request(request)
+        assert response.status == 200
+        assert json.loads(response.body) == {'run_id':'run-original'}
+        adapter._response_store.close()
+        adapter._response_store = ResponseStore(db_path=str(tmp_path/'lookup.db'))
+        assert json.loads((await adapter._handle_run_request(request)).body) == {'run_id':'run-original'}
+        assert (await adapter._handle_run_request(SimpleNamespace(headers={}))).status == 400
+        with patch.object(adapter._response_store, 'get_run_idempotency', side_effect=RuntimeError('locked')):
+            assert (await adapter._handle_run_request(request)).status == 503
+        create.assert_not_called()
+    adapter._response_store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_request_lookup_requires_authentication(auth_adapter):
+    from types import SimpleNamespace
+    response = await auth_adapter._handle_run_request(SimpleNamespace(headers={'Idempotency-Key':'key'},method='GET',path_qs='/v1/run-request'))
+    assert response.status == 401
+
+
+@pytest.mark.asyncio
+async def test_run_concurrency_rejection_proves_no_idempotency_claim(adapter, tmp_path):
+    from unittest.mock import AsyncMock
+    adapter._response_store.close()
+    adapter._response_store = ResponseStore(db_path=str(tmp_path/'rejection.db'))
+    adapter._max_concurrent_runs = 1
+    request = MagicMock()
+    request.headers = {'Idempotency-Key':'rejected-turn'}
+    request.json = AsyncMock(return_value={'input':'bounded fixture'})
+    try:
+        with patch('gateway.run._load_gateway_config', return_value={}), \
+             patch('gateway.platforms.api_server._resolve_run_workspace', return_value=(None,str(tmp_path),None,None)), \
+             patch.object(adapter,'active_agent_work_count',return_value=2), \
+             patch.object(adapter,'_persist_gateway_active_work'), \
+             patch.object(adapter,'_create_agent') as create:
+            response = await adapter._handle_runs(request)
+            assert response.status == 429
+            assert response.headers['Hermes-Run-Admission'] == 'rejected'
+            assert adapter._response_store.get_run_idempotency('api_server.runs:default','rejected-turn') is None
+            create.assert_not_called()
+            # A previously accepted key bypasses the cap and is never marked
+            # rejected, even while another request fills the last slot.
+            from gateway.platforms.api_server import _make_run_request_fingerprint
+            adapter._response_store.claim_run_idempotency(
+                'api_server.runs:default','rejected-turn',
+                _make_run_request_fingerprint({'input':'bounded fixture'},None),'run-existing')
+            replay = await adapter._handle_runs(request)
+            assert replay.status == 202
+            assert json.loads(replay.body)['run_id'] == 'run-existing'
+            assert 'Hermes-Run-Admission' not in replay.headers
+            create.assert_not_called()
+            # A lookup/claim-store failure is ambiguous, never marked rejected.
+            with patch.object(adapter._response_store,'get_run_idempotency',side_effect=RuntimeError('unavailable')):
+                uncertain = await adapter._handle_runs(request)
+                assert uncertain.status == 503
+                assert 'Hermes-Run-Admission' not in uncertain.headers
+    finally:
+        adapter._response_store.close()

@@ -16,6 +16,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
+- GET  /v1/run-request             — read-only run identity lookup by Idempotency-Key
 - GET  /v1/runs/{run_id}           — retrieve current run status
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
@@ -255,7 +256,10 @@ def _evaluate_api_goal_turn(
     final_response: str,
     *,
     user_initiated: bool,
+    native_goal: bool = True,
 ) -> Optional[Dict[str, Any]]:
+    if not native_goal:
+        return None
     mgr = _api_goal_manager(session_id)
     if not mgr.is_active():
         return None
@@ -2852,6 +2856,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/trash/{item_id}/restore", self._handle_restore_trash),
             ("POST", "/v1/trash/{item_id}/purge", self._handle_purge_trash),
             ("POST", "/v1/runs", self._handle_runs),
+            ("GET", "/v1/run-request", self._handle_run_request),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -4545,6 +4550,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
             },
             "features": {
+                "managed_goal_exclusion": True,
+                "run_request_lookup": True,
                 "chat_completions": True,
                 "chat_completions_streaming": True,
                 "responses_api": True,
@@ -4607,6 +4614,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "run_request": {"method": "GET", "path": "/v1/run-request"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
@@ -9218,8 +9226,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        if project == "talos-steward" and session_id != "hermes-chat-talos":
+            return web.json_response(_openai_error("talos-steward is reserved for the Talos conversation"), status=400)
 
+        # A managed sync goal owns continuation and its turn cap. Older callers
+        # omit this field and retain native /goal behavior unchanged.
+        native_goal = body.get("native_goal", True)
+        if not isinstance(native_goal, bool):
+            return web.json_response(_openai_error("native_goal must be boolean"), status=400)
         goal_command_args = _api_goal_command_args(user_message)
+        if not native_goal and goal_command_args is not None:
+            return web.json_response(_openai_error("Native /goal is disabled for managed turns"), status=409)
         execution_mode = _clean_request_string(body.get("execution_mode")) or "orchestrated"
         if execution_mode not in {"orchestrated", "single_model"}:
             return web.json_response(
@@ -9319,6 +9336,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # obey the shared cap before they reserve a durable run id.
         limited = self._concurrency_limited_response()
         if limited is not None:
+            # Explicit proof for managed launch recovery: lookup found no
+            # prior claim, and this request has not attempted to create one.
+            limited.headers["Hermes-Run-Admission"] = "rejected"
             return limited
 
         run_id = f"run_{uuid.uuid4().hex}"
@@ -9718,6 +9738,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     session_id,
                                     final_text,
                                     user_initiated=goal_user_initiated,
+                                    native_goal=native_goal,
                                 )
                                 if not decision:
                                     break
@@ -10018,6 +10039,27 @@ class APIServerAdapter(BasePlatformAdapter):
             status=202,
             headers=response_headers,
         )
+
+    async def _handle_run_request(self, request: "web.Request") -> "web.Response":
+        """Read-only recovery by original key; never create or retry a run.
+
+        A missing/expired claim is unknown, NOT evidence that a send failed.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        key = request.headers.get("Idempotency-Key", "").strip()
+        if not key or len(key) > MAX_IDEMPOTENCY_KEY_LENGTH or re.search(r"[\x00-\x1f\x7f]", key):
+            return web.json_response(_openai_error("Invalid Idempotency-Key header"), status=400)
+        try:
+            claim = self._response_store.get_run_idempotency(
+                f"api_server.runs:{_api_request_profile.get() or 'default'}", key
+            )
+        except Exception:
+            return web.json_response(_openai_error("Run lookup unavailable"), status=503)
+        if claim is None:
+            return web.json_response(_openai_error("Run request unknown"), status=404)
+        return web.json_response({"run_id": claim["run_id"]})
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""

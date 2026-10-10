@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Typed goal judge for hermes-sync's standing conversation goals.
 
-Reads {"goal": ..., "reply": ...} on stdin and prints {"done": bool, "p": float,
-"reason": str}. The verdict comes from Jev (the same typed judge Will's harness
+Reads {"goal": ..., "reply": ...} on stdin and prints
+{"verdict": "done"|"continue"|"blocked", "done": bool, "p": float, "reason": str}.
+The legacy done field is true only for a done verdict. The verdict comes from Jev (the same typed judge Will's harness
 uses for its gates) through the hermes-agent typesafe tool, so it costs a
 fraction of a cent and never runs a metered chat model. A missing answer is an
 error exit: hermes-sync pauses the goal rather than guessing.
@@ -10,6 +11,7 @@ error exit: hermes-sync pauses the goal rather than guessing.
 from __future__ import annotations
 
 import json
+import math
 import sys
 
 DONE_THRESHOLD = 0.75
@@ -45,12 +47,15 @@ def main() -> int:
     met = float((answers.get("met") or {}).get("noul") or 0.0)
     claims = float((answers.get("claims_done") or {}).get("noul") or 0.0)
     blocked = float((answers.get("blocked") or {}).get("noul") or 0.0)
-    done = met >= DONE_THRESHOLD or (claims >= 0.9 and met >= 0.5) or blocked >= 0.9
+    if not all(type((answers.get(key) or {}).get("noul")) in (int, float) and math.isfinite(answers[key]["noul"]) and 0 <= answers[key]["noul"] <= 1 for key in ("met", "claims_done", "blocked")):
+        raise ValueError("judge returned incomplete verdict")
+    verdict = "blocked" if blocked >= 0.9 else "done" if met >= DONE_THRESHOLD or (claims >= 0.9 and met >= 0.5) else "continue"
+    done = verdict == "done"
     reason = (
         f"met={met:.2f} claims_done={claims:.2f} blocked={blocked:.2f}"
         + (" · stopped: the reply says the goal cannot proceed" if blocked >= 0.9 and met < DONE_THRESHOLD else "")
     )
-    print(json.dumps({"done": done, "p": met, "reason": reason, "provider": answer.get("provider")}))
+    print(json.dumps({"verdict": verdict, "done": done, "p": met, "reason": reason, "provider": answer.get("provider")}))
     return 0
 
 

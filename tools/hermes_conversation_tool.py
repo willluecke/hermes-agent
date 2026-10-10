@@ -119,7 +119,7 @@ def _read(conversation_id: str, tail: int = 8) -> dict:
     return {
         **_summary(conversation),
         "tail": [
-            {"role": m.get("role"), "content": _trim(m.get("content"), 4000), "id": m.get("id")}
+            {"role": m.get("role"), "content": _trim(m.get("content"), 4000), "id": m.get("clientTurnId") or m.get("id")}
             for m in messages[-tail:] if isinstance(m, dict)
         ],
     }
@@ -176,7 +176,7 @@ def _set_runtime(conversation_id: str, model: str = "", effort: str = "") -> dic
     return _call("/conversations/" + parse.quote(conversation_id, safe="") + "/runtime", payload)
 
 
-def _goal(conversation_id: str, verb: str, text: str = "", max_turns: Any = None, actor: str = "") -> dict:
+def _goal(conversation_id: str, verb: str, text: str = "", max_turns: Any = None, actor: str = "", **options: Any) -> dict:
     verb = (verb or "status").strip().lower()
     path = "/conversations/" + parse.quote(conversation_id, safe="") + "/goal"
     if verb == "status":
@@ -187,9 +187,9 @@ def _goal(conversation_id: str, verb: str, text: str = "", max_turns: Any = None
         body = {"action": "set", "text": text.strip(), "actor": actor or "Talos"}
         if max_turns is not None:
             body["max_turns"] = int(max_turns)
-        return _call(path, body)
+        return _call(path, {**body, **options})
     if verb in ("pause", "resume", "clear"):
-        return _call(path, {"action": verb})
+        return _call(path, {"action": verb, **({"max_turns": int(max_turns)} if max_turns is not None else {}), **options})
     raise ValueError("goal verb must be set, status, pause, resume or clear")
 
 
@@ -231,6 +231,11 @@ def _send(conversation_id: str, text: str, wait_seconds: int = 0, actor: str = "
 def hermes_conversation_tool(action: str, **kwargs: Any) -> str:
     action = str(action or "").strip().lower()
     try:
+        if action == "create":
+            required = {"project", "title", "model", "effort", "request_key"}
+            if not required <= kwargs.keys() or kwargs.keys() - required - {"direction_id", "parent_conversation_id"}:
+                raise ValueError("create needs project,title,model,effort,request_key and optional direction_id,parent_conversation_id")
+            return json.dumps({"ok": True, "action": action, "result": _call("/conversations/create", kwargs)})
         if action == "list":
             return json.dumps({"ok": True, "action": action, "result": _list(str(kwargs.get("project") or ""), kwargs.get("limit") or 20)})
         if action == "read":
@@ -246,7 +251,8 @@ def hermes_conversation_tool(action: str, **kwargs: Any) -> str:
         if action == "goal":
             return json.dumps({"ok": True, "action": action, "result": _goal(
                 str(kwargs.get("id") or ""), str(kwargs.get("verb") or "status"), str(kwargs.get("text") or ""),
-                kwargs.get("max_turns"), str(kwargs.get("actor") or ""))})
+                kwargs.get("max_turns"), str(kwargs.get("actor") or ""),
+                **{k: kwargs[k] for k in ("request_key", "model", "effort", "delegation_id", "goal_id", "expected_revision", "reason") if k in kwargs})})
         raise ValueError("Unknown action; use list, read, send, set_runtime or goal")
     except ValueError as exc:
         return json.dumps({"ok": False, "action": action, "error": str(exc)})
@@ -269,11 +275,11 @@ HERMES_CONVERSATION_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list", "read", "send", "set_runtime", "goal"]},
+            "action": {"type": "string", "enum": ["list", "read", "send", "set_runtime", "goal", "create"]},
             "model": {"type": "string", "description": "Model selector, e.g. claude-code::claude-fable-5-1 or openai-codex::gpt-6-astra."},
             "effort": {"type": "string", "enum": list(EFFORTS)},
             "verb": {"type": "string", "enum": ["set", "status", "pause", "resume", "clear"], "description": "For goal."},
-            "max_turns": {"type": "integer", "minimum": 1, "maximum": 500, "description": "For goal set: turn cap (default 50)."},
+            "max_turns": {"type": "integer", "minimum": 1, "maximum": 500, "description": "For goal set: turn cap (default 50). For resume: explicitly authorized total, never an increment."},
             "id": {"type": "string", "description": "Conversation id, e.g. c_mt9bcwww_ah7ikn (from list)."},
             "project": {"type": "string", "description": "For list: only this project's conversations."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -286,6 +292,15 @@ HERMES_CONVERSATION_SCHEMA = {
     },
 }
 
+HERMES_CONVERSATION_SCHEMA["description"] += (
+    " create(project,title,model,effort,request_key,direction_id?,parent_conversation_id?) makes an empty registered-project thread, "
+    "deduplicated by request_key; it queues nothing. goal set accepts request_key,model,effort,delegation_id. "
+    "Managed mutations require goal_id,expected_revision,request_key. Resume accepts an authorized max_turns total; never adds turns implicitly. "
+    "Use talos dispatch for managed work; its reconciler owns create and goal set."
+)
+for _field in ("title", "request_key", "direction_id", "parent_conversation_id", "delegation_id", "goal_id", "reason"):
+    HERMES_CONVERSATION_SCHEMA["parameters"]["properties"][_field] = {"type": "string"}
+HERMES_CONVERSATION_SCHEMA["parameters"]["properties"]["expected_revision"] = {"type": "integer", "minimum": 1}
 
 registry.register(
     name="hermes_conversation",

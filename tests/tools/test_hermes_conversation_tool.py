@@ -162,3 +162,31 @@ def test_goal_set_status_pause_resume_clear(sync_server):
     assert json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="resume"))["result"]["goal"]["status"] == "active"
     assert json.loads(convo.hermes_conversation_tool("goal", id="c_regwatch", verb="clear"))["result"]["cleared"] is True
 
+
+
+def test_create_and_managed_goal_wire_contract(monkeypatch):
+    seen = []
+    monkeypatch.setattr(convo, '_call', lambda path, payload=None: seen.append((path, payload)) or {'goal': {'revision': 2}})
+    create = dict(project='p', title='Direction', model='openai-codex::gpt-6-astra', effort='high', request_key='m:create', direction_id='d', parent_conversation_id='talos')
+    assert json.loads(convo.hermes_conversation_tool('create', **create))['ok']
+    assert seen.pop() == ('/conversations/create', create)
+    options = dict(request_key='m:set', model=create['model'], effort='high', delegation_id='del')
+    assert json.loads(convo.hermes_conversation_tool('goal', id='c:1', verb='set', text='Fix it', max_turns=1, actor='Talos', **options))['ok']
+    assert seen.pop() == ('/conversations/c%3A1/goal', dict(action='set', text='Fix it', max_turns=1, actor='Talos', **options))
+    for verb in ('pause', 'resume', 'clear'):
+        cas = dict(goal_id='g', expected_revision=2, request_key='m:'+verb, reason='user')
+        extra = {'max_turns': 6} if verb == 'resume' else {}
+        assert json.loads(convo.hermes_conversation_tool('goal', id='c', verb=verb, **cas, **extra))['ok']
+        assert seen.pop() == ('/conversations/c/goal', dict(action=verb, **cas, **extra))
+    assert json.loads(convo.hermes_conversation_tool('goal', id='c', verb='resume'))['ok']
+    assert seen.pop()[1] == {'action': 'resume'}  # legacy call never adds a cap
+    assert json.loads(convo.hermes_conversation_tool('create', **create, cwd='/tmp'))['ok'] is False
+
+
+def test_read_preserves_submitted_message_provenance(monkeypatch):
+    monkeypatch.setattr(convo, '_conversation', lambda _: {'id':'talos','messages':[
+        {'role':'user','content':'Fix header','clientTurnId':'turn_original'},
+        {'role':'assistant','content':'older','id':'legacy_id'},
+    ]})
+    tail=json.loads(convo.hermes_conversation_tool('read',id='talos'))['result']['tail']
+    assert [m['id'] for m in tail]==['turn_original','legacy_id']

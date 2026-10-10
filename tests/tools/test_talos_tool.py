@@ -136,7 +136,7 @@ def test_mandate_read_and_merged_save_with_version_check(talos_server):
     assert sent["version"] == 1 and sent["mode"] == "active" and sent["priority"] == 70
     assert sent["body"]["objective"] == "Ship X" and sent["body"]["milestone"] == "M1"
     assert sent["body"]["allowed_paths"] == ["src/**"], "unchanged fields are kept"
-    assert sent["body"]["authority"].startswith("steward:")
+    assert "authority" not in sent["body"], "unrelated edits must not manufacture authority"
     stale = json.loads(talos.talos_tool("mandate_save", id="p", version=9, mandate={"objective": "Z"}))
     assert stale["ok"] is False and "version" in stale["error"]
     bad = json.loads(talos.talos_tool("mandate_save", id="p", mandate={"obligations": []}))
@@ -150,3 +150,70 @@ def test_hold_pause_and_resume(talos_server):
     resumed = json.loads(talos.talos_tool("hold", verb="resume"))
     assert resumed["ok"] is True and seen[-1][3] == {"action": "resume"}
 
+
+
+def test_mandate_preserves_authority_and_accepts_explicit_change(monkeypatch):
+    body = {"authority": "user:original-message", "objective": "O"}
+    project = {"id": "p", "repo": "/r", "mode": "paused", "priority": 1, "version": 2, "body": body}
+    sent = []
+    def call(path, payload=None):
+        if payload is None: return {"projects": [project]}
+        sent.append(payload)
+        return payload
+    monkeypatch.setattr(talos, "_call", call)
+    talos._mandate_save({"id": "p", "version": 2, "mandate": {"objective": "New"}})
+    assert sent[-1]["body"]["authority"] == "user:original-message"
+    talos._mandate_save({"id": "p", "version": 2, "mandate": {"authority": "user:explicit-new-message"}})
+    assert sent[-1]["body"]["authority"] == "user:explicit-new-message"
+    talos._mandate_save({"id": "p", "version": 2, "mandate": {"authority": None}})
+    assert sent[-1]["body"]["authority"] is None
+
+
+@pytest.mark.parametrize('scores,expected', [((0.1,0.2,0.99),'blocked'), ((0.9,0.9,0.1),'done'), ((0.2,0.2,0.2),'continue')])
+def test_goal_judge_typed_verdict_without_provider_calls(monkeypatch,capsys,scores,expected):
+    import io
+    import sys
+    from tools import goal_judge_cli
+    from tools import typesafe_tool
+    monkeypatch.setattr(sys,'stdin',io.StringIO(json.dumps({'goal':'Bounded work','reply':'Latest result'})))
+    monkeypatch.setattr(typesafe_tool,'ask_jev',lambda *args: {'answers':{key:{'noul':score} for key,score in zip(('met','claims_done','blocked'),scores)}})
+    assert goal_judge_cli.main()==0
+    result=json.loads(capsys.readouterr().out)
+    assert result['verdict']==expected
+    assert result['done'] is (expected=='done')
+
+
+def test_goal_judge_missing_answer_is_an_error(monkeypatch):
+    import io
+    import sys
+    from tools import goal_judge_cli, typesafe_tool
+    monkeypatch.setattr(sys,'stdin',io.StringIO('{"goal":"Do work","reply":"Something"}'))
+    monkeypatch.setattr(typesafe_tool,'ask_jev',lambda *args: {'answers':{}})
+    with pytest.raises(ValueError,match='incomplete verdict'):
+        goal_judge_cli.main()
+
+@pytest.mark.parametrize('action,args,path', [
+    ('directions', {'project_id': 'p:one'}, '/api/directions?project_id=p%3Aone'),
+    ('direction', {'id': 'd:one'}, '/api/directions/d%3Aone'),
+    ('delegation', {'id': 'run:one'}, '/api/delegations/run%3Aone'),
+    ('direction_save', {'id': 'd', 'version': 0, 'project_id': 'p', 'patch': {'title': 'Leaf'}, 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'request_key': 'm:1'}, '/api/directions/save'),
+    ('interview_save', {'project_id': 'p', 'version': 1, 'focus_id': None, 'mode': 'paused', 'question': None, 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'request_key': 'm:2'}, '/api/interviews/save'),
+    ('dispatch', {'direction_id': 'd', 'version': 2, 'request_key': 'm:3', 'lane': 'conversation', 'reason': 'bounded', 'scope': {'allowed_paths': ['src/**'], 'access': 'write'}, 'authorization': {'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'scope': 'fix'}, 'work_class': 'core', 'target': {'conversation_id': 'c'}, 'goal': {'text': 'fix', 'max_turns': 1, 'model': 'openai-codex::gpt-6-astra', 'effort': 'high'}}, '/api/delegations/dispatch'),
+    ('delegation_control', {'id': 'd', 'version': 3, 'verb': 'resume', 'reason': 'authorized two', 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'request_key': 'm:4', 'max_turns': 2}, '/api/delegations/control'),
+])
+def test_steward_wire_payloads(monkeypatch, action, args, path):
+    seen = []
+    monkeypatch.setattr(talos, '_call', lambda path, payload=None: seen.append((path, payload)) or {'version': 4})
+    result = json.loads(talos.talos_tool(action, **args))
+    assert result['ok'] and result['result'] == {'version': 4}
+    assert seen == [(path, None if action in ('directions', 'direction', 'delegation') else args)]
+
+
+def test_steward_wire_refuses_path_injection_and_propagates_conflicts(monkeypatch):
+    monkeypatch.setattr(talos, '_call', lambda *a: pytest.fail('must not call'))
+    for action, args in [('direction', {'id': '../state'}), ('delegation', {'id': 'x?y'}), ('directions', {'project_id': 'x', 'extra': 1}), ('dispatch', {})]:
+        assert json.loads(talos.talos_tool(action, **args))['ok'] is False
+    def refused(*a): raise ValueError('Talos refused (409): stale')
+    monkeypatch.setattr(talos, '_call', refused)
+    assert '409' in json.loads(talos.talos_tool('direction', id='x'))['error']
+    assert set(talos.STEWARD_WRITES) <= set(talos.TALOS_SCHEMA['parameters']['properties']['action']['enum'])

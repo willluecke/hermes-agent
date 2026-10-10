@@ -14,7 +14,8 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+from urllib import error, request, parse
+import re
 
 from tools.registry import registry
 
@@ -38,6 +39,13 @@ WRITE_ACTIONS = {
     "grant_revoke": ("/api/grants/revoke", ("id",)),
     "hold": ("/api/hold", ("action",)),
 }
+STEWARD_WRITES = {
+    "direction_save": ("directions/save", ("id", "version", "project_id", "patch", "source", "request_key")),
+    "interview_save": ("interviews/save", ("project_id", "version", "focus_id", "mode", "question", "source", "request_key")),
+    "dispatch": ("delegations/dispatch", ("direction_id", "version", "request_key", "lane", "reason", "scope", "authorization", "work_class")),
+    "delegation_control": ("delegations/control", ("id", "version", "verb", "reason", "source", "request_key")),
+}
+
 MANDATE_FIELDS = ("name", "objective", "success_measure", "milestone", "allowed_paths", "daily_calls", "authority", "task_templates", "planning_contract", "facts")
 
 
@@ -101,7 +109,8 @@ def _compact_state(state: dict) -> dict:
         "models": state.get("models"), "projects": projects, "tasks": tasks,
         "decisions": state.get("decisions"), "commitments": state.get("commitments"),
         "routines": [{k: r.get(k) for k in ("id", "project_id", "owner", "enabled", "next_due")} | {"title": (r.get("body") or {}).get("title")} for r in state.get("routines", [])],
-        "budgets": state.get("budgets"),
+        "budgets": state.get("budgets"), "holds": state.get("holds"),
+        "direction_counts": state.get("direction_counts"), "delegation_counts": state.get("delegation_counts"),
     }
 
 
@@ -140,7 +149,7 @@ def _mandate_save(kwargs: dict) -> Any:
         raise ValueError(f"Unknown mandate fields: {', '.join(unknown)}")
     if not fields and not any(k in kwargs for k in ("mode", "priority")):
         raise ValueError("mandate_save needs at least one mandate field, mode or priority")
-    body = {**body, **fields, "authority": fields.get("authority") or f"steward:{kwargs.get('actor') or 'talos-thread'}"}
+    body = {**body, **fields}
     payload = {"id": project_id, "repo": kwargs.get("repo") or current["repo"], "version": current["version"],
                "mode": kwargs.get("mode") or current["mode"], "priority": kwargs.get("priority", current["priority"]), "body": body}
     return _call("/api/projects/save", payload)
@@ -149,6 +158,22 @@ def _mandate_save(kwargs: dict) -> Any:
 def talos_tool(action: str, **kwargs: Any) -> str:
     action = str(action or "").strip().lower()
     try:
+        if action in ("directions", "direction", "delegation"):
+            key = "project_id" if action == "directions" else "id"
+            value = kwargs.get(key)
+            if set(kwargs) != {key} or not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+                raise ValueError(f"{action} requires only a valid {key}")
+            path = ("/api/directions?" + parse.urlencode({key: value}) if action == "directions"
+                    else "/api/" + {"direction": "directions", "delegation": "delegations"}[action] + "/" + parse.quote(value, safe=""))
+            return json.dumps({"ok": True, "action": action, "result": _call(path)})
+        if action in STEWARD_WRITES:
+            path, required = STEWARD_WRITES[action]
+            missing = [key for key in required if key not in kwargs]
+            if missing:
+                raise ValueError(f"{action} requires {', '.join(missing)}")
+            # Preserve explicit null focus/question and the delegation verb. The
+            # frontier reducer owns strict field and transition validation.
+            return json.dumps({"ok": True, "action": action, "result": _call("/api/" + path, kwargs)})
         if action in READ_ACTIONS:
             result = _call(READ_ACTIONS[action])
             if action == "state":
@@ -228,6 +253,31 @@ TALOS_SCHEMA = {
         "required": ["action"],
     },
 }
+TALOS_SCHEMA["description"] += (
+    " directions(project_id) reads a direction tree and interview; direction(id) reads one leaf and execution history. "
+    "direction_save(id,version,project_id,patch,source,request_key) saves a CAS patch with source={conversation_id,message_id}. "
+    "interview_save(project_id,version,focus_id,mode,question,source,request_key) persists one question. "
+    "dispatch(direction_id,version,request_key,lane,reason,scope,authorization,work_class) starts authorized bounded work: "
+    "scope={allowed_paths,access:read|write}, authorization={source,scope}; conversation adds target={conversation_id} or "
+    "{project,title,model,effort} and goal={text,max_turns,model,effort}; ledger adds contract,dedupe_key,dependencies. "
+    "Peripheral work requires spec_ref. The reconciler owns creation and kickoff; never also send. "
+    "delegation(id) reads status; delegation_control(id,version,verb,reason,source,request_key,max_turns?) controls it. "
+    "Resume max_turns is an explicitly authorized total, never an increment."
+)
+_props = TALOS_SCHEMA["parameters"]["properties"]
+_props["action"] = {"type": "string", "enum": list(READ_ACTIONS) + list(WRITE_ACTIONS) + list(STEWARD_WRITES) + ["task", "mandate", "mandate_save", "directions", "direction", "delegation"]}
+for _field in ("patch", "source", "authorization", "target", "goal"):
+    _props[_field] = {"type": "object"}
+for _field in ("request_key", "direction_id", "spec_ref", "supersedes_id"):
+    _props[_field] = {"type": "string"}
+_props.update({
+    "lane": {"type": "string", "enum": ["conversation", "ledger"]},
+    "work_class": {"type": "string", "enum": ["core", "peripheral"]},
+    "focus_id": {"type": ["string", "null"]}, "question": {"type": ["object", "null"]},
+    "mode": {"type": "string", "enum": ["active", "maintain", "paused"]},
+    "scope": {"oneOf": [{"type": "string"}, {"type": "object", "required": ["allowed_paths", "access"], "properties": {"allowed_paths": {"type": "array", "items": {"type": "string"}}, "access": {"enum": ["read", "write"]}}, "additionalProperties": False}]},
+    "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
+})
 # `action` names the tool action; the commitment/control verb travels as `verb`.
 TALOS_SCHEMA["parameters"]["properties"].pop("action_name")
 TALOS_SCHEMA["parameters"]["properties"]["verb"] = {
