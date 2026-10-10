@@ -1252,6 +1252,9 @@ def maybe_tune(session_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
+    from agent.steward_policy import is_steward
+    if is_steward(session=kwargs.get('session_id',''),project=kwargs.get('project',''),cwd=kwargs.get('cwd','')):
+        return None
     mode = current_mode()
     if mode == "off":
         return None

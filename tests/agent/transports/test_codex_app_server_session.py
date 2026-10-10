@@ -2301,3 +2301,26 @@ def test_a_silent_turn_is_still_stopped_by_the_inactivity_watchdog():
     assert result.error_code == session_mod.TURN_INACTIVITY_ERROR_CODE
     assert "without activity" in result.error
     assert result.interrupted and result.should_retire
+
+
+def test_steward_native_tools_disabled_but_scoped_mcp_retained(tmp_path):
+    import tomllib
+    captured={}
+    (tmp_path/'config.toml').write_text('[mcp_servers.other]\ncommand="unsafe"\n[mcp_servers.hermes-tools]\ncommand="old-unrestricted"\n')
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient(**kwargs)
+    session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
+    session.ensure_started()
+    args=captured['extra_args']
+    assert 'sandbox_mode="read-only"' in args and 'approval_policy="never"' in args
+    for feature in ['shell_tool','unified_exec','apply_patch_freeform','js_repl','multi_agent','hooks','plugins']:
+        assert ['--disable',feature] in [args[i:i+2] for i in range(len(args)-1)]
+    overlays=[a for a in args if a.startswith('mcp_servers=')]
+    assert len(overlays)==1
+    servers=tomllib.loads(overlays[0])['mcp_servers']
+    assert servers['other']['enabled'] is False
+    config=servers['hermes-tools']
+    assert config['enabled'] is True
+    assert config['env']['HERMES_STEWARD']=='1'
+    assert config['env']['HERMES_TOOLS_MCP_ONLY']=='talos,hermes_conversation'

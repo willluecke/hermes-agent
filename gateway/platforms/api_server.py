@@ -1751,6 +1751,30 @@ def _admit_api_agent_request(handler):
         self._pending_agent_requests += 1
         self._persist_gateway_active_work()
         try:
+            from gateway.managed_controls import start_allowed
+            try:
+                admission_body=await request.json()
+            except Exception:
+                admission_body={}
+            if isinstance(admission_body,dict):
+                sessions=[admission_body.get('session_id'),getattr(request,'match_info',{}).get('session_id')]
+                previous=admission_body.get('previous_response_id')
+                stored=self._response_store.get(previous) if previous else None
+                if isinstance(stored,dict): sessions.append(stored.get('session_id'))
+                for session in sessions:
+                    if not start_allowed(request.headers,{**admission_body,'session_id':session}):
+                        headers={}
+                        # A rejected first send is safely retryable only after
+                        # proving this caller's request key has no existing claim.
+                        key=request.headers.get('Idempotency-Key','').strip()
+                        if handler.__name__=='_handle_runs' and key and len(key)<=MAX_IDEMPOTENCY_KEY_LENGTH and not re.search(r'[\x00-\x1f\x7f]',key):
+                            try:
+                                namespace=f"api_server.runs:{_api_request_profile.get() or 'default'}"
+                                if self._response_store.get_run_idempotency(namespace,key) is None:
+                                    headers['Hermes-Run-Admission']='rejected'
+                            except Exception:
+                                pass  # Unknown admission retains lookup-only recovery.
+                        return web.json_response(_openai_error("Managed conversation requires its goal controller or Will's operator capability"),status=403,headers=headers)
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
@@ -4551,6 +4575,8 @@ class APIServerAdapter(BasePlatformAdapter):
             },
             "features": {
                 "managed_goal_exclusion": True,
+                "steward_tool_only": True,
+                "managed_control_capabilities": True,
                 "run_request_lookup": True,
                 "chat_completions": True,
                 "chat_completions_streaming": True,
@@ -9226,12 +9252,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
-        if project == "talos-steward" and session_id != "hermes-chat-talos":
+        if (project == "talos-steward") != (session_id == "hermes-chat-talos"):
+            # Neither identity may be reused with an unrestricted workspace.
             return web.json_response(_openai_error("talos-steward is reserved for the Talos conversation"), status=400)
 
         # A managed sync goal owns continuation and its turn cap. Older callers
         # omit this field and retain native /goal behavior unchanged.
-        native_goal = body.get("native_goal", True)
+        native_goal = False if project=="talos-steward" else body.get("native_goal", True)
         if not isinstance(native_goal, bool):
             return web.json_response(_openai_error("native_goal must be boolean"), status=400)
         goal_command_args = _api_goal_command_args(user_message)
@@ -9476,6 +9503,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             model=body.get("model", self._model_name),
             execution_mode=execution_mode,
+            managed_goal=body.get("native_goal") is False,
             project=project or None,
         )
 
@@ -10411,6 +10439,9 @@ class APIServerAdapter(BasePlatformAdapter):
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        from gateway.managed_controls import steer_allowed
+        if not steer_allowed(request.headers,run_id,managed=status.get("managed_goal",False)):
+            return web.json_response(_openai_error("Only Will may steer a managed delegate"),status=403)
         # Only genuinely running runs are steerable.  /stop retains agent/task
         # refs during cooperative shutdown, so the status gate (not the mere
         # presence of an agent ref) is what rejects stop-then-steer.

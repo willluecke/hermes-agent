@@ -221,6 +221,8 @@ def _tool_annotations(name: str) -> Any:
 def selected_tools(env: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
     """EXPOSED_TOOLS, narrowed to the names in HERMES_TOOLS_MCP_ONLY when set."""
     source = os.environ if env is None else env
+    if source.get('HERMES_STEWARD') == '1':
+        return ('talos','hermes_conversation')
     raw = (source.get(ONLY_ENV) or "").strip()
     if not raw:
         return EXPOSED_TOOLS
@@ -275,6 +277,8 @@ def _build_server() -> Any:
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
+    from agent.steward_policy import StewardTools
+    steward = StewardTools() if os.environ.get('HERMES_STEWARD')=='1' else None
     exposed_count = 0
     wanted = selected_tools()
 
@@ -303,7 +307,8 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
+                    if steward: return steward.run(tool_name,args,handle_function_call)
+                    return handle_function_call(tool_name,args or {})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})

@@ -2078,3 +2078,24 @@ def test_a_short_cap_keeps_its_short_auth_window():
     assert session._auth_min_validity_seconds() == 300.0 + 10 * 60
     uncapped = ClaudeCodeSession(cwd="/tmp", model="claude-fable-5", absolute_timeout=float("inf"))
     assert uncapped._auth_min_validity_seconds() == 2 * 60 * 60 + 10 * 60
+
+
+def test_steward_has_no_native_tools_extensions_or_hooks_but_keeps_scoped_mcp():
+    import json
+    args=claude_code_args(model='claude-opus-5-5',session_id='fixture',steward=True,settings_json='{"hooks":{"unsafe":true}}')
+    assert args[args.index('--tools')+1]==''
+    assert args[args.index('--setting-sources')+1]==''
+    assert '--strict-mcp-config' in args and '--safe-mode' not in args and '--no-chrome' in args
+    assert '--disable-slash-commands' in args
+    settings=json.loads(args[args.index('--settings')+1])
+    assert settings['disableAllHooks'] is True and settings['enabledPlugins']=={}
+    assert 'hooks' not in settings
+    servers=json.loads(args[args.index('--mcp-config')+1])['mcpServers']
+    assert list(servers)==['hermes-tools']
+    assert servers['hermes-tools']['env']['HERMES_STEWARD']=='1'
+
+
+def test_steward_identity_propagates_even_when_cwd_is_an_alias():
+    session=ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward=True)
+    assert session.steward
+    assert session.extra_env['CLAUDE_CODE_DISABLE_CLAUDE_MDS']=='1'

@@ -994,6 +994,8 @@ def _claude_hook_parity(
     outcome. Bounded by ``agent.max_verify_nudges``. Returns the number of
     follow-up turns run. Mirrors ``agent.codex_runtime._codex_hook_parity``.
     """
+    from agent.steward_policy import steward_agent
+    if steward_agent(agent): return 0
     from hermes_cli.lifecycle import has_hook, invoke_hook
 
     session_id = getattr(agent, "session_id", "") or ""
@@ -1272,6 +1274,14 @@ def run_claude_code_turn(
         "Launch long-lived previews only in tmux or a project service and verify "
         "the reachable URL before reporting it."
     )
+    from agent.steward_policy import steward_agent
+    steward = steward_agent(agent)
+    if steward:
+        from agent.steward_policy import instructions
+        runtime_contract=instructions()
+    if steward and getattr(agent,'_claude_code_session',None):
+        agent._claude_code_session.close()
+        agent._claude_code_session=None
     read_only = bool(getattr(agent, "read_only", False))
     if read_only:
         runtime_contract += (
@@ -1406,7 +1416,7 @@ def run_claude_code_turn(
                 lead=CLAUDE_REBUILD_LEAD.format(reason=rebuild_reason),
             )
         sections = [prompt]
-        if plugin_user_context:
+        if plugin_user_context and not steward:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the user message here as it does on the default
             # loop, where it is stamped on the API copy of the message.
@@ -1479,7 +1489,7 @@ def run_claude_code_turn(
             calls.append((raw_name, name, args, result, call_id, is_error))
 
         bridge = make_claude_code_event_bridge(agent, record=_record, cwd=cwd)
-        hook_token, hook_env, hook_settings = _claude_hook_binding(agent, read_only=read_only)
+        hook_token, hook_env, hook_settings = _claude_hook_binding(agent, read_only=read_only or steward)
 
         def _late_answer(record: dict[str, Any]) -> None:
             save_claude_late_answer(agent, record)
@@ -1505,6 +1515,7 @@ def run_claude_code_turn(
                 startup_first_event_timeout=startup_first_event_timeout,
                 extra_env=hook_env,
                 settings_json=hook_settings,
+                **({"steward":True} if steward else {}),
             )
             session.late_answer_context = late_context
             session.history_fingerprint = prior_fingerprint

@@ -1,0 +1,88 @@
+from types import SimpleNamespace
+import pytest
+from agent.steward_policy import StewardTools, require_steward_runtime
+from agent.transports.hermes_tools_mcp_server import selected_tools
+
+
+def test_steward_cannot_expand_tool_surface():
+    assert selected_tools({'HERMES_STEWARD':'1','HERMES_TOOLS_MCP_ONLY':'terminal,delegate_task'})==('talos','hermes_conversation')
+
+
+@pytest.mark.parametrize('name,args',[('terminal',{}),('delegate_task',{}),('hermes_conversation',{'action':'send','id':'delegate'}),('hermes_conversation',{'action':'goal','verb':'resume'}),('talos',{'action':'unknown'})])
+def test_forbidden_tool_actions_are_refused(name,args):
+    with pytest.raises(ValueError): StewardTools().check(name,args)
+
+
+def test_dispatch_allows_one_acknowledgement_then_forces_report():
+    policy=StewardTools()
+    policy.check('talos',{'action':'dispatch'})
+    policy.completed('talos',{'action':'dispatch'},'{}')
+    policy.check('talos',{'action':'delegation','id':'one'})
+    for args in [{'action':'delegation','id':'two'},{'action':'dispatch'},{'action':'live'}]:
+        with pytest.raises(ValueError): policy.check('talos',args)
+
+
+def test_status_reads_cannot_poll_by_varying_limits():
+    policy=StewardTools()
+    policy.check('hermes_conversation',{'action':'read','id':'c','limit':10})
+    with pytest.raises(ValueError): policy.check('hermes_conversation',{'action':'read','id':'c','limit':20})
+    StewardTools().check('hermes_conversation',{'action':'read','id':'c'}) # new user turn
+
+
+def test_no_unrestricted_runtime_fallback_or_post_turn_review():
+    from agent.codex_runtime import _codex_hook_parity
+    from agent.claude_runtime import _claude_hook_parity
+    agent=SimpleNamespace(session_project='talos-steward',api_mode='chat_completions')
+    with pytest.raises(RuntimeError): require_steward_runtime(agent)
+    for mode in ['codex_app_server','claude_code']:
+        agent.api_mode=mode
+        require_steward_runtime(agent)
+    assert _codex_hook_parity(agent,None,[],None,'task')==0
+    assert _claude_hook_parity(agent,None,None,[],[],None,'task')==0
+
+
+def test_dispatch_blocks_runtime_change_before_any_remote_read(monkeypatch):
+    from unittest.mock import Mock
+    import tools.hermes_conversation_tool as conversation
+    goal=Mock()
+    monkeypatch.setattr(conversation,'_goal',goal)
+    policy=StewardTools()
+    policy.completed('talos',{'action':'dispatch'},'{}')
+    with pytest.raises(ValueError): policy.check('hermes_conversation',{'action':'set_runtime','id':'delegate'})
+    goal.assert_not_called()
+
+
+def test_jev_preflight_never_runs_for_steward(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    path=Path(__file__).resolve().parents[2]/'plugins/system-one-preflight/__init__.py'
+    spec=importlib.util.spec_from_file_location('steward_preflight_fixture',path)
+    module=importlib.util.module_from_spec(spec)
+    import sys
+    monkeypatch.setitem(sys.modules,spec.name,module)
+    spec.loader.exec_module(module)
+    assert module.on_pre_llm_call(session_id='hermes-chat-talos',user_message='Fix delivery') is None
+
+
+def test_uncertain_dispatch_error_still_closes_the_action_budget():
+    policy=StewardTools()
+    def unavailable(*args): raise OSError('lost response')
+    with pytest.raises(OSError): policy.run('talos',{'action':'dispatch'},unavailable)
+    with pytest.raises(ValueError): policy.run('talos',{'action':'dispatch'},unavailable)
+    assert policy.run('talos',{'action':'delegation','id':'d'},lambda *_:'preparing')=='preparing'
+
+
+def test_parallel_dispatches_cannot_pass_the_same_fence():
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    policy=StewardTools()
+    start=threading.Barrier(2)
+    calls=[]
+    def invoke():
+        start.wait(timeout=5)
+        try: return policy.run('talos',{'action':'dispatch'},lambda *_:calls.append('one'))
+        except ValueError: return 'refused'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(lambda _:invoke(),range(2)))
+    assert calls==['one']
+    assert results.count('refused')==1

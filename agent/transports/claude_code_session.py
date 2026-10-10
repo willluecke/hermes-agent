@@ -736,6 +736,7 @@ def claude_code_args(
     additional_dirs: Optional[list[str]] = None,
     read_only: bool = False,
     no_tools: bool = False,
+    steward: bool = False,
     debug_file: Optional[str] = None,
     settings_json: Optional[str] = None,
 ) -> list[str]:
@@ -771,7 +772,7 @@ def claude_code_args(
         "--name",
         "Hermes Chat",
     ]
-    if read_only:
+    if read_only and not steward:
         # Ignore user/project MCP registrations as well as the Hermes bridge.
         # Safe mode also disables hooks, plugins, agents, and other local
         # customizations that could perform side effects outside Claude's
@@ -779,11 +780,22 @@ def claude_code_args(
         # in plan mode.
         args[args.index("--mcp-config") + 1] = '{"mcpServers":{}}'
         args.extend(["--strict-mcp-config", "--safe-mode"])
-    if no_tools:
+    if no_tools and not steward:
         # An advisor sees only the supplied context. Plan mode alone still
         # exposes file tools, so explicitly remove the entire built-in set.
         args[args.index("--setting-sources") + 1] = ""
         args.extend(["--tools", "", "--no-chrome", "--no-session-persistence"])
+    if steward:
+        from agent.steward_policy import mcp_server
+        args[args.index('--permission-mode')+1]='bypassPermissions'
+        args[args.index('--setting-sources')+1]=''
+        args[args.index('--mcp-config')+1]=json.dumps({'mcpServers':{'hermes-tools':mcp_server()}})
+        # --safe-mode drops even explicitly configured stdio MCP servers.
+        # Disable customizations explicitly while retaining our scoped server.
+        settings={'disableAllHooks':True,'enabledPlugins':{},'disableClaudeAiConnectors':True,
+                  'autoMemoryEnabled':False,'autoDreamEnabled':False}
+        args.extend(['--strict-mcp-config','--tools','','--no-chrome','--disable-slash-commands',
+                     '--settings',json.dumps(settings)])
     if effort:
         args.extend(["--effort", effort])
     args.extend(["--resume" if resume else "--session-id", session_id])
@@ -793,7 +805,7 @@ def claude_code_args(
         args.extend(["--add-dir", directory])
     if debug_file:
         args.extend(["--debug-file", debug_file])
-    if settings_json and not read_only:
+    if settings_json and not read_only and not steward:
         # Hermes' own Claude Code hooks (hermes_cli.claude_hooks): the live
         # tool-call channel for the plugin hooks. Safe mode disables hooks,
         # so a read-only session gets none.
@@ -821,6 +833,7 @@ class ClaudeCodeSession:
         additional_dirs: Optional[list[str]] = None,
         read_only: bool = False,
         no_tools: bool = False,
+        steward: bool = False,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
         on_watchdog_timeout: Optional[Callable[[dict[str, Any]], None]] = None,
@@ -832,11 +845,15 @@ class ClaudeCodeSession:
         extra_env: Optional[dict[str, str]] = None,
         settings_json: Optional[str] = None,
     ) -> None:
+        from agent.steward_policy import is_steward
+        self.steward = bool(steward or is_steward(cwd=cwd))
         self.cwd = cwd
         # The gateway's hook endpoint and per-session token ride the process
         # environment so Claude Code's command hooks can reach it; the
         # settings document wires those hooks (see hermes_cli.claude_hooks).
         self.extra_env = {str(k): str(v) for k, v in (extra_env or {}).items()}
+        if self.steward:
+            self.extra_env['CLAUDE_CODE_DISABLE_CLAUDE_MDS']='1'
         self.settings_json = settings_json
         self.model = model
         self.session_id = str(session_id or uuid4())
@@ -1091,6 +1108,7 @@ class ClaudeCodeSession:
             additional_dirs=self.additional_dirs,
             read_only=self.read_only,
             no_tools=self.no_tools,
+            steward=self.steward,
             debug_file=self._next_debug_file(),
             settings_json=self.settings_json,
         )

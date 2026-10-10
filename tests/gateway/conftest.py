@@ -552,3 +552,10 @@ def pytest_configure(config):
         else:
             cache_file.write_text("clean", encoding="utf-8")
 
+
+
+@pytest.fixture(autouse=True)
+def isolated_managed_control_store(tmp_path, monkeypatch):
+    # Gateway admission must never inspect the host's live sync store in tests.
+    monkeypatch.setenv('HERMES_SYNC_DATA_DIR',str(tmp_path/'sync'))
+    monkeypatch.setenv('HERMES_MANAGED_CONTROL_FILE',str(tmp_path/'managed-control.json'))

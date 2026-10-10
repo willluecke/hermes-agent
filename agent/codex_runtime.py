@@ -1240,6 +1240,8 @@ def _codex_hook_parity(
     turn object is updated to the follow-up's outcome. Bounded by
     ``agent.max_verify_nudges``. Returns the number of follow-up turns run.
     """
+    from agent.steward_policy import steward_agent
+    if steward_agent(agent): return 0
     from hermes_cli.lifecycle import has_hook, invoke_hook
 
     session_id = getattr(agent, "session_id", "") or ""
@@ -1830,9 +1832,11 @@ def run_codex_app_server_turn(
             resume_thread_id[:8],
             len(pending_entries),
         )
+    from agent.steward_policy import steward_agent
+    steward = steward_agent(agent)
     resident_codex_session = getattr(agent, "_codex_session", None)
     if resident_codex_session is not None and (
-        not resume_thread_id
+        steward or not resume_thread_id
         or str(getattr(resident_codex_session, "_thread_id", "") or "")
         != resume_thread_id
     ):
@@ -2032,7 +2036,10 @@ def run_codex_app_server_turn(
             reason=continuity_reason,
             thread_id=str(thread_id or ""),
         )
-        if plugin_user_context:
+        if steward:
+            from agent.steward_policy import instructions
+            turn_input = _with_turn_note(turn_input,instructions())
+        if plugin_user_context and not steward:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the turn input here as it rides the API copy
             # of the user message on the default loop. It is not part of

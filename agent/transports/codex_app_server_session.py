@@ -576,7 +576,9 @@ class CodexAppServerSession:
         self._parent_provider = str(parent_provider or "").strip().lower()
         self._opus_worker_enabled = bool(opus_worker_enabled)
         self._require_exact = bool(require_exact)
-        self._read_only = bool(read_only)
+        from agent.steward_policy import is_steward
+        self._steward = is_steward(session=hermes_session_id,project=project_key,cwd=self._cwd)
+        self._read_only = bool(read_only or self._steward)
         self._exact_runtime_validated = False
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -758,6 +760,7 @@ class CodexAppServerSession:
             policy = self._reversible_deletion_policy
             if (
                 self._project_key
+                and not self._steward
                 and policy is not None
                 and getattr(policy, "enabled", False)
             ):
@@ -809,6 +812,25 @@ class CodexAppServerSession:
                 # filesystem changes; ``never`` prevents an unattended turn
                 # from requesting an escalation out of that boundary.
                 client_extra_args.extend(_read_only_codex_args(self._codex_home))
+            if self._steward:
+                from agent.steward_policy import mcp_server
+                server=mcp_server()
+                # Replace inherited MCP definitions and native execution surfaces.
+                # Hermes MCP is a separate trusted process, outside the shell sandbox.
+                config='"hermes-tools"={enabled=true,command='+json.dumps(server['command'])+',args='+json.dumps(server['args'])+',env={'+','.join(json.dumps(k)+'='+json.dumps(v) for k,v in server['env'].items())+'}}'
+                # Keep disabling inherited servers and enabling our server in ONE
+                # override; duplicate CLI keys may otherwise replace each other.
+                for i, value in enumerate(client_extra_args):
+                    if value.startswith('mcp_servers='):
+                        inherited=tomllib.loads(value)['mcp_servers']
+                        disabled=','.join(json.dumps(name)+'={enabled=false}' for name in inherited if name!='hermes-tools')
+                        client_extra_args[i]='mcp_servers={'+(disabled+',' if disabled else '')+config+'}'
+                        break
+                else:
+                    client_extra_args.extend(['-c','mcp_servers={'+config+'}'])
+                client_extra_args.extend(['-c','web_search="disabled"','-c','tools.view_image=false'])
+                for feature in ('shell_tool','unified_exec','apply_patch_freeform','js_repl','multi_agent'):
+                    client_extra_args.extend(['--disable',feature])
             if client_env:
                 client_kwargs["env"] = client_env
             if client_extra_args:
@@ -836,6 +858,7 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._steward: params.update(sandbox="read-only",approvalPolicy="never")
         if self._model:
             params["model"] = self._model
         method = "thread/start"
@@ -1082,6 +1105,7 @@ class CodexAppServerSession:
                 {
                     "threadId": self._thread_id,
                     "input": turn_input,
+                    **({"sandboxPolicy":{"type":"readOnly"},"approvalPolicy":"never"} if self._steward else {}),
                     **({"model": self._model} if self._model else {}),
                     **({"effort": effort} if (effort := self._turn_effort()) else {}),
                 },
@@ -1715,6 +1739,9 @@ class CodexAppServerSession:
         rid = req.get("id")
         params = req.get("params") or {}
 
+        if self._steward and method in {'item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval'}:
+            self._client.respond(rid,{'decision':'cancel'})
+            return
         if method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)
             self._client.respond(rid, {"decision": decision})

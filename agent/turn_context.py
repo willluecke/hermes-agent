@@ -455,6 +455,8 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    from agent.steward_policy import require_steward_runtime
+    require_steward_runtime(agent)
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1255,7 +1257,8 @@ def build_turn_context(
         logger.debug("turn emitter binding failed", exc_info=True)
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        from agent.steward_policy import steward_agent
+        _pre_results = [] if steward_agent(agent) else _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
