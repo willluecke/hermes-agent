@@ -2440,17 +2440,22 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory", "project"]. `kanban` is auto-recovered by
-    # _get_platform_tools (a non-configurable platform toolset in hermes-cli's
-    # universe); `project` is GUI-only, folded in by _load_enabled_toolsets.
-    # Toolsets inside their first release (_RECENTLY_SHIPPED_TOOLSETS) are
-    # back-filled onto saved lists that never offered them — allow those too.
-    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
+    # The fallback is exactly the configured CLI toolsets as the platform
+    # resolver computes them: the saved entries, non-configurable toolsets it
+    # recovers from hermes-cli's universe (kanban, decision_log, typesafe, ...)
+    # and first-release back-fills; `project` is GUI-only, folded in by
+    # _load_enabled_toolsets. Comparing against the resolver keeps this test
+    # true as new auto-recovered toolsets ship.
+    from hermes_cli.tools_config import _get_platform_tools
 
+    configured = set(
+        _get_platform_tools(config_mod.load_config(), "cli", include_default_mcp_servers=True)
+    )
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) == configured | {"project"}
+    assert "mcp-off" not in result
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2471,12 +2476,16 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
+    from hermes_cli.tools_config import _get_platform_tools
 
+    configured = set(
+        _get_platform_tools(config_mod.load_config(), "cli", include_default_mcp_servers=True)
+    )
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) == configured | {"project"}
+    assert "nope" not in result
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
