@@ -99,3 +99,23 @@ async def test_rejected_controller_cannot_strand_or_release_an_uncertain_start(m
     assert response.status==403
     assert (response.headers.get('Hermes-Run-Admission')=='rejected') is (existing is None)
     lookup.assert_called_once_with('api_server.runs:default','goal-turn')
+
+
+def test_non_chat_start_does_not_touch_sync_store(managed):
+    with patch('gateway.managed_controls.Path.exists',side_effect=AssertionError('must not touch store')), patch('gateway.managed_controls.sqlite3.connect',side_effect=AssertionError('must not connect')):
+        assert start_allowed({}, {'session_id':'telegram-session'})
+        assert start_allowed({}, {})
+
+
+def test_failed_observation_allows_ordinary_chat_but_preserves_known_owner(managed):
+    assert not start_allowed({}, {'session_id':'hermes-chat-delegate'})
+    with patch('gateway.managed_controls.sqlite3.connect',side_effect=sqlite3.OperationalError('locked')):
+        assert start_allowed({}, {'session_id':'hermes-chat-ordinary'})
+        assert not start_allowed({}, {'session_id':'hermes-chat-delegate'})
+        assert not steer_allowed({}, 'run_delegate')
+    with sqlite3.connect(managed/'sync.db') as db:
+        db.execute("UPDATE conversation_goals SET data=?",(json.dumps({'status':'cleared','delegation_id':'d'}),))
+        db.execute("UPDATE goal_turns SET state='settled'")
+    assert start_allowed({}, {'session_id':'hermes-chat-delegate'})
+    with patch('gateway.managed_controls.sqlite3.connect',side_effect=sqlite3.OperationalError('locked')):
+        assert start_allowed({}, {'session_id':'hermes-chat-delegate'})

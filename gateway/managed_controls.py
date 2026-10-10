@@ -21,24 +21,38 @@ def authorized(headers, role):
         return False
 
 
+# Retain positive observations through a transient outage; a successful read
+# showing release removes the fence. Keys include the store for test isolation.
+_known_managed = set()
+
 def managed_owner(session_id=None, run_id=None):
+    chat = isinstance(session_id,str) and session_id.startswith('hermes-chat-')
+    if not chat and not run_id: return False
     path=Path(os.environ.get('HERMES_SYNC_DATA_DIR',str(Path.home()/'.hermes-chat-sync')))/'sync.db'
-    if not path.exists(): return False
+    key=(str(path),session_id)
+    def observed(owned):
+        if chat:
+            if owned: _known_managed.add(key)
+            else: _known_managed.discard(key)
+        return owned
     db=None
     try:
+        if not path.exists(): return key in _known_managed
         db=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=1)
         tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if 'conversation_goals' not in tables: return False
+        if 'conversation_goals' not in tables: return observed(False)
         if run_id and 'goal_turns' in tables:
             if db.execute("SELECT 1 FROM goal_turns WHERE run_id=? AND json_extract(data,'$.delegation_id') IS NOT NULL",(run_id,)).fetchone(): return True
-        if not str(session_id or '').startswith('hermes-chat-'): return False
+        if not chat: return False
         conversation_id=session_id[len('hermes-chat-'):]
         row=db.execute('SELECT data FROM conversation_goals WHERE conversation_id=?',(conversation_id,)).fetchone()
         goal=json.loads(row[0]) if row else {}
-        if goal.get('delegation_id') and goal.get('status') in {'active','paused'}: return True
-        return bool('goal_turns' in tables and db.execute("SELECT 1 FROM goal_turns WHERE conversation_id=? AND state IN ('launching','running','judging') AND json_extract(data,'$.delegation_id') IS NOT NULL",(conversation_id,)).fetchone())
+        if goal.get('delegation_id') and goal.get('status') in {'active','paused'}: return observed(True)
+        return observed(bool('goal_turns' in tables and db.execute("SELECT 1 FROM goal_turns WHERE conversation_id=? AND state IN ('launching','running','judging') AND json_extract(data,'$.delegation_id') IS NOT NULL",(conversation_id,)).fetchone()))
     except (OSError,sqlite3.Error,ValueError):
-        return True  # Admission/control cannot infer freedom from an outage.
+        # Ordinary human chat never depends on a successful observation.
+        # Run steering remains fail-closed, as do positively known owners.
+        return bool(run_id) or key in _known_managed
     finally:
         if db: db.close()
 
