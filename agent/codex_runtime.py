@@ -198,6 +198,25 @@ def _input_text(turn_input: Any) -> str:
     return "\n".join(texts).strip()
 
 
+def _steward_contract_due(agent, thread_id: Any) -> bool:
+    """Whether Jim's contract (instructions plus Will's profile) rides this turn.
+
+    It rides the first turn of each Codex thread (new, rebuilt or first seen
+    by this agent) and the first turn after a compaction, never otherwise:
+    appending ~12 KB to every turn piled a copy into the thread history per
+    message (Will, 2026-10-10: "at the start ... or after compaction, only
+    those two conditions"). Compaction is seen through the compressor's count
+    or the previous turn's live compaction notice, whichever is available.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    compactions = int(getattr(compressor, "compression_count", 0) or 0)
+    key = (str(thread_id or ""), compactions)
+    compacted_last_turn = int(getattr(agent, "_codex_compactions_announced", 0) or 0) > 0
+    due = compacted_last_turn or getattr(agent, "_steward_contract_key", None) != key
+    agent._steward_contract_key = key
+    return due
+
+
 def _with_turn_note(turn_input: Any, note: str) -> Any:
     """Append a per-turn note (preflight, ultracode) to the Codex input.
 
@@ -2036,7 +2055,7 @@ def run_codex_app_server_turn(
             reason=continuity_reason,
             thread_id=str(thread_id or ""),
         )
-        if steward:
+        if steward and _steward_contract_due(agent, thread_id):
             from agent.steward_policy import instructions
             turn_input = _with_turn_note(turn_input,instructions())
         if plugin_user_context and not steward:
@@ -2075,6 +2094,8 @@ def run_codex_app_server_turn(
         _announce_codex_limit_stop(agent, turn, limit_seconds=turn_limit)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        # A steward contract this turn carried may never have reached Codex.
+        agent._steward_contract_key = None
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:

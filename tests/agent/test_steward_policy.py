@@ -118,3 +118,30 @@ def test_instructions_survive_a_missing_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(steward_policy.Path, 'home', classmethod(lambda cls: home))
     monkeypatch.delenv('HERMES_HOME', raising=False)
     assert steward_policy.instructions() == "You are Jim, Will's project manager."
+
+
+def test_steward_contract_rides_thread_start_and_compaction_only():
+    from agent.codex_runtime import _steward_contract_due
+    agent = SimpleNamespace(context_compressor=SimpleNamespace(compression_count=0))
+    assert _steward_contract_due(agent, 'thread-a')          # first turn of a thread
+    assert not _steward_contract_due(agent, 'thread-a')      # ordinary turns skip it
+    assert not _steward_contract_due(agent, 'thread-a')
+    agent.context_compressor.compression_count = 1           # compaction recorded
+    assert _steward_contract_due(agent, 'thread-a')
+    assert not _steward_contract_due(agent, 'thread-a')
+    agent._codex_compactions_announced = 1                   # previous turn compacted live
+    assert _steward_contract_due(agent, 'thread-a')
+    agent._codex_compactions_announced = 0
+    assert not _steward_contract_due(agent, 'thread-a')
+    assert _steward_contract_due(agent, 'thread-b')          # new or rebuilt thread
+    agent._steward_contract_key = None                       # a failed turn clears it
+    assert _steward_contract_due(agent, 'thread-b')
+
+
+def test_steward_contract_works_without_a_compressor():
+    from agent.codex_runtime import _steward_contract_due
+    agent = SimpleNamespace(context_compressor=None)
+    assert _steward_contract_due(agent, 'thread-a')
+    assert not _steward_contract_due(agent, 'thread-a')
+    agent._codex_compactions_announced = 2
+    assert _steward_contract_due(agent, 'thread-a')
