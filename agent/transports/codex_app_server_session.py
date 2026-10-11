@@ -813,6 +813,17 @@ class CodexAppServerSession:
                 # from requesting an escalation out of that boundary.
                 client_extra_args.extend(_read_only_codex_args(self._codex_home))
             if self._steward:
+                # The steward must reach its own MCP tools. Under "never",
+                # Codex declines every MCP call needing confirmation before
+                # asking us, so Jim could not read or record anything
+                # (2026-10-10). "on-request" routes each request here, where
+                # only hermes-tools elicitations are accepted and exec, file
+                # and permission requests are cancelled; the shell and patch
+                # tools stay disabled and the sandbox stays read-only.
+                client_extra_args = [
+                    'approval_policy="on-request"' if arg == 'approval_policy="never"' else arg
+                    for arg in client_extra_args
+                ]
                 from agent.steward_policy import mcp_server
                 server=mcp_server()
                 # Replace inherited MCP definitions and native execution surfaces.
@@ -858,7 +869,7 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        if self._steward: params.update(sandbox="read-only",approvalPolicy="never")
+        if self._steward: params.update(sandbox="read-only",approvalPolicy="on-request")
         if self._model:
             params["model"] = self._model
         method = "thread/start"
@@ -1105,7 +1116,7 @@ class CodexAppServerSession:
                 {
                     "threadId": self._thread_id,
                     "input": turn_input,
-                    **({"sandboxPolicy":{"type":"readOnly"},"approvalPolicy":"never"} if self._steward else {}),
+                    **({"sandboxPolicy":{"type":"readOnly"},"approvalPolicy":"on-request"} if self._steward else {}),
                     **({"model": self._model} if self._model else {}),
                     **({"effort": effort} if (effort := self._turn_effort()) else {}),
                 },

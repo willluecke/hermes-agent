@@ -2303,6 +2303,19 @@ def test_a_silent_turn_is_still_stopped_by_the_inactivity_watchdog():
     assert result.interrupted and result.should_retire
 
 
+def test_steward_thread_start_asks_so_its_mcp_calls_are_not_declined(tmp_path):
+    clients=[]
+    def factory(**kwargs):
+        client=FakeClient(**kwargs)
+        clients.append(client)
+        return client
+    session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
+    session.ensure_started()
+    method, params = next(r for r in clients[0].requests if r[0] == "thread/start")
+    assert params["sandbox"] == "read-only"
+    assert params["approvalPolicy"] == "on-request"
+
+
 def test_steward_native_tools_disabled_but_scoped_mcp_retained(tmp_path):
     import tomllib
     captured={}
@@ -2313,7 +2326,10 @@ def test_steward_native_tools_disabled_but_scoped_mcp_retained(tmp_path):
     session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
     session.ensure_started()
     args=captured['extra_args']
-    assert 'sandbox_mode="read-only"' in args and 'approval_policy="never"' in args
+    # The steward asks, so its own MCP calls reach the client (which accepts
+    # only hermes-tools); "never" made Codex decline them unasked.
+    assert 'sandbox_mode="read-only"' in args and 'approval_policy="on-request"' in args
+    assert 'approval_policy="never"' not in args
     for feature in ['shell_tool','unified_exec','apply_patch_freeform','js_repl','multi_agent','hooks','plugins']:
         assert ['--disable',feature] in [args[i:i+2] for i in range(len(args)-1)]
     overlays=[a for a in args if a.startswith('mcp_servers=')]
