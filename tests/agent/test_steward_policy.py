@@ -145,3 +145,12 @@ def test_steward_contract_works_without_a_compressor():
     assert not _steward_contract_due(agent, 'thread-a')
     agent._codex_compactions_announced = 2
     assert _steward_contract_due(agent, 'thread-a')
+
+
+def test_steward_contract_rides_again_when_its_text_changes():
+    from agent.codex_runtime import _steward_contract_due
+    agent = SimpleNamespace(context_compressor=SimpleNamespace(compression_count=0))
+    assert _steward_contract_due(agent, 'thread-a', 'instructions v1')
+    assert not _steward_contract_due(agent, 'thread-a', 'instructions v1')
+    assert _steward_contract_due(agent, 'thread-a', 'instructions v2 with the project framework')
+    assert not _steward_contract_due(agent, 'thread-a', 'instructions v2 with the project framework')

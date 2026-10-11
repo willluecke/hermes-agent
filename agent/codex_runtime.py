@@ -198,19 +198,21 @@ def _input_text(turn_input: Any) -> str:
     return "\n".join(texts).strip()
 
 
-def _steward_contract_due(agent, thread_id: Any) -> bool:
+def _steward_contract_due(agent, thread_id: Any, contract: str = "") -> bool:
     """Whether Jim's contract (instructions plus Will's profile) rides this turn.
 
     It rides the first turn of each Codex thread (new, rebuilt or first seen
-    by this agent) and the first turn after a compaction, never otherwise:
-    appending ~12 KB to every turn piled a copy into the thread history per
-    message (Will, 2026-10-10: "at the start ... or after compaction, only
-    those two conditions"). Compaction is seen through the compressor's count
+    by this agent), the first turn after a compaction, and the first turn
+    after the contract text itself changes (new instructions or an updated
+    profile), never otherwise: appending ~12 KB to every turn piled a copy
+    into the thread history per message (Will, 2026-10-10: "at the start ...
+    or after compaction"). Compaction is seen through the compressor's count
     or the previous turn's live compaction notice, whichever is available.
     """
     compressor = getattr(agent, "context_compressor", None)
     compactions = int(getattr(compressor, "compression_count", 0) or 0)
-    key = (str(thread_id or ""), compactions)
+    digest = hashlib.sha256(contract.encode("utf-8")).hexdigest() if contract else ""
+    key = (str(thread_id or ""), compactions, digest)
     compacted_last_turn = int(getattr(agent, "_codex_compactions_announced", 0) or 0) > 0
     due = compacted_last_turn or getattr(agent, "_steward_contract_key", None) != key
     agent._steward_contract_key = key
@@ -2055,9 +2057,11 @@ def run_codex_app_server_turn(
             reason=continuity_reason,
             thread_id=str(thread_id or ""),
         )
-        if steward and _steward_contract_due(agent, thread_id):
+        if steward:
             from agent.steward_policy import instructions
-            turn_input = _with_turn_note(turn_input,instructions())
+            contract = instructions()
+            if _steward_contract_due(agent, thread_id, contract):
+                turn_input = _with_turn_note(turn_input, contract)
         if plugin_user_context and not steward:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the turn input here as it rides the API copy
