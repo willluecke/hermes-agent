@@ -170,6 +170,27 @@ def find_claude_binary() -> str:
     return candidate
 
 
+# Claude Code 2.1.257+ follows each tool result for Fable 5.1 with a batching
+# reminder: "First privately list what you need next; then request every item
+# that doesn't depend on another's result in this one response." Fable keeps
+# that list in its thinking, until on 2026-10-11 the Closure Engine thread
+# opened four answers running with "Private list: ...", each copying the one
+# before. The CLI takes the reminder's text from this variable; ours keeps
+# the batching and says where the list goes. Setting it turns the reminder on
+# for every model, so it is set only where the CLI sends it already, and an
+# operator's own value wins.
+BATCHING_REMINDER_ENV = "CLAUDE_CODE_TOASTY_THIMBLE"
+FABLE_BATCHING_REMINDER = (
+    "First, in your thinking, list what you need next; then request every item "
+    "that doesn't depend on another's result in this one response. The list "
+    "stays out of your reply."
+)
+
+
+def _sends_batching_reminder(model: str) -> bool:
+    return str(model or "").strip().lower().startswith("claude-fable-5-1")
+
+
 _CREDENTIAL_NAME_RE = re.compile(r"(API_KEY|_KEY|_TOKEN|_SECRET|PASSWORD|PASSPHRASE)$")
 _SUBSCRIPTION_ENV_KEEP = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
 
@@ -1115,6 +1136,8 @@ class ClaudeCodeSession:
         # This route must use the signed-in Max subscription. An ambient key
         # would silently turn it into metered API usage.
         env = claude_subscription_env()
+        if _sends_batching_reminder(self.model):
+            env.setdefault(BATCHING_REMINDER_ENV, FABLE_BATCHING_REMINDER)
         env.update(self.extra_env)
         process = subprocess.Popen(
             [binary, *args],

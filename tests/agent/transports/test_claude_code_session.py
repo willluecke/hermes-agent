@@ -1248,6 +1248,37 @@ def test_hook_environment_and_settings_reach_the_spawned_process(monkeypatch):
     assert "ANTHROPIC_API_KEY" not in env
 
 
+def test_fable_batching_reminder_keeps_its_list_out_of_the_reply(monkeypatch):
+    # Claude Code tells Fable 5.1 to "privately list" what it needs next; on
+    # 2026-10-11 Fable started printing that list as "Private list: ...".
+    from agent.transports.claude_code_session import BATCHING_REMINDER_ENV, FABLE_BATCHING_REMINDER
+
+    def spawned_env(model):
+        session = ClaudeCodeSession(cwd="/tmp", model=model)
+        fake = SimpleNamespace(pid=7, stdin=io.StringIO(), stdout=io.StringIO(""), stderr=io.StringIO(""), poll=lambda: None)
+        with patch(
+            "agent.transports.claude_code_session.find_claude_binary", return_value="/usr/bin/claude",
+        ), patch(
+            "agent.transports.claude_code_session.claude_subscription_auth_available", return_value=True,
+        ), patch(
+            "agent.transports.claude_code_session._current_claude_auth_generation", return_value="gen",
+        ), patch(
+            "agent.transports.claude_code_session.subprocess.Popen", return_value=fake,
+        ) as popen:
+            session._start_process()
+        return popen.call_args.kwargs["env"]
+
+    monkeypatch.setenv("HERMES_CLAUDE_CODE_DEBUG", "0")
+    monkeypatch.delenv(BATCHING_REMINDER_ENV, raising=False)
+    assert spawned_env("claude-fable-5-1")[BATCHING_REMINDER_ENV] == FABLE_BATCHING_REMINDER
+    assert "privately" not in FABLE_BATCHING_REMINDER and "out of your reply" in FABLE_BATCHING_REMINDER
+    # Any value turns the reminder on for the model, so other models get none.
+    assert BATCHING_REMINDER_ENV not in spawned_env("claude-opus-5-5")
+    # An operator's own text, or "0" for off, is kept.
+    monkeypatch.setenv(BATCHING_REMINDER_ENV, "0")
+    assert spawned_env("claude-fable-5-1")[BATCHING_REMINDER_ENV] == "0"
+
+
 # --- Monitor keeps the Hermes turn open (2026-09-20) -----------------------
 
 def _monitor_frames(session_id, task_id, timeout_ms, *, description="hero render"):
