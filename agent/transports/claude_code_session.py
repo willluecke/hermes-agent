@@ -185,6 +185,14 @@ FABLE_BATCHING_REMINDER = (
     "that doesn't depend on another's result in this one response. The list "
     "stays out of your reply."
 )
+# The reminder only follows tool results, and a thread that has printed the
+# list keeps copying its own replies: Closure Engine's opened two more turns
+# with it, one with no tool call or Jev note before it. So Fable's runtime
+# contract says it too.
+FABLE_PLANNING_NOTE = (
+    " Keep your planning in your thinking: never open a reply with a list of "
+    "next steps such as \"Private list:\"; start with the answer or the action."
+)
 
 
 def _sends_batching_reminder(model: str) -> bool:

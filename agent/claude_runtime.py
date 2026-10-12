@@ -32,8 +32,10 @@ from agent.turn_time_limit import (
 )
 from agent.transports.claude_code_session import (
     TURN_TIME_LIMIT_ERROR_CODE as CLAUDE_TURN_TIME_LIMIT_ERROR_CODE,
+    FABLE_PLANNING_NOTE,
     HERMES_MONITOR_NOTE,
     HERMES_RESULT_DEFERRED,
+    _sends_batching_reminder,
 )
 
 logger = logging.getLogger(__name__)
@@ -1291,6 +1293,8 @@ def run_claude_code_turn(
             "follow-up action in an ordinary chat turn."
         )
     model = str(getattr(agent, "model", "") or "claude-fable-5")
+    if not steward and _sends_batching_reminder(model):
+        runtime_contract += FABLE_PLANNING_NOTE
     effort = _claude_code_effort(getattr(agent, "reasoning_config", None))
     resident_first_event_timeout = resolve_timeout(
         "claude_code.resident_first_event",

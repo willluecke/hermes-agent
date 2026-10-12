@@ -91,6 +91,27 @@ def test_claude_code_read_only_posture_reaches_native_session(monkeypatch):
     assert observed["read_only"] is True
 
 
+def test_fable_is_told_to_keep_its_planning_list_out_of_replies(monkeypatch):
+    # On 2026-10-11 a Fable thread opened six replies running with "Private list: ...".
+    from agent.transports.claude_code_session import FABLE_PLANNING_NOTE
+
+    observed = {}
+
+    def _run_turn(session, prompt):
+        observed[session.model] = session.system_prompt
+        return ClaudeCodeTurnResult(final_text="ok")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    for model in ("claude-fable-5-1", "claude-opus-5-5"):
+        agent = _make_agent()
+        agent.model = model
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("plan the launch")
+
+    assert observed["claude-fable-5-1"].endswith(FABLE_PLANNING_NOTE)
+    assert "Private list" not in observed["claude-opus-5-5"]
+
+
 def test_claude_auth_preflight_error_is_structured_and_terminal(monkeypatch):
     def _run_turn(_session, _prompt):
         raise ClaudeCodeError(
