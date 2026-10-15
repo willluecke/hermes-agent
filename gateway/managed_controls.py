@@ -66,3 +66,10 @@ def start_allowed(headers, body):
 
 def steer_allowed(headers, run_id, managed=False):
     return (not managed and not managed_owner(run_id=run_id)) or authorized(headers,'operator')
+
+
+def review_allowed(headers):
+    """A steward final review is a managed start: the same controller capability
+    that admits native_goal:false goal turns (or Will's operator capability),
+    never the ordinary API key alone."""
+    return authorized(headers,'controller') or authorized(headers,'operator')

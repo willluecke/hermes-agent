@@ -783,3 +783,56 @@ def test_claude_no_cap_setting_means_no_wall_clock_limit(monkeypatch):
         agent.run_conversation("continue")
 
     assert seen["limit"] == math.inf
+
+
+_REVIEW_RUN = "run_" + "c" * 32
+_REVIEW = {"id": "final_" + "a" * 64, "content_hash": "b" * 64, "queue_id": "jim_final_" + "a" * 64,
+           "review_run_id": _REVIEW_RUN, "source": {"conversation_id": "talos", "message_id": _REVIEW_RUN}}
+
+
+def _steward_workspace(tmp_path, monkeypatch):
+    from agent import steward_policy
+
+    docs = tmp_path / ".hermes" / "talos-steward" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "steward-instructions.md").write_text("You are Jim. Review the assigned final.")
+    monkeypatch.setattr(steward_policy.Path, "home", classmethod(lambda cls: tmp_path))
+
+
+def test_the_claude_steward_lane_carries_the_gateway_bound_review_and_nothing_else(monkeypatch, tmp_path):
+    _steward_workspace(tmp_path, monkeypatch)
+    observed = []
+
+    def _run_turn(session, prompt):
+        observed.append({"steward": session.steward, "review": session.steward_review, "read_only": session.read_only,
+                         "contract": session.system_prompt})
+        return ClaudeCodeTurnResult(final_text="Acknowledged.")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    for review in (_REVIEW, None):
+        agent = _make_agent(session_id="hermes-steward-review" if review else "hermes-chat-talos")
+        agent.session_project = "talos-steward"
+        if review is not None:
+            agent._steward_review = review  # what the gateway binds for one run
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("Internal final review final_" + "a" * 64)
+        assert result["final_response"] == "Acknowledged."
+
+    assert [o["review"] for o in observed] == [_REVIEW, None]
+    assert all(o["steward"] for o in observed)
+    assert all(o["contract"].startswith("You are Jim.") for o in observed)
+
+
+def test_a_review_binding_never_reaches_an_unrestricted_claude_session(monkeypatch, tmp_path):
+    observed = []
+
+    def _run_turn(session, prompt):
+        observed.append(session.steward_review)
+        return ClaudeCodeTurnResult(final_text="ok")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    agent = _make_agent()
+    agent._steward_review = _REVIEW  # not the steward: the lane must not carry it
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        agent.run_conversation("hello")
+    assert observed == [None]

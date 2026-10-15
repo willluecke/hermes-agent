@@ -2340,3 +2340,53 @@ def test_steward_native_tools_disabled_but_scoped_mcp_retained(tmp_path):
     assert config['enabled'] is True
     assert config['env']['HERMES_STEWARD']=='1'
     assert config['env']['HERMES_TOOLS_MCP_ONLY']=='talos,hermes_conversation'
+
+
+_REVIEW_RUN='run_'+'c'*32
+_REVIEW={'id':'final_'+'a'*64,'content_hash':'b'*64,'queue_id':'jim_final_'+'a'*64,'review_run_id':_REVIEW_RUN,
+         'source':{'conversation_id':'talos','message_id':_REVIEW_RUN}}
+
+
+def test_steward_review_binding_rides_the_scoped_mcp_env_on_the_codex_lane(tmp_path):
+    import json
+    import tomllib
+    captured={}
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient(**kwargs)
+    session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-steward-review',project_key='talos-steward',
+                                  steward_review=_REVIEW,codex_home=str(tmp_path),client_factory=factory)
+    session.ensure_started()
+    args=captured['extra_args']
+    overlays=[a for a in args if a.startswith('mcp_servers=')]
+    config=tomllib.loads(overlays[0])['mcp_servers']['hermes-tools']
+    assert json.loads(config['env']['HERMES_STEWARD_REVIEW'])==_REVIEW
+    assert config['env']['HERMES_STEWARD']=='1' and config['env']['HERMES_TOOLS_MCP_ONLY']=='talos'
+    # Still the restricted steward runtime: read-only sandbox, asks, no native execution surfaces.
+    assert 'sandbox_mode="read-only"' in args and 'approval_policy="on-request"' in args
+    for feature in ['shell_tool','unified_exec','apply_patch_freeform','js_repl','multi_agent']:
+        assert ['--disable',feature] in [args[i:i+2] for i in range(len(args)-1)]
+    method, params = next(r for r in session._client.requests if r[0]=='thread/start')
+    assert params['sandbox']=='read-only' and params['approvalPolicy']=='on-request'
+
+
+def test_ordinary_steward_codex_turns_carry_no_review_binding(tmp_path):
+    import tomllib
+    captured={}
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient(**kwargs)
+    session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
+    session.ensure_started()
+    config=tomllib.loads(next(a for a in captured['extra_args'] if a.startswith('mcp_servers=')))['mcp_servers']['hermes-tools']
+    assert 'HERMES_STEWARD_REVIEW' not in config['env']
+    assert config['env']['HERMES_TOOLS_MCP_ONLY']=='talos,hermes_conversation'
+
+
+def test_a_review_binding_is_refused_outside_the_steward_or_when_malformed(tmp_path):
+    with pytest.raises(ValueError):
+        CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-other',steward_review=_REVIEW,client_factory=FakeClient)
+    with pytest.raises(ValueError):
+        CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-steward-review',project_key='talos-steward',
+                              steward_review={**_REVIEW,'source':{'conversation_id':'delegate','message_id':_REVIEW_RUN}},
+                              client_factory=FakeClient)

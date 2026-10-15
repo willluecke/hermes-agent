@@ -1519,7 +1519,10 @@ def run_claude_code_turn(
                 startup_first_event_timeout=startup_first_event_timeout,
                 extra_env=hook_env,
                 settings_json=hook_settings,
-                **({"steward":True} if steward else {}),
+                # The gateway binds a final review to the run before the model
+                # runs; the steward's process is rebuilt every turn, so each
+                # review spawns its own scoped MCP server carrying it.
+                **({"steward":True,"steward_review":getattr(agent,"_steward_review",None)} if steward else {}),
             )
             session.late_answer_context = late_context
             session.history_fingerprint = prior_fingerprint

@@ -2130,3 +2130,34 @@ def test_steward_identity_propagates_even_when_cwd_is_an_alias():
     session=ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward=True)
     assert session.steward
     assert session.extra_env['CLAUDE_CODE_DISABLE_CLAUDE_MDS']=='1'
+
+
+_REVIEW_RUN='run_'+'c'*32
+_REVIEW={'id':'final_'+'a'*64,'content_hash':'b'*64,'queue_id':'jim_final_'+'a'*64,'review_run_id':_REVIEW_RUN,
+         'source':{'conversation_id':'talos','message_id':_REVIEW_RUN}}
+
+
+def test_steward_review_binding_rides_the_scoped_mcp_env_on_the_claude_lane():
+    import json
+    args=claude_code_args(model='claude-opus-5-5',session_id='fixture',steward=True,steward_review=_REVIEW)
+    servers=json.loads(args[args.index('--mcp-config')+1])['mcpServers']
+    assert list(servers)==['hermes-tools']
+    env=servers['hermes-tools']['env']
+    assert json.loads(env['HERMES_STEWARD_REVIEW'])==_REVIEW
+    assert env['HERMES_STEWARD']=='1' and env['HERMES_TOOLS_MCP_ONLY']=='talos'
+    # Still the restricted steward runtime: no native tools, extensions or hooks.
+    assert args[args.index('--tools')+1]=='' and '--strict-mcp-config' in args and '--no-chrome' in args
+    settings=json.loads(args[args.index('--settings')+1])
+    assert settings['disableAllHooks'] is True and settings['enabledPlugins']=={}
+    ordinary=claude_code_args(model='claude-opus-5-5',session_id='fixture',steward=True)
+    assert 'HERMES_STEWARD_REVIEW' not in json.loads(ordinary[ordinary.index('--mcp-config')+1])['mcpServers']['hermes-tools']['env']
+
+
+def test_claude_session_carries_the_binding_only_as_the_steward():
+    session=ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward=True,steward_review=_REVIEW)
+    assert session.steward and session.steward_review==_REVIEW
+    assert ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward=True).steward_review is None
+    with pytest.raises(ValueError):
+        ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward_review=_REVIEW)
+    with pytest.raises(ValueError):
+        ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward=True,steward_review={**_REVIEW,'review_run_id':'other run'})

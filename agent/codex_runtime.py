@@ -1981,6 +1981,10 @@ def run_codex_app_server_turn(
             require_exact=require_exact,
             read_only=read_only,
             project_key=str(getattr(agent, "session_project", "") or ""),
+            # The gateway binds a final review to the run before the model
+            # runs; the steward's session is rebuilt every turn, so each
+            # review spawns its own scoped MCP server carrying it.
+            steward_review=getattr(agent, "_steward_review", None),
             reversible_deletion_policy=reversible_deletion_policy,
             workspace_snapshot_policy=workspace_snapshot_policy,
             approval_callback=approval_callback,

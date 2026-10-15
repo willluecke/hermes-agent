@@ -221,6 +221,9 @@ def _tool_annotations(name: str) -> Any:
 def selected_tools(env: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
     """EXPOSED_TOOLS, narrowed to the names in HERMES_TOOLS_MCP_ONLY when set."""
     source = os.environ if env is None else env
+    if source.get('HERMES_STEWARD_REVIEW'):
+        # A bound final review sees one tool; the binding is validated at build.
+        return ('talos',)
     if source.get('HERMES_STEWARD') == '1':
         return ('talos','hermes_conversation')
     raw = (source.get(ONLY_ENV) or "").strip()
@@ -277,13 +280,21 @@ def _build_server() -> Any:
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
-    from agent.steward_policy import StewardTools
-    steward = StewardTools() if os.environ.get('HERMES_STEWARD')=='1' else None
+    from agent.steward_policy import StewardTools, review_from_env
+    # A malformed review binding raises here: the server fails closed with no
+    # tools rather than falling back to the ordinary steward surface.
+    review = review_from_env()
+    steward = StewardTools(review=review) if (review is not None or os.environ.get('HERMES_STEWARD')=='1') else None
     exposed_count = 0
     wanted = selected_tools()
 
     for name in wanted:
         spec = all_defs.get(name)
+        if review is not None and name == 'talos':
+            # Review mode dispatches through StewardTools.run -> review_tool,
+            # so the model sees the review contract, not the operator surface.
+            from tools.talos_tool import REVIEW_SCHEMA
+            spec = REVIEW_SCHEMA
         if spec is None:
             logger.debug(
                 "skipping %s — not registered in this Hermes process", name
@@ -377,7 +388,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         server = _build_server()
-    except ImportError as exc:
+    except (ImportError, ValueError) as exc:
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
 

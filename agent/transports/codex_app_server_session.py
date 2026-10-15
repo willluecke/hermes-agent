@@ -546,6 +546,7 @@ class CodexAppServerSession:
         read_only: bool = False,
         permission_profile: Optional[str] = None,
         project_key: Optional[str] = None,
+        steward_review: Optional[dict] = None,
         reversible_deletion_policy: Any = None,
         workspace_snapshot_policy: Any = None,
         approval_callback: Optional[Callable[..., str]] = None,
@@ -576,9 +577,14 @@ class CodexAppServerSession:
         self._parent_provider = str(parent_provider or "").strip().lower()
         self._opus_worker_enabled = bool(opus_worker_enabled)
         self._require_exact = bool(require_exact)
-        from agent.steward_policy import is_steward
+        from agent.steward_policy import is_steward, review_context
         self._steward = is_steward(session=hermes_session_id,project=project_key,cwd=self._cwd)
         self._read_only = bool(read_only or self._steward)
+        # The gateway-bound final review (never model-set) rides to the scoped
+        # MCP server as trusted environment; only the steward may carry one.
+        self._steward_review = review_context(steward_review) if steward_review is not None else None
+        if self._steward_review is not None and not self._steward:
+            raise ValueError('A steward final review runs only as the restricted steward')
         self._exact_runtime_validated = False
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -825,7 +831,7 @@ class CodexAppServerSession:
                     for arg in client_extra_args
                 ]
                 from agent.steward_policy import mcp_server
-                server=mcp_server()
+                server=mcp_server(review=self._steward_review)
                 # Replace inherited MCP definitions and native execution surfaces.
                 # Hermes MCP is a separate trusted process, outside the shell sandbox.
                 config='"hermes-tools"={enabled=true,command='+json.dumps(server['command'])+',args='+json.dumps(server['args'])+',env={'+','.join(json.dumps(k)+'='+json.dumps(v) for k,v in server['env'].items())+'}}'

@@ -766,6 +766,7 @@ def claude_code_args(
     read_only: bool = False,
     no_tools: bool = False,
     steward: bool = False,
+    steward_review: Optional[dict] = None,
     debug_file: Optional[str] = None,
     settings_json: Optional[str] = None,
 ) -> list[str]:
@@ -818,7 +819,7 @@ def claude_code_args(
         from agent.steward_policy import mcp_server
         args[args.index('--permission-mode')+1]='bypassPermissions'
         args[args.index('--setting-sources')+1]=''
-        args[args.index('--mcp-config')+1]=json.dumps({'mcpServers':{'hermes-tools':mcp_server()}})
+        args[args.index('--mcp-config')+1]=json.dumps({'mcpServers':{'hermes-tools':mcp_server(review=steward_review)}})
         # --safe-mode drops even explicitly configured stdio MCP servers.
         # Disable customizations explicitly while retaining our scoped server.
         settings={'disableAllHooks':True,'enabledPlugins':{},'disableClaudeAiConnectors':True,
@@ -863,6 +864,7 @@ class ClaudeCodeSession:
         read_only: bool = False,
         no_tools: bool = False,
         steward: bool = False,
+        steward_review: Optional[dict] = None,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
         on_session_id: Optional[Callable[[str], None]] = None,
         on_watchdog_timeout: Optional[Callable[[dict[str, Any]], None]] = None,
@@ -874,8 +876,13 @@ class ClaudeCodeSession:
         extra_env: Optional[dict[str, str]] = None,
         settings_json: Optional[str] = None,
     ) -> None:
-        from agent.steward_policy import is_steward
+        from agent.steward_policy import is_steward, review_context
         self.steward = bool(steward or is_steward(cwd=cwd))
+        # The gateway-bound final review (never model-set) rides to the scoped
+        # MCP server as trusted environment; only the steward may carry one.
+        self.steward_review = review_context(steward_review) if steward_review is not None else None
+        if self.steward_review is not None and not self.steward:
+            raise ValueError('A steward final review runs only as the restricted steward')
         self.cwd = cwd
         # The gateway's hook endpoint and per-session token ride the process
         # environment so Claude Code's command hooks can reach it; the
@@ -1138,6 +1145,7 @@ class ClaudeCodeSession:
             read_only=self.read_only,
             no_tools=self.no_tools,
             steward=self.steward,
+            steward_review=self.steward_review,
             debug_file=self._next_debug_file(),
             settings_json=self.settings_json,
         )

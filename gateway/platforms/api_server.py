@@ -9252,7 +9252,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
-        if (project == "talos-steward") != (session_id == "hermes-chat-talos"):
+        from agent.steward_policy import REVIEW_SESSION, review_request as _steward_review_request
+        steward_review_request = None
+        if "steward_review" in body or session_id == REVIEW_SESSION:
+            # A system-origin final review (docs/turn-final-reviews.md in the
+            # Talos repo). The managed controller capability admits it, never
+            # the API key alone; it runs only as the steward, in its serialized
+            # review session, as a managed (native_goal:false) turn. The field
+            # is read from the request body only, never from chat input.
+            from gateway.managed_controls import review_allowed
+            if not review_allowed(request.headers):
+                return web.json_response(_openai_error("steward_review requires the managed controller capability"), status=403)
+            if project != "talos-steward" or session_id != REVIEW_SESSION or body.get("native_goal") is not False:
+                return web.json_response(_openai_error(
+                    "steward_review runs only as talos-steward in the hermes-steward-review session with native_goal false"), status=400)
+            try:
+                steward_review_request = _steward_review_request(body.get("steward_review"))
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc)), status=400)
+        elif (project == "talos-steward") != (session_id == "hermes-chat-talos"):
             # Neither identity may be reused with an unrestricted workspace.
             return web.json_response(_openai_error("talos-steward is reserved for the Talos conversation"), status=400)
 
@@ -9496,6 +9514,12 @@ class APIServerAdapter(BasePlatformAdapter):
             # so reattach/archive consumers receive the same ordered notice.
             _interim_cb(message, already_streamed=False)
 
+        # Bind the review to this gateway run id before any model execution.
+        # The binding is the only review context the lanes ever see.
+        steward_review = None
+        if steward_review_request is not None:
+            from agent.steward_policy import bind_review
+            steward_review = bind_review(steward_review_request, run_id)
         self._set_run_status(
             run_id,
             "queued",
@@ -9505,6 +9529,7 @@ class APIServerAdapter(BasePlatformAdapter):
             execution_mode=execution_mode,
             managed_goal=body.get("native_goal") is False,
             project=project or None,
+            **({"review_id": steward_review["id"]} if steward_review else {}),
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -9666,6 +9691,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 project=project or "",
                             )
                             self._active_run_agents[run_id] = agent
+                            # The trusted review binding for this run only (None
+                            # for every other run, so a cached steward agent never
+                            # carries a stale one). User input and model output
+                            # cannot set it; the lanes read it when they spawn
+                            # the scoped MCP server.
+                            agent._steward_review = steward_review
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
                             # environment state.
@@ -9812,6 +9843,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # guard as gateway/run.py and _run_agent above).
                             if agent is not None:
                                 _clear_turn_process_ownership(agent)
+                                agent._steward_review = None
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:

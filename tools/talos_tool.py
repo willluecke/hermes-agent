@@ -10,6 +10,7 @@ release anything. Prompts, packets and credentials never pass through it.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,18 @@ from urllib import error, request, parse
 import re
 
 from tools.registry import registry
+
+# Every-turn final review (docs/turn-final-reviews.md in the Talos repo).
+# These actions exist only inside the trusted review invocation: the
+# restricted MCP server calls review_tool() with the gateway-bound context,
+# never through the model-facing talos_tool() path below.
+REVIEW_ACTIONS = ("review", "review_content", "review_ack")
+REVIEW_CONTENT_LIMIT = 64_000  # bytes of complete final content one review may read
+REVIEW_TEXT_LIMIT = 1500
+ASSESSMENTS = ("aligned", "drift", "needs_action", "insufficient")
+NEEDED_ACTIONS = ("none", "clarification", "approval", "propose_followup")
+COVERAGES = ("complete", "insufficient")
+_HASH = re.compile(r"^[0-9a-f]{64}$")
 
 DEFAULT_URL = "http://127.0.0.1:41005"
 DEFAULT_TOKEN_FILE = Path.home() / "coding-projects" / "talos" / ".talos" / "runtime" / "dashboard.token"
@@ -158,6 +171,8 @@ def _mandate_save(kwargs: dict) -> Any:
 def talos_tool(action: str, **kwargs: Any) -> str:
     action = str(action or "").strip().lower()
     try:
+        if action in REVIEW_ACTIONS:
+            raise ValueError("Final review actions run only inside a trusted internal review invocation")
         if action in ("directions", "direction", "delegation"):
             key = "project_id" if action == "directions" else "id"
             value = kwargs.get(key)
@@ -284,6 +299,186 @@ TALOS_SCHEMA["parameters"]["properties"]["verb"] = {
     "type": "string",
     "description": "For commitment_action: done, defer or delegate. For control: the task control action.",
 }
+
+
+REVIEW_SCHEMA = {
+    "name": "talos",
+    "description": (
+        "Internal final-review mode: only the assigned delegated final can be read and acknowledged. "
+        "review reads the assigned review record once (the final's text, availability, terminal status, "
+        "completeness and digest, plus the original delegation context). review_content, only when the "
+        "record's final has complete=false, reads its complete immutable content once; the trusted wrapper "
+        "fetches the recorded reference and verifies its SHA-256 and byte count. review_ack acknowledges once "
+        "with assessment (aligned|drift|needs_action|insufficient), a bounded reason, needed_action "
+        "(none|clarification|approval|propose_followup), action_detail (omit when needed_action is none) and "
+        "coverage (complete|insufficient); identity, digests and provenance come from the trusted context. "
+        "coverage=complete is accepted only when the complete content was in the record or verified by "
+        "review_content; a blank, unavailable, provider-error or unread final is assessed insufficient. "
+        "After review_ack, end the turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": list(REVIEW_ACTIONS)},
+            "id": {"type": "string", "description": "The assigned review id (final_<digest>)."},
+            "assessment": {"type": "string", "enum": list(ASSESSMENTS)},
+            "reason": {"type": "string", "description": "At most 1500 characters."},
+            "needed_action": {"type": "string", "enum": list(NEEDED_ACTIONS)},
+            "action_detail": {"type": "string", "description": "Omit when needed_action is none; otherwise at most 1500 characters."},
+            "coverage": {"type": "string", "enum": list(COVERAGES)},
+        },
+        "required": ["action"],
+    },
+}
+
+
+def _review_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > REVIEW_TEXT_LIMIT:
+        raise ValueError(f"{field} must be nonempty text of at most {REVIEW_TEXT_LIMIT} characters")
+    return value
+
+
+def _check_record(record: Any, context: dict) -> dict:
+    """The record must be the assigned final, archived, delivered and unchanged."""
+    if not isinstance(record, dict) or record.get("id") != context["id"]:
+        raise ValueError("Talos returned a record for another review")
+    if record.get("content_hash") != context["content_hash"] or not isinstance(record.get("body"), dict):
+        raise ValueError("The assigned packet digest does not match the archived Talos record; this review cannot proceed")
+    final = record["body"].get("final")
+    if not isinstance(final, dict) or not {"availability", "text", "complete", "sha256", "bytes", "reference"} <= set(final):
+        raise ValueError("The archived final packet is incomplete")
+    if not isinstance(final["sha256"], str) or not _HASH.fullmatch(final["sha256"]) or type(final["complete"]) is not bool:
+        raise ValueError("The archived final packet is incomplete")
+    delivery = record.get("delivery")
+    if not isinstance(delivery, dict) or delivery.get("queue_id") != context["queue_id"]:
+        raise ValueError("The assigned review has no matching durable delivery; it cannot be acknowledged from this invocation")
+    return record
+
+
+def _sync_read(path: str, size: int) -> bytes:
+    """One authenticated read of a recorded complete reference from hermes-sync."""
+    from tools.hermes_conversation_tool import _base_url as sync_url, _key as sync_key
+
+    req = request.Request(sync_url() + path, method="GET",
+                          headers={"Authorization": "Bearer " + sync_key(), "Accept": "text/plain"})
+    try:
+        with request.urlopen(req, timeout=TIMEOUT_SECONDS) as response:
+            return response.read(size + 1)
+    except error.HTTPError as exc:
+        body = exc.read(4096).decode("utf-8", "replace")
+        try:
+            detail = json.loads(body).get("error") or ""
+        except ValueError:
+            detail = ""
+        raise ValueError(f"hermes-sync refused the complete reference ({exc.code}): {str(detail)[:300]}") from None
+    except (error.URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"hermes-sync is unreachable: {getattr(exc, 'reason', exc)}") from None
+
+
+def _review_content(review: Any, context: dict) -> dict:
+    final = review.record["body"]["final"]
+    reference = final.get("reference")
+    if final["complete"] is not False or not isinstance(reference, dict) or set(reference) != {"path", "sha256", "bytes"}:
+        raise ValueError("The record has no complete reference to read")
+    path, digest, size = reference["path"], reference["sha256"], reference["bytes"]
+    if (not isinstance(path, str) or not path.startswith("/conversations/") or "content=complete" not in path
+            or "://" in path or any(c in path for c in " \r\n")):
+        raise ValueError("The recorded reference is not an immutable final address")
+    if digest != final["sha256"] or type(size) is not int or size != final["bytes"] or size <= 0:
+        raise ValueError("The recorded reference does not address this final's digest and length")
+    if size > REVIEW_CONTENT_LIMIT:
+        raise ValueError(f"The complete final is {size} bytes; one review may read at most {REVIEW_CONTENT_LIMIT}. "
+                         "Acknowledge coverage=insufficient and name the unread complete content.")
+    review.attempted.add("review_content")
+    raw = _sync_read(path, size)
+    if len(raw) != size:
+        raise ValueError(f"Complete content length mismatch: expected {size} bytes, received {len(raw)}; coverage is insufficient")
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("Complete content digest mismatch; coverage is insufficient")
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise ValueError("Complete content is not valid UTF-8; coverage is insufficient") from None
+    review.content_verified = True
+    return {"id": context["id"], "sha256": digest, "bytes": size, "text": text}
+
+
+def _review_ack(review: Any, context: dict, kwargs: dict) -> dict:
+    final = review.record["body"]["final"]
+    unknown = set(kwargs) - {"id", "assessment", "reason", "needed_action", "action_detail", "coverage",
+                             "content_hash", "queue_id", "review_run_id", "source", "final_sha256"}
+    if unknown:
+        raise ValueError("review_ack does not accept: " + ", ".join(sorted(unknown)))
+    assessment, needed_action, coverage = kwargs.get("assessment"), kwargs.get("needed_action"), kwargs.get("coverage")
+    if assessment not in ASSESSMENTS:
+        raise ValueError("assessment must be one of " + ", ".join(ASSESSMENTS))
+    if needed_action not in NEEDED_ACTIONS:
+        raise ValueError("needed_action must be one of " + ", ".join(NEEDED_ACTIONS))
+    if coverage not in COVERAGES:
+        raise ValueError("coverage must be complete or insufficient")
+    reason = _review_text(kwargs.get("reason"), "reason")
+    action_detail = kwargs.get("action_detail")
+    if needed_action == "none":
+        if action_detail is not None:
+            raise ValueError("action_detail must be omitted when needed_action is none")
+    else:
+        action_detail = _review_text(action_detail, "action_detail")
+    if assessment == "aligned" and needed_action != "none":
+        raise ValueError("An aligned review has no needed action")
+    if assessment in {"drift", "needs_action"} and needed_action == "none":
+        raise ValueError("A drift or needs_action review must propose a next action")
+    if coverage == "complete" and not (final["complete"] is True or review.content_verified):
+        raise ValueError("coverage=complete requires the complete final content: this record is bounded and "
+                         "review_content has not verified it. Read it first, or acknowledge coverage=insufficient.")
+    if (coverage == "insufficient" or final["availability"] != "present") and assessment != "insufficient":
+        raise ValueError("A blank, unavailable, provider-error or insufficiently read final must be assessed insufficient")
+    payload = {
+        "id": context["id"], "content_hash": context["content_hash"], "queue_id": context["queue_id"],
+        "source": context["source"], "review_run_id": context["review_run_id"],
+        "assessment": assessment, "reason": reason, "needed_action": needed_action,
+        "action_detail": action_detail, "coverage": coverage, "final_sha256": final["sha256"],
+    }
+    # From here the acknowledgement counts as attempted, whatever the outcome:
+    # an uncertain receipt is recovered by the controller, never re-sent here.
+    review.attempted.add("review_ack")
+    try:
+        return _call("/api/delegation-reviews/ack", payload)
+    except ValueError as exc:
+        raise ValueError(f"Acknowledgement outcome uncertain: {exc}. Do not retry; the controller recovers "
+                         "the receipt. Report this and end the turn.") from None
+
+
+def review_tool(review: Any, action: str = "", **kwargs: Any) -> str:
+    """Trusted review entry point for the restricted MCP server.
+
+    ``review`` is the turn's StewardTools instance: ``review.review`` is the
+    gateway-bound context, and the fetched record plus verification state live
+    on it. Provenance, identity and digests always come from that context.
+    """
+    action = str(action or "").strip().lower()
+    try:
+        context = review.review
+        if action in ("review_content", "review_ack") and review.record is None:
+            raise ValueError("Read the assigned record with review first")
+        if action == "review":
+            if set(kwargs) - {"id"}:
+                raise ValueError("review accepts only the assigned id")
+            review.attempted.add("review")
+            record = _check_record(_call("/api/delegation-reviews/" + parse.quote(context["id"], safe="")), context)
+            review.record = record
+            final = record["body"]["final"]
+            return json.dumps({"ok": True, "action": action, "result": record,
+                               "complete_content": "in_record" if final["complete"] else "read_with_review_content",
+                               "availability": final["availability"]})
+        if action == "review_content":
+            if set(kwargs) - {"id"}:
+                raise ValueError("review_content accepts only the assigned id")
+            return json.dumps({"ok": True, "action": action, "result": _review_content(review, context)}, ensure_ascii=False)
+        if action == "review_ack":
+            return json.dumps({"ok": True, "action": action, "result": _review_ack(review, context, kwargs)})
+        raise ValueError("Internal review mode permits only review, review_content and review_ack")
+    except ValueError as exc:
+        return json.dumps({"ok": False, "action": action, "error": str(exc)})
 
 
 def _handler(args: dict, **kwargs: Any) -> str:
