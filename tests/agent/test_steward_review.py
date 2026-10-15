@@ -513,6 +513,27 @@ def test_review_ack_local_validation_refuses_without_spending_the_single_attempt
     assert ack['ok'] is True and len(talos.requests) == 2
 
 
+def test_a_refused_ack_tells_jim_nothing_was_recorded_and_how_to_correct_it(services):
+    # 2026-10-14, the first live reviews: Jim judged a research final aligned
+    # but needing Will's approval, read "An aligned review has no needed
+    # action" as a failed acknowledgement and ended the review unrecorded.
+    talos, _ = services
+    serve_record(talos, record())
+    policy = StewardTools(review=CONTEXT)
+    run(policy, {'action': 'review', 'id': ID})
+    refused = run(policy, {'action': 'review_ack', 'assessment': 'aligned', 'needed_action': 'approval',
+                           'action_detail': 'Executing the plan needs Will.', 'reason': 'Complete and in scope.',
+                           'coverage': 'complete'})
+    assert refused['ok'] is False
+    assert 'assess needs_action' in refused['error'] and 'Nothing was recorded' in refused['error']
+    assert 'call review_ack again' in refused['error'] and 'review_ack' not in policy.attempted
+    assert 'when aligned work still needs' in REVIEW_SCHEMA['description']
+    ack = run(policy, {'action': 'review_ack', 'assessment': 'needs_action', 'needed_action': 'approval',
+                       'action_detail': 'Executing the plan needs Will.', 'reason': 'Complete and in scope.',
+                       'coverage': 'complete'})
+    assert ack['ok'] is True and talos.requests[-1]['body']['assessment'] == 'needs_action'
+
+
 @pytest.mark.parametrize('availability,terminal', [('blank', 'completed'), ('unavailable', 'failed'), ('provider_error', 'cancelled')])
 def test_missing_finals_must_be_acknowledged_insufficient(services, availability, terminal):
     talos, _ = services

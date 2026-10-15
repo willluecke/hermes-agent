@@ -312,6 +312,8 @@ REVIEW_SCHEMA = {
         "with assessment (aligned|drift|needs_action|insufficient), a bounded reason, needed_action "
         "(none|clarification|approval|propose_followup), action_detail (omit when needed_action is none) and "
         "coverage (complete|insufficient); identity, digests and provenance come from the trusted context. "
+        "aligned always pairs with needed_action none: when aligned work still needs Will's approval or a "
+        "clarification, or a follow-up, assess needs_action with that needed_action. "
         "coverage=complete is accepted only when the complete content was in the record or verified by "
         "review_content; a blank, unavailable, provider-error or unread final is assessed insufficient. "
         "After review_ack, end the turn."
@@ -403,8 +405,30 @@ def _review_content(review: Any, context: dict) -> dict:
     return {"id": context["id"], "sha256": digest, "bytes": size, "text": text}
 
 
+# A locally refused acknowledgement sends nothing, so it must say so: on
+# 2026-10-14 Jim read "An aligned review has no needed action", took the
+# refusal for a failed acknowledgement and ended the review unrecorded.
+ACK_NOT_RECORDED = ("Nothing was recorded and your one acknowledgement is still unused: "
+                    "correct the fields and call review_ack again.")
+
+
 def _review_ack(review: Any, context: dict, kwargs: dict) -> dict:
     final = review.record["body"]["final"]
+    try:
+        payload = _review_ack_payload(review, context, kwargs, final)
+    except ValueError as exc:
+        raise ValueError(f"{str(exc).rstrip('.')}. {ACK_NOT_RECORDED}") from None
+    # From here the acknowledgement counts as attempted, whatever the outcome:
+    # an uncertain receipt is recovered by the controller, never re-sent here.
+    review.attempted.add("review_ack")
+    try:
+        return _call("/api/delegation-reviews/ack", payload)
+    except ValueError as exc:
+        raise ValueError(f"Acknowledgement outcome uncertain: {exc}. Do not retry; the controller recovers "
+                         "the receipt. Report this and end the turn.") from None
+
+
+def _review_ack_payload(review: Any, context: dict, kwargs: dict, final: dict) -> dict:
     unknown = set(kwargs) - {"id", "assessment", "reason", "needed_action", "action_detail", "coverage",
                              "content_hash", "queue_id", "review_run_id", "source", "final_sha256"}
     if unknown:
@@ -424,28 +448,22 @@ def _review_ack(review: Any, context: dict, kwargs: dict) -> dict:
     else:
         action_detail = _review_text(action_detail, "action_detail")
     if assessment == "aligned" and needed_action != "none":
-        raise ValueError("An aligned review has no needed action")
+        raise ValueError("An aligned review has no needed action: if the work is aligned but still needs Will's "
+                         "approval or a clarification, or a follow-up, assess needs_action with that needed_action")
     if assessment in {"drift", "needs_action"} and needed_action == "none":
-        raise ValueError("A drift or needs_action review must propose a next action")
+        raise ValueError("A drift or needs_action review must propose a next action "
+                         "(clarification, approval or propose_followup) with its action_detail")
     if coverage == "complete" and not (final["complete"] is True or review.content_verified):
         raise ValueError("coverage=complete requires the complete final content: this record is bounded and "
                          "review_content has not verified it. Read it first, or acknowledge coverage=insufficient.")
     if (coverage == "insufficient" or final["availability"] != "present") and assessment != "insufficient":
         raise ValueError("A blank, unavailable, provider-error or insufficiently read final must be assessed insufficient")
-    payload = {
+    return {
         "id": context["id"], "content_hash": context["content_hash"], "queue_id": context["queue_id"],
         "source": context["source"], "review_run_id": context["review_run_id"],
         "assessment": assessment, "reason": reason, "needed_action": needed_action,
         "action_detail": action_detail, "coverage": coverage, "final_sha256": final["sha256"],
     }
-    # From here the acknowledgement counts as attempted, whatever the outcome:
-    # an uncertain receipt is recovered by the controller, never re-sent here.
-    review.attempted.add("review_ack")
-    try:
-        return _call("/api/delegation-reviews/ack", payload)
-    except ValueError as exc:
-        raise ValueError(f"Acknowledgement outcome uncertain: {exc}. Do not retry; the controller recovers "
-                         "the receipt. Report this and end the turn.") from None
 
 
 def review_tool(review: Any, action: str = "", **kwargs: Any) -> str:
