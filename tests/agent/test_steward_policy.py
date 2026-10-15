@@ -88,6 +88,31 @@ def test_parallel_dispatches_cannot_pass_the_same_fence():
     assert results.count('refused')==1
 
 
+WATCH_SAVE={'action':'watch_save','conversation_id':'regwatch','criteria':'Done means the claim is filed and the receipt number is quoted.',
+            'source':{'conversation_id':'talos','message_id':'m1'},'active':True}
+
+
+def test_watch_mode_actions_are_steward_actions_in_ordinary_turns():
+    policy=StewardTools()
+    policy.check('talos',{'action':'watches'})
+    with pytest.raises(ValueError): policy.check('talos',{'action':'watches'})                      # a read: once per turn
+    policy.check('talos',{'action':'watches','conversation_id':'regwatch'})                         # another query is another read
+    with pytest.raises(ValueError): policy.check('talos',{'action':'watches','conversation_id':'regwatch'})
+    policy.check('talos',WATCH_SAVE)
+    policy.check('talos',{**WATCH_SAVE,'active':False})                                             # a write: start, then stop, in one turn
+    policy.completed('talos',{'action':'dispatch'},'{}')
+    with pytest.raises(ValueError): policy.check('talos',WATCH_SAVE)                                # after a dispatch only its acknowledgement remains
+
+
+def test_watch_mode_actions_are_refused_in_review_mode():
+    review={'id':'final_'+'a'*64,'content_hash':'b'*64,'queue_id':'jim_final_'+'a'*64,'review_run_id':'run_1',
+            'source':{'conversation_id':'talos','message_id':'run_1'}}
+    policy=StewardTools(review=review)
+    for args in [{'action':'watches'},{'action':'watches','conversation_id':'regwatch'},WATCH_SAVE,{**WATCH_SAVE,'active':False}]:
+        with pytest.raises(ValueError): policy.check('talos',args)
+        with pytest.raises(ValueError): policy.run('talos',args,lambda *_: pytest.fail('a refused action never runs'))
+
+
 def _steward_home(tmp_path, profile=None):
     docs = tmp_path/'.hermes'/'talos-steward'/'docs'
     docs.mkdir(parents=True)

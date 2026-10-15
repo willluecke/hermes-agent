@@ -42,6 +42,8 @@ def talos_server(monkeypatch, tmp_path):
                 return self._reply(200, {"at": 1, "items": [], "needs_you": 0})
             if self.path == "/api/tasks/t":
                 return self._reply(200, {"task": {"id": "t"}, "findings": [], "reviews": [], "verifications": []})
+            if self.path == "/api/watches" or self.path.startswith("/api/watches?"):
+                return self._reply(200, {"watches": [{"id": "watch_1", "conversation_id": "regwatch", "active": True, "version": 1}]})
             return self._reply(404, {"error": "Not found"})
 
         def do_POST(self):
@@ -54,6 +56,8 @@ def talos_server(monkeypatch, tmp_path):
                 return self._reply(200, {"id": payload["id"], "version": 2, "body": payload["body"], "mode": payload["mode"]})
             if self.path == "/api/hold":
                 return self._reply(200, {"hold": {"scope": payload.get("scope") or "*", "actor": "x"}} if payload["action"] == "pause" else {"cleared": True})
+            if self.path == "/api/watches/save":
+                return self._reply(200, {"id": "watch_1", "version": 1, "created": 1.0, **payload})
             return self._reply(404, {"error": "Unknown operator action"})
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -200,13 +204,17 @@ def test_goal_judge_missing_answer_is_an_error(monkeypatch):
     ('interview_save', {'project_id': 'p', 'version': 1, 'focus_id': None, 'mode': 'paused', 'question': None, 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'request_key': 'm:2'}, '/api/interviews/save'),
     ('dispatch', {'direction_id': 'd', 'version': 2, 'request_key': 'm:3', 'lane': 'conversation', 'reason': 'bounded', 'scope': {'allowed_paths': ['src/**'], 'access': 'write'}, 'authorization': {'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'scope': 'fix'}, 'work_class': 'core', 'target': {'conversation_id': 'c'}, 'goal': {'text': 'fix', 'max_turns': 1, 'model': 'openai-codex::gpt-6-astra', 'effort': 'high'}}, '/api/delegations/dispatch'),
     ('delegation_control', {'id': 'd', 'version': 3, 'verb': 'resume', 'reason': 'authorized two', 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'request_key': 'm:4', 'max_turns': 2}, '/api/delegations/control'),
+    ('watches', {}, '/api/watches'),
+    ('watches', {'conversation_id': 'reg:watch'}, '/api/watches?conversation_id=reg%3Awatch'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': 'Done means the claim is filed.', 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'project_id': 'p', 'active': True}, '/api/watches/save'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': 'Done means the claim is filed.', 'source': {'conversation_id': 'talos', 'message_id': 'm'}, 'active': False}, '/api/watches/save'),
 ])
 def test_steward_wire_payloads(monkeypatch, action, args, path):
     seen = []
     monkeypatch.setattr(talos, '_call', lambda path, payload=None: seen.append((path, payload)) or {'version': 4})
     result = json.loads(talos.talos_tool(action, **args))
     assert result['ok'] and result['result'] == {'version': 4}
-    assert seen == [(path, None if action in ('directions', 'direction', 'delegation') else args)]
+    assert seen == [(path, None if action in ('directions', 'direction', 'delegation', 'watches') else args)]
 
 
 def test_steward_wire_refuses_path_injection_and_propagates_conflicts(monkeypatch):
@@ -217,3 +225,57 @@ def test_steward_wire_refuses_path_injection_and_propagates_conflicts(monkeypatc
     monkeypatch.setattr(talos, '_call', refused)
     assert '409' in json.loads(talos.talos_tool('direction', id='x'))['error']
     assert set(talos.STEWARD_WRITES) <= set(talos.TALOS_SCHEMA['parameters']['properties']['action']['enum'])
+
+
+SOURCE = {'conversation_id': 'talos', 'message_id': 'm1'}
+CRITERIA = 'Done means the claim is filed and the receipt number is quoted.'
+
+
+def test_watch_actions_carry_the_operator_token_and_send_only_the_watch_fields(talos_server):
+    seen, _ = talos_server
+    listed = json.loads(talos.talos_tool('watches', conversation_id='regwatch'))
+    assert listed['ok'] is True and listed['result']['watches'][0]['id'] == 'watch_1'
+    assert seen[-1][:3] == ('GET', '/api/watches?conversation_id=regwatch', 'Bearer ' + 't' * 40)
+    assert json.loads(talos.talos_tool('watches'))['ok'] is True and seen[-1][1] == '/api/watches'
+    saved = json.loads(talos.talos_tool('watch_save', conversation_id='regwatch', criteria=CRITERIA, source=SOURCE, active=True))
+    assert saved['ok'] is True and saved['result']['id'] == 'watch_1'
+    assert seen[-1][:3] == ('POST', '/api/watches/save', 'Bearer ' + 't' * 40)
+    assert seen[-1][3] == {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'active': True}  # no null project_id
+    stopped = json.loads(talos.talos_tool('watch_save', conversation_id='regwatch', criteria=CRITERIA, source=SOURCE, active=False, project_id='p'))
+    assert stopped['ok'] is True
+    assert seen[-1][3] == {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'project_id': 'p', 'active': False}
+    assert 't' * 40 not in json.dumps([listed, saved, stopped])
+
+
+@pytest.mark.parametrize('action,args,expected', [
+    ('watch_save', {}, 'requires conversation_id, criteria, source, active'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE}, 'requires active'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'active': True, 'goal': {'text': 'x'}}, 'does not accept: goal'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'active': True, 'request_key': 'm:1'}, 'does not accept: request_key'),
+    ('watch_save', {'conversation_id': 'talos', 'criteria': CRITERIA, 'source': SOURCE, 'active': True}, "Jim's own"),
+    ('watch_save', {'conversation_id': '../state', 'criteria': CRITERIA, 'source': SOURCE, 'active': True}, 'conversation_id'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': '', 'source': SOURCE, 'active': True}, 'criteria'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': 'c' * 4001, 'source': SOURCE, 'active': True}, '4000'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': ['done'], 'source': SOURCE, 'active': True}, 'criteria'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'active': 'yes'}, 'active'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'active': 1}, 'active'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': 'm1', 'active': True}, 'source'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': {'conversation_id': 'talos'}, 'active': True}, 'source'),
+    ('watch_save', {'conversation_id': 'regwatch', 'criteria': CRITERIA, 'source': SOURCE, 'active': True, 'project_id': 'bad id'}, 'project_id'),
+    ('watches', {'conversation_id': 'x?y'}, 'conversation_id'),
+    ('watches', {'project_id': 'p'}, 'only an optional conversation_id'),
+])
+def test_watch_actions_refuse_bad_fields_before_reaching_talos(monkeypatch, action, args, expected):
+    monkeypatch.setattr(talos, '_call', lambda *a: pytest.fail('must not call'))
+    result = json.loads(talos.talos_tool(action, **args))
+    assert result['ok'] is False and expected in result['error']
+
+
+def test_watch_save_relays_a_talos_refusal(monkeypatch):
+    def refused(*a): raise ValueError('Talos refused (409): a managed goal owns this conversation')
+    monkeypatch.setattr(talos, '_call', refused)
+    result = json.loads(talos.talos_tool('watch_save', conversation_id='regwatch', criteria=CRITERIA, source=SOURCE, active=True))
+    assert result['ok'] is False and '409' in result['error'] and 'managed goal' in result['error']
+    enum = talos.TALOS_SCHEMA['parameters']['properties']['action']['enum']
+    assert {'watches', 'watch_save'} <= set(enum)
+    assert talos.TALOS_SCHEMA['parameters']['properties']['active']['type'] == 'boolean'

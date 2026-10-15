@@ -128,8 +128,11 @@ class StewardTools:
             if action=='goal' and args.get('verb','status')!='status':
                 raise ValueError('Only the goal controller manages delegated goals.')
         elif name=='talos':
+            # watches/watch_save: Jim reviews finals of a thread Will drives himself
+            # (watch mode). A watch is read or saved only in an ordinary turn; review
+            # mode admits nothing but the three review actions (check_review).
             if action not in {'state','live','projects','project','mandate','mandate_save','directions','direction','direction_save',
-                              'interview_save','dispatch','delegation','delegation_control','hold','sessions'}:
+                              'interview_save','dispatch','delegation','delegation_control','hold','sessions','watches','watch_save'}:
                 raise ValueError('This tool action is not available to the steward.')
         else:
             raise ValueError('Steward tools are limited to talos and hermes_conversation.')
@@ -139,8 +142,8 @@ class StewardTools:
             goal=current.get('goal',current) if isinstance(current,dict) else {}
             if goal and goal.get('delegation_id') and goal.get('status') in {'active','paused'}:
                 raise ValueError('Managed runtime is pinned; ask Will rather than changing live delegated work.')
-        if action in {'list','read','goal','state','live','projects','project','mandate','directions','direction','delegation','sessions'}:
-            key=(name,action,args.get('id'),args.get('project_id') or args.get('project'))
+        if action in {'list','read','goal','state','live','projects','project','mandate','directions','direction','delegation','sessions','watches'}:
+            key=(name,action,args.get('id'),args.get('project_id') or args.get('project'),args.get('conversation_id'))
             if key in self.reads:
                 raise ValueError('Already read this state this turn. Answer once; do not poll.')
             self.reads.add(key)

@@ -31,6 +31,7 @@ ASSESSMENTS = ("aligned", "drift", "needs_action", "insufficient")
 NEEDED_ACTIONS = ("none", "clarification", "approval", "propose_followup")
 COVERAGES = ("complete", "insufficient")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
+_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")  # Talos's safe-ID alphabet
 
 DEFAULT_URL = "http://127.0.0.1:41005"
 DEFAULT_TOKEN_FILE = Path.home() / "coding-projects" / "talos" / ".talos" / "runtime" / "dashboard.token"
@@ -57,7 +58,14 @@ STEWARD_WRITES = {
     "interview_save": ("interviews/save", ("project_id", "version", "focus_id", "mode", "question", "source", "request_key")),
     "dispatch": ("delegations/dispatch", ("direction_id", "version", "request_key", "lane", "reason", "scope", "authorization", "work_class")),
     "delegation_control": ("delegations/control", ("id", "version", "verb", "reason", "source", "request_key")),
+    "watch_save": ("watches/save", ("conversation_id", "criteria", "source", "active")),
 }
+# Watch mode: Jim reviews each final of a thread Will drives himself against
+# Will's criteria. Talos owns the rules (never the talos thread, the review
+# session or a managed-goal thread; an identical replay returns the saved row;
+# changed criteria is a new version); this tool sends exactly these fields.
+WATCH_FIELDS = ("conversation_id", "criteria", "source", "project_id", "active")
+WATCH_CRITERIA_LIMIT = 4000  # characters of Will's criteria text, Talos's bound
 
 MANDATE_FIELDS = ("name", "objective", "success_measure", "milestone", "allowed_paths", "daily_calls", "authority", "task_templates", "planning_contract", "facts")
 
@@ -168,6 +176,38 @@ def _mandate_save(kwargs: dict) -> Any:
     return _call("/api/projects/save", payload)
 
 
+def _ident(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not _IDENT.fullmatch(value):
+        raise ValueError(f"{field} must be a valid id")
+    return value
+
+
+def _watch_save(kwargs: dict) -> Any:
+    """Start, revise or stop (active=false) a watch on a thread Will drives himself."""
+    path, required = STEWARD_WRITES["watch_save"]
+    unknown = sorted(set(kwargs) - set(WATCH_FIELDS))
+    if unknown:
+        raise ValueError("watch_save does not accept: " + ", ".join(unknown))
+    missing = [key for key in required if key not in kwargs]
+    if missing:
+        raise ValueError("watch_save requires " + ", ".join(missing))
+    if _ident(kwargs["conversation_id"], "conversation_id") == "talos":
+        raise ValueError("The talos thread is Jim's own; a watch is for a thread Will drives himself")
+    criteria = kwargs["criteria"]
+    if not isinstance(criteria, str) or not criteria.strip() or len(criteria) > WATCH_CRITERIA_LIMIT:
+        raise ValueError(f"criteria must be nonempty text of at most {WATCH_CRITERIA_LIMIT} characters")
+    if type(kwargs["active"]) is not bool:
+        raise ValueError("active must be true (watch) or false (stop watching)")
+    source = kwargs["source"]
+    if not isinstance(source, dict) or set(source) != {"conversation_id", "message_id"}:
+        raise ValueError("source must be {conversation_id, message_id}: Will's message that asked for the watch")
+    if kwargs.get("project_id") is not None:
+        _ident(kwargs["project_id"], "project_id")
+    # project_id is optional: absent stays absent rather than travelling as null.
+    payload = {key: kwargs[key] for key in WATCH_FIELDS if kwargs.get(key) is not None}
+    return _call("/api/" + path, payload)
+
+
 def talos_tool(action: str, **kwargs: Any) -> str:
     action = str(action or "").strip().lower()
     try:
@@ -181,6 +221,15 @@ def talos_tool(action: str, **kwargs: Any) -> str:
             path = ("/api/directions?" + parse.urlencode({key: value}) if action == "directions"
                     else "/api/" + {"direction": "directions", "delegation": "delegations"}[action] + "/" + parse.quote(value, safe=""))
             return json.dumps({"ok": True, "action": action, "result": _call(path)})
+        if action == "watches":
+            if set(kwargs) - {"conversation_id"}:
+                raise ValueError("watches accepts only an optional conversation_id")
+            path = "/api/watches"
+            if "conversation_id" in kwargs:
+                path += "?" + parse.urlencode({"conversation_id": _ident(kwargs["conversation_id"], "conversation_id")})
+            return json.dumps({"ok": True, "action": action, "result": _call(path)})
+        if action == "watch_save":
+            return json.dumps({"ok": True, "action": action, "result": _watch_save(kwargs)})
         if action in STEWARD_WRITES:
             path, required = STEWARD_WRITES[action]
             missing = [key for key in required if key not in kwargs]
@@ -280,7 +329,7 @@ TALOS_SCHEMA["description"] += (
     "Resume max_turns is an explicitly authorized total, never an increment."
 )
 _props = TALOS_SCHEMA["parameters"]["properties"]
-_props["action"] = {"type": "string", "enum": list(READ_ACTIONS) + list(WRITE_ACTIONS) + list(STEWARD_WRITES) + ["task", "mandate", "mandate_save", "directions", "direction", "delegation"]}
+_props["action"] = {"type": "string", "enum": list(READ_ACTIONS) + list(WRITE_ACTIONS) + list(STEWARD_WRITES) + ["task", "mandate", "mandate_save", "directions", "direction", "delegation", "watches"]}
 for _field in ("patch", "source", "authorization", "target", "goal"):
     _props[_field] = {"type": "object"}
 for _field in ("request_key", "direction_id", "spec_ref", "supersedes_id"):
@@ -292,7 +341,17 @@ _props.update({
     "mode": {"type": "string", "enum": ["active", "maintain", "paused"]},
     "scope": {"oneOf": [{"type": "string"}, {"type": "object", "required": ["allowed_paths", "access"], "properties": {"allowed_paths": {"type": "array", "items": {"type": "string"}}, "access": {"enum": ["read", "write"]}}, "additionalProperties": False}]},
     "max_turns": {"type": "integer", "minimum": 1, "maximum": 500},
+    "conversation_id": {"type": "string", "description": "For watches (optional filter) and watch_save: the watched hermes-chat conversation."},
+    "criteria": {"type": "string", "maxLength": WATCH_CRITERIA_LIMIT, "description": "For watch_save: Will's criteria for a final of the watched thread to count as done."},
+    "active": {"type": "boolean", "description": "For watch_save: true to watch, false to stop watching."},
 })
+TALOS_SCHEMA["description"] += (
+    " Watch mode: watches(conversation_id?) lists watches, threads Will drives himself whose every final Jim "
+    "reviews against Will's criteria; watch_save(conversation_id,criteria,source,active,project_id?) starts or "
+    "revises one (changed criteria is a new version; an identical replay returns the saved row) or stops it "
+    "(active=false). A watch works under a hold, never sends to the thread, attaches a goal or lifts a hold; "
+    "aligned reviews stay silent and an actionable one posts a Review needs you note."
+)
 # `action` names the tool action; the commitment/control verb travels as `verb`.
 TALOS_SCHEMA["parameters"]["properties"].pop("action_name")
 TALOS_SCHEMA["parameters"]["properties"]["verb"] = {
@@ -304,9 +363,11 @@ TALOS_SCHEMA["parameters"]["properties"]["verb"] = {
 REVIEW_SCHEMA = {
     "name": "talos",
     "description": (
-        "Internal final-review mode: only the assigned delegated final can be read and acknowledged. "
+        "Internal final-review mode: only the assigned final can be read and acknowledged. "
         "review reads the assigned review record once (the final's text, availability, terminal status, "
-        "completeness and digest, plus the original delegation context). review_content, only when the "
+        "completeness and digest, plus the original delegation context). A watched final (watch_id set; "
+        "delegation_id, goal_id and ordinal null) is a turn Will ran himself in a thread he asked Jim to "
+        "watch: judge it against Will's criteria in context.criteria. review_content, only when the "
         "record's final has complete=false, reads its complete immutable content once; the trusted wrapper "
         "fetches the recorded reference and verifies its SHA-256 and byte count. review_ack acknowledges once "
         "with assessment (aligned|drift|needs_action|insufficient), a bounded reason, needed_action "
@@ -341,7 +402,12 @@ def _review_text(value: Any, field: str) -> str:
 
 
 def _check_record(record: Any, context: dict) -> dict:
-    """The record must be the assigned final, archived, delivered and unchanged."""
+    """The record must be the assigned final, archived, delivered and unchanged.
+
+    Only the final packet and the delivery are checked: a watched final has
+    delegation_id, goal_id and ordinal null and watch_id set, and its context
+    is the watch (project, Will's criteria) rather than a delegation.
+    """
     if not isinstance(record, dict) or record.get("id") != context["id"]:
         raise ValueError("Talos returned a record for another review")
     if record.get("content_hash") != context["content_hash"] or not isinstance(record.get("body"), dict):

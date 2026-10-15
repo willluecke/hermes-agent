@@ -33,6 +33,8 @@ CONTEXT = {**REQUEST, 'review_run_id': RUN, 'source': {'conversation_id': 'talos
 TALOS_TOKEN = 'talos-operator-token-' + 't' * 24
 SYNC_KEY = 'sync-service-key-' + 's' * 24
 COMPLETE_PATH = '/conversations/c1/delegation-finals/g1/1?run_id=run_worker&content=complete'
+WATCH_COMPLETE_PATH = '/conversations/regwatch/finals/run_will?content=complete'
+CRITERIA = 'Done means the claim is filed and the receipt number is quoted.'
 
 
 def sha(raw: bytes) -> str:
@@ -64,6 +66,24 @@ def record(text='The final answer: the header fits one row.', *, complete=True, 
 def bounded_record(complete_text: str, excerpt='The final answer:'):
     raw = complete_text.encode()
     return record(excerpt, complete=False, reference={'path': COMPLETE_PATH, 'sha256': sha(raw), 'bytes': len(raw)})
+
+
+def watch_record(text='Filed the claim; receipt 4471 is quoted below.', *, complete=True, reference=None):
+    """A watched final (watch mode): a turn Will ran himself in a thread he asked
+    Jim to watch. No delegation, goal, ordinal or fence; the context is the
+    watch and Will's criteria. Everything else is the same review record."""
+    raw = text.encode()
+    final = {'delegation_id': None, 'conversation_id': 'regwatch', 'goal_id': None, 'ordinal': None, 'fence': None,
+             'run_id': 'run_will', 'terminal': 'completed', 'availability': 'present', 'text': text,
+             'complete': complete, 'sha256': sha(raw), 'bytes': len(raw), 'reference': reference, 'reason': None}
+    if reference is not None:
+        final.update(sha256=reference['sha256'], bytes=reference['bytes'])
+    return {'id': ID, 'delegation_id': None, 'goal_id': None, 'ordinal': None, 'watch_id': 'watch_regwatch_1',
+            'run_id': 'run_will', 'state': 'delivered',
+            'body': {'final': final, 'context': {'project_id': 'regwatch', 'criteria': CRITERIA, 'watch_id': 'watch_regwatch_1',
+                                                 'conversation_id': 'regwatch', 'started_by': {'conversation_id': 'talos', 'message_id': 'm1'}}},
+            'content_hash': HASH, 'delivery': REQUEST, 'acknowledgement': None,
+            'attempts': 1, 'next_at': 0, 'last_error': None, 'created': 1.0, 'updated': 2.0}
 
 
 class FakeService:
@@ -279,6 +299,11 @@ DENIED = [
     ('terminal', {'command': 'ls'}), ('delegate_task', {'goal': 'x'}), ('read_file', {'path': '/etc/passwd'}),
     ('web_search', {'query': 'x'}), ('talos', {'action': 'review', 'id': 'final_' + 'f' * 64}),
     ('talos', {'action': 'review_content', 'id': ID}), ('talos', {'action': 'review_ack', 'id': ID, 'assessment': 'aligned'}),
+    ('talos', {'action': 'watches'}), ('talos', {'action': 'watches', 'conversation_id': 'regwatch'}),   # watch mode: reads
+    ('talos', {'action': 'watch_save', 'conversation_id': 'regwatch', 'criteria': CRITERIA,             # and writes stay outside
+               'source': {'conversation_id': 'talos', 'message_id': 'm1'}, 'active': True}),
+    ('talos', {'action': 'watch_save', 'conversation_id': 'regwatch', 'criteria': CRITERIA,
+               'source': {'conversation_id': 'talos', 'message_id': 'm1'}, 'active': False}),
 ]
 
 
@@ -348,6 +373,55 @@ def test_review_is_uncertain_only_once(services):
     assert run(policy, {'action': 'review', 'id': ID})['ok'] is False
     with pytest.raises(ValueError):
         policy.check('talos', {'action': 'review', 'id': ID})
+
+
+# ---- watch mode: a final of a thread Will drives himself -------------------
+
+def test_a_watched_final_reviews_like_a_delegated_one_and_shows_wills_criteria(services):
+    talos, sync = services
+    complete = 'Filed the claim. ' + 'Receipt 4471 is quoted on the confirmation page. ' * 30
+    raw = complete.encode()
+    serve_record(talos, watch_record('Filed the claim.', complete=False,
+                                     reference={'path': WATCH_COMPLETE_PATH, 'sha256': sha(raw), 'bytes': len(raw)}))
+    sync.routes[('GET', WATCH_COMPLETE_PATH)] = (200, raw)
+    policy = StewardTools(review=CONTEXT)
+    result = run(policy, {'action': 'review', 'id': ID})
+    assert result['ok'] is True and result['complete_content'] == 'read_with_review_content'
+    row = result['result']
+    assert row['delegation_id'] is None and row['goal_id'] is None and row['ordinal'] is None
+    assert row['watch_id'] == 'watch_regwatch_1' and row['body']['final']['fence'] is None
+    assert row['body']['context']['criteria'] == CRITERIA
+    assert row['body']['context']['conversation_id'] == 'regwatch'
+    assert 'criteria' in REVIEW_SCHEMA['description']
+    content = run(policy, {'action': 'review_content', 'id': ID})
+    assert content['ok'] is True and content['result'] == {'id': ID, 'sha256': sha(raw), 'bytes': len(raw), 'text': complete}
+    assert sync.requests == [{'method': 'GET', 'path': WATCH_COMPLETE_PATH, 'authorization': 'Bearer ' + SYNC_KEY, 'body': None}]
+    ack = run(policy, {'action': 'review_ack', 'assessment': 'aligned', 'reason': 'Filed, with the receipt number quoted.',
+                       'needed_action': 'none', 'coverage': 'complete'})
+    assert ack['ok'] is True and ack['result']['state'] == 'reviewed'
+    assert talos.requests[-1]['body'] == {
+        'id': ID, 'content_hash': HASH, 'queue_id': 'jim_' + ID,
+        'source': {'conversation_id': 'talos', 'message_id': RUN}, 'review_run_id': RUN,
+        'assessment': 'aligned', 'reason': 'Filed, with the receipt number quoted.', 'needed_action': 'none',
+        'action_detail': None, 'coverage': 'complete', 'final_sha256': sha(raw),
+    }
+    assert_no_credentials(json.dumps(result), json.dumps(content), json.dumps(ack))
+
+
+def test_a_watched_final_in_the_record_is_acknowledged_against_the_criteria(services):
+    talos, sync = services
+    serve_record(talos, watch_record('Filed the claim; the receipt number was not shown.'))
+    policy = StewardTools(review=CONTEXT)
+    result = run(policy, {'action': 'review', 'id': ID})
+    assert result['ok'] is True and result['complete_content'] == 'in_record'
+    assert result['result']['body']['context']['criteria'] == CRITERIA
+    with pytest.raises(ValueError):  # complete in the record: nothing to read
+        policy.check('talos', {'action': 'review_content', 'id': ID})
+    ack = run(policy, {'action': 'review_ack', 'assessment': 'needs_action', 'needed_action': 'clarification',
+                       'action_detail': 'The receipt number is not quoted; ask for it before calling this done.',
+                       'reason': 'Filed, but the criteria require the receipt number.', 'coverage': 'complete'})
+    assert ack['ok'] is True and talos.requests[-1]['body']['assessment'] == 'needs_action'
+    assert sync.requests == []
 
 
 # ---- review_content ------------------------------------------------------
