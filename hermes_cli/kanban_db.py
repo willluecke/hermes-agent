@@ -6249,6 +6249,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    handoff: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -6277,10 +6278,23 @@ def block_task(
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
+
+    ``handoff`` is an optional structured "forward dossier" the blocking
+    worker leaves for whoever picks the task up next — conventionally
+    ``{"tried": ..., "failed_because": ..., "next": ..., "artifacts": ...}``.
+    It is persisted on the closing run's ``metadata`` (the same channel
+    :func:`complete_task` uses for structured handoff facts) and surfaced to
+    downstream / retry workers via :func:`build_worker_context`, so a
+    successor resumes at the frontier instead of re-deriving the dead end.
+    Must be a dict or ``None``.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    if handoff is not None and not isinstance(handoff, dict):
+        raise ValueError(
+            "block handoff must be a dict of forward-looking facts or None"
         )
     recurrences = 0
     with write_txn(conn):
@@ -6327,11 +6341,12 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=reason, metadata=handoff,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or handoff):
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=handoff,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -6339,6 +6354,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    "handoff_keys": sorted(handoff) if handoff else None,
                 },
                 run_id=run_id,
             )
@@ -6385,11 +6401,12 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=reason, metadata=handoff,
             )
-            if run_id is None and reason:
+            if run_id is None and (reason or handoff):
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
+                    metadata=handoff,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -6399,6 +6416,7 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    "handoff_keys": sorted(handoff) if handoff else None,
                 },
                 run_id=run_id,
             )
@@ -6439,15 +6457,16 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=reason, metadata=handoff,
             )
             # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
-            if run_id is None and reason:
+            # reason (and any forward dossier) is preserved in attempt history.
+            if run_id is None and (reason or handoff):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
                     summary=reason,
+                    metadata=handoff,
                 )
             _append_event(
                 conn, task_id, "blocked",
@@ -6456,6 +6475,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
+                    "handoff_keys": sorted(handoff) if handoff else None,
                 },
                 run_id=run_id,
             )
