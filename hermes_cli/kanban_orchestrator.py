@@ -12,6 +12,8 @@ tasks. Decision (:func:`plan_cycle`) is pure and separate from apply
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -178,4 +180,221 @@ def run_cycle(
             "max_concurrent_workers": envelope.max_concurrent_workers,
             "max_attempts": envelope.max_attempts,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Talos bridge: turn the decision (a Plan + dossiers) into Talos dispatch
+# payloads. Talos owns the model policy, envelope, execution, and governance;
+# this is only the seam that carries the kanban decision signal into a
+# conversation-lane dispatch. It is pure — no network, no DB writes, and it
+# never fabricates authorization. The live POST to the Talos operator ledger
+# is deliberately out of scope here and gated to a human.
+# ---------------------------------------------------------------------------
+
+# Mirrors talos/steward.py FRONTIERS (Talos is authoritative). Used only to
+# enforce "core work requires a frontier pin" before a payload is emitted.
+TALOS_FRONTIER_MODELS = frozenset({
+    "openai-codex::gpt-6-astra",
+    "claude-code::claude-fable-5-1",
+})
+TALOS_MANAGED_TURN_CAPS = frozenset({1, 6, 12})
+TALOS_EFFORTS = frozenset({"high", "xhigh", "max"})
+TALOS_WORK_CLASSES = frozenset({"core", "peripheral"})
+
+
+@dataclass(frozen=True)
+class DispatchPolicy:
+    """Per-dispatch runtime pin, mirroring Talos's model policy.
+
+    ``model`` is a namespaced ``harness::model`` string. The default is a
+    frontier pin so core resume work is valid. Talos remains the authority on
+    the full model catalog; this only pre-validates the constraints Talos will
+    enforce, so a bad preview fails here instead of at the live call.
+    """
+
+    model: str = "claude-code::claude-fable-5-1"
+    effort: str = "high"
+    max_turns: int = 6
+    work_class: str = "core"
+
+    def validate(self) -> None:
+        if self.work_class not in TALOS_WORK_CLASSES:
+            raise ValueError(
+                f"work_class must be one of {sorted(TALOS_WORK_CLASSES)}"
+            )
+        if self.effort not in TALOS_EFFORTS:
+            raise ValueError(f"effort must be one of {sorted(TALOS_EFFORTS)}")
+        if self.max_turns not in TALOS_MANAGED_TURN_CAPS:
+            raise ValueError(
+                f"max_turns must be one of {sorted(TALOS_MANAGED_TURN_CAPS)} "
+                "(Talos managed caps)"
+            )
+        if not self.model or "::" not in self.model:
+            raise ValueError("model must be a namespaced 'harness::model' pin")
+        if self.work_class == "core" and self.model not in TALOS_FRONTIER_MODELS:
+            raise ValueError(
+                "core work requires a frontier-pinned model "
+                f"(one of {sorted(TALOS_FRONTIER_MODELS)})"
+            )
+
+
+@dataclass(frozen=True)
+class DispatchRequest:
+    """A single Talos conversation-lane dispatch, plus kanban provenance."""
+
+    direction_id: Optional[str]
+    version: int
+    request_key: str
+    lane: str
+    reason: str
+    scope: Any
+    authorization: Any
+    work_class: str
+    target: dict
+    goal: dict
+    task_id: str  # the kanban lane this resumes; provenance, not sent to Talos
+
+    def payload(self) -> dict[str, Any]:
+        """The exact body Talos's /api/delegations/dispatch expects."""
+        return {
+            "direction_id": self.direction_id,
+            "version": self.version,
+            "request_key": self.request_key,
+            "lane": self.lane,
+            "reason": self.reason,
+            "scope": self.scope,
+            "authorization": self.authorization,
+            "work_class": self.work_class,
+            "target": self.target,
+            "goal": self.goal,
+        }
+
+
+def dossier_goal_text(title: str, dossier: Optional[dict]) -> str:
+    """Assemble a resume brief from a gap-A block dossier.
+
+    The point of the dossier is that the successor starts at the frontier: it
+    is told what already failed (don't repeat it) and what to try next, rather
+    than re-deriving the dead end.
+    """
+    def _join(value: Any) -> str:
+        if isinstance(value, (list, tuple)):
+            return "; ".join(str(v) for v in value)
+        return str(value)
+
+    lines = [
+        f"Resume this task: {title}.",
+        "A previous worker blocked this lane and left a dossier. Continue from "
+        "the frontier; do not repeat what already failed.",
+    ]
+    d = dossier or {}
+    if d.get("failed_because"):
+        lines.append(f"What blocked it: {_join(d['failed_because'])}")
+    if d.get("tried"):
+        lines.append(f"Already tried (do not repeat): {_join(d['tried'])}")
+    if d.get("next"):
+        lines.append(f"Try next: {_join(d['next'])}")
+    if d.get("artifacts"):
+        lines.append(f"Artifacts: {_join(d['artifacts'])}")
+    if not dossier:
+        lines.append("No dossier was left; re-establish context before acting.")
+    return "\n".join(lines)
+
+
+def _request_key(project: str, task_id: str, dossier: Optional[dict]) -> str:
+    """Deterministic idempotency key for a resume dispatch."""
+    canonical = json.dumps(
+        {"project": project, "task": task_id, "dossier": dossier},
+        sort_keys=True, ensure_ascii=False, default=str,
+    )
+    return "orq_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def plan_to_dispatch(
+    snapshot: BoardSnapshot,
+    plan: Plan,
+    *,
+    project: str,
+    direction_id: Optional[str],
+    version: int,
+    authorization: Any,
+    policy: Optional[DispatchPolicy] = None,
+    scope: Any = None,
+    reason: Optional[str] = None,
+) -> list[DispatchRequest]:
+    """Map a plan's opened lanes to Talos conversation-lane dispatch requests.
+
+    One request per opened lane; retired and held lanes produce nothing. The
+    model/effort come from ``policy`` (Talos's pins); the goal text is built
+    from each lane's gap-A dossier. ``authorization`` is passed through and
+    never fabricated. Pure: no network, no DB writes.
+    """
+    policy = policy or DispatchPolicy()
+    policy.validate()
+    by_id = {t.id: t for t in snapshot.tasks}
+    requests: list[DispatchRequest] = []
+    for tid in plan.open_ids:
+        tv = by_id.get(tid)
+        if tv is None:
+            continue
+        goal = {
+            "text": dossier_goal_text(tv.title, tv.dossier),
+            "max_turns": policy.max_turns,
+            "model": policy.model,
+            "effort": policy.effort,
+        }
+        target = {
+            "project": project,
+            "model": policy.model,
+            "effort": policy.effort,
+        }
+        requests.append(
+            DispatchRequest(
+                direction_id=direction_id,
+                version=version,
+                request_key=_request_key(project, tid, tv.dossier),
+                lane="conversation",
+                reason=reason or "orchestrator: resume blocked lane at its frontier",
+                scope=scope,
+                authorization=authorization,
+                work_class=policy.work_class,
+                target=target,
+                goal=goal,
+                task_id=tid,
+            )
+        )
+    return requests
+
+
+def preview_dispatches(
+    conn,
+    board: Optional[str] = None,
+    *,
+    envelope: Optional[Envelope] = None,
+    policy: Optional[DispatchPolicy] = None,
+    direction_id: Optional[str] = None,
+    version: int = 1,
+    authorization: Any = None,
+    scope: Any = None,
+) -> dict[str, Any]:
+    """Dry-run: the dispatch payloads this cycle's plan would emit to Talos.
+
+    Applies no routing and performs no live write. ``sent`` is always False —
+    the live POST to the Talos operator ledger is gated and out of scope here.
+    """
+    envelope = envelope or Envelope()
+    snap = snapshot_board(conn, board)
+    plan = plan_cycle(snap, envelope)
+    project = board or kb.get_current_board()
+    requests = plan_to_dispatch(
+        snap, plan, project=project, direction_id=direction_id,
+        version=version, authorization=authorization, policy=policy, scope=scope,
+    )
+    return {
+        "project": project,
+        "plan": plan.as_dict(),
+        "dispatch": [r.payload() for r in requests],
+        "dossier": summarize_board(conn, board),
+        "sent": False,
     }

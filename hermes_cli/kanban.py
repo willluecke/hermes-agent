@@ -670,6 +670,39 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--once", action="store_true",
         help="Run a single cycle (the only mode for now) and print the result.",
     )
+    p_orch.add_argument(
+        "--emit-dispatch", dest="emit_dispatch", action="store_true",
+        help="Dry-run: print the Talos dispatch payloads this plan would emit "
+             "(no routing change, no live write to the Talos ledger).",
+    )
+    p_orch.add_argument(
+        "--direction", dest="direction", default=None,
+        help="Talos direction id the dispatch serves (shown in the preview).",
+    )
+    p_orch.add_argument(
+        "--version", dest="version", type=int, default=1,
+        help="Direction version for optimistic concurrency.",
+    )
+    p_orch.add_argument(
+        "--authorization", dest="authorization", default=None,
+        help="Grant reference authorizing the dispatch. Never fabricated; you supply it.",
+    )
+    p_orch.add_argument(
+        "--model", dest="model", default=None,
+        help="Namespaced model pin for dispatched work (default: a frontier pin).",
+    )
+    p_orch.add_argument(
+        "--effort", dest="effort", default=None,
+        help="Reasoning effort: high, xhigh, or max.",
+    )
+    p_orch.add_argument(
+        "--max-turns", dest="max_turns", type=int, default=None,
+        help="Managed turn cap: 1, 6, or 12.",
+    )
+    p_orch.add_argument(
+        "--work-class", dest="work_class", default=None,
+        help="core (requires a frontier model) or peripheral.",
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2377,6 +2410,29 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
         max_attempts=getattr(args, "max_attempts", None) or 3,
     )
     board = getattr(args, "board", None)
+    if getattr(args, "emit_dispatch", False):
+        # Dry-run: show the Talos dispatch payloads this plan would emit. No
+        # routing change, no live write to the Talos operator ledger.
+        d = orch.DispatchPolicy()
+        policy = orch.DispatchPolicy(
+            model=getattr(args, "model", None) or d.model,
+            effort=getattr(args, "effort", None) or d.effort,
+            max_turns=getattr(args, "max_turns", None) or d.max_turns,
+            work_class=getattr(args, "work_class", None) or d.work_class,
+        )
+        try:
+            with kb.connect_closing(board=board) as conn:
+                result = orch.preview_dispatches(
+                    conn, board=board, envelope=envelope, policy=policy,
+                    direction_id=getattr(args, "direction", None),
+                    version=getattr(args, "version", None) or 1,
+                    authorization=getattr(args, "authorization", None),
+                )
+        except ValueError as exc:
+            print(f"kanban orchestrate: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     with kb.connect_closing(board=board) as conn:
         result = orch.run_cycle(conn, board=board, envelope=envelope)
     print(json.dumps(result, indent=2, sort_keys=True))

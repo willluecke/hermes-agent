@@ -195,3 +195,106 @@ def test_cli_orchestrate_once(kanban_home: Path, capsys: pytest.CaptureFixture) 
     assert "dossier" in payload and "actions" in payload
     assert tid in payload["actions"]["opened"]
     assert payload["envelope"]["max_concurrent_workers"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Talos dispatch adapter
+# ---------------------------------------------------------------------------
+
+
+def test_plan_to_dispatch_maps_only_open_lanes() -> None:
+    snap = orch.BoardSnapshot(tasks=(
+        orch.TaskView("b1", "wire exporter", "blocked",
+                      dossier={"next": ["read main.py"]}),
+        orch.TaskView("b2", "retire me", "blocked"),
+        orch.TaskView("b3", "held", "blocked", dossier={"next": ["later"]}),
+    ))
+    plan = orch.Plan(open_ids=("b1",), retire_ids=("b2",), held_ids=("b3",))
+    reqs = orch.plan_to_dispatch(
+        snap, plan, project="proj", direction_id="dir_1", version=2,
+        authorization="grant_x",
+    )
+    assert [r.task_id for r in reqs] == ["b1"]
+    p = reqs[0].payload()
+    assert p["lane"] == "conversation"
+    assert set(p) >= {"direction_id", "version", "request_key", "lane", "reason",
+                      "scope", "authorization", "work_class", "target", "goal"}
+    assert p["direction_id"] == "dir_1" and p["version"] == 2
+    assert p["authorization"] == "grant_x"
+    assert p["goal"]["model"] == p["target"]["model"]
+    assert p["goal"]["max_turns"] in (1, 6, 12)
+    assert "read main.py" in p["goal"]["text"]
+
+
+def test_dispatch_goal_text_from_dossier() -> None:
+    text = orch.dossier_goal_text("port script", {
+        "failed_because": "no python2", "tried": ["pyenv"], "next": ["use 2to3"],
+    })
+    assert "no python2" in text and "pyenv" in text and "use 2to3" in text
+
+
+def test_dispatch_policy_rejects_core_non_frontier() -> None:
+    bad = orch.DispatchPolicy(model="claude-code::claude-opus-5-5", work_class="core")
+    with pytest.raises(ValueError):
+        orch.plan_to_dispatch(
+            orch.BoardSnapshot(), orch.Plan(), project="p",
+            direction_id=None, version=1, authorization=None, policy=bad,
+        )
+
+
+def test_dispatch_policy_rejects_bad_caps() -> None:
+    with pytest.raises(ValueError):
+        orch.DispatchPolicy(max_turns=5).validate()
+    with pytest.raises(ValueError):
+        orch.DispatchPolicy(effort="low").validate()
+
+
+def test_request_key_is_idempotent() -> None:
+    snap = orch.BoardSnapshot(tasks=(
+        orch.TaskView("b1", "t", "blocked", dossier={"next": ["x"]}),
+    ))
+    plan = orch.Plan(open_ids=("b1",))
+    k1 = orch.plan_to_dispatch(snap, plan, project="p", direction_id=None,
+                               version=1, authorization=None)[0].request_key
+    k2 = orch.plan_to_dispatch(snap, plan, project="p", direction_id=None,
+                               version=1, authorization=None)[0].request_key
+    assert k1 == k2
+    snap2 = orch.BoardSnapshot(tasks=(
+        orch.TaskView("b1", "t", "blocked", dossier={"next": ["different"]}),
+    ))
+    k3 = orch.plan_to_dispatch(snap2, plan, project="p", direction_id=None,
+                               version=1, authorization=None)[0].request_key
+    assert k3 != k1
+
+
+def test_dispatch_does_not_fabricate_authorization() -> None:
+    snap = orch.BoardSnapshot(tasks=(
+        orch.TaskView("b1", "t", "blocked", dossier={"next": ["x"]}),
+    ))
+    reqs = orch.plan_to_dispatch(snap, orch.Plan(open_ids=("b1",)), project="p",
+                                 direction_id=None, version=1, authorization=None)
+    assert reqs[0].payload()["authorization"] is None
+
+
+def test_cli_emit_dispatch_preview(kanban_home: Path, capsys: pytest.CaptureFixture) -> None:
+    import argparse
+
+    from hermes_cli import kanban as kc
+
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="wire exporter")
+        kb.block_task(conn, tid, reason="x", kind="capability",
+                      handoff={"next": ["read worker/main.py"]})
+    ns = argparse.Namespace(
+        board=None, max_concurrent=5, max_attempts=3, once=True,
+        emit_dispatch=True, direction="dir_1", version=1, authorization="grant_x",
+        model=None, effort=None, max_turns=None, work_class=None,
+    )
+    assert kc._cmd_orchestrate(ns) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sent"] is False
+    assert len(payload["dispatch"]) == 1
+    assert payload["dispatch"][0]["lane"] == "conversation"
+    assert "read worker/main.py" in payload["dispatch"][0]["goal"]["text"]
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"  # preview changed no routing
