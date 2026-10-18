@@ -637,6 +637,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--handoff", default=None,
+        help=(
+            'JSON object left for whoever picks this task up next — '
+            '\'{"tried": [...], "failed_because": "...", "next": [...], '
+            '"artifacts": [...]}\'. Stored on the closing run and surfaced to '
+            'downstream/retry workers so they resume at the frontier.'
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2339,6 +2348,26 @@ def _cmd_block(args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    raw_handoff = getattr(args, "handoff", None)
+    # Per-task, like --summary/--metadata on complete: refuse to stamp the
+    # same dossier onto every task in a bulk block.
+    if len(ids) > 1 and raw_handoff:
+        print(
+            "kanban: --handoff is per-task and can't be used with multiple "
+            "ids (would apply the same dossier to every task). Block tasks "
+            "one at a time, or drop the flag for the bulk block.",
+            file=sys.stderr,
+        )
+        return 2
+    handoff = None
+    if raw_handoff:
+        try:
+            handoff = json.loads(raw_handoff)
+            if not isinstance(handoff, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --handoff: {exc}", file=sys.stderr)
+            return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -2349,6 +2378,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                handoff=handoff,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

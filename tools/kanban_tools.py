@@ -832,6 +832,12 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    handoff = args.get("handoff")
+    if handoff is not None and not isinstance(handoff, dict):
+        return tool_error(
+            "handoff must be an object of forward-looking facts "
+            "(tried / failed_because / next / artifacts)"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -869,6 +875,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                handoff=handoff,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1892,6 +1899,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "handoff": {
+                "type": "object",
+                "description": (
+                    "Optional forward dossier for whoever picks this task "
+                    "up next — {\"tried\": [...], \"failed_because\": "
+                    "\"...\", \"next\": [...], \"artifacts\": [...]}. Stored "
+                    "on the run and surfaced to downstream/retry workers so "
+                    "they resume at the frontier instead of re-deriving the "
+                    "dead end. Say what you ruled out and what to try next."
                 ),
             },
             "board": _board_schema_prop(),

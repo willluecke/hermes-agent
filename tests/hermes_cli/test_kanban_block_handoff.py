@@ -94,3 +94,49 @@ def test_block_handoff_must_be_a_dict(kanban_home: Path) -> None:
         tid = _running_task(conn)
         with pytest.raises(ValueError):
             kb.block_task(conn, tid, reason="x", handoff="not a dict")
+
+
+# ---------------------------------------------------------------------------
+# Caller wiring: the CLI and the agent tool must pass the dossier through.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_block_handoff_persists(kanban_home: Path) -> None:
+    import argparse
+
+    from hermes_cli import kanban as kc
+
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+    ns = argparse.Namespace(
+        task_id=tid, reason=[], kind="capability", ids=None,
+        handoff='{"tried": ["a"], "failed_because": "x", "next": ["b"]}',
+    )
+    assert kc._cmd_block(ns) == 0
+    with kb.connect_closing() as conn:
+        closed = [r for r in kb.list_runs(conn, tid) if r.outcome == "blocked"]
+    assert closed and closed[-1].metadata == {
+        "tried": ["a"], "failed_because": "x", "next": ["b"],
+    }
+
+
+def test_cli_block_handoff_rejects_non_object(kanban_home: Path) -> None:
+    import argparse
+
+    from hermes_cli import kanban as kc
+
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+    ns = argparse.Namespace(
+        task_id=tid, reason=[], kind=None, ids=None,
+        handoff='["not", "a", "dict"]',
+    )
+    assert kc._cmd_block(ns) == 2
+
+
+def test_block_tool_schema_exposes_handoff() -> None:
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+
+    props = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]
+    assert "handoff" in props
+    assert props["handoff"]["type"] == "object"
