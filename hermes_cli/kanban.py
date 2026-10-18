@@ -647,6 +647,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_orch = sub.add_parser(
+        "orchestrate",
+        help="Run one cycle of the per-project orchestrator for a board",
+    )
+    p_orch.add_argument(
+        "board", nargs="?", default=None,
+        help="Board slug (the project). Defaults to the current board.",
+    )
+    p_orch.add_argument(
+        "--max-concurrent", dest="max_concurrent", type=int, default=4,
+        help="Envelope: max tasks in flight (running + ready) at once.",
+    )
+    p_orch.add_argument(
+        "--max-attempts", dest="max_attempts", type=int, default=3,
+        help=(
+            "Envelope: retire a blocked lane to triage once it has been "
+            "blocked this many times (safe exit)."
+        ),
+    )
+    p_orch.add_argument(
+        "--once", action="store_true",
+        help="Run a single cycle (the only mode for now) and print the result.",
+    )
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1139,6 +1163,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "orchestrate": _cmd_orchestrate,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -2340,6 +2365,21 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_orchestrate(args: argparse.Namespace) -> int:
+    """Run one cycle of the per-project orchestrator for a board."""
+    from hermes_cli import kanban_orchestrator as orch
+
+    envelope = orch.Envelope(
+        max_concurrent_workers=getattr(args, "max_concurrent", None) or 4,
+        max_attempts=getattr(args, "max_attempts", None) or 3,
+    )
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
+        result = orch.run_cycle(conn, board=board, envelope=envelope)
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 

@@ -6907,6 +6907,36 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+def retire_to_triage(
+    conn: sqlite3.Connection, task_id: str, *, note: Optional[str] = None
+) -> bool:
+    """Route a blocked task to ``triage`` — the orchestrator's safe exit.
+
+    When a lane has exhausted its attempt budget, the per-project orchestrator
+    (``hermes_cli.kanban_orchestrator``) retires it to ``triage`` for a human
+    decision rather than reopening it into another doomed attempt. Only acts on
+    a ``blocked`` task, whose run ``block_task`` has already closed, so there is
+    no active run to reclaim. Returns True on a successful transition.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'triage',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status = 'blocked'
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "orchestrator_retired", {"note": note})
+    return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
