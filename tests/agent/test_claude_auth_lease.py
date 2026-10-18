@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import threading
 import time
 from unittest.mock import patch
+
+import pytest
 
 from agent.claude_auth_lease import acquire_claude_auth_lease
 
@@ -202,3 +205,81 @@ def test_setup_token_env_is_a_lease_without_the_credential_file(monkeypatch, tmp
     assert lease.refreshed is False
     assert lease.generation == lease_module.claude_auth_generation("sk-ant-oat01-example-long-lived")
     assert not (tmp_path / ".credentials.json").exists()
+
+
+def _write_token_file(lease_module, line: str):
+    """Write ``line`` to the token file for this test's HERMES_HOME and return its path."""
+    path = lease_module.claude_token_env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(line, encoding="utf-8")
+    return path
+
+
+def test_token_file_is_a_lease_when_the_environment_was_stripped(monkeypatch, tmp_path):
+    """The hermes-tools MCP server inherits neither the token nor the gateway's
+    CLAUDE_CONFIG_DIR from Codex or Claude Code; the systemd token file must
+    still sign it in without touching the credential file or refreshing."""
+    from agent import claude_auth_lease as lease_module
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-code"))  # no credential file
+    monkeypatch.setattr(
+        lease_module,
+        "refresh_anthropic_oauth_pure",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not refresh")),
+    )
+    _write_token_file(lease_module, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-from-token-file\n")
+
+    lease = lease_module.acquire_claude_auth_lease(10 * 60 * 60)
+
+    assert lease.available is True
+    assert lease.credentials_found is True
+    assert lease.refreshed is False
+    assert lease.generation == lease_module.claude_auth_generation("sk-ant-oat01-from-token-file")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in os.environ  # resolved, not injected
+
+
+def test_environment_token_wins_over_the_token_file(monkeypatch, tmp_path):
+    from agent import claude_auth_lease as lease_module
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-code"))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-from-environment")
+    _write_token_file(lease_module, "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-from-token-file\n")
+
+    assert lease_module.resolve_claude_oauth_token() == "sk-ant-oat01-from-environment"
+    lease = lease_module.acquire_claude_auth_lease(0)
+    assert lease.generation == lease_module.claude_auth_generation("sk-ant-oat01-from-environment")
+
+
+def test_missing_token_file_leaves_the_lease_unavailable(monkeypatch, tmp_path):
+    """Without the file the preflight keeps its old fallbacks and finds nothing."""
+    from agent import claude_auth_lease as lease_module
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-code"))
+    assert not lease_module.claude_token_env_path().exists()
+
+    assert lease_module.resolve_claude_oauth_token() == ""
+    lease = lease_module.acquire_claude_auth_lease(0)
+    assert lease.available is False
+    assert lease.credentials_found is False
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        ("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-plain\n", "sk-ant-oat01-plain"),
+        ('export CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-exported"\n', "sk-ant-oat01-exported"),
+        ("# systemd EnvironmentFile\nOTHER_SETTING=1\nCLAUDE_CODE_OAUTH_TOKEN='sk-ant-oat01-quoted'\n", "sk-ant-oat01-quoted"),
+        ("CLAUDE_CODE_OAUTH_TOKEN=\n", ""),
+        ("OTHER_SETTING=1\n", ""),
+        ("# CLAUDE_CODE_OAUTH_TOKEN=commented-out\n", ""),
+    ],
+)
+def test_token_file_parser_accepts_systemd_and_shell_forms(tmp_path, content, expected):
+    from agent import claude_auth_lease as lease_module
+
+    path = tmp_path / "claude-token.env"
+    path.write_text(content, encoding="utf-8")
+    assert lease_module._read_claude_oauth_token_file(path) == expected
+    assert lease_module._read_claude_oauth_token_file(tmp_path / "absent.env") == ""

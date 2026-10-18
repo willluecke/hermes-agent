@@ -270,3 +270,39 @@ def test_api_advisor_context_uses_one_user_message(monkeypatch):
     assert [message["role"] for message in calls[0]["messages"]] == ["system", "user"]
     assert "Context" in calls[0]["messages"][1]["content"]
     assert "Advise" in calls[0]["messages"][1]["content"]
+
+
+def test_native_route_authenticates_from_token_file_in_stripped_mcp_env(monkeypatch, tmp_path):
+    """Regression for the hermes-tools MCP server under Codex and Claude Code:
+    with no CLAUDE_CODE_OAUTH_TOKEN and no CLAUDE_CONFIG_DIR inherited, the
+    real preflight must still find the gateway's token file, and the token
+    must not surface in the tool result."""
+    import agent.transports.claude_code_session as native
+    from agent.claude_auth_lease import claude_token_env_path
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-code"))  # no credential file
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "metered-api-key")
+    monkeypatch.setattr(native, "find_claude_binary", lambda: "/fake/claude")
+    probes = []
+    signed_out = SimpleNamespace(returncode=1, stdout=json.dumps({"loggedIn": False}))
+    monkeypatch.setattr(native.subprocess, "run", lambda *a, **k: probes.append(k) or signed_out)
+    monkeypatch.setattr(consult, "_api_inventory_rows", lambda: [])
+    token_path = claude_token_env_path()
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-from-token-file\n", encoding="utf-8")
+
+    raw = consult.model_consult_tool("list", provider="claude-code")
+    result = json.loads(raw)
+
+    assert result["ok"] is True
+    assert result["provider"] == "claude-code"
+    assert result["authenticated"] is True
+    assert result["billing"] == "subscription"
+    assert "sk-ant-oat01-from-token-file" not in raw
+    assert probes == []  # the token file alone signed the preflight in
+
+    token_path.unlink()
+    assert json.loads(consult.model_consult_tool("list", provider="claude-code"))["authenticated"] is False
+    assert len(probes) == 1  # without the file the old fallback chain runs
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in probes[0]["env"]

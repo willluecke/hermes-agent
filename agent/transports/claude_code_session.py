@@ -229,14 +229,21 @@ def claude_subscription_env() -> dict[str, str]:
     for key in list(env):
         if key not in _SUBSCRIPTION_ENV_KEEP and _CREDENTIAL_NAME_RE.search(key):
             env.pop(key, None)
-    oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    # The environment or $HERMES_HOME/claude-token.env: the MCP server does
+    # not inherit the variable from Codex or Claude Code, so the probe and
+    # the CLI it spawns would otherwise run signed out.
+    from agent.claude_auth_lease import resolve_claude_oauth_token
+
+    oauth = resolve_claude_oauth_token()
     if oauth:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
     return env
 
 
 def _current_claude_auth_generation() -> str:
-    explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    from agent.claude_auth_lease import resolve_claude_oauth_token
+
+    explicit = resolve_claude_oauth_token()
     if explicit:
         from agent.claude_auth_lease import claude_auth_generation
 
@@ -268,8 +275,17 @@ def claude_subscription_auth_available(
     claude.ai Max subscription.  Anthropic API variables are removed from the
     probe environment so an API key cannot make this subscription-only route
     pass its preflight.
+
+    The long-lived token is read from the environment or, when a parent
+    stripped it, from ``$HERMES_HOME/claude-token.env`` (see
+    :func:`agent.claude_auth_lease.resolve_claude_oauth_token`).  The
+    hermes-tools MCP server is such a child under both Codex and Claude Code,
+    and until 2026-10-17 its ``model_consult`` reported the subscription
+    unavailable while a shell in the same session was signed in.
     """
-    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+    from agent.claude_auth_lease import resolve_claude_oauth_token
+
+    if resolve_claude_oauth_token():
         return True
     try:
         from agent.claude_auth_lease import acquire_claude_auth_lease

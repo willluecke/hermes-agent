@@ -7,6 +7,15 @@ and a losing process can clear the shared credential file after its stale
 refresh fails.  Hermes avoids that upstream race by refreshing early under a
 machine-wide file lock, before a managed turn begins.
 
+A long-lived ``claude setup-token`` value is the other credential source.
+The gateway's systemd unit reads it from ``$HERMES_HOME/claude-token.env``,
+but processes started without that unit's environment -- the hermes-tools
+MCP server under Codex, which only receives a whitelist of variables, and
+the one under Claude Code, which does not forward the token to MCP children
+-- used to see no credential at all and report the subscription unavailable.
+:func:`resolve_claude_oauth_token` reads the same file so every Hermes
+process agrees on the token.
+
 The module's CLI emits metadata only.  Tokens never leave the credential file.
 """
 
@@ -18,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 import time
 from typing import Any, Optional
 
@@ -34,6 +44,59 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_VALIDITY_SECONDS = 2 * 60 * 60 + 10 * 60
 _EXPIRY_SAFETY_SECONDS = 60
 _LOCK_TIMEOUT_SECONDS = 30.0
+CLAUDE_OAUTH_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+#: systemd ``EnvironmentFile`` holding ``CLAUDE_CODE_OAUTH_TOKEN=...`` for the
+#: gateway; the same file is the fallback for processes that did not inherit it.
+CLAUDE_TOKEN_ENV_FILENAME = "claude-token.env"
+
+
+def claude_token_env_path() -> Path:
+    """Return ``$HERMES_HOME/claude-token.env`` for the active Hermes home."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / CLAUDE_TOKEN_ENV_FILENAME
+
+
+def _read_claude_oauth_token_file(path: Path) -> str:
+    """Parse the token out of a systemd-style env file; "" when absent.
+
+    Accepts ``KEY=value``, ``export KEY=value``, single or double quotes and
+    ``#`` comment lines.  The value is returned to the caller only; it is
+    never logged, and a missing or unreadable file is not an error.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, separator, value = line.partition("=")
+        if not separator or key.strip() != CLAUDE_OAUTH_TOKEN_ENV:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
+def resolve_claude_oauth_token() -> str:
+    """Return the long-lived Claude Code OAuth token this install signs in with.
+
+    The environment wins.  When ``CLAUDE_CODE_OAUTH_TOKEN`` is absent -- the
+    hermes-tools MCP server is spawned with a stripped environment by both
+    Codex and Claude Code -- fall back to ``$HERMES_HOME/claude-token.env``,
+    the file the gateway's systemd unit already loads.  Returns "" when
+    neither source has a value, so callers keep their existing fallbacks.
+    """
+    explicit = os.environ.get(CLAUDE_OAUTH_TOKEN_ENV, "").strip()
+    if explicit:
+        return explicit
+    return _read_claude_oauth_token_file(claude_token_env_path())
 
 
 @dataclass(frozen=True)
@@ -109,8 +172,9 @@ def acquire_claude_auth_lease(
     minimum = max(0.0, float(min_validity_seconds))
     # A long-lived token from `claude setup-token` is the native headless
     # credential: the CLI reads it from the environment, nothing rotates, and
-    # the shared credential file is out of the loop entirely.
-    explicit = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    # the shared credential file is out of the loop entirely.  The token file
+    # covers processes whose parent stripped the variable.
+    explicit = resolve_claude_oauth_token()
     if explicit:
         return ClaudeAuthLease(
             available=True,

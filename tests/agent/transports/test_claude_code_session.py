@@ -2161,3 +2161,78 @@ def test_claude_session_carries_the_binding_only_as_the_steward():
         ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward_review=_REVIEW)
     with pytest.raises(ValueError):
         ClaudeCodeSession(cwd='/tmp',model='claude-opus-5-5',steward=True,steward_review={**_REVIEW,'review_run_id':'other run'})
+
+
+def _write_claude_token_file(token: str) -> None:
+    from agent.claude_auth_lease import claude_token_env_path
+
+    path = claude_token_env_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"CLAUDE_CODE_OAUTH_TOKEN={token}\n", encoding="utf-8")
+
+
+def test_token_file_satisfies_subscription_preflight_in_stripped_mcp_env(
+    monkeypatch, tmp_path
+):
+    """Codex starts the hermes-tools MCP server with a whitelisted environment
+    and Claude Code does not forward the token to MCP children, so the server
+    sees neither CLAUDE_CODE_OAUTH_TOKEN nor the gateway's CLAUDE_CONFIG_DIR.
+    The systemd token file must sign the preflight, the probe and the spawned
+    CLI in, while the metered API key stays out of all of them."""
+    from agent.claude_auth_lease import claude_auth_generation
+    from agent.transports.claude_code_session import (
+        _current_claude_auth_generation,
+        claude_subscription_auth_available,
+        claude_subscription_env,
+    )
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-code"))  # no credential file
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "metered-api-key")
+    _write_claude_token_file("sk-ant-oat01-from-token-file")
+
+    with patch(
+        "agent.anthropic_adapter.read_claude_code_credentials"
+    ) as read_credentials, patch(
+        "agent.transports.claude_code_session.subprocess.run"
+    ) as native_probe:
+        assert claude_subscription_auth_available() is True
+        env = claude_subscription_env()
+
+    read_credentials.assert_not_called()
+    native_probe.assert_not_called()
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-from-token-file"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert _current_claude_auth_generation() == claude_auth_generation(
+        "sk-ant-oat01-from-token-file"
+    )
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in os.environ
+
+
+def test_api_key_alone_does_not_satisfy_preflight_without_token_file(monkeypatch, tmp_path):
+    from agent.claude_auth_lease import claude_token_env_path
+    from agent.transports.claude_code_session import (
+        claude_subscription_auth_available,
+        claude_subscription_env,
+    )
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-code"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "metered-api-key")
+    assert not claude_token_env_path().exists()
+    signed_out = SimpleNamespace(
+        returncode=1, stdout=json.dumps({"loggedIn": False, "authMethod": "none"})
+    )
+
+    with patch(
+        "agent.transports.claude_code_session.find_claude_binary",
+        return_value="/usr/bin/claude",
+    ), patch(
+        "agent.transports.claude_code_session.subprocess.run",
+        return_value=signed_out,
+    ) as native_probe:
+        assert claude_subscription_auth_available() is False
+
+    native_probe.assert_called_once()  # the old fallback chain still runs
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in native_probe.call_args.kwargs["env"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_subscription_env()
