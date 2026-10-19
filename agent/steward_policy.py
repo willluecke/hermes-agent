@@ -25,6 +25,30 @@ def steward_agent(agent):
     return is_steward(session=getattr(agent,'session_id',''), project=getattr(agent,'session_project',''), cwd=getattr(agent,'session_cwd',''))
 
 
+def turn_source(value, *, session='', project=''):
+    """The submitted chat message a steward turn answers: {conversation_id, message_id}.
+
+    Carried on the run request as `turn_source` and handed to the model as a
+    per-turn note, never through the turn instructions: a message id in the
+    instructions changed them every turn, so the gateway rebuilt the resident
+    agent for every message ("Session resumed from disk ... after the turn
+    instructions changed", 2026-10-19). Only the steward conversation has one.
+    """
+    if not isinstance(value, dict) or set(value) != {'conversation_id', 'message_id'}:
+        raise ValueError('turn_source must be an object with exactly conversation_id and message_id')
+    if not all(isinstance(v, str) and _IDENT.fullmatch(v) for v in value.values()):
+        raise ValueError('turn_source ids must be safe identifiers')
+    if not is_steward(session=session, project=project) or str(session) == REVIEW_SESSION:
+        raise ValueError('turn_source belongs to the Talos conversation only')
+    return {'conversation_id': value['conversation_id'], 'message_id': value['message_id']}
+
+
+def source_note(source):
+    """The per-turn note that tells Jim which submitted message he is answering."""
+    return ('Submitted message source: ' + json.dumps(source, sort_keys=True, separators=(',', ':'))
+            + '. Use this durable client turn ID for provenance and deduplication; composer drafts are not submissions.')
+
+
 def review_request(value):
     """The `steward_review` request field: exactly {id, content_hash, queue_id}."""
     if not isinstance(value, dict) or set(value) != {'id', 'content_hash', 'queue_id'}:

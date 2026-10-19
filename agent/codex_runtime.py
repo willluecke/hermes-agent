@@ -2066,6 +2066,10 @@ def run_codex_app_server_turn(
             contract = instructions()
             if _steward_contract_due(agent, thread_id, contract):
                 turn_input = _with_turn_note(turn_input, contract)
+            source = getattr(agent, "_turn_source", None)
+            if isinstance(source, dict):
+                from agent.steward_policy import source_note
+                turn_input = _with_turn_note(turn_input, source_note(source))
         if plugin_user_context and not steward:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the turn input here as it rides the API copy

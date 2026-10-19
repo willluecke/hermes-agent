@@ -186,3 +186,46 @@ async def test_a_review_run_is_steerable_only_with_the_operator_capability(manag
         response = await adapter._handle_steer_run(request)
         assert response.status == 403
     agent.steer.assert_not_called()
+
+
+SOURCE = {'conversation_id': 'talos', 'message_id': 'turn_mvfhs2vv_htduhdhk'}
+
+
+def chat_body(**changes):
+    body = {'model': 'hermes-agent', 'input': 'Clear the nons', 'session_id': 'hermes-chat-talos', 'project': 'talos-steward',
+            'instructions': 'You are Jim.', 'turn_source': SOURCE}
+    body.update(changes)
+    return {k: v for k, v in body.items() if v is not None}
+
+
+@pytest.mark.asyncio
+async def test_turn_source_reaches_the_steward_agent_as_a_per_run_binding_and_is_cleared(managed, adapter):
+    captured = []
+    agent = MagicMock()
+
+    def _run(user_message=None, conversation_history=None, task_id=None, **_):
+        captured.append(agent._turn_source)
+        return {'final_response': 'Recorded.'}
+    agent.run_conversation.side_effect = _run
+    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+    async with TestClient(TestServer(_app(adapter))) as cli:
+        with patch.object(adapter, '_create_agent', return_value=agent):
+            response = await cli.post('/v1/runs', json=chat_body())
+            assert response.status == 202, await response.text()
+            await _settled(cli, (await response.json())['run_id'])
+    assert captured == [SOURCE]
+    assert agent._turn_source is None  # a cached agent never carries a stale source into the next turn
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('changes', [
+    {'session_id': 'hermes-chat-other', 'project': 'reg-watch'},          # only the Talos conversation has a source
+    {'turn_source': {'conversation_id': 'talos'}},                      # malformed
+    {'turn_source': SOURCE | {'message_id': 'not an id'}},
+])
+async def test_turn_source_is_refused_elsewhere_and_when_malformed(managed, adapter, changes):
+    async with TestClient(TestServer(_app(adapter))) as cli:
+        with patch.object(adapter, '_create_agent') as create:
+            response = await cli.post('/v1/runs', json=chat_body(**changes))
+            assert response.status == 400, await response.text()
+            create.assert_not_called()

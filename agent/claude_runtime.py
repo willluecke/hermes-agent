@@ -1420,6 +1420,9 @@ def run_claude_code_turn(
                 lead=CLAUDE_REBUILD_LEAD.format(reason=rebuild_reason),
             )
         sections = [prompt]
+        if steward and isinstance(getattr(agent, "_turn_source", None), dict):
+            from agent.steward_policy import source_note
+            sections.append(source_note(agent._turn_source))
         if plugin_user_context and not steward:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the user message here as it does on the default

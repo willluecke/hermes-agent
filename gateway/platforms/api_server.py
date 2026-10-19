@@ -9375,6 +9375,15 @@ class APIServerAdapter(BasePlatformAdapter):
         elif (project == "talos-steward") != (session_id == "hermes-chat-talos"):
             # Neither identity may be reused with an unrestricted workspace.
             return web.json_response(_openai_error("talos-steward is reserved for the Talos conversation"), status=400)
+        turn_source = None
+        if body.get("turn_source") is not None:
+            # The submitted message Jim answers, delivered as a per-turn note so
+            # the turn instructions stay stable and the resident agent is reused.
+            from agent.steward_policy import turn_source as _turn_source
+            try:
+                turn_source = _turn_source(body.get("turn_source"), session=session_id or "", project=project or "")
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc)), status=400)
 
         # A managed sync goal owns continuation and its turn cap. Older callers
         # omit this field and retain native /goal behavior unchanged.
@@ -9807,6 +9816,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             # cannot set it; the lanes read it when they spawn
                             # the scoped MCP server.
                             agent._steward_review = steward_review
+                            agent._turn_source = turn_source
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
                             # environment state.
@@ -9954,6 +9964,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             if agent is not None:
                                 _clear_turn_process_ownership(agent)
                                 agent._steward_review = None
+                                agent._turn_source = None
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:

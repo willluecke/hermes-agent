@@ -179,3 +179,16 @@ def test_steward_contract_rides_again_when_its_text_changes():
     assert not _steward_contract_due(agent, 'thread-a', 'instructions v1')
     assert _steward_contract_due(agent, 'thread-a', 'instructions v2 with the project framework')
     assert not _steward_contract_due(agent, 'thread-a', 'instructions v2 with the project framework')
+
+
+def test_turn_source_is_the_stewards_submitted_message_and_becomes_a_note():
+    from agent.steward_policy import REVIEW_SESSION, source_note, turn_source
+    source = {'conversation_id': 'talos', 'message_id': 'turn_mvfhs2vv_htduhdhk'}
+    assert turn_source(source, session='hermes-chat-talos', project='talos-steward') == source
+    note = source_note(source)
+    assert note.startswith('Submitted message source: {"conversation_id":"talos","message_id":"turn_mvfhs2vv_htduhdhk"}')
+    assert 'composer drafts are not submissions' in note
+    for bad, kw in [({'conversation_id': 'talos'}, {}), ({**source, 'extra': 1}, {}), ({**source, 'message_id': 'a b'}, {}),
+                    (source, {'session': 'hermes-chat-other', 'project': 'reg-watch'}), (source, {'session': REVIEW_SESSION, 'project': 'talos-steward'})]:
+        with pytest.raises(ValueError):
+            turn_source(bad, session=kw.get('session', 'hermes-chat-talos'), project=kw.get('project', 'talos-steward'))
