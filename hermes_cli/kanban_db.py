@@ -11432,6 +11432,74 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     }
 
 
+def list_orchestrated_tasks_for_session(
+    session_id: str, *, statuses: Iterable[str] = ("running", "ready")
+) -> list[dict]:
+    """Kanban tasks working for a chat session, across every board.
+
+    A task belongs to a session when a notify subscription targets it on the
+    ``api_server`` platform with ``chat_id`` equal to the session id (the
+    hermes-chat conversation key). Only tasks in ``statuses`` are returned, so
+    the chat's working indicator shows live workers, not finished or parked
+    ones. Boards whose database does not exist are skipped (never created),
+    and a failing board is skipped rather than failing the caller: this feeds a
+    UI poll and must degrade to "nothing", not an error.
+    """
+    sid = str(session_id or "").strip()
+    wanted = tuple(dict.fromkeys(str(s) for s in statuses if s))
+    if not sid or not wanted:
+        return []
+    placeholders = ",".join("?" * len(wanted))
+    rows: list[dict] = []
+    seen: set[str] = set()
+    try:
+        boards = list_boards()
+    except Exception:
+        return []
+    for meta in boards:
+        slug = meta.get("slug") if isinstance(meta, dict) else None
+        if not slug:
+            continue
+        try:
+            if not kanban_db_path(slug).exists():
+                continue
+            conn = connect(board=slug)
+        except Exception:
+            continue
+        try:
+            cur = conn.execute(
+                f"""
+                SELECT t.id, t.title, t.status, t.started_at, t.assignee
+                  FROM kanban_notify_subs s
+                  JOIN tasks t ON t.id = s.task_id
+                 WHERE s.platform = 'api_server' AND s.chat_id = ?
+                   AND t.status IN ({placeholders})
+                 ORDER BY t.started_at ASC, t.id ASC
+                """,
+                (sid, *wanted),
+            )
+            for r in cur.fetchall():
+                if r["id"] in seen:
+                    continue
+                seen.add(r["id"])
+                rows.append({
+                    "task_id": r["id"],
+                    "title": r["title"],
+                    "status": r["status"],
+                    "started_at": r["started_at"],
+                    "assignee": r["assignee"],
+                    "board": slug,
+                })
+        except Exception:
+            continue
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return rows
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,

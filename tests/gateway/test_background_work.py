@@ -838,3 +838,55 @@ def test_an_idle_switch_replaces_the_agent_without_a_row(switch_cache):
 
     assert reused is False and replacement is not agent
     assert not [event for event, _, _ in events if event == "session.continuity"]
+
+
+@pytest.mark.asyncio
+async def test_session_background_route_lists_orchestrated_kanban_workers(tmp_path, monkeypatch):
+    """Kanban tasks subscribed to the session appear as kanban_task entries, and
+    a kanban failure degrades to no entries rather than a failed poll."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "background-jobs").mkdir()
+    monkeypatch.setattr(background_jobs, "systemd_unit_state", lambda unit: "active")
+    from hermes_cli import kanban_db as kb
+
+    calls: list[str] = []
+
+    def fake_list(session_id, **kw):
+        calls.append(session_id)
+        return [{"task_id": "t_abc", "title": "wire the exporter", "status": "running",
+                 "started_at": 1700000000, "assignee": "worker", "board": "reg-watch"}]
+
+    monkeypatch.setattr(kb, "list_orchestrated_tasks_for_session", fake_list)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "secret"}))
+    adapter.gateway_runner = SimpleNamespace(
+        _agent_cache=OrderedDict(), _agent_cache_lock=threading.Lock(),
+    )
+    app = web.Application()
+    app.router.add_get(
+        "/api/sessions/{session_id}/background", adapter._handle_session_background
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/api/sessions/hermes-chat-c1/background",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert response.status == 200
+        payload = await response.json()
+    assert calls == ["hermes-chat-c1"]
+    kanban = [t for t in payload["tasks"] if t["task_type"] == "kanban_task"]
+    assert [(t["task_id"], t["description"], t["board"], t["running"]) for t in kanban] == [
+        ("kanban:t_abc", "wire the exporter", "reg-watch", True),
+    ]
+
+    def boom(session_id, **kw):
+        raise RuntimeError("kanban unavailable")
+
+    monkeypatch.setattr(kb, "list_orchestrated_tasks_for_session", boom)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/api/sessions/hermes-chat-c1/background",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert response.status == 200
+        payload = await response.json()
+    assert [t for t in payload["tasks"] if t["task_type"] == "kanban_task"] == []

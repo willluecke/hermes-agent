@@ -5681,6 +5681,29 @@ class APIServerAdapter(BasePlatformAdapter):
 
         tasks = self._session_background_tasks(session_id)
         jobs = await asyncio.to_thread(registered_jobs, session_id)
+        # Kanban workers orchestrated for this chat: tasks whose notify
+        # subscription targets this session. The chat shows them as
+        # orchestrated workers in its header, never as conversations. Guarded:
+        # a kanban problem must not fail the poll.
+        try:
+            from hermes_cli.kanban_db import list_orchestrated_tasks_for_session
+
+            orchestrated = await asyncio.to_thread(
+                list_orchestrated_tasks_for_session, session_id
+            )
+        except Exception:
+            orchestrated = []
+        for row in orchestrated:
+            tasks.append({
+                "task_id": f"kanban:{row['task_id']}",
+                "task_type": "kanban_task",
+                "description": row.get("title") or row["task_id"],
+                "started_at": row.get("started_at"),
+                "kind": "kanban_task",
+                "running": True,
+                "board": row.get("board"),
+                "status": row.get("status"),
+            })
         return web.json_response(
             {
                 "object": "hermes.session.background",
