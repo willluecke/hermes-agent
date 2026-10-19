@@ -890,3 +890,41 @@ async def test_session_background_route_lists_orchestrated_kanban_workers(tmp_pa
         assert response.status == 200
         payload = await response.json()
     assert [t for t in payload["tasks"] if t["task_type"] == "kanban_task"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_background_kanban_stream_route(tmp_path, monkeypatch):
+    """One orchestrated worker's stream, scoped by the session; 404 otherwise."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli import kanban_db as kb
+
+    def fake_stream(session_id, task_id, **kw):
+        if session_id == "hermes-chat-c1" and task_id == "t_abc":
+            return {"task_id": "t_abc", "title": "wire the exporter", "status": "running",
+                    "board": "reg-watch", "started_at": 1700000000,
+                    "comments": [{"at": 1, "author": "worker", "text": "reading main.py"}],
+                    "events": [{"at": 1, "kind": "claimed", "text": ""}],
+                    "log": ["line one"], "log_updated_at": 1}
+        return None
+
+    monkeypatch.setattr(kb, "orchestrated_task_stream", fake_stream)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "secret"}))
+    app = web.Application()
+    app.router.add_get(
+        "/api/sessions/{session_id}/background/kanban/{task_id}",
+        adapter._handle_session_background_kanban,
+    )
+    async with TestClient(TestServer(app)) as client:
+        ok = await client.get(
+            "/api/sessions/hermes-chat-c1/background/kanban/t_abc",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert ok.status == 200
+        payload = await ok.json()
+        assert payload["title"] == "wire the exporter"
+        assert payload["log"] == ["line one"]
+        missing = await client.get(
+            "/api/sessions/hermes-chat-c1/background/kanban/t_zzz",
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert missing.status == 404

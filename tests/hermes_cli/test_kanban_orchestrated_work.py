@@ -68,3 +68,27 @@ def test_empty_session_and_missing_board_db_yield_nothing(kanban_home: Path) -> 
     # The default board DB exists (init_db) but holds no subs; a board listed
     # without a database on disk is skipped rather than created.
     assert kb.list_orchestrated_tasks_for_session("hermes-chat-none") == []
+
+
+def test_stream_returns_recent_activity_for_subscribed_task(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, "wire the exporter")
+        _subscribe(conn, tid, "hermes-chat-c1")
+        kb.add_comment(conn, tid, "worker", "reading worker/main.py")
+    log_dir = kb.worker_logs_dir("default")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{tid}.log").write_text("line one\nline two\n", encoding="utf-8")
+    stream = kb.orchestrated_task_stream("hermes-chat-c1", tid)
+    assert stream is not None
+    assert stream["task_id"] == tid and stream["board"] == "default"
+    assert any(c["text"] == "reading worker/main.py" for c in stream["comments"])
+    assert stream["log"][-2:] == ["line one", "line two"]
+    assert any(e["kind"] == "claimed" for e in stream["events"])
+
+
+def test_stream_is_none_for_foreign_session_or_unknown_task(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, "private")
+        _subscribe(conn, tid, "hermes-chat-c2")
+    assert kb.orchestrated_task_stream("hermes-chat-c1", tid) is None
+    assert kb.orchestrated_task_stream("hermes-chat-c1", "t_nope") is None

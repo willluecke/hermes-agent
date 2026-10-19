@@ -11500,6 +11500,93 @@ def list_orchestrated_tasks_for_session(
     return rows
 
 
+def orchestrated_task_stream(
+    session_id: str, task_id: str, *, limit: int = 40, log_bytes: int = 16_384
+) -> Optional[dict]:
+    """Recent activity for one kanban worker orchestrated for a chat session.
+
+    Scoped by subscription: the task must carry a notify subscription for
+    ``session_id`` on the ``api_server`` platform, so one conversation cannot
+    read another conversation's worker. Returns the latest comments and
+    events plus the tail of the worker log when one exists, or ``None`` when
+    the task is not subscribed to the session on any board. Boards without a
+    database are skipped, never created; a failing board is skipped.
+    """
+    sid = str(session_id or "").strip()
+    tid = str(task_id or "").strip()
+    if not sid or not tid:
+        return None
+    try:
+        boards = list_boards()
+    except Exception:
+        return None
+    for meta in boards:
+        slug = meta.get("slug") if isinstance(meta, dict) else None
+        if not slug:
+            continue
+        try:
+            if not kanban_db_path(slug).exists():
+                continue
+            conn = connect(board=slug)
+        except Exception:
+            continue
+        try:
+            row = conn.execute(
+                """
+                SELECT t.id, t.title, t.status, t.started_at
+                  FROM kanban_notify_subs s
+                  JOIN tasks t ON t.id = s.task_id
+                 WHERE s.platform = 'api_server' AND s.chat_id = ? AND t.id = ?
+                 LIMIT 1
+                """,
+                (sid, tid),
+            ).fetchone()
+            if row is None:
+                continue
+            comments = [
+                {"at": c.created_at, "author": c.author, "text": c.body}
+                for c in list_comments(conn, tid)[-limit:]
+            ]
+            events = []
+            for e in list_events(conn, tid)[-limit:]:
+                payload = e.payload if isinstance(e.payload, dict) else {}
+                text = payload.get("reason") or payload.get("summary") or ""
+                events.append({"at": e.created_at, "kind": e.kind, "text": text})
+            log_lines: list[str] = []
+            log_updated_at = None
+            try:
+                log_path = worker_logs_dir(slug) / f"{tid}.log"
+                if log_path.is_file():
+                    log_updated_at = int(log_path.stat().st_mtime)
+                    with log_path.open("rb") as fh:
+                        fh.seek(0, 2)
+                        size = fh.tell()
+                        fh.seek(max(0, size - log_bytes))
+                        chunk = fh.read().decode("utf-8", errors="replace")
+                    log_lines = chunk.splitlines()[-limit:]
+            except OSError:
+                pass
+            return {
+                "task_id": row["id"],
+                "title": row["title"],
+                "status": row["status"],
+                "board": slug,
+                "started_at": row["started_at"],
+                "comments": comments,
+                "events": events,
+                "log": log_lines,
+                "log_updated_at": log_updated_at,
+            }
+        except Exception:
+            continue
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return None
+
+
 def add_notify_sub(
     conn: sqlite3.Connection,
     *,

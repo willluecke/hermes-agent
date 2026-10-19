@@ -2856,6 +2856,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("GET", "/api/sessions/{session_id}/background", self._handle_session_background),
+            ("GET", "/api/sessions/{session_id}/background/kanban/{task_id}", self._handle_session_background_kanban),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             # Managed Claude Code processes report each tool call here through
             # their own command hooks; authenticated by a per-session token,
@@ -5664,6 +5665,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(task, dict) and task.get("task_id"):
                     tasks.append({**task, "kind": "claude_task", "running": True})
         return tasks
+
+    async def _handle_session_background_kanban(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/background/kanban/{task_id} — one
+        orchestrated kanban worker's recent stream (comments, events, log
+        tail), scoped by the session's notify subscription. 404 when the task
+        is not subscribed to this session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = str(request.match_info["session_id"] or "").strip()
+        task_id = str(request.match_info["task_id"] or "").strip()
+        try:
+            from hermes_cli.kanban_db import orchestrated_task_stream
+
+            stream = await asyncio.to_thread(orchestrated_task_stream, session_id, task_id)
+        except Exception:
+            stream = None
+        if stream is None:
+            return web.json_response(
+                {"error": "no such orchestrated task for this session"},
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        return web.json_response(
+            {
+                "object": "hermes.session.background.kanban",
+                "session_id": session_id,
+                **stream,
+                "checked_at": time.time(),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _handle_session_background(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}/background — work still running for a chat.
