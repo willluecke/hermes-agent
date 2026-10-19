@@ -1654,6 +1654,19 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        # Mirror the kanban_create tool: when this CLI runs inside a chat
+        # session (an agent's shell), subscribe that chat so completion and
+        # block notifications report back. The helper keys on the gateway
+        # session platform/chat id, never HERMES_SESSION_ID, so a bare CLI or
+        # cron call stays a no-op (the over-eager behaviour #19718 reverted).
+        # A task created from the shell used to have no channel back to the
+        # conversation, so its finish went unreported.
+        try:
+            from tools.kanban_tools import _maybe_auto_subscribe
+
+            _maybe_auto_subscribe(conn, task_id)
+        except Exception:
+            pass
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))

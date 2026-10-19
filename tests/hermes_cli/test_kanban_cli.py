@@ -179,3 +179,34 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# CLI create auto-subscribes the originating chat (parity with kanban_create)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_create_subscribes_originating_chat(kanban_home, monkeypatch):
+    """A task created from an agent's shell inside a chat session must notify
+    that chat on finish/block, exactly like the kanban_create tool does.
+    Regression for a task whose completion went unreported because it was
+    created from the command line with no subscription."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "private")
+    raw = kc.run_slash('create "subscribe me" --assignee worker --json')
+    tid = json.loads(raw)["id"]
+    with kb.connect_closing() as conn:
+        subs = kb.list_notify_subs(conn, tid, include_unowned=True)
+    assert any(s.get("platform") == "telegram" and s.get("chat_id") == "chat-42" for s in subs), subs
+
+
+def test_cli_create_without_chat_session_does_not_subscribe(kanban_home, monkeypatch):
+    """A bare CLI/cron call has no persistent channel and must stay a no-op."""
+    for var in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID",
+                "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    raw = kc.run_slash('create "no channel" --assignee worker --json')
+    tid = json.loads(raw)["id"]
+    with kb.connect_closing() as conn:
+        assert kb.list_notify_subs(conn, tid, include_unowned=True) == []
