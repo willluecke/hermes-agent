@@ -1134,3 +1134,80 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_orchestrate: the per-project orchestrator as an agent tool
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def orch_home(monkeypatch, tmp_path):
+    """Isolated board, no worker task context."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def _blocked_with_dossier(title="stuck"):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title=title, assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        kb.claim_task(conn, tid, claimer="worker")
+        kb.block_task(conn, tid, reason="x", kind="capability",
+                      handoff={"next": ["read main.py"]})
+    finally:
+        conn.close()
+    return tid
+
+
+def test_kanban_orchestrate_registered_and_in_toolset():
+    import toolsets
+    from tools import kanban_tools as kt
+    from tools.registry import registry
+    assert registry.get_entry("kanban_orchestrate") is not None
+    assert "kanban_orchestrate" in toolsets.TOOLSETS["kanban"]["tools"]
+    props = kt.KANBAN_ORCHESTRATE_SCHEMA["parameters"]["properties"]
+    assert {"board", "max_concurrent", "max_attempts", "emit_dispatch"} <= set(props)
+
+
+def test_kanban_orchestrate_runs_a_cycle(orch_home):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    tid = _blocked_with_dossier()
+    out = json.loads(kt._handle_orchestrate({"max_concurrent": 5, "max_attempts": 3}))
+    assert out["ok"] is True
+    assert tid in out["actions"]["opened"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status in ("ready", "todo", "review")
+    finally:
+        conn.close()
+
+
+def test_kanban_orchestrate_emit_dispatch_changes_nothing(orch_home):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    tid = _blocked_with_dossier()
+    out = json.loads(kt._handle_orchestrate({
+        "emit_dispatch": True, "direction": "dir_1", "authorization": "grant_x",
+    }))
+    assert out["ok"] is True and out["sent"] is False
+    assert len(out["dispatch"]) == 1
+    assert out["dispatch"][0]["lane"] == "conversation"
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()

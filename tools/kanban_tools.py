@@ -902,6 +902,63 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_orchestrate(args: dict, **kw) -> str:
+    """Run one cycle of the per-project orchestrator for a board.
+
+    Routing mode (default) reopens blocked lanes that left a forward dossier and
+    retires lanes past their attempt budget to triage; it never does task work.
+    ``emit_dispatch`` previews the Talos dispatch payloads instead (no routing
+    change, no live send).
+    """
+    from hermes_cli import kanban_orchestrator as orch
+
+    emit = bool(args.get("emit_dispatch"))
+    if not emit:
+        # Routing changes task state; delegated children may not mutate the board.
+        delegated_err = _reject_delegated_child_mutation("kanban_orchestrate")
+        if delegated_err:
+            return delegated_err
+    try:
+        envelope = orch.Envelope(
+            max_concurrent_workers=int(args.get("max_concurrent") or 4),
+            max_attempts=int(args.get("max_attempts") or 3),
+        )
+    except (TypeError, ValueError):
+        return tool_error(
+            "kanban_orchestrate: max_concurrent and max_attempts must be integers"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+    except Exception as e:
+        return tool_error(f"kanban_orchestrate: {e}")
+    try:
+        if emit:
+            d = orch.DispatchPolicy()
+            policy = orch.DispatchPolicy(
+                model=args.get("model") or d.model,
+                effort=args.get("effort") or d.effort,
+                max_turns=int(args.get("max_turns") or d.max_turns),
+                work_class=args.get("work_class") or d.work_class,
+            )
+            result = orch.preview_dispatches(
+                conn, board=board, envelope=envelope, policy=policy,
+                direction_id=args.get("direction"),
+                version=int(args.get("version") or 1),
+                authorization=args.get("authorization"),
+            )
+        else:
+            result = orch.run_cycle(conn, board=board, envelope=envelope)
+        return _ok(**result)
+    except ValueError as e:
+        return tool_error(f"kanban_orchestrate: {e}")
+    except Exception as e:
+        logger.exception("kanban_orchestrate failed")
+        return tool_error(f"kanban_orchestrate: {e}")
+    finally:
+        conn.close()
+
+
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
@@ -1918,6 +1975,83 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_ORCHESTRATE_SCHEMA = {
+    "name": "kanban_orchestrate",
+    "description": (
+        "Run one cycle of the per-project orchestrator for a board. Routing mode "
+        "(default) reopens blocked lanes that left a forward dossier so a fresh "
+        "worker resumes at the frontier, up to the concurrency cap, and retires "
+        "lanes that exhausted their attempt budget to triage for a human. It never "
+        "does task work itself; the dispatcher spawns whatever it reopens. Set "
+        "emit_dispatch=true to instead preview the Talos dispatch payloads this "
+        "plan would emit (no routing change, no live send; sent is always false). "
+        "Use when asked to orchestrate a board or run a cycle, or after workers "
+        "block."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+            "max_concurrent": {
+                "type": "integer",
+                "description": "Envelope: max tasks in flight (running + ready). Default 4.",
+            },
+            "max_attempts": {
+                "type": "integer",
+                "description": (
+                    "Envelope: retire a blocked lane to triage once it has been "
+                    "blocked this many times. Default 3."
+                ),
+            },
+            "emit_dispatch": {
+                "type": "boolean",
+                "description": (
+                    "Preview the Talos dispatch payloads instead of applying "
+                    "routing. Never sends."
+                ),
+            },
+            "direction": {
+                "type": "string",
+                "description": "Talos direction id the preview dispatch serves.",
+            },
+            "version": {
+                "type": "integer",
+                "description": "Direction version for optimistic concurrency. Default 1.",
+            },
+            "authorization": {
+                "type": "string",
+                "description": (
+                    "Grant reference for the dispatch preview. Passed through, "
+                    "never fabricated."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Namespaced harness::model pin for dispatched work "
+                    "(default: a frontier pin)."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "enum": ["high", "xhigh", "max"],
+                "description": "Reasoning effort for dispatched work.",
+            },
+            "max_turns": {
+                "type": "integer",
+                "enum": [1, 6, 12],
+                "description": "Talos managed turn cap.",
+            },
+            "work_class": {
+                "type": "string",
+                "enum": ["core", "peripheral"],
+                "description": "core requires a frontier model.",
+            },
+        },
+        "required": [],
+    },
+}
+
 KANBAN_REQUEST_REVIEW_SCHEMA = {
     "name": "kanban_request_review",
     "description": (
@@ -2405,6 +2539,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_orchestrate",
+    toolset="kanban",
+    schema=KANBAN_ORCHESTRATE_SCHEMA,
+    handler=_handle_orchestrate,
+    check_fn=_check_kanban_mode,
+    emoji="🧭",
 )
 
 registry.register(
