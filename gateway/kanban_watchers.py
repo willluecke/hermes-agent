@@ -289,6 +289,18 @@ class GatewayKanbanWatchersMixin:
         _gc_next_at = 0.0  # 0 → sweep on the first tick after startup
 
         while self._running:
+            if getattr(self, "_draining", False) or getattr(
+                self, "_external_drain_active", False
+            ):
+                # A draining gateway refuses new turns (503), so a wake could
+                # only fail. Leave every cursor where it is; the next gateway
+                # process delivers the events.
+                logger.debug("kanban notifier: gateway draining; tick skipped")
+                for _ in range(int(max(1, interval))):
+                    if not self._running:
+                        return
+                    await asyncio.sleep(1)
+                continue
             try:
                 _gc_due = time.monotonic() >= _gc_next_at
                 _gc_retention_days = 30
@@ -844,19 +856,45 @@ class GatewayKanbanWatchersMixin:
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
                             # it must succeed BEFORE the cursor advances.
-                            from gateway.wake import deliver_wake
+                            from gateway.wake import WakeDrainingError, deliver_wake
 
+                            # One key per (board, task, destination, claimed
+                            # cursor): a rewound retry, or a re-post after a
+                            # slow admission, replays the same run instead
+                            # of waking the session twice for one event.
+                            _wake_key = (
+                                f"kanban-wake:{board_slug}:{sub['task_id']}:"
+                                f"{_session_key}:{d['cursor']}"
+                            )
                             try:
                                 await deliver_wake(
                                     adapter,
                                     text=_synth,
                                     session_id=_session_key,
+                                    idempotency_key=_wake_key,
                                 )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                                 )
                                 sub_fail_counts.pop(sub_key, None)
+                            except WakeDrainingError:
+                                # The gateway is restarting, not the
+                                # destination failing: keep the subscription
+                                # and the event. The next gateway delivers it.
+                                logger.info(
+                                    "kanban notifier: gateway draining; wake for %s "
+                                    "deferred to the next gateway",
+                                    sub["task_id"],
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                continue
                             except Exception as _wk_err:
                                 fails = sub_fail_counts.get(sub_key, 0) + 1
                                 sub_fail_counts[sub_key] = fails

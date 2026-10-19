@@ -2626,6 +2626,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "worker_pid_ns" not in cols:
+        # PID namespace the worker PID was recorded from (the inode of the
+        # spawner's /proc/self/ns/pid). A PID recorded inside a sandboxed
+        # turn's namespace names an unrelated process on the host, so the
+        # liveness probe must not trust it. NULL = legacy row, trusted as
+        # before.
+        _add_column_if_missing(
+            conn, "tasks", "worker_pid_ns", "worker_pid_ns INTEGER"
+        )
+
     if "provider_override" not in cols:
         # Provider the model_override belongs to. NULL = worker profile's
         # provider resolves the model (the behaviour existing rows had).
@@ -4978,8 +4988,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "SELECT id, claim_lock, worker_pid, worker_pid_ns, claim_expires, "
+        "       last_heartbeat_at, assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -4988,6 +4998,10 @@ def release_stale_claims(
     for row in stale:
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
+        # A PID recorded in another PID namespace (sandboxed manual dispatch)
+        # names an unrelated host process: neither extend on its liveness
+        # nor signal it. Let the claim lapse so the task is respawned.
+        probe_trusted = _worker_pid_probe_trusted(row["worker_pid_ns"])
         hb = row["last_heartbeat_at"]
         # Heartbeat staleness backstop: if we have a heartbeat at all
         # and it's older than the max-stale threshold, the worker is
@@ -5000,6 +5014,7 @@ def release_stale_claims(
         if (
             host_local
             and row["worker_pid"]
+            and probe_trusted
             and _pid_alive(row["worker_pid"])
             and not heartbeat_stale
         ):
@@ -5040,7 +5055,9 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"] if probe_trusted else None,
+            row["claim_lock"],
+            signal_fn=signal_fn,
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -5081,6 +5098,7 @@ def release_stale_claims(
                 "now": now,
                 "host_local": host_local,
                 "heartbeat_stale": bool(heartbeat_stale),
+                "pid_probe_trusted": bool(probe_trusted),
                 "retry_status": retry_status,
             }
             payload.update(termination)
@@ -8300,6 +8318,40 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _pid_namespace_id() -> Optional[int]:
+    """Identity of this process's PID namespace, or None where unknown.
+
+    The inode of ``/proc/self/ns/pid`` names the namespace itself, so two
+    processes observe the same number exactly when their PIDs are
+    comparable. Absent on non-Linux platforms.
+    """
+    try:
+        return int(os.stat("/proc/self/ns/pid").st_ino)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _worker_pid_probe_trusted(recorded_ns: Optional[int]) -> bool:
+    """Whether probing or signalling a recorded worker PID means anything here.
+
+    A worker dispatched from inside a PID-namespaced sandbox records its
+    namespace PID (``5``, say). On the host that number is a kernel thread,
+    so ``_pid_alive`` answers "alive" forever and a stale claim is extended
+    for a worker that died with its sandbox. The probe is trusted only when
+    the PID was recorded in this process's namespace. Legacy rows with no
+    namespace recorded keep the historical behaviour.
+    """
+    if recorded_ns is None:
+        return True
+    mine = _pid_namespace_id()
+    if mine is None:
+        return True
+    try:
+        return int(recorded_ns) == mine
+    except (TypeError, ValueError):
+        return True
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -8493,7 +8545,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.worker_pid_ns, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -8517,12 +8569,13 @@ def enforce_max_runtime(
         tid = row["id"]
         # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
         # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
+        # before the grace expires. A PID recorded in another PID namespace
+        # is not our worker on this host, so it is never signalled.
         killed = False
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
-        if kill is not None:
+        if kill is not None and _worker_pid_probe_trusted(row["worker_pid_ns"]):
             try:
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -8633,7 +8686,8 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_pid_ns, t.last_heartbeat_at, "
+        "       t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -8655,6 +8709,10 @@ def detect_stale_running(
             continue  # recent heartbeat → still alive
 
         pid = row["worker_pid"]
+        if not _worker_pid_probe_trusted(row["worker_pid_ns"]):
+            # Recorded in another PID namespace: that number is not our
+            # worker on this host, so never signal it.
+            pid = None
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
@@ -8754,14 +8812,15 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, worker_pid_ns "
+        "FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _pid_alive(pid):
+        if pid and _worker_pid_probe_trusted(row["worker_pid_ns"]) and _pid_alive(pid):
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
             _log.debug(
@@ -8942,7 +9001,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_pid_ns, claim_lock, started_at, "
+            "       assignee "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -8960,6 +9020,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
+            if not _worker_pid_probe_trusted(row["worker_pid_ns"]):
+                # Recorded in another PID namespace: the host probe would
+                # answer for an unrelated process. Leave the row to the claim
+                # TTL (``release_stale_claims``) instead of guessing.
+                continue
             if _pid_alive(row["worker_pid"]):
                 continue
 
@@ -9400,10 +9465,11 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    pid_ns = _pid_namespace_id()
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ?, worker_pid_ns = ? WHERE id = ?",
+            (int(pid), pid_ns, task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
@@ -9411,7 +9477,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(
+            conn, task_id, "spawned", {"pid": int(pid), "pid_ns": pid_ns},
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:

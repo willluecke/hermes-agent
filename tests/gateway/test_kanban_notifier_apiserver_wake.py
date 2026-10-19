@@ -111,7 +111,7 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kw):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -168,7 +168,7 @@ def test_apiserver_subscriptions_have_independent_wake_destinations(
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kw):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -193,7 +193,7 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     )
     attempted_sessions = []
 
-    async def fail_once_then_succeed(adapter, *, text, session_id):
+    async def fail_once_then_succeed(adapter, *, text, session_id, **_kw):
         attempted_sessions.append(session_id)
         if len(attempted_sessions) == 1:
             raise RuntimeError("simulated wake failure")
@@ -217,3 +217,66 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 
+
+
+def test_apiserver_wake_during_drain_keeps_subscription_and_event(
+    tmp_path, monkeypatch,
+):
+    """A draining gateway answers 503; that is not a dead destination. The
+    cursor rewinds, the subscription stays, nothing counts as a failure, and
+    the retry carries the same Idempotency-Key so it can only replay."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-drain.db"))
+    kb.init_db()
+    tid = _create_completed_subscription("api_server", "origin-session")
+
+    import gateway.wake as wake_mod
+
+    keys = []
+
+    async def draining(adapter, *, text, session_id, **kw):
+        keys.append(kw.get("idempotency_key"))
+        raise wake_mod.WakeDrainingError("gateway draining")
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", draining)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(keys) == 2 and keys[0] == keys[1]
+    assert keys[0].startswith(f"kanban-wake:") and tid in keys[0]
+    assert runner._kanban_sub_fail_counts == {}
+    assert _unseen_terminal_events(tid, "api_server", "origin-session")
+    conn = kb.connect()
+    try:
+        subs = conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert subs == 1
+
+
+def test_apiserver_notifier_skips_ticks_while_the_gateway_drains(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-drain-skip.db"))
+    kb.init_db()
+    tid = _create_completed_subscription("api_server", "origin-session")
+
+    import gateway.wake as wake_mod
+
+    posted = []
+
+    async def record(adapter, *, text, session_id, **kw):
+        posted.append(session_id)
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", record)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+    runner._draining = True
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert posted == []
+    assert _unseen_terminal_events(tid, "api_server", "origin-session")

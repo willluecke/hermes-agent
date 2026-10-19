@@ -1276,6 +1276,16 @@ class ResponseStore:
             """CREATE INDEX IF NOT EXISTS idx_run_idempotency_created_at
                ON run_idempotency(created_at)"""
         )
+        # The project workspace each session's turns run in, so a later turn
+        # that names only the session (a kanban wake, a resend from another
+        # device) lands in the same workspace instead of the default project.
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS session_projects (
+                session_id TEXT PRIMARY KEY,
+                project TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
         self._conn.commit()
         self._run_idempotency_lock = threading.Lock()
         # response_store.db contains conversation history (tool payloads,
@@ -1462,6 +1472,31 @@ class ResponseStore:
         if row is not None and row[0] == fingerprint:
             return "replay", row[1]
         return "conflict", row[1] if row is not None else ""
+
+    def remember_session_project(self, session_id: str, project: str) -> None:
+        """Record the project workspace a session's turns run in."""
+        if not session_id or not project:
+            return
+        with self._run_idempotency_lock:
+            self._conn.execute(
+                "INSERT INTO session_projects (session_id, project, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "project = excluded.project, updated_at = excluded.updated_at",
+                (session_id, project, time.time()),
+            )
+            self._conn.commit()
+
+    def get_session_project(self, session_id: str) -> Optional[str]:
+        """The project last recorded for ``session_id``, or None."""
+        if not session_id:
+            return None
+        with self._run_idempotency_lock:
+            row = self._conn.execute(
+                "SELECT project FROM session_projects WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
 
     def close(self) -> None:
         """Close the database connection."""
@@ -9252,8 +9287,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         from gateway.run import _load_gateway_config
 
+        requested_project = body.get("project")
+        if requested_project is None and isinstance(body.get("session_id"), str):
+            # A turn that names only the session (a kanban wake, a resend
+            # from another device) runs where that session's turns run, not
+            # in the default project.
+            try:
+                requested_project = self._response_store.get_session_project(
+                    body["session_id"].strip()
+                )
+            except Exception:
+                requested_project = None
         project, run_cwd, workspace_error, workspace_status = _resolve_run_workspace(
-            _load_gateway_config(), body.get("project")
+            _load_gateway_config(), requested_project
         )
         if workspace_error:
             return web.json_response(
@@ -9492,6 +9538,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # tool results, or mid-turn commentary. This is deliberately the first
         # await after the durable claim: no async session work can race a
         # duplicate request into creating a second run.
+        if session_id and project:
+            # Remember the workspace so a later session-only turn (a kanban
+            # wake after a restart, say) resumes in the same project.
+            try:
+                self._response_store.remember_session_project(session_id, project)
+            except Exception:
+                logger.debug("[api_server] session project memo failed", exc_info=True)
+
         history_restored = 0
         if session_id:
             session_db = await self._ensure_session_db_async()

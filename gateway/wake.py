@@ -31,9 +31,21 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# A wake self-post runs the entire agent turn synchronously (stream=false);
-# generous ceiling so long tool-using turns aren't killed mid-flight.
-WAKE_TURN_TIMEOUT_SECONDS = 600.0
+# The runs API admits the wake turn and answers at once with a run id; the
+# turn itself runs detached. Only that admission needs a ceiling. (The old
+# chat-completions self-post waited for the whole turn, so a turn longer
+# than its timeout was re-posted as a duplicate wake.)
+WAKE_ACCEPT_TIMEOUT_SECONDS = 30.0
+# Kept for importers of the old name; nothing waits for a whole turn now.
+WAKE_TURN_TIMEOUT_SECONDS = WAKE_ACCEPT_TIMEOUT_SECONDS
+
+
+class WakeDrainingError(RuntimeError):
+    """The gateway refused the wake because it is draining for a restart.
+
+    Not a failure of the destination: the event is still unseen and the next
+    gateway process delivers it. Callers rewind without counting a failure.
+    """
 
 # Backoff delays between retries on transient failures (429 concurrency cap,
 # connection errors). The API server has no per-session lock — concurrent
@@ -59,6 +71,7 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    idempotency_key: str = "",
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -91,19 +104,30 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    kwargs: dict = {"text": text, "session_id": session_id}
+    if idempotency_key:
+        kwargs["idempotency_key"] = idempotency_key
+    await _self_post_chat_completion(adapter, **kwargs)
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any, *, text: str, session_id: str, idempotency_key: str = ""
 ) -> None:
-    """POST the wake text to the in-pod API server as a normal session turn.
+    """POST the wake text to the in-pod API server as a detached session run.
 
-    Uses the adapter's own bind host/port/key (``ApiServerAdapter.__init__``).
-    Session continuation via ``X-Hermes-Session-Id`` is 403-gated on
-    ``API_SERVER_KEY`` being configured, so a missing key is a hard error —
-    raise loudly rather than run the wake in a fresh fingerprint-derived
-    session nobody is looking at.
+    Uses ``/v1/runs`` on the adapter's own bind host/port/key
+    (``ApiServerAdapter.__init__``): the server admits the turn on the named
+    session and answers immediately with a run id, so a slow wake turn can
+    no longer outlive this call and be re-posted as a duplicate.
+    ``idempotency_key`` (when given) makes any retry — ours below, or a later
+    notifier tick's after a cursor rewind — replay the same run instead of
+    waking the session a second time for one event.
+
+    A 503 ``gateway_draining`` answer raises ``WakeDrainingError`` at once:
+    the gateway is restarting, nothing is wrong with the destination, and the
+    next gateway process delivers the event. A missing API key is a hard
+    error — raise loudly rather than run the wake in a fresh session nobody
+    is looking at.
     """
     import aiohttp
 
@@ -122,15 +146,19 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    url = f"http://{host}:{port}/v1/runs"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    # ``project`` is deliberately absent: the runs API resumes the session's
+    # own remembered project workspace when only the session is named.
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
-        "messages": [{"role": "user", "content": text}],
-        "stream": False,
+        "input": text,
+        "session_id": session_id,
     }
 
     last_err: Optional[BaseException] = None
@@ -139,7 +167,7 @@ async def _self_post_chat_completion(
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
         try:
-            timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
+            timeout = aiohttp.ClientTimeout(total=WAKE_ACCEPT_TIMEOUT_SECONDS)
             async with aiohttp.ClientSession(timeout=timeout) as http:
                 async with http.post(url, json=payload, headers=headers) as resp:
                     if resp.status == 429:
@@ -148,6 +176,25 @@ async def _self_post_chat_completion(
                         last_err = RuntimeError(
                             f"wake self-post got HTTP 429 (concurrency cap) "
                             f"for session {session_id}"
+                        )
+                        logger.warning(
+                            "%s; attempt %d/%d", last_err, attempt + 1, attempts
+                        )
+                        continue
+                    if resp.status == 503:
+                        body = (await resp.text())[:300]
+                        if "gateway_draining" in body:
+                            # The gateway is restarting: not a destination
+                            # failure, and retrying here would only spin
+                            # against the drain. The caller keeps the event.
+                            raise WakeDrainingError(
+                                f"wake self-post deferred for session "
+                                f"{session_id}: gateway draining"
+                            )
+                        # Other 503s (durable store hiccup) are transient.
+                        last_err = RuntimeError(
+                            f"wake self-post got HTTP 503 for session "
+                            f"{session_id}: {body}"
                         )
                         logger.warning(
                             "%s; attempt %d/%d", last_err, attempt + 1, attempts
@@ -162,7 +209,7 @@ async def _self_post_chat_completion(
                         )
                     await resp.read()
                     logger.info(
-                        "wake self-post delivered for session %s (attempt %d)",
+                        "wake self-post admitted for session %s (attempt %d)",
                         session_id,
                         attempt + 1,
                     )
