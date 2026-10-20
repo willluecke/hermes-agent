@@ -116,7 +116,7 @@ def review_from_env(env=None):
 
 def mcp_server(review=None):
     env = {'PYTHONPATH':str(Path(__file__).resolve().parents[1]),'HERMES_STEWARD':'1',
-           'HERMES_TOOLS_MCP_ONLY':'talos,hermes_conversation'}
+           'HERMES_TOOLS_MCP_ONLY':'talos,hermes_conversation,steward_jobs'}
     if review is not None:
         # A review session sees one tool, bound to one final. The binding is
         # canonical JSON so the subprocess validates exactly what the gateway bound.
@@ -169,6 +169,13 @@ class StewardTools:
                 raise ValueError('Steward cannot send extra turns, create goals, or supervise delegates. Use talos dispatch.')
             if action=='goal' and args.get('verb','status')!='status':
                 raise ValueError('Only the goal controller manages delegated goals.')
+        elif name=='steward_jobs':
+            # Jim's own cron jobs (owner jim): read them, change prompt/schedule/
+            # enabled/name. Will, 2026-10-19: "jim should be able to change anything
+            # that you can change" (the morning-plan job). The tool itself holds the
+            # allowlist, backup, prompt scan and audit; here only the actions.
+            if action not in {'jobs','job_save'}:
+                raise ValueError('steward_jobs offers jobs and job_save only.')
         elif name=='talos':
             # watches/watch_save: Jim reviews finals of a thread Will drives himself
             # (watch mode). A watch is read or saved only in an ordinary turn; review
@@ -180,14 +187,14 @@ class StewardTools:
             if action == 'routine_create':
                 reminder_check(args)
         else:
-            raise ValueError('Steward tools are limited to talos and hermes_conversation.')
+            raise ValueError('Steward tools are limited to talos, hermes_conversation and steward_jobs.')
         if name=='hermes_conversation' and action=='set_runtime':
             from tools.hermes_conversation_tool import _goal
             current=_goal(args.get('id'),'status')
             goal=current.get('goal',current) if isinstance(current,dict) else {}
             if goal and goal.get('delegation_id') and goal.get('status') in {'active','paused'}:
                 raise ValueError('Managed runtime is pinned; ask Will rather than changing live delegated work.')
-        if action in {'list','read','goal','state','live','projects','project','mandate','directions','direction','delegation','sessions','watches'}:
+        if action in {'list','read','goal','state','live','projects','project','mandate','directions','direction','delegation','sessions','watches','jobs'}:
             key=(name,action,args.get('id'),args.get('project_id') or args.get('project'),args.get('conversation_id'))
             if key in self.reads:
                 raise ValueError('Already read this state this turn. Answer once; do not poll.')

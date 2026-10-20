@@ -147,6 +147,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "model_consult",
     "talos",
     "hermes_conversation",
+    "steward_jobs",
     "typesafe_decide",
     # Stateless stand-in for `todo` on the Codex and Claude lanes: returns the
     # criteria in the todo result shape so the verify judge can use them.
@@ -225,7 +226,7 @@ def selected_tools(env: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
         # A bound final review sees one tool; the binding is validated at build.
         return ('talos',)
     if source.get('HERMES_STEWARD') == '1':
-        return ('talos','hermes_conversation')
+        return ('talos','hermes_conversation','steward_jobs')
     raw = (source.get(ONLY_ENV) or "").strip()
     if not raw:
         return EXPOSED_TOOLS

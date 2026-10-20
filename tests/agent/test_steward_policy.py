@@ -5,7 +5,7 @@ from agent.transports.hermes_tools_mcp_server import selected_tools
 
 
 def test_steward_cannot_expand_tool_surface():
-    assert selected_tools({'HERMES_STEWARD':'1','HERMES_TOOLS_MCP_ONLY':'terminal,delegate_task'})==('talos','hermes_conversation')
+    assert selected_tools({'HERMES_STEWARD':'1','HERMES_TOOLS_MCP_ONLY':'terminal,delegate_task'})==('talos','hermes_conversation','steward_jobs')
 
 
 @pytest.mark.parametrize('name,args',[('terminal',{}),('delegate_task',{}),('hermes_conversation',{'action':'send','id':'delegate'}),('hermes_conversation',{'action':'goal','verb':'resume'}),('talos',{'action':'unknown'})])
@@ -212,3 +212,15 @@ def test_steward_files_reminders_for_will_and_no_other_routine():
               'source': {'conversation_id': 'talos', 'message_id': 'run_1'}}
     with pytest.raises(ValueError):  # review mode admits only the review actions
         StewardTools(review=review).run('talos', reminder, lambda name, args: 'ok')
+
+
+def test_steward_jobs_is_a_steward_tool_in_ordinary_turns_only():
+    policy = StewardTools()
+    assert policy.run('steward_jobs', {'action': 'jobs'}, lambda name, args: 'ok') == 'ok'
+    with pytest.raises(ValueError): policy.check('steward_jobs', {'action': 'jobs'})   # a read: once per turn
+    assert policy.run('steward_jobs', {'action': 'job_save', 'id': 'j', 'prompt': 'p', 'reason': 'r'}, lambda name, args: 'ok') == 'ok'
+    with pytest.raises(ValueError): policy.check('steward_jobs', {'action': 'job_delete'})
+    review = {'id': 'final_'+'a'*64, 'content_hash': 'b'*64, 'queue_id': 'jim_final_'+'a'*64, 'review_run_id': 'run_1',
+              'source': {'conversation_id': 'talos', 'message_id': 'run_1'}}
+    with pytest.raises(ValueError): StewardTools(review=review).check('steward_jobs', {'action': 'jobs'})
+    assert selected_tools({'HERMES_STEWARD_REVIEW': '{}'}) == ('talos',)

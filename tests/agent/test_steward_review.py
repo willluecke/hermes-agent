@@ -208,7 +208,7 @@ def test_review_context_is_strict(bad):
 def test_mcp_server_carries_the_binding_only_for_reviews():
     ordinary = mcp_server()
     assert REVIEW_ENV not in ordinary['env']
-    assert ordinary['env']['HERMES_TOOLS_MCP_ONLY'] == 'talos,hermes_conversation'
+    assert ordinary['env']['HERMES_TOOLS_MCP_ONLY'] == 'talos,hermes_conversation,steward_jobs'
     review = mcp_server(review=CONTEXT)
     assert review['command'] == ordinary['command'] and review['args'] == ordinary['args']
     assert review['env']['HERMES_STEWARD'] == '1'
@@ -217,7 +217,7 @@ def test_mcp_server_carries_the_binding_only_for_reviews():
     assert review_from_env(review['env']) == CONTEXT
     assert review_from_env(ordinary['env']) is None
     assert selected_tools(review['env']) == ('talos',)
-    assert selected_tools(ordinary['env']) == ('talos', 'hermes_conversation')
+    assert selected_tools(ordinary['env']) == ('talos', 'hermes_conversation', 'steward_jobs')
     with pytest.raises(ValueError):
         mcp_server(review={**REQUEST, 'review_run_id': RUN})
     for raw in ('{', json.dumps({**CONTEXT, 'source': {'conversation_id': 'delegate', 'message_id': RUN}})):
