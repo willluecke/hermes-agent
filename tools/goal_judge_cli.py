@@ -7,6 +7,13 @@ The legacy done field is true only for a done verdict. The verdict comes from Je
 uses for its gates) through the hermes-agent typesafe tool, so it costs a
 fraction of a cent and never runs a metered chat model. A missing answer is an
 error exit: hermes-sync pauses the goal rather than guessing.
+
+A reply that explicitly declares the goal complete (or impossible) ends the
+goal even when the judge scores it as not fully met. The met score is advice
+for the steward's final review, not a reason to re-send the same goal: on
+2026-10-19 a research worker that honestly disclosed a shortfall was re-run
+three times, repeating the same completion each time, because met stayed
+below threshold while claims_done was 0.98.
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ import math
 import sys
 
 DONE_THRESHOLD = 0.75
+CLAIMS_THRESHOLD = 0.9  # an explicit completion claim ends the goal on its own
 MAX_REPLY_CHARS = 12_000
 
 
@@ -49,11 +57,12 @@ def main() -> int:
     blocked = float((answers.get("blocked") or {}).get("noul") or 0.0)
     if not all(type((answers.get(key) or {}).get("noul")) in (int, float) and math.isfinite(answers[key]["noul"]) and 0 <= answers[key]["noul"] <= 1 for key in ("met", "claims_done", "blocked")):
         raise ValueError("judge returned incomplete verdict")
-    verdict = "blocked" if blocked >= 0.9 else "done" if met >= DONE_THRESHOLD or (claims >= 0.9 and met >= 0.5) else "continue"
+    verdict = "blocked" if blocked >= 0.9 else "done" if met >= DONE_THRESHOLD or claims >= CLAIMS_THRESHOLD else "continue"
     done = verdict == "done"
     reason = (
         f"met={met:.2f} claims_done={claims:.2f} blocked={blocked:.2f}"
         + (" · stopped: the reply says the goal cannot proceed" if blocked >= 0.9 and met < DONE_THRESHOLD else "")
+        + (" · done: the reply declares completion; the met score is for the steward's review" if done and met < DONE_THRESHOLD else "")
     )
     print(json.dumps({"verdict": verdict, "done": done, "p": met, "reason": reason, "provider": answer.get("provider")}))
     return 0
