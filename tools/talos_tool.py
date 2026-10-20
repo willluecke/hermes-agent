@@ -344,6 +344,8 @@ _props.update({
     "conversation_id": {"type": "string", "description": "For watches (optional filter) and watch_save: the watched hermes-chat conversation."},
     "criteria": {"type": "string", "maxLength": WATCH_CRITERIA_LIMIT, "description": "For watch_save: Will's criteria for a final of the watched thread to count as done."},
     "active": {"type": "boolean", "description": "For watch_save: true to watch, false to stop watching."},
+    "owner": {"type": "string", "enum": ["human", "agent"],
+              "description": "For routine_create: human for a reminder Will ticks off himself (the steward may file only these); agent for a routine that runs work."},
 })
 TALOS_SCHEMA["description"] += (
     " Watch mode: watches(conversation_id?) lists watches, threads Will drives himself whose every final Jim "

@@ -192,3 +192,23 @@ def test_turn_source_is_the_stewards_submitted_message_and_becomes_a_note():
                     (source, {'session': 'hermes-chat-other', 'project': 'reg-watch'}), (source, {'session': REVIEW_SESSION, 'project': 'talos-steward'})]:
         with pytest.raises(ValueError):
             turn_source(bad, session=kw.get('session', 'hermes-chat-talos'), project=kw.get('project', 'talos-steward'))
+
+
+def test_steward_files_reminders_for_will_and_no_other_routine():
+    from agent.steward_policy import StewardTools
+    reminder = {'action': 'routine_create', 'project_id': 'reg-watch', 'id': 'regwatch-email-warmup', 'owner': 'human',
+                'body': {'title': 'Daily RegWatch email warmup', 'estimated_minutes': 5, 'missed_run_policy': 'retain',
+                         'recurrence': {'kind': 'daily', 'at': '09:00', 'timezone': 'America/Los_Angeles'}}}
+    assert StewardTools().run('talos', reminder, lambda name, args: 'ok') == 'ok'
+    for broken in ({**reminder, 'owner': 'agent'},                                   # an agent routine runs work
+                   {**reminder, 'body': {**reminder['body'], 'kind': 'steward'}},    # what Jim tried on 2026-10-19
+                   {**reminder, 'body': {**reminder['body'], 'contract': {}}},       # a task contract
+                   {**reminder, 'body': {**reminder['body'], 'missed_run_policy': 'coalesce'}},
+                   {**reminder, 'body': {**reminder['body'], 'title': ' '}},
+                   {k: v for k, v in reminder.items() if k != 'owner'}):
+        with pytest.raises(ValueError):
+            StewardTools().run('talos', broken, lambda name, args: 'ok')
+    review = {'id': 'final_'+'a'*64, 'content_hash': 'b'*64, 'queue_id': 'jim_final_'+'a'*64, 'review_run_id': 'run_1',
+              'source': {'conversation_id': 'talos', 'message_id': 'run_1'}}
+    with pytest.raises(ValueError):  # review mode admits only the review actions
+        StewardTools(review=review).run('talos', reminder, lambda name, args: 'ok')

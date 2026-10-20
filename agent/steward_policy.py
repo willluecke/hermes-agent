@@ -49,6 +49,24 @@ def source_note(source):
             + '. Use this durable client turn ID for provenance and deduplication; composer drafts are not submissions.')
 
 
+REMINDER_FIELDS = {'title', 'estimated_minutes', 'missed_run_policy', 'recurrence'}
+
+
+def reminder_check(args):
+    """The steward files reminders for Will and nothing else through routine_create:
+    a human-owned, retained commitment with a title and a recurrence. Agent task,
+    summary or steward routines stay out of reach (Jim tried `kind: steward` for a
+    daily warmup reminder on 2026-10-19 and was refused outright)."""
+    body = args.get('body')
+    if args.get('owner') != 'human' or not isinstance(body, dict) or not isinstance(args.get('project_id'), str):
+        raise ValueError("A steward routine is a reminder for Will: owner 'human', a project_id, and a body with "
+                         "title, recurrence, estimated_minutes and missed_run_policy 'retain'.")
+    unknown = set(body) - REMINDER_FIELDS
+    if unknown or body.get('missed_run_policy') != 'retain' or not isinstance(body.get('title'), str) or not body['title'].strip():
+        raise ValueError('A reminder body carries only title, recurrence, estimated_minutes and missed_run_policy=retain'
+                         + (': not ' + ', '.join(sorted(unknown)) if unknown else '') + '.')
+
+
 def review_request(value):
     """The `steward_review` request field: exactly {id, content_hash, queue_id}."""
     if not isinstance(value, dict) or set(value) != {'id', 'content_hash', 'queue_id'}:
@@ -156,8 +174,11 @@ class StewardTools:
             # (watch mode). A watch is read or saved only in an ordinary turn; review
             # mode admits nothing but the three review actions (check_review).
             if action not in {'state','live','projects','project','mandate','mandate_save','directions','direction','direction_save',
-                              'interview_save','dispatch','delegation','delegation_control','hold','sessions','watches','watch_save'}:
+                              'interview_save','dispatch','delegation','delegation_control','hold','sessions','watches','watch_save',
+                              'routine_create'}:
                 raise ValueError('This tool action is not available to the steward.')
+            if action == 'routine_create':
+                reminder_check(args)
         else:
             raise ValueError('Steward tools are limited to talos and hermes_conversation.')
         if name=='hermes_conversation' and action=='set_runtime':
