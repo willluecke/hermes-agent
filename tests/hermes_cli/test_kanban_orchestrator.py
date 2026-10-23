@@ -287,14 +287,42 @@ def test_cli_emit_dispatch_preview(kanban_home: Path, capsys: pytest.CaptureFixt
                       handoff={"next": ["read worker/main.py"]})
     ns = argparse.Namespace(
         board=None, max_concurrent=5, max_attempts=3, once=True,
-        emit_dispatch=True, direction="dir_1", version=1, authorization="grant_x",
+        emit_dispatch=True, direction="dir_1", direction_version=2,
+        authorization="grant_x",
         model=None, effort=None, max_turns=None, work_class=None,
     )
     assert kc._cmd_orchestrate(ns) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["sent"] is False
     assert len(payload["dispatch"]) == 1
+    assert payload["dispatch"][0]["version"] == 2
     assert payload["dispatch"][0]["lane"] == "conversation"
     assert "read worker/main.py" in payload["dispatch"][0]["goal"]["text"]
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "blocked"  # preview changed no routing
+
+
+def test_orchestrate_flags_do_not_collide_with_parent_parser():
+    """`hermes kanban --board X orchestrate --once` must not trip the top-level
+    --version flag (dest collision printed the banner and skipped the cycle)
+    nor let the optional positional board overwrite the kanban-level --board.
+    """
+    from hermes_cli import kanban as kc
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, sub, _chat = build_top_level_parser()
+    kc.build_parser(sub)
+
+    args = parser.parse_args(
+        ["kanban", "--board", "proj", "orchestrate", "--once", "--version", "3"]
+    )
+    assert args.version is False  # top-level flag untouched
+    assert args.board == "proj"
+    assert args.board_positional is None
+    assert args.direction_version == 3
+
+    args = parser.parse_args(["kanban", "orchestrate", "proj2", "--once"])
+    assert args.version is False
+    assert args.board is None
+    assert args.board_positional == "proj2"
+    assert args.direction_version == 1

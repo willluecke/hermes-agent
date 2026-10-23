@@ -651,8 +651,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "orchestrate",
         help="Run one cycle of the per-project orchestrator for a board",
     )
+    # The attribute must not be "board": the kanban-level `--board <slug>`
+    # flag uses that dest, and an optional positional with the same name
+    # would overwrite it with None, silently running the cycle on the
+    # current board instead of the one the caller named.
     p_orch.add_argument(
-        "board", nargs="?", default=None,
+        "board_positional", nargs="?", metavar="board", default=None,
         help="Board slug (the project). Defaults to the current board.",
     )
     p_orch.add_argument(
@@ -679,8 +683,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--direction", dest="direction", default=None,
         help="Talos direction id the dispatch serves (shown in the preview).",
     )
+    # dest must not be "version": the top-level parser's --version flag
+    # shares that attribute, and main() prints the version banner and returns
+    # whenever args.version is truthy. default=1 made every
+    # `hermes kanban orchestrate` invocation print the banner instead of
+    # running a cycle.
     p_orch.add_argument(
-        "--version", dest="version", type=int, default=1,
+        "--version", dest="direction_version", type=int, default=1,
         help="Direction version for optimistic concurrency.",
     )
     p_orch.add_argument(
@@ -2422,7 +2431,10 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
         max_concurrent_workers=getattr(args, "max_concurrent", None) or 4,
         max_attempts=getattr(args, "max_attempts", None) or 3,
     )
-    board = getattr(args, "board", None)
+    board = (
+        getattr(args, "board_positional", None)
+        or getattr(args, "board", None)
+    )
     if getattr(args, "emit_dispatch", False):
         # Dry-run: show the Talos dispatch payloads this plan would emit. No
         # routing change, no live write to the Talos operator ledger.
@@ -2438,7 +2450,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
                 result = orch.preview_dispatches(
                     conn, board=board, envelope=envelope, policy=policy,
                     direction_id=getattr(args, "direction", None),
-                    version=getattr(args, "version", None) or 1,
+                    version=getattr(args, "direction_version", None) or 1,
                     authorization=getattr(args, "authorization", None),
                 )
         except ValueError as exc:
