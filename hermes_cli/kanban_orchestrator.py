@@ -23,6 +23,14 @@ from hermes_cli import kanban_db as kb
 IN_FLIGHT_STATUSES = ("running", "ready")
 # 'dependency' blocks auto-resume via parent gating — not the orchestrator's job.
 AUTO_RESUMING_BLOCK_KIND = "dependency"
+# Blocks that wait on a human decision. The orchestrator neither reopens nor
+# retires these: a discovery candidate parked ``needs_input`` stays parked until
+# someone runs ``hermes kanban accept`` (or ``reject``).
+HUMAN_GATED_BLOCK_KINDS = frozenset({"needs_input"})
+# Statuses that mean the board already has work for the dispatcher or a
+# specifier/decomposer; discovery is not recommended while any exist.
+OPEN_STATUSES = frozenset({"triage", "todo", "scheduled", "ready", "running", "review"})
+DISCOVERY_CREATOR = "discovery-sweep"
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,15 @@ class TaskView:
     block_kind: Optional[str] = None
     block_recurrences: int = 0
     dossier: Optional[dict] = None  # gap-A forward handoff from the latest run
+    created_by: Optional[str] = None
+
+    @property
+    def human_gated(self) -> bool:
+        return self.status == "blocked" and self.block_kind in HUMAN_GATED_BLOCK_KINDS
+
+    @property
+    def is_candidate(self) -> bool:
+        return self.human_gated and self.created_by == DISCOVERY_CREATOR
 
 
 @dataclass(frozen=True)
@@ -84,6 +101,8 @@ def plan_cycle(snapshot: BoardSnapshot, envelope: Envelope) -> Plan:
             continue
         if t.block_kind == AUTO_RESUMING_BLOCK_KIND:
             continue
+        if t.block_kind in HUMAN_GATED_BLOCK_KINDS:
+            continue  # waits on a person, not on headroom
         if t.block_recurrences >= envelope.max_attempts:
             retire.append(t.id)
         else:
@@ -112,9 +131,35 @@ def snapshot_board(conn, board: Optional[str] = None) -> BoardSnapshot:
                 block_kind=t.block_kind,
                 block_recurrences=t.block_recurrences,
                 dossier=dossier,
+                created_by=t.created_by,
             )
         )
     return BoardSnapshot(tasks=tuple(views))
+
+
+def discovery_recommended(snapshot: BoardSnapshot) -> tuple[bool, str]:
+    """Pure: should the orchestrator read the project for new work?
+
+    Yes only when the board has nothing to route: no open work, no blocked
+    lane the orchestrator could reopen, and no discovery candidates already
+    waiting on a decision (re-sweeping while a list sits unanswered only
+    piles up more of the same).
+    """
+    open_work = [t for t in snapshot.tasks if t.status in OPEN_STATUSES]
+    if open_work:
+        return False, f"board has {len(open_work)} open task(s)"
+    reopenable = [
+        t for t in snapshot.tasks
+        if t.status == "blocked"
+        and t.block_kind != AUTO_RESUMING_BLOCK_KIND
+        and t.block_kind not in HUMAN_GATED_BLOCK_KINDS
+    ]
+    if reopenable:
+        return False, f"{len(reopenable)} blocked lane(s) can be reopened"
+    pending = [t for t in snapshot.tasks if t.is_candidate]
+    if pending:
+        return False, f"{len(pending)} discovery candidate(s) await acceptance"
+    return True, "no open work on the board"
 
 
 def summarize_board(conn, board: Optional[str] = None) -> dict[str, Any]:
@@ -123,11 +168,14 @@ def summarize_board(conn, board: Optional[str] = None) -> dict[str, Any]:
     counts: dict[str, int] = {}
     frontier: list[str] = []
     blocked: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for t in snap.tasks:
         counts[t.status] = counts.get(t.status, 0) + 1
         if t.status in IN_FLIGHT_STATUSES:
             frontier.append(t.id)
-        if t.status == "blocked":
+        if t.is_candidate:
+            candidates.append({"id": t.id, "title": t.title})
+        elif t.status == "blocked":
             blocked.append(
                 {
                     "id": t.id,
@@ -143,6 +191,7 @@ def summarize_board(conn, board: Optional[str] = None) -> dict[str, Any]:
         "in_flight": snap.in_flight,
         "frontier": frontier,
         "blocked": blocked,
+        "candidates": candidates,
     }
 
 
@@ -169,6 +218,7 @@ def run_cycle(
             conn, tid, note="orchestrator: attempt budget exhausted"
         ):
             retired.append(tid)
+    recommended, why = discovery_recommended(snapshot_board(conn, board))
     return {
         "dossier": summarize_board(conn, board),
         "actions": {
@@ -180,6 +230,10 @@ def run_cycle(
             "max_concurrent_workers": envelope.max_concurrent_workers,
             "max_attempts": envelope.max_attempts,
         },
+        # The read-first step: when nothing is left to route, the CLI runs a
+        # read-only discovery sweep (``hermes_cli.kanban_discovery``) unless
+        # told not to, and parks the candidates for a human to accept.
+        "discovery": {"recommended": recommended, "reason": why},
     }
 
 

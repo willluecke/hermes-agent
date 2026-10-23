@@ -6955,6 +6955,73 @@ def retire_to_triage(
     return True
 
 
+def park_candidate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    kind: str = "needs_input",
+) -> bool:
+    """Type a freshly created ``blocked`` task as waiting on a human decision.
+
+    Used by the discovery sweep (``hermes_cli.kanban_discovery``): a candidate
+    is created directly in ``blocked`` and stamped ``needs_input`` so the
+    dispatcher never spawns it, the auto-decomposer (triage only) never fans
+    it out, and the orchestrator never reopens it. The event written here is a
+    real ``blocked`` event: :func:`recompute_ready` auto-promotes a blocked
+    task with no parents unless its latest block event is sticky, and a parked
+    candidate must stay parked until a person decides. Only acts on a
+    ``blocked`` task; returns False otherwise (for example when
+    ``create_task`` returned an existing task for an idempotency key).
+    """
+    if kind not in VALID_BLOCK_KINDS:
+        raise ValueError(
+            f"block kind must be one of {sorted(VALID_BLOCK_KINDS)}"
+        )
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET block_kind = ? WHERE id = ? AND status = 'blocked'",
+            (kind, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "blocked",
+            {"reason": reason, "kind": kind, "candidate": True},
+        )
+    return True
+
+
+def accept_candidate(
+    conn: sqlite3.Connection, task_id: str, *, note: Optional[str] = None
+) -> bool:
+    """A human accepted a parked candidate: ``blocked``/``needs_input`` → ``triage``.
+
+    From ``triage`` the normal pipeline (specify / decompose / dispatch) takes
+    over under its own gating. The block kind is cleared so the task's later
+    history reads cleanly. Only acts on a ``needs_input``-blocked task.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'triage',
+                   block_kind    = NULL,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status = 'blocked'
+               AND block_kind = 'needs_input'
+            """,
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "candidate_accepted", {"note": note})
+    return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 

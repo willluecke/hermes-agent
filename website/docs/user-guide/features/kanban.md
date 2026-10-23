@@ -557,6 +557,27 @@ The orchestrator guidance ships in the worker's system prompt automatically — 
 
 For best results, pair it with a profile whose toolsets are restricted to board operations (`kanban`, `gateway`, `memory`) so the orchestrator literally cannot execute implementation tasks even if it tries.
 
+## Discovery sweep: the orchestrator reads first, you pick
+
+`hermes kanban orchestrate <board>` is the per-project orchestrator's wake cycle. It reopens blocked lanes that left a forward dossier and retires lanes that exhausted their attempt budget. When the board has **nothing left to route** it does not stop at "no work": it reads the project first.
+
+```bash
+hermes kanban boards set-default-workdir myproject ~/code/myproject   # once: which repo to read
+hermes kanban orchestrate myproject                                    # routing cycle, then a read-only sweep if the board is empty
+hermes kanban candidates                                               # the ranked list, any time
+hermes kanban accept t_1a2b3c t_4d5e6f                                 # into triage -> specify/decompose/dispatch as usual
+hermes kanban reject t_7g8h9i "already handled in the v2 rewrite"      # archived; never re-proposed
+```
+
+What the sweep does:
+
+1. **Read only.** Three `hermes chat` runs with the `read_only` toolset (file reads and searches, no terminal, no writes) sweep the board's default workdir from three angles: half-built features, promises vs reality (docs and UI copy against the code), and reliability/test gaps. Titles already on the board, archived ones included, are given to each sweep as exclusions.
+2. **Assemble.** The per-angle findings are merged (same problem under different wording, or the same `file:line` evidence, folds into one), ranked by confidence, how many angles found it, and evidence, and capped (`--max-candidates`, default 14).
+3. **Park, don't dispatch.** Each candidate becomes a task created directly in `blocked` with kind `needs_input` and `created_by: discovery-sweep`. That column is invisible to the dispatcher (it spawns only `ready`) and to the auto-decomposer (it fans out only `triage`), and the orchestrator never reopens a `needs_input` block. Nothing runs until you say so.
+4. **You pick.** `accept` moves a candidate to `triage`, where the normal pipeline takes over under its own gating. `reject` archives it with your reason, and a later sweep will not propose it again. The sweep is not re-run while candidates are still waiting on you; `--discover` forces one anyway, `--no-discover` suppresses one.
+
+The orchestrate output (one JSON document on stdout) carries the sweep report under `discovery`; the human-readable candidate table goes to stderr. Candidates are **unverified**: each body carries the sweep's confidence, impact, evidence references, and angle, and is a lead to confirm, not a verified bug.
+
 ## Dashboard (GUI)
 
 The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard).

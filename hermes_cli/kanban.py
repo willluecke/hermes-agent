@@ -709,6 +709,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Managed turn cap: 1, 6, or 12.",
     )
     p_orch.add_argument(
+        "--discover", dest="discover", action="store_true",
+        help="Run the read-only discovery sweep even if the board has open work.",
+    )
+    p_orch.add_argument(
+        "--no-discover", dest="no_discover", action="store_true",
+        help="Skip the discovery sweep the cycle would otherwise run on an "
+             "empty board.",
+    )
+    p_orch.add_argument(
+        "--project-root", dest="project_root", default=None,
+        help="Repository to sweep (default: the board's default workdir).",
+    )
+    p_orch.add_argument(
+        "--max-candidates", dest="max_candidates", type=int, default=None,
+        help="Cap on candidates parked per sweep (default 14).",
+    )
+    p_orch.add_argument(
+        "--sweep-timeout", dest="sweep_timeout", type=int, default=None,
+        help="Seconds allowed per sweep angle (default 1200).",
+    )
+    p_orch.add_argument(
         "--work-class", dest="work_class", default=None,
         help="core (requires a frontier model) or peripheral.",
     )
@@ -806,6 +827,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="store_true",
         help="Emit machine-readable JSON result",
     )
+
+    # --- discovery candidates: list / accept / reject ---
+    sub.add_parser(
+        "candidates",
+        help="List discovery candidates parked on the board awaiting acceptance",
+    )
+    p_accept = sub.add_parser(
+        "accept",
+        help="Accept discovery candidates: blocked/needs_input -> triage, where "
+             "the normal specify/decompose/dispatch pipeline takes over",
+    )
+    p_accept.add_argument("task_id")
+    p_accept.add_argument("reason", nargs="*", help="Optional note (recorded as a comment)")
+    p_accept.add_argument("--ids", nargs="+", default=None,
+                          help="Additional candidate ids to accept (bulk mode)")
+    p_reject = sub.add_parser(
+        "reject",
+        help="Reject discovery candidates: archived with your reason, and never "
+             "re-proposed by a later sweep",
+    )
+    p_reject.add_argument("task_id")
+    p_reject.add_argument("reason", nargs="*", help="Why (recorded as a comment)")
+    p_reject.add_argument("--ids", nargs="+", default=None,
+                          help="Additional candidate ids to reject (bulk mode)")
 
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
@@ -1206,6 +1251,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "orchestrate": _cmd_orchestrate,
+            "candidates": _cmd_candidates,
+            "accept":   _cmd_accept,
+            "reject":   _cmd_reject,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -1285,6 +1333,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "specify",
     "decompose",
     "gc",
+    "accept",
+    "reject",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -2460,8 +2510,120 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
         return 0
     with kb.connect_closing(board=board) as conn:
         result = orch.run_cycle(conn, board=board, envelope=envelope)
+    _maybe_discover(args, board, result)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def _maybe_discover(args: argparse.Namespace, board: Optional[str], result: dict) -> None:
+    """The read-first step of an orchestrate cycle.
+
+    On a board with nothing to route the orchestrator does not report "no
+    work": it sweeps the project read-only, parks what it finds as candidates
+    awaiting acceptance, and prints the list. ``--discover`` forces a sweep,
+    ``--no-discover`` suppresses one. The sweep report lands under
+    ``result["discovery"]``; the human-readable table goes to stderr so stdout
+    stays one JSON document.
+    """
+    from hermes_cli import kanban_discovery as disc
+
+    info = result.setdefault("discovery", {})
+    forced = bool(getattr(args, "discover", False))
+    if getattr(args, "no_discover", False):
+        info["ran"] = False
+        info["skipped"] = "--no-discover"
+        return
+    if not forced and not info.get("recommended"):
+        info["ran"] = False
+        return
+    slug = board or kb.get_current_board()
+    root = getattr(args, "project_root", None)
+    if not root:
+        root = kb.read_board_metadata(slug).get("default_workdir")
+    if not root:
+        info["ran"] = False
+        info["skipped"] = "no project root"
+        print(
+            f"kanban orchestrate: board {slug!r} has no default workdir to sweep; "
+            f"set one with `hermes kanban boards set-default-workdir {slug} <path>` "
+            "or pass --project-root",
+            file=sys.stderr,
+        )
+        return
+    kwargs: dict[str, Any] = {}
+    if getattr(args, "max_candidates", None):
+        kwargs["max_candidates"] = int(args.max_candidates)
+    if getattr(args, "sweep_timeout", None):
+        kwargs["timeout"] = int(args.sweep_timeout)
+    try:
+        with kb.connect_closing(board=board) as conn:
+            report = disc.discover(
+                conn, board=slug, project_root=root,
+                log=lambda m: print(m, file=sys.stderr), **kwargs,
+            )
+    except ValueError as exc:
+        info["ran"] = False
+        info["error"] = str(exc)
+        print(f"kanban orchestrate: discovery failed: {exc}", file=sys.stderr)
+        return
+    info["ran"] = True
+    info.update(report)
+    with kb.connect_closing(board=board) as conn:
+        rows = disc.list_candidates(conn)
+    print(disc.format_candidates(rows, board=slug), file=sys.stderr)
+
+
+def _cmd_candidates(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_discovery as disc
+
+    with kb.connect_closing() as conn:
+        rows = disc.list_candidates(conn)
+    print(disc.format_candidates(rows, board=kb.get_current_board()))
+    return 0
+
+
+def _cmd_accept(args: argparse.Namespace) -> int:
+    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    note = " ".join(args.reason).strip() if getattr(args, "reason", None) else None
+    author = _profile_author()
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if not kb.accept_candidate(conn, tid, note=note):
+                failed.append(tid)
+                print(
+                    f"cannot accept {tid} (not a parked candidate: must be "
+                    "blocked with kind needs_input)",
+                    file=sys.stderr,
+                )
+                continue
+            kb.add_comment(conn, tid, author, "ACCEPT: " + (note or "accepted into triage"))
+            print(f"Accepted {tid} -> triage" + (f": {note}" if note else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_reject(args: argparse.Namespace) -> int:
+    ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    reason = " ".join(args.reason).strip() if getattr(args, "reason", None) else ""
+    if not reason:
+        print("reject needs a reason, so the next sweep knows why", file=sys.stderr)
+        return 2
+    author = _profile_author()
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            task = kb.get_task(conn, tid)
+            if task is None or task.status != "blocked" or task.block_kind != "needs_input":
+                failed.append(tid)
+                print(f"cannot reject {tid} (not a parked candidate)", file=sys.stderr)
+                continue
+            kb.add_comment(conn, tid, author, f"REJECT: {reason}")
+            if not kb.archive_task(conn, tid):
+                failed.append(tid)
+                print(f"cannot archive {tid}", file=sys.stderr)
+                continue
+            print(f"Rejected {tid}: {reason}")
+    return 0 if not failed else 1
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
