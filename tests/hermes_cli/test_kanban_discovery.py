@@ -368,11 +368,16 @@ def test_cli_orchestrate_runs_discovery_on_an_empty_board(kanban_home: Path, tmp
     # a second cycle does not re-sweep: candidates are waiting on a decision,
     # and the report still comes back so the agent can show it again
     assert kc._cmd_orchestrate(_orch_ns(project_root=str(repo))) == 0
-    payload2 = json.loads(capsys.readouterr().out)
+    out2, err2 = capsys.readouterr()
+    payload2 = json.loads(out2)
     assert payload2["discovery"]["ran"] is False
     assert "await acceptance" in payload2["discovery"]["reason"]
     assert payload2["discovery"]["waiting"] == 1
     assert f"- {tid} Sync has no timeout." in payload2["discovery"]["report_markdown"]
+    assert payload2["discovery"]["relay"] == disc.RELAY_INSTRUCTION
+    # stderr carries the same list in place of the old table, on this cycle too
+    assert f"- {tid} Sync has no timeout." in err2 and "relay the list below" in err2
+    assert "Discovery candidates awaiting acceptance" not in err + err2
 
 
 def test_cli_orchestrate_no_discover_and_missing_root(kanban_home: Path, capsys, monkeypatch):
