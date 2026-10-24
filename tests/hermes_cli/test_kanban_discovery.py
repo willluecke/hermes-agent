@@ -357,14 +357,22 @@ def test_cli_orchestrate_runs_discovery_on_an_empty_board(kanban_home: Path, tmp
     assert payload["discovery"]["recommended"] is True
     assert [c["title"] for c in payload["discovery"]["candidates"]] == ["Sync has no timeout"], payload["discovery"]
     assert len(payload["discovery"]["posted"]) == 1
-    assert "awaiting acceptance" in err and "hermes kanban accept" in err
+    tid = payload["discovery"]["posted"][0]
+    # the list the user reads: id-first bullets, relayed as written
+    report = payload["discovery"]["report_markdown"]
+    assert f"- {tid} Sync has no timeout." in report
+    assert payload["discovery"]["relay"] == disc.RELAY_INSTRUCTION
+    assert f"- {tid} Sync has no timeout." in err and "accept <id>" in err
     with kb.connect_closing() as conn:
         assert len(disc.list_candidates(conn)) == 1
-    # a second cycle does not re-sweep: candidates are waiting on a decision
+    # a second cycle does not re-sweep: candidates are waiting on a decision,
+    # and the report still comes back so the agent can show it again
     assert kc._cmd_orchestrate(_orch_ns(project_root=str(repo))) == 0
     payload2 = json.loads(capsys.readouterr().out)
     assert payload2["discovery"]["ran"] is False
     assert "await acceptance" in payload2["discovery"]["reason"]
+    assert payload2["discovery"]["waiting"] == 1
+    assert f"- {tid} Sync has no timeout." in payload2["discovery"]["report_markdown"]
 
 
 def test_cli_orchestrate_no_discover_and_missing_root(kanban_home: Path, capsys, monkeypatch):
@@ -514,3 +522,83 @@ def test_parser_wires_focus():
     args = parser.parse_args(["kanban", "orchestrate", "proj", "--focus", "get paid file sales live"])
     assert args.focus == "get paid file sales live"
     assert parser.parse_args(["kanban", "orchestrate", "proj"]).focus is None
+
+
+# ---------------------------------------------------------------------------
+# The report the user reads (2026-10-24: every orchestrator report reads like
+# the 3dcarparts one, id first, so Hermes Chat can put a note under each line)
+# ---------------------------------------------------------------------------
+
+def test_markdown_report_is_id_first_grouped_by_angle_with_commands(kanban_home: Path):
+    with kb.connect_closing() as conn:
+        posted, _ = disc.post_candidates(conn, [
+            disc.Candidate(
+                title="Stripe finalizes paid webhooks after handoff failures",
+                impact="Paid orders can sit unfulfilled",
+                confidence="high", evidence=["a.ts:1"], angles=["reliability"],
+            ),
+            disc.Candidate(
+                title="Account deletion promised by the privacy policy does not exist",
+                impact="Settings only open a mailto link.",
+                confidence="high", evidence=["b.tsx:2"], angles=["promises", "half-built"],
+            ),
+            disc.Candidate(
+                title="Late webhooks erase refund state", confidence="medium",
+                evidence=["c.ts:3"], angles=["reliability"],
+            ),
+        ], source="t")
+        text = disc.format_candidates_markdown(disc.list_candidates(conn), board="proj")
+    stripe, deletion, late = posted
+    lines = text.splitlines()
+    assert lines[0].startswith("The read-first sweep has 3 candidates waiting on proj.")
+    # grouped under the angle titles, strongest group first, rank order inside
+    assert lines.index("**Reliability and test gaps**") < lines.index("**Promises vs reality**")
+    assert (
+        f"- {stripe} Stripe finalizes paid webhooks after handoff failures. "
+        "Paid orders can sit unfulfilled." in lines
+    )
+    assert lines.index(f"- {late} Late webhooks erase refund state.") < lines.index("**Promises vs reality**")
+    assert (
+        f"- {deletion} Account deletion promised by the privacy policy does not exist. "
+        "Settings only open a mailto link. Found by two angles." in lines
+    )
+    # every candidate line starts with its id; commands are board-scoped
+    bullets = [line for line in lines if line.startswith("- ")]
+    assert [b.split()[1] for b in bullets] == [stripe, late, deletion]
+    assert "hermes kanban --board proj accept <id> [--ids <id> ...]" in lines
+    assert "hermes kanban --board proj reject <id> <reason>" in lines
+
+
+def test_markdown_report_mentions_cap_and_failed_angles_and_handles_empty():
+    rows = [{"id": "t_00000001", "title": "One", "impact": "", "angles": ["half-built"]}]
+    text = disc.format_candidates_markdown(
+        rows, board="b",
+        report={"dropped_over_cap": 7, "errors": {"promises": "timed out"}},
+    )
+    assert "7 more fell over the cap" in text
+    assert "These angles failed and found nothing: Promises vs reality." in text
+    assert "- t_00000001 One." in text
+    assert disc.format_candidates_markdown([], board="b") == "No discovery candidates are waiting on b."
+
+
+def test_cli_candidates_prints_the_markdown_report(kanban_home: Path, capsys):
+    from hermes_cli import kanban as kc
+
+    with kb.connect_closing() as conn:
+        (tid,), _ = disc.post_candidates(conn, [_cand("Keep me", "high")], source="t")
+    assert kc._cmd_candidates(argparse.Namespace()) == 0
+    assert f"- {tid} Keep me." in capsys.readouterr().out
+
+
+def test_read_first_step_reports_waiting_candidates_without_sweeping(kanban_home: Path, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.kanban_discovery.hermes_chat_runner",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    with kb.connect_closing() as conn:
+        (tid,), _ = disc.post_candidates(conn, [_cand("Waiting already")], source="t")
+    info = disc.read_first_step(board=None, recommended=False)
+    assert info["ran"] is False and info["waiting"] == 1
+    assert f"- {tid} Waiting already." in info["report_markdown"]
+    skipped = disc.read_first_step(board=None, recommended=True, skip=True)
+    assert skipped["skipped"] == "--no-discover" and skipped["waiting"] == 1

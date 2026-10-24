@@ -565,7 +565,7 @@ For best results, pair it with a profile whose toolsets are restricted to board 
 hermes kanban boards set-default-workdir myproject ~/code/myproject   # once: which repo to read
 hermes kanban orchestrate myproject                                    # routing cycle, then a read-only sweep if the board is empty
 hermes kanban candidates                                               # the ranked list, any time
-hermes kanban accept t_1a2b3c t_4d5e6f                                 # into triage -> specify/decompose/dispatch as usual
+hermes kanban accept t_1a2b3c --ids t_4d5e6f                           # into triage -> specify/decompose/dispatch as usual
 hermes kanban reject t_7g8h9i "already handled in the v2 rewrite"      # archived; never re-proposed
 ```
 
@@ -576,7 +576,7 @@ What the sweep does:
 3. **Park, don't dispatch.** Each candidate becomes a task created directly in `blocked` with kind `needs_input` and `created_by: discovery-sweep`. That column is invisible to the dispatcher (it spawns only `ready`) and to the auto-decomposer (it fans out only `triage`), and the orchestrator never reopens a `needs_input` block. Nothing runs until you say so.
 4. **You pick.** `accept` moves a candidate to `triage`, where the normal pipeline takes over under its own gating. `reject` archives it with your reason, and a later sweep will not propose it again. The sweep is not re-run while candidates are still waiting on you; `--discover` forces one anyway, `--no-discover` suppresses one.
 
-The orchestrate output (one JSON document on stdout) carries the sweep report under `discovery`; the human-readable candidate table goes to stderr. Candidates are **unverified**: each body carries the sweep's confidence, impact, evidence references, and angle, and is a lead to confirm, not a verified bug.
+The orchestrate output (one JSON document on stdout) carries the sweep report under `discovery`. Whenever candidates are waiting it also carries `discovery.report_markdown`, the list the user reads: grouped by the angle that found each candidate, one bullet per candidate starting with its task id, then the board-scoped accept and reject commands. The same markdown goes to stderr, and `discovery.relay` tells an agent to show it as written, because Hermes Chat puts a note field under every line that starts with a task id. The `kanban_orchestrate` agent tool runs the same read-first step and returns the same fields (`discover`, `focus` and `project_root` mirror the CLI flags). Candidates are **unverified**: each body carries the sweep's confidence, impact, evidence references, and angle, and is a lead to confirm, not a verified bug.
 
 ## Dashboard (GUI)
 

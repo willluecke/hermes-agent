@@ -949,6 +949,24 @@ def _handle_orchestrate(args: dict, **kw) -> str:
             )
         else:
             result = orch.run_cycle(conn, board=board, envelope=envelope)
+            # The read-first step, exactly as `hermes kanban orchestrate`
+            # runs it: sweep a board with nothing to route, park candidates,
+            # and hand back the id-first report the user should read.
+            from hermes_cli import kanban_discovery as disc
+
+            discover = args.get("discover")
+            focus = (args.get("focus") or "").strip() or None
+            info = result.setdefault("discovery", {})
+            info.update(disc.read_first_step(
+                board=board,
+                recommended=bool(info.get("recommended")),
+                force=discover is True or bool(focus),
+                skip=discover is False,
+                goal=focus,
+                project_root=args.get("project_root") or None,
+                max_candidates=args.get("max_candidates") or None,
+                log=logger.info,
+            ))
         return _ok(**result)
     except ValueError as e:
         return tool_error(f"kanban_orchestrate: {e}")
@@ -1985,8 +2003,17 @@ KANBAN_ORCHESTRATE_SCHEMA = {
         "does task work itself; the dispatcher spawns whatever it reopens. Set "
         "emit_dispatch=true to instead preview the Talos dispatch payloads this "
         "plan would emit (no routing change, no live send; sent is always false). "
-        "Use when asked to orchestrate a board or run a cycle, or after workers "
-        "block."
+        "Read first: when the board has nothing to route, the cycle sweeps the "
+        "board's default workdir read-only from three angles (this takes several "
+        "minutes) and parks the findings as candidates awaiting the user's "
+        "accept or reject; nothing dispatches until the user accepts. "
+        "discover=true forces a sweep, discover=false skips it, focus aims it at "
+        "one goal. Whenever candidates are waiting, the result carries "
+        "discovery.report_markdown: show it to the user exactly as written, "
+        "without rewording, regrouping or renumbering, because each candidate "
+        "line starts with its task id and that is what puts a note field under "
+        "it in Hermes Chat. Use when asked to orchestrate a board or run a "
+        "cycle, or after workers block."
     ),
     "parameters": {
         "type": "object",
@@ -2009,6 +2036,31 @@ KANBAN_ORCHESTRATE_SCHEMA = {
                     "Preview the Talos dispatch payloads instead of applying "
                     "routing. Never sends."
                 ),
+            },
+            "discover": {
+                "type": "boolean",
+                "description": (
+                    "Read-first sweep: true forces one, false skips it. Omit to "
+                    "sweep only when the board has nothing to route and no "
+                    "candidates already waiting."
+                ),
+            },
+            "focus": {
+                "type": "string",
+                "description": (
+                    "Aim the sweep at one goal (forces a sweep), e.g. "
+                    "'checkout reliability'."
+                ),
+            },
+            "project_root": {
+                "type": "string",
+                "description": (
+                    "Directory to sweep when the board has no default workdir."
+                ),
+            },
+            "max_candidates": {
+                "type": "integer",
+                "description": "Cap on candidates parked by a sweep. Default 14.",
             },
             "direction": {
                 "type": "string",

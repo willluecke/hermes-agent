@@ -1180,6 +1180,8 @@ def test_kanban_orchestrate_registered_and_in_toolset():
     assert "kanban_orchestrate" in toolsets.TOOLSETS["kanban"]["tools"]
     props = kt.KANBAN_ORCHESTRATE_SCHEMA["parameters"]["properties"]
     assert {"board", "max_concurrent", "max_attempts", "emit_dispatch"} <= set(props)
+    assert {"discover", "focus", "project_root", "max_candidates"} <= set(props)
+    assert "report_markdown" in kt.KANBAN_ORCHESTRATE_SCHEMA["description"]
 
 
 def test_kanban_orchestrate_runs_a_cycle(orch_home):
@@ -1211,3 +1213,48 @@ def test_kanban_orchestrate_emit_dispatch_changes_nothing(orch_home):
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
+
+
+
+def _sweep_runner(findings):
+    def run(prompt, project_root, timeout):
+        if "Angle: Reliability and test gaps" in prompt:
+            return json.dumps(findings)
+        return "[]"
+    return run
+
+
+def test_kanban_orchestrate_sweeps_an_empty_board_and_returns_the_report(orch_home, tmp_path, monkeypatch):
+    """The agent tool runs the read-first step the CLI runs, and hands back the
+    id-first report with the instruction to show it as written."""
+    from tools import kanban_tools as kt
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.kanban_discovery.hermes_chat_runner",
+        _sweep_runner([{"title": "Sync has no timeout", "confidence": "high",
+                        "impact": "Jobs hang forever", "evidence": ["sync.ts:160"]}]),
+    )
+    out = json.loads(kt._handle_orchestrate({"project_root": str(repo)}))
+    assert out["ok"] is True
+    disc_info = out["discovery"]
+    assert disc_info["ran"] is True and len(disc_info["posted"]) == 1
+    tid = disc_info["posted"][0]
+    assert f"- {tid} Sync has no timeout. Jobs hang forever." in disc_info["report_markdown"]
+    assert "as written" in disc_info["relay"]
+    # next cycle: no new sweep, the waiting list comes back
+    again = json.loads(kt._handle_orchestrate({"project_root": str(repo)}))
+    assert again["discovery"]["ran"] is False and again["discovery"]["waiting"] == 1
+    assert f"- {tid} " in again["discovery"]["report_markdown"]
+
+
+def test_kanban_orchestrate_discover_false_skips_the_sweep(orch_home, tmp_path, monkeypatch):
+    from tools import kanban_tools as kt
+    monkeypatch.setattr(
+        "hermes_cli.kanban_discovery.hermes_chat_runner",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    out = json.loads(kt._handle_orchestrate({"discover": False, "project_root": str(tmp_path)}))
+    assert out["ok"] is True
+    assert out["discovery"]["ran"] is False and out["discovery"]["skipped"] == "--no-discover"
+    assert "report_markdown" not in out["discovery"]

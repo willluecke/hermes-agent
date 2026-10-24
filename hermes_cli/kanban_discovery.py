@@ -543,6 +543,187 @@ def discover(
     }
 
 
+# ---------------------------------------------------------------------------
+# The report the user reads
+# ---------------------------------------------------------------------------
+
+#: What an agent relaying the sweep is told. Hermes Chat puts a note field
+#: under every line that starts with a task id, so a reworded list (ids moved
+#: into parentheses mid-line, say) loses that. Will, 2026-10-24: every
+#: orchestrator report should read like the 3dcarparts one.
+RELAY_INSTRUCTION = (
+    "Show report_markdown to the user as written. Do not reword, regroup, "
+    "renumber or reorder it: every candidate line starts with its task id, "
+    "which is what lets Hermes Chat put a note field under each one. Put any "
+    "remarks of your own before or after it, never inside it."
+)
+
+_ANGLE_TITLES = {a.key: a.title for a in ANGLES}
+_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five"}
+
+
+def _body_field(body: str, name: str) -> str:
+    m = re.search(rf"^{name}:\s*(.+)$", body or "", re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _sentence(text: str) -> str:
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    return text if text[-1] in ".!?" else text + "."
+
+
+def _candidate_entry(row) -> dict[str, Any]:
+    """id, title, impact and angles from a parked task row or a candidate dict."""
+    if isinstance(row, dict):
+        return {
+            "id": row.get("id") or "-",
+            "title": row.get("title") or "",
+            "impact": row.get("impact") or "",
+            "angles": [a for a in (row.get("angles") or []) if a],
+        }
+    body = row.body or ""
+    angles = [
+        a.strip() for a in _body_field(body, "angles").split(",")
+        if a.strip() and a.strip() != "-"
+    ]
+    return {
+        "id": row.id,
+        "title": row.title,
+        "impact": _body_field(body, "impact"),
+        "angles": angles,
+    }
+
+
+def format_candidates_markdown(
+    rows: Iterable,
+    *,
+    board: Optional[str] = None,
+    report: Optional[dict[str, Any]] = None,
+) -> str:
+    """The candidate report as the user should read it in chat.
+
+    One bullet per candidate, starting with its task id, then its title and
+    impact as sentences, grouped under the sweep angle that found it (the
+    strongest group first, ranked order within each), and a fenced block of
+    board-scoped accept/reject commands. ``report`` is the sweep report of a
+    sweep that just ran, if any: it adds what fell over the cap and which
+    angles failed.
+    """
+    entries = [_candidate_entry(r) for r in rows]
+    where = f" on {board}" if board else ""
+    if not entries:
+        return f"No discovery candidates are waiting{where}."
+    n = len(entries)
+    lead = (
+        f"The read-first sweep has {n} candidate{'s' if n != 1 else ''} "
+        f"waiting{where}. Nothing dispatches until you accept one. Each is a "
+        "lead backed by file-and-line evidence, not a verified bug."
+    )
+    if report:
+        dropped = int(report.get("dropped_over_cap") or 0)
+        if dropped:
+            lead += f" {dropped} more fell over the cap and were not posted."
+        failed = sorted((report.get("errors") or {}).keys())
+        if failed:
+            names = ", ".join(_ANGLE_TITLES.get(k, k) for k in failed)
+            lead += f" These angles failed and found nothing: {names}."
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        groups.setdefault(entry["angles"][0] if entry["angles"] else "", []).append(entry)
+    lines = [lead]
+    for key, group in groups.items():
+        heading = _ANGLE_TITLES.get(key) or (key.replace("-", " ").capitalize() if key else "Other")
+        lines += ["", f"**{heading}**", ""]
+        for entry in group:
+            text = _sentence(entry["title"])
+            if entry["impact"]:
+                text += " " + _sentence(entry["impact"])
+            if len(entry["angles"]) > 1:
+                count = len(entry["angles"])
+                text += f" Found by {_COUNT_WORDS.get(count, str(count))} angles."
+            lines.append(f"- {entry['id']} {text}")
+    flag = f"--board {board} " if board else ""
+    lines += [
+        "",
+        "Accept or reject by id. Accepted items enter triage and the normal pipeline; rejected ones are archived and never proposed again.",
+        "",
+        "```",
+        f"hermes kanban {flag}accept <id> [--ids <id> ...]",
+        f"hermes kanban {flag}reject <id> <reason>",
+        f"hermes kanban {flag}show <id>",
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def read_first_step(
+    *,
+    board: Optional[str],
+    recommended: bool,
+    force: bool = False,
+    skip: bool = False,
+    goal: Optional[str] = None,
+    project_root: Optional[str] = None,
+    max_candidates: Optional[int] = None,
+    timeout: Optional[int] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """The read-first step of an orchestrate cycle, shared by the CLI and the
+    ``kanban_orchestrate`` agent tool.
+
+    Sweeps when the cycle recommends it (nothing to route and no candidates
+    already waiting) or when ``force`` is set; ``skip`` suppresses it. Then,
+    whether or not it swept, whenever candidates are waiting it adds the
+    ready-to-relay ``report_markdown`` and the ``relay`` instruction. Returns
+    the keys to merge into ``result["discovery"]``.
+    """
+    log = log or (lambda _msg: None)
+    slug = board or kb.get_current_board()
+    info: dict[str, Any] = {}
+    report: Optional[dict[str, Any]] = None
+    if skip:
+        info.update(ran=False, skipped="--no-discover")
+    elif not force and not recommended:
+        info["ran"] = False
+    else:
+        root = project_root or kb.read_board_metadata(slug).get("default_workdir")
+        if not root:
+            info.update(
+                ran=False,
+                skipped="no project root",
+                hint=(
+                    f"board {slug!r} has no default workdir to sweep; set one with "
+                    f"`hermes kanban boards set-default-workdir {slug} <path>` "
+                    "or pass a project root"
+                ),
+            )
+        else:
+            kwargs: dict[str, Any] = {}
+            if max_candidates:
+                kwargs["max_candidates"] = int(max_candidates)
+            if timeout:
+                kwargs["timeout"] = int(timeout)
+            if goal:
+                kwargs["goal"] = goal
+            try:
+                with kb.connect_closing(board=board) as conn:
+                    report = discover(conn, board=slug, project_root=root, log=log, **kwargs)
+            except ValueError as exc:
+                info.update(ran=False, error=str(exc))
+            else:
+                info["ran"] = True
+                info.update(report)
+    with kb.connect_closing(board=board) as conn:
+        rows = list_candidates(conn)
+    info["waiting"] = len(rows)
+    if rows:
+        info["report_markdown"] = format_candidates_markdown(rows, board=slug, report=report)
+        info["relay"] = RELAY_INSTRUCTION
+    return info
+
+
 def format_candidates(rows: Iterable, *, board: Optional[str] = None) -> str:
     """Human-readable table of parked candidates (task rows or dicts)."""
     lines: list[str] = []

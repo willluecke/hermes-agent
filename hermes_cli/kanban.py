@@ -2525,61 +2525,42 @@ def _maybe_discover(args: argparse.Namespace, board: Optional[str], result: dict
 
     On a board with nothing to route the orchestrator does not report "no
     work": it sweeps the project read-only, parks what it finds as candidates
-    awaiting acceptance, and prints the list. ``--discover`` forces a sweep,
+    awaiting acceptance, and reports them. ``--discover`` forces a sweep,
     ``--no-discover`` suppresses one. The sweep report lands under
-    ``result["discovery"]``; the human-readable table goes to stderr so stdout
-    stays one JSON document.
+    ``result["discovery"]``; whenever candidates are waiting it also carries
+    ``report_markdown`` (the id-first list the user should read) and a
+    ``relay`` instruction, and the same markdown goes to stderr so stdout
+    stays one JSON document. The step itself is shared with the
+    ``kanban_orchestrate`` agent tool (``kanban_discovery.read_first_step``).
     """
     from hermes_cli import kanban_discovery as disc
 
     info = result.setdefault("discovery", {})
     goal = (getattr(args, "focus", None) or "").strip() or None
-    # A focus only means something for a sweep, so it forces one.
-    forced = bool(getattr(args, "discover", False)) or bool(goal)
-    if getattr(args, "no_discover", False):
-        info["ran"] = False
-        info["skipped"] = "--no-discover"
-        return
-    if not forced and not info.get("recommended"):
-        info["ran"] = False
-        return
-    slug = board or kb.get_current_board()
-    root = getattr(args, "project_root", None)
-    if not root:
-        root = kb.read_board_metadata(slug).get("default_workdir")
-    if not root:
-        info["ran"] = False
-        info["skipped"] = "no project root"
+    step = disc.read_first_step(
+        board=board,
+        recommended=bool(info.get("recommended")),
+        # A focus only means something for a sweep, so it forces one.
+        force=bool(getattr(args, "discover", False)) or bool(goal),
+        skip=bool(getattr(args, "no_discover", False)),
+        goal=goal,
+        project_root=getattr(args, "project_root", None),
+        max_candidates=getattr(args, "max_candidates", None),
+        timeout=getattr(args, "sweep_timeout", None),
+        log=lambda m: print(m, file=sys.stderr),
+    )
+    info.update(step)
+    if step.get("hint"):
+        print(f"kanban orchestrate: {step['hint']}", file=sys.stderr)
+    if step.get("error"):
+        print(f"kanban orchestrate: discovery failed: {step['error']}", file=sys.stderr)
+    if step.get("report_markdown"):
         print(
-            f"kanban orchestrate: board {slug!r} has no default workdir to sweep; "
-            f"set one with `hermes kanban boards set-default-workdir {slug} <path>` "
-            "or pass --project-root",
+            "kanban orchestrate: relay the list below to the user as written "
+            "(each candidate line starts with its task id):",
             file=sys.stderr,
         )
-        return
-    kwargs: dict[str, Any] = {}
-    if getattr(args, "max_candidates", None):
-        kwargs["max_candidates"] = int(args.max_candidates)
-    if getattr(args, "sweep_timeout", None):
-        kwargs["timeout"] = int(args.sweep_timeout)
-    if goal:
-        kwargs["goal"] = goal
-    try:
-        with kb.connect_closing(board=board) as conn:
-            report = disc.discover(
-                conn, board=slug, project_root=root,
-                log=lambda m: print(m, file=sys.stderr), **kwargs,
-            )
-    except ValueError as exc:
-        info["ran"] = False
-        info["error"] = str(exc)
-        print(f"kanban orchestrate: discovery failed: {exc}", file=sys.stderr)
-        return
-    info["ran"] = True
-    info.update(report)
-    with kb.connect_closing(board=board) as conn:
-        rows = disc.list_candidates(conn)
-    print(disc.format_candidates(rows, board=slug), file=sys.stderr)
+        print(step["report_markdown"], file=sys.stderr)
 
 
 def _cmd_candidates(args: argparse.Namespace) -> int:
@@ -2587,7 +2568,7 @@ def _cmd_candidates(args: argparse.Namespace) -> int:
 
     with kb.connect_closing() as conn:
         rows = disc.list_candidates(conn)
-    print(disc.format_candidates(rows, board=kb.get_current_board()))
+    print(disc.format_candidates_markdown(rows, board=kb.get_current_board()))
     return 0
 
 
