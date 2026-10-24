@@ -145,12 +145,32 @@ def build_sweep_prompt(
     known_titles: Iterable[str] = (),
     *,
     limit: int = PER_ANGLE_LIMIT,
+    goal: Optional[str] = None,
 ) -> str:
+    """One angle's read-only sweep prompt.
+
+    With a ``goal`` (``hermes kanban orchestrate --focus``), the sweep looks
+    only for what stands between the current code and that goal: missing or
+    half-built pieces it needs, promises around it the code does not keep,
+    and failures that would hurt it. Unrelated problems are left out.
+    """
     known = "\n".join(f"- {t}" for t in known_titles) or "- (none)"
+    if goal:
+        opening = (
+            "You are a read-only code auditor. Sweep the repository at "
+            f"{project_root} for everything that stands between the current "
+            f"code and this goal: {goal}\n\n"
+            "Report only problems and gaps that block, endanger or undermine "
+            "that goal. Ignore unrelated issues, however real.\n\n"
+        )
+    else:
+        opening = (
+            "You are a read-only code auditor. Sweep the repository at "
+            f"{project_root} and report candidate problems worth fixing.\n\n"
+        )
     return (
-        "You are a read-only code auditor. Sweep the repository at "
-        f"{project_root} and report candidate problems worth fixing.\n\n"
-        f"Angle: {angle.title}. Look for {angle.focus}\n\n"
+        opening
+        + f"Angle: {angle.title}. Look for {angle.focus}\n\n"
         "Rules:\n"
         "- Read only. Use search_files and read_file. You have no terminal "
         "and must not propose edits.\n"
@@ -448,8 +468,12 @@ def discover(
     timeout: int = DEFAULT_SWEEP_TIMEOUT,
     log: Optional[Callable[[str], None]] = None,
     parallel: bool = True,
+    goal: Optional[str] = None,
 ) -> dict[str, Any]:
     """Sweep ``project_root`` read-only and park the ranked candidates.
+
+    ``goal`` aims every angle at one outcome (see :func:`build_sweep_prompt`)
+    and is recorded in each candidate's source line.
 
     Returns the sweep report: what each angle produced, which angles failed,
     the ranked candidates (with the ids they were posted under), and what was
@@ -462,8 +486,12 @@ def discover(
     if not os.path.isdir(root):
         raise ValueError(f"project root is not a directory: {root}")
     known = known_titles(conn)
-    prompts = {a.key: build_sweep_prompt(a, root, known) for a in angles}
-    log(f"discovery: sweeping {root} read-only from {len(angles)} angle(s)")
+    goal = (goal or "").strip() or None
+    prompts = {a.key: build_sweep_prompt(a, root, known, goal=goal) for a in angles}
+    log(
+        f"discovery: sweeping {root} read-only from {len(angles)} angle(s)"
+        + (f" for: {goal}" if goal else "")
+    )
 
     def _one(angle: Angle) -> tuple[str, str, Optional[str]]:
         started = time.time()
@@ -494,6 +522,8 @@ def discover(
     dropped = max(0, len(merged) - max_candidates)
     merged = merged[:max_candidates]
     source = f"discovery sweep {time.strftime('%Y-%m-%d')} on {board}"
+    if goal:
+        source += f" for: {goal}"
     posted, skipped = post_candidates(conn, merged, source=source)
     log(
         f"discovery: {len(posted)} candidate(s) parked awaiting acceptance, "
@@ -502,6 +532,7 @@ def discover(
     return {
         "board": board,
         "project_root": root,
+        "goal": goal,
         "angles": [a.key for a in angles],
         "parsed": parsed,
         "errors": errors,

@@ -450,3 +450,67 @@ def test_parser_wires_discovery_flags_and_commands():
     args = parser.parse_args(["kanban", "reject", "t_1", "not", "now"])
     assert args.reason == ["not", "now"]
     assert parser.parse_args(["kanban", "candidates"]).kanban_action == "candidates"
+
+
+# ---------------------------------------------------------------------------
+# Focused sweeps (hermes kanban orchestrate --focus)
+# ---------------------------------------------------------------------------
+
+def test_prompt_aims_at_the_goal_only_when_one_is_given():
+    angle = disc.ANGLES[0]
+    plain = disc.build_sweep_prompt(angle, "/repo")
+    focused = disc.build_sweep_prompt(angle, "/repo", goal="get paid file sales live")
+    assert "get paid file sales live" not in plain
+    assert "report candidate problems worth fixing" in plain
+    assert "stands between the current code and this goal: get paid file sales live" in focused
+    assert "Ignore unrelated issues" in focused
+    # the angle, rules and output contract are unchanged
+    for text in (plain, focused):
+        assert f"Angle: {angle.title}." in text
+        assert "Return ONLY a JSON array" in text
+
+
+def test_discover_sends_the_goal_to_every_angle_and_records_it(kanban_home: Path, tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    seen: list = []
+    outputs = {"Half-built features": json.dumps([
+        {"title": "Buy button posts to a route that 404s", "confidence": "high", "evidence": ["buy.tsx:12"]},
+    ])}
+    with kb.connect_closing() as conn:
+        report = disc.discover(
+            conn, board="proj", project_root=str(repo), runner=_runner_for(outputs, seen),
+            parallel=False, goal="  get paid file sales live  ",
+        )
+        (row,) = disc.list_candidates(conn)
+    assert report["goal"] == "get paid file sales live"
+    assert len(seen) == len(disc.ANGLES)
+    assert all("this goal: get paid file sales live" in prompt for prompt, _, _ in seen)
+    assert "for: get paid file sales live" in row.body
+
+
+def test_cli_focus_forces_a_sweep_and_passes_the_goal(kanban_home: Path, tmp_path: Path, capsys, monkeypatch):
+    from hermes_cli import kanban as kc
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    seen: list = []
+    monkeypatch.setattr("hermes_cli.kanban_discovery.hermes_chat_runner", _runner_for({}, seen))
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="open work")  # a sweep would not be recommended
+    assert kc._cmd_orchestrate(_orch_ns(project_root=str(repo), focus="get paid file sales live")) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["discovery"]["ran"] is True
+    assert payload["discovery"]["goal"] == "get paid file sales live"
+    assert seen and all("get paid file sales live" in prompt for prompt, _, _ in seen)
+
+
+def test_parser_wires_focus():
+    from hermes_cli import kanban as kc
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, sub, _chat = build_top_level_parser()
+    kc.build_parser(sub)
+    args = parser.parse_args(["kanban", "orchestrate", "proj", "--focus", "get paid file sales live"])
+    assert args.focus == "get paid file sales live"
+    assert parser.parse_args(["kanban", "orchestrate", "proj"]).focus is None

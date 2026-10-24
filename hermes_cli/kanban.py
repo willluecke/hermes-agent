@@ -718,6 +718,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "empty board.",
     )
     p_orch.add_argument(
+        "--focus", dest="focus", default=None,
+        help="Aim the read-only discovery sweep at one goal, e.g. "
+             "\"get paid file sales live\". Forces a sweep.",
+    )
+    p_orch.add_argument(
         "--project-root", dest="project_root", default=None,
         help="Repository to sweep (default: the board's default workdir).",
     )
@@ -2528,7 +2533,9 @@ def _maybe_discover(args: argparse.Namespace, board: Optional[str], result: dict
     from hermes_cli import kanban_discovery as disc
 
     info = result.setdefault("discovery", {})
-    forced = bool(getattr(args, "discover", False))
+    goal = (getattr(args, "focus", None) or "").strip() or None
+    # A focus only means something for a sweep, so it forces one.
+    forced = bool(getattr(args, "discover", False)) or bool(goal)
     if getattr(args, "no_discover", False):
         info["ran"] = False
         info["skipped"] = "--no-discover"
@@ -2555,6 +2562,8 @@ def _maybe_discover(args: argparse.Namespace, board: Optional[str], result: dict
         kwargs["max_candidates"] = int(args.max_candidates)
     if getattr(args, "sweep_timeout", None):
         kwargs["timeout"] = int(args.sweep_timeout)
+    if goal:
+        kwargs["goal"] = goal
     try:
         with kb.connect_closing(board=board) as conn:
             report = disc.discover(
