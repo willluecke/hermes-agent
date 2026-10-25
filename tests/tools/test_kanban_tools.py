@@ -1258,3 +1258,29 @@ def test_kanban_orchestrate_discover_false_skips_the_sweep(orch_home, tmp_path, 
     assert out["ok"] is True
     assert out["discovery"]["ran"] is False and out["discovery"]["skipped"] == "--no-discover"
     assert "report_markdown" not in out["discovery"]
+
+
+
+def test_kanban_orchestrate_from_a_chat_backgrounds_the_sweep_unless_wait(orch_home, tmp_path, monkeypatch):
+    """From a Hermes Chat conversation the tool hands the sweep to the
+    background, where it posts its own list; wait=true runs it in the call."""
+    from tools import kanban_tools as kt
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "hermes-chat-c_tool")
+    spawned = []
+    monkeypatch.setattr("hermes_cli.kanban_discovery._spawn_detached",
+                        lambda argv, **kw: spawned.append(argv) or "process")
+    monkeypatch.setattr(
+        "hermes_cli.kanban_discovery.hermes_chat_runner",
+        _sweep_runner([{"title": "Sync has no timeout", "confidence": "high"}]),
+    )
+    out = json.loads(kt._handle_orchestrate({"project_root": str(repo)}))
+    assert out["discovery"]["background"] is True and out["discovery"]["started"] is True
+    assert out["discovery"]["delivers_to"] == "hermes-chat-c_tool" and len(spawned) == 1
+    import importlib
+    importlib.import_module("hermes_cli.kanban_discovery").sweep_marker_path("default").unlink()
+    waited = json.loads(kt._handle_orchestrate({"project_root": str(repo), "wait": True}))
+    assert waited["discovery"]["ran"] is True and len(spawned) == 1
+    assert "Sync has no timeout." in waited["discovery"]["report_markdown"]

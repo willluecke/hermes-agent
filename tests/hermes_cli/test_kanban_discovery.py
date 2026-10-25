@@ -326,7 +326,7 @@ def _orch_ns(**over):
     base = dict(
         board=None, board_positional=None, max_concurrent=4, max_attempts=3, once=True,
         emit_dispatch=False, discover=False, no_discover=False, project_root=None,
-        max_candidates=None, sweep_timeout=None,
+        max_candidates=None, sweep_timeout=None, wait=False,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -592,7 +592,10 @@ def test_cli_candidates_prints_the_markdown_report(kanban_home: Path, capsys):
     with kb.connect_closing() as conn:
         (tid,), _ = disc.post_candidates(conn, [_cand("Keep me", "high")], source="t")
     assert kc._cmd_candidates(argparse.Namespace()) == 0
-    assert f"- {tid} Keep me." in capsys.readouterr().out
+    out, err = capsys.readouterr()
+    assert f"- {tid} Keep me." in out
+    # whichever way an agent reads candidates, the instruction comes with them
+    assert "relay the list below to the user as written" in err
 
 
 def test_read_first_step_reports_waiting_candidates_without_sweeping(kanban_home: Path, monkeypatch):
@@ -607,3 +610,193 @@ def test_read_first_step_reports_waiting_candidates_without_sweeping(kanban_home
     assert f"- {tid} Waiting already." in info["report_markdown"]
     skipped = disc.read_first_step(board=None, recommended=True, skip=True)
     assert skipped["skipped"] == "--no-discover" and skipped["waiting"] == 1
+
+
+
+# ---------------------------------------------------------------------------
+# Background by default from a chat; the orchestrator posts its own list
+# (2026-10-25: a reg-watch agent read the sweep through a keyword filter and
+# reworded the list, so the note fields never appeared)
+# ---------------------------------------------------------------------------
+
+def _fresh():
+    """The live module: another test file can drop hermes_cli.* from
+    sys.modules, after which the ``disc`` alias above is a stale copy."""
+    import importlib
+
+    return importlib.import_module("hermes_cli.kanban_discovery")
+
+
+def test_chat_session_id_is_only_a_hermes_chat_conversation(monkeypatch):
+    d = _fresh()
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "hermes-chat-c_test")
+    assert d.chat_session_id() == "hermes-chat-c_test"
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "some-other-session")
+    assert d.chat_session_id() is None
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "hermes-chat-c_test")
+    assert d.chat_session_id() is None
+
+
+def test_post_report_writes_an_adoptable_assistant_row(kanban_home: Path):
+    import sqlite3
+
+    from hermes_state import LATE_ANSWER_DISPLAY_KIND, SessionDB
+
+    d = _fresh()
+    db = SessionDB()
+    # the conversation that launched the sweep always has a session row
+    db.create_session("hermes-chat-c_test", source="api_server")
+    pings: list = []
+    try:
+        row = d.post_report_to_session(
+            "hermes-chat-c_test", "- t_00000001 One.", board="b", db=db, ping=pings.append,
+        )
+        assert row
+        assert d.post_report_to_session("cli-session", "x", board="b", db=db, ping=pings.append) is None
+        assert d.post_report_to_session("hermes-chat-c_test", "  ", board="b", db=db, ping=pings.append) is None
+        path = db.db_path
+    finally:
+        db.close()
+    with sqlite3.connect(path) as conn:
+        role, content, kind, meta = conn.execute(
+            "SELECT role, content, display_kind, display_metadata FROM messages WHERE id = ?", (row,),
+        ).fetchone()
+    assert (role, content, kind) == ("assistant", "- t_00000001 One.", LATE_ANSWER_DISPLAY_KIND)
+    assert json.loads(meta)["source"] == "kanban_orchestrator"
+    assert pings == ["hermes-chat-c_test"]
+
+
+def test_report_leads_with_new_candidates_and_lists_earlier_ones_apart():
+    d = _fresh()
+    rows = [
+        {"id": "t_00000001", "title": "Older lead", "impact": "", "angles": ["promises"]},
+        {"id": "t_00000002", "title": "Trial cancel still charges", "impact": "Customers billed",
+         "angles": ["reliability"]},
+    ]
+    text = d.format_candidates_markdown(rows, board="b", new_ids=["t_00000002"], focus="trial billing")
+    lines = text.splitlines()
+    assert lines[0].startswith("The read-first sweep for: trial billing parked 1 new candidate on b.")
+    assert lines.index("- t_00000002 Trial cancel still charges. Customers billed.") \
+        < lines.index("**Still waiting from earlier sweeps**") \
+        < lines.index("- t_00000001 Older lead.")
+    nothing = d.format_candidates_markdown(rows[:1], board="b", new_ids=[], focus="x")
+    assert nothing.startswith("The read-first sweep for: x found nothing new on b.")
+
+
+def test_run_sweep_posts_its_report_to_the_conversation(kanban_home: Path, tmp_path: Path, monkeypatch):
+    d = _fresh()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(d, "hermes_chat_runner", _runner_for({"Reliability and test gaps": json.dumps([
+        {"title": "Trial cancel still charges", "confidence": "high", "impact": "Customers billed",
+         "evidence": ["billing.ts:12"]},
+    ])}))
+    with kb.connect_closing() as conn:
+        (older,), _ = d.post_candidates(conn, [_cand("Older lead")], source="t")
+    posted: dict = {}
+    monkeypatch.setattr(d, "post_report_to_session",
+                        lambda sid, text, **kw: posted.update(sid=sid, text=text, kw=kw) or 7)
+    info = d.run_sweep(board=None, goal="trial billing", project_root=str(repo),
+                       deliver_to="hermes-chat-c_test")
+    assert info["ran"] is True and info["delivered_row"] == 7
+    new = info["posted"][0]
+    assert posted["sid"] == "hermes-chat-c_test" and posted["text"] == info["report_markdown"]
+    assert posted["text"].index(f"- {new} Trial cancel still charges.") \
+        < posted["text"].index(f"- {older} Older lead.")
+    assert d.running_sweep("default") is None  # the marker is released
+
+
+def test_run_sweep_without_a_root_posts_a_failure_note(kanban_home: Path, monkeypatch):
+    d = _fresh()
+    posted: list = []
+    monkeypatch.setattr(d, "post_report_to_session",
+                        lambda sid, text, **kw: posted.append((sid, text, kw)) or 3)
+    info = d.run_sweep(board=None, deliver_to="hermes-chat-c_test")
+    assert info["ran"] is False and info["skipped"] == "no project root"
+    assert posted and "could not run" in posted[0][1] and posted[0][2]["ok"] is False
+
+
+def test_background_sweep_starts_detached_and_one_runs_per_board(kanban_home: Path, tmp_path: Path, monkeypatch):
+    d = _fresh()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    spawned: list = []
+    monkeypatch.setattr(d, "_spawn_detached", lambda argv, **kw: spawned.append((argv, kw)) or "process")
+    info = d.read_first_step(board=None, recommended=True, goal="billing", project_root=str(repo),
+                             background_session="hermes-chat-c_test")
+    assert info["background"] is True and info["started"] is True
+    assert info["delivers_to"] == "hermes-chat-c_test" and info["note"] == d.BACKGROUND_NOTE
+    assert "report_markdown" not in info  # the posted list is the one the user reads
+    argv, kw = spawned[0]
+    i = argv.index("sweep")
+    assert argv[i - 3:i] == ["kanban", "--board", "default"]
+    assert argv[i + 1:i + 4] == ["default", "--deliver-to", "hermes-chat-c_test"]
+    assert argv[argv.index("--focus") + 1] == "billing"
+    token = kw["env"]["HERMES_DISCOVERY_SWEEP_TOKEN"]
+    # a second call while that sweep is live does not start another
+    again = d.read_first_step(board=None, recommended=True, project_root=str(repo),
+                              background_session="hermes-chat-c_test")
+    assert again["running"] is True and len(spawned) == 1
+    # the detached child owns the marker through the shared token
+    monkeypatch.setenv("HERMES_DISCOVERY_SWEEP_TOKEN", token)
+    monkeypatch.setattr(d, "hermes_chat_runner", _runner_for({}))
+    monkeypatch.setattr(d, "post_report_to_session", lambda *a, **k: 1)
+    child = d.run_sweep(board=None, project_root=str(repo), deliver_to="hermes-chat-c_test")
+    assert child["ran"] is True and d.running_sweep("default") is None
+
+
+def test_background_sweep_needs_a_root_and_spawns_nothing_without_one(kanban_home: Path, monkeypatch):
+    d = _fresh()
+    monkeypatch.setattr(d, "_spawn_detached",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not spawn")))
+    info = d.read_first_step(board=None, recommended=True, background_session="hermes-chat-c_test")
+    assert info["skipped"] == "no project root"
+
+
+def test_cli_orchestrate_from_a_chat_backgrounds_the_sweep_unless_wait(kanban_home: Path, tmp_path: Path, capsys, monkeypatch):
+    from hermes_cli import kanban as kc
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "hermes-chat-c_test")
+    spawned: list = []
+    monkeypatch.setattr("hermes_cli.kanban_discovery._spawn_detached",
+                        lambda argv, **kw: spawned.append(argv) or "process")
+    monkeypatch.setattr("hermes_cli.kanban_discovery.hermes_chat_runner", _runner_for({
+        "Reliability and test gaps": json.dumps([{"title": "Sync has no timeout", "confidence": "high"}]),
+    }))
+    assert kc._cmd_orchestrate(_orch_ns(project_root=str(repo))) == 0
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert payload["discovery"]["background"] is True and len(spawned) == 1
+    assert payload["discovery"]["delivers_to"] == "hermes-chat-c_test"
+    assert "posts its candidate list to this conversation itself" in err
+    _fresh().sweep_marker_path("default").unlink()
+    # --wait runs it here and prints the list
+    assert kc._cmd_orchestrate(_orch_ns(project_root=str(repo), wait=True)) == 0
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert payload["discovery"]["ran"] is True and len(spawned) == 1
+    assert "Sync has no timeout." in payload["discovery"]["report_markdown"]
+
+
+def test_cli_sweep_command_runs_and_delivers(kanban_home: Path, tmp_path: Path, capsys, monkeypatch):
+    from hermes_cli import kanban as kc
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr("hermes_cli.kanban_discovery.hermes_chat_runner", _runner_for({
+        "Half-built features": json.dumps([{"title": "Export button does nothing", "confidence": "high"}]),
+    }))
+    delivered: list = []
+    monkeypatch.setattr("hermes_cli.kanban_discovery.post_report_to_session",
+                        lambda sid, text, **kw: delivered.append((sid, text)) or 5)
+    ns = argparse.Namespace(board=None, board_positional=None, focus=None, project_root=str(repo),
+                            max_candidates=None, sweep_timeout=None, deliver_to="hermes-chat-c_test")
+    assert kc._cmd_sweep(ns) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ran"] is True and payload["delivered_row"] == 5
+    assert delivered[0][0] == "hermes-chat-c_test" and "Export button does nothing." in delivered[0][1]

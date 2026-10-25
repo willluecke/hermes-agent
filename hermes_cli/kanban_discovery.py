@@ -596,31 +596,61 @@ def _candidate_entry(row) -> dict[str, Any]:
     }
 
 
+def _bullet(entry: dict[str, Any]) -> str:
+    text = _sentence(entry["title"])
+    if entry["impact"]:
+        text += " " + _sentence(entry["impact"])
+    if len(entry["angles"]) > 1:
+        count = len(entry["angles"])
+        text += f" Found by {_COUNT_WORDS.get(count, str(count))} angles."
+    return f"- {entry['id']} {text}"
+
+
 def format_candidates_markdown(
     rows: Iterable,
     *,
     board: Optional[str] = None,
     report: Optional[dict[str, Any]] = None,
+    new_ids: Optional[Iterable[str]] = None,
+    focus: Optional[str] = None,
 ) -> str:
     """The candidate report as the user should read it in chat.
 
     One bullet per candidate, starting with its task id, then its title and
     impact as sentences, grouped under the sweep angle that found it (the
     strongest group first, ranked order within each), and a fenced block of
-    board-scoped accept/reject commands. ``report`` is the sweep report of a
-    sweep that just ran, if any: it adds what fell over the cap and which
-    angles failed.
+    board-scoped accept/reject commands.
+
+    ``new_ids`` are the candidates a sweep just parked: they lead, and every
+    other waiting candidate is listed after them under "Still waiting from
+    earlier sweeps". ``focus`` is that sweep's goal. ``report`` is its sweep
+    report: it adds what fell over the cap and which angles failed.
     """
     entries = [_candidate_entry(r) for r in rows]
     where = f" on {board}" if board else ""
-    if not entries:
-        return f"No discovery candidates are waiting{where}."
-    n = len(entries)
-    lead = (
-        f"The read-first sweep has {n} candidate{'s' if n != 1 else ''} "
-        f"waiting{where}. Nothing dispatches until you accept one. Each is a "
-        "lead backed by file-and-line evidence, not a verified bug."
+    caveat = (
+        " Nothing dispatches until you accept one. Each is a lead backed by "
+        "file-and-line evidence, not a verified bug."
     )
+    if new_ids is None:
+        fresh, earlier = entries, []
+        if not entries:
+            return f"No discovery candidates are waiting{where}."
+        n = len(entries)
+        lead = f"The read-first sweep has {n} candidate{'s' if n != 1 else ''} waiting{where}." + caveat
+    else:
+        wanted = set(new_ids)
+        fresh = [e for e in entries if e["id"] in wanted]
+        earlier = [e for e in entries if e["id"] not in wanted]
+        n = len(fresh)
+        aim = f" for: {focus.strip()}" if focus and focus.strip() else ""
+        if n:
+            lead = (
+                f"The read-first sweep{aim} parked {n} new candidate"
+                f"{'s' if n != 1 else ''}{where}." + caveat
+            )
+        else:
+            lead = f"The read-first sweep{aim} found nothing new{where}."
     if report:
         dropped = int(report.get("dropped_over_cap") or 0)
         if dropped:
@@ -630,20 +660,18 @@ def format_candidates_markdown(
             names = ", ".join(_ANGLE_TITLES.get(k, k) for k in failed)
             lead += f" These angles failed and found nothing: {names}."
     groups: dict[str, list[dict[str, Any]]] = {}
-    for entry in entries:
+    for entry in fresh:
         groups.setdefault(entry["angles"][0] if entry["angles"] else "", []).append(entry)
     lines = [lead]
     for key, group in groups.items():
         heading = _ANGLE_TITLES.get(key) or (key.replace("-", " ").capitalize() if key else "Other")
         lines += ["", f"**{heading}**", ""]
-        for entry in group:
-            text = _sentence(entry["title"])
-            if entry["impact"]:
-                text += " " + _sentence(entry["impact"])
-            if len(entry["angles"]) > 1:
-                count = len(entry["angles"])
-                text += f" Found by {_COUNT_WORDS.get(count, str(count))} angles."
-            lines.append(f"- {entry['id']} {text}")
+        lines += [_bullet(entry) for entry in group]
+    if earlier:
+        lines += ["", "**Still waiting from earlier sweeps**", ""]
+        lines += [_bullet(entry) for entry in earlier]
+    if not entries:
+        return lines[0]
     flag = f"--board {board} " if board else ""
     lines += [
         "",
@@ -658,6 +686,356 @@ def format_candidates_markdown(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Delivery to the conversation that asked
+# ---------------------------------------------------------------------------
+
+#: Told to an agent whose sweep went to the background. The orchestrator
+#: posts the list itself, so what the user reads never depends on how the
+#: agent reads or rewords the output (reg-watch, 2026-10-25).
+BACKGROUND_NOTE = (
+    "The sweep is running in the background; it usually takes 5 to 10 "
+    "minutes. When it finishes, the orchestrator posts its candidate list to "
+    "this conversation itself, in the standard format with a note field "
+    "under each item. Tell the user it has started. Do not wait for it, poll "
+    "it, or restate the list when it arrives; if you comment on candidates, "
+    "refer to them by task id."
+)
+RUNNING_NOTE = (
+    "A sweep of this board is already running. Its list posts to the "
+    "conversation that started it when it finishes; do not start another."
+)
+REPORT_SOURCE = "kanban_orchestrator"
+SWEEP_GRACE_SECONDS = 600
+
+
+def chat_session_id() -> Optional[str]:
+    """The Hermes Chat session this process acts for, or None.
+
+    Set for gateway turns (context variables) and inherited by the shell of a
+    resident agent (environment), so both the agent tool and a CLI call made
+    from a chat know where to post.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    except Exception:
+        platform = os.environ.get("HERMES_SESSION_PLATFORM", "")
+        chat_id = os.environ.get("HERMES_SESSION_CHAT_ID", "")
+    chat_id = (chat_id or "").strip()
+    if platform == "api_server" and chat_id.startswith("hermes-chat-"):
+        return chat_id
+    return None
+
+
+def sync_store_ping(session_id: str) -> None:
+    """Tell Hermes Chat's sync store the session has a row to adopt. Best
+    effort: the store also sweeps on a timer."""
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    base = os.environ.get("HERMES_SYNC_URL", "http://127.0.0.1:8643").rstrip("/")
+    key_file = os.environ.get("HERMES_SYNC_KEY_FILE", "").strip()
+    try:
+        key = Path(key_file or Path.home() / ".hermes-api-key").read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if not key:
+        return
+    request = urllib.request.Request(
+        f"{base}/adoptable-messages/changed",
+        data=json.dumps({"sessionId": session_id}).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5.0) as response:  # noqa: S310
+            response.read()
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        pass
+
+
+def post_report_to_session(
+    session_id: Optional[str],
+    text: str,
+    *,
+    board: str,
+    ok: bool = True,
+    db: Any = None,
+    ping: Optional[Callable[[str], None]] = None,
+) -> Optional[int]:
+    """Post ``text`` into a Hermes Chat conversation as the orchestrator.
+
+    The row is an assistant late answer in the gateway's session store, the
+    same path an answer written after its turn takes, so Hermes Chat adopts
+    it into the conversation as its own message. Returns the row id, or None
+    when there is no chat session or the write fails.
+    """
+    text = (text or "").strip()
+    if not session_id or not session_id.startswith("hermes-chat-") or not text:
+        return None
+    try:
+        from hermes_state import LATE_ANSWER_DISPLAY_KIND, SessionDB
+
+        owned = db is None
+        store = db if db is not None else SessionDB()
+        try:
+            row_id = store.append_message(
+                session_id,
+                "assistant",
+                text,
+                finish_reason="stop",
+                display_kind=LATE_ANSWER_DISPLAY_KIND,
+                display_metadata={
+                    "source": REPORT_SOURCE,
+                    "origin": "discovery-sweep",
+                    "board": board,
+                    "complete": True,
+                    "is_error": not ok,
+                    "captured_at": time.time(),
+                },
+            )
+        finally:
+            if owned:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+    except Exception:
+        return None
+    (ping or sync_store_ping)(session_id)
+    return row_id
+
+
+# ---------------------------------------------------------------------------
+# One sweep at a time per board
+# ---------------------------------------------------------------------------
+
+def sweep_marker_path(board: str):
+    return kb.board_dir(board) / "discovery" / "running.json"
+
+
+def running_sweep(board: str) -> Optional[dict[str, Any]]:
+    """The live sweep of ``board``, or None. A marker past its deadline, or
+    whose process is gone, is stale."""
+    path = sweep_marker_path(board)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if time.time() > float(data.get("deadline") or 0):
+        return None
+    pid = data.get("pid")
+    if pid and kb._worker_pid_probe_trusted(data.get("pid_ns")) and not kb._pid_alive(int(pid)):
+        return None
+    return data
+
+
+def _write_marker(board: str, data: dict[str, Any]) -> None:
+    path = sweep_marker_path(board)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _clear_marker(board: str, token: str) -> None:
+    path = sweep_marker_path(board)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict) and data.get("token") == token:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _resolve_root(slug: str, project_root: Optional[str]) -> Optional[str]:
+    return project_root or kb.read_board_metadata(slug).get("default_workdir") or None
+
+
+def _no_root_hint(slug: str) -> str:
+    return (
+        f"board {slug!r} has no default workdir to sweep; set one with "
+        f"`hermes kanban boards set-default-workdir {slug} <path>` "
+        "or pass a project root"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Running a sweep: foreground, or detached with the report posted
+# ---------------------------------------------------------------------------
+
+def run_sweep(
+    *,
+    board: Optional[str],
+    goal: Optional[str] = None,
+    project_root: Optional[str] = None,
+    max_candidates: Optional[int] = None,
+    timeout: Optional[int] = None,
+    deliver_to: Optional[str] = None,
+    log: Optional[Callable[[str], None]] = None,
+    ping: Optional[Callable[[str], None]] = None,
+) -> dict[str, Any]:
+    """Sweep now, in this process, holding the board's sweep marker.
+
+    Returns the sweep info (the sweep report plus ``report_markdown`` and
+    ``relay``). With ``deliver_to`` the finished report, or a short failure
+    note, is also posted into that Hermes Chat session.
+    """
+    log = log or (lambda _msg: None)
+    slug = board or kb.get_current_board()
+    goal = (goal or "").strip() or None
+    token = os.environ.get("HERMES_DISCOVERY_SWEEP_TOKEN") or f"fg-{os.getpid()}-{time.time()}"
+    live = running_sweep(slug)
+    if live and live.get("token") != token:
+        return {"ran": False, "running": True, "since": live.get("started_at"),
+                "delivers_to": live.get("session"), "note": RUNNING_NOTE}
+    info: dict[str, Any] = {}
+
+    def _fail(reason: str, **extra: Any) -> dict[str, Any]:
+        info.update(ran=False, **extra)
+        if deliver_to:
+            note = f"The read-first sweep on {slug} could not run: {reason}."
+            info["delivered_row"] = post_report_to_session(
+                deliver_to, note, board=slug, ok=False, ping=ping,
+            )
+        return info
+
+    root = _resolve_root(slug, project_root)
+    if not root:
+        return _fail(_no_root_hint(slug), skipped="no project root", hint=_no_root_hint(slug))
+    budget = int(timeout or DEFAULT_SWEEP_TIMEOUT)
+    _write_marker(slug, {
+        "token": token, "pid": os.getpid(), "pid_ns": kb._pid_namespace_id(),
+        "started_at": time.time(), "deadline": time.time() + budget + SWEEP_GRACE_SECONDS,
+        "session": deliver_to, "focus": goal,
+    })
+    try:
+        kwargs: dict[str, Any] = {"timeout": budget}
+        if max_candidates:
+            kwargs["max_candidates"] = int(max_candidates)
+        if goal:
+            kwargs["goal"] = goal
+        try:
+            with kb.connect_closing(board=board) as conn:
+                report = discover(conn, board=slug, project_root=root, log=log, **kwargs)
+        except ValueError as exc:
+            return _fail(str(exc), error=str(exc))
+        except Exception as exc:  # a crashed sweep still tells the conversation
+            return _fail(f"{type(exc).__name__}: {exc}", error=str(exc))
+        info["ran"] = True
+        info.update(report)
+        with kb.connect_closing(board=board) as conn:
+            rows = list_candidates(conn)
+        info["waiting"] = len(rows)
+        info["report_markdown"] = format_candidates_markdown(
+            rows, board=slug, report=report, new_ids=report.get("posted") or [], focus=goal,
+        )
+        info["relay"] = RELAY_INSTRUCTION
+        if deliver_to:
+            info["delivered_row"] = post_report_to_session(
+                deliver_to, info["report_markdown"], board=slug, ping=ping,
+            )
+        return info
+    finally:
+        _clear_marker(slug, token)
+
+
+def _spawn_detached(argv: list[str], *, session: str, title: str, log_path, env: dict) -> str:
+    """Start ``argv`` outside this process's lifetime. Prefers ``hermes-bg``
+    (a systemd user unit registered to the conversation, which survives a
+    gateway restart and shows in Hermes Chat's background indicator), and
+    falls back to a detached process. Returns which launcher ran it."""
+    shell_cmd = ["/bin/sh", "-c", 'exec "$@" >>"$0" 2>&1', str(log_path)] + argv
+    home = env.get("HERMES_HOME")
+    if home:
+        shell_cmd = ["/usr/bin/env", f"HERMES_HOME={home}",
+                     f"HERMES_DISCOVERY_SWEEP_TOKEN={env['HERMES_DISCOVERY_SWEEP_TOKEN']}"] + shell_cmd
+    else:
+        shell_cmd = ["/usr/bin/env",
+                     f"HERMES_DISCOVERY_SWEEP_TOKEN={env['HERMES_DISCOVERY_SWEEP_TOKEN']}"] + shell_cmd
+    bg = shutil.which("hermes-bg")
+    if bg:
+        try:
+            done = subprocess.run(
+                [bg, "--session", session, "--title", title, "--"] + shell_cmd,
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            if done.returncode == 0:
+                return "hermes-bg"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    with open(log_path, "ab") as out:
+        subprocess.Popen(
+            argv, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return "process"
+
+
+def launch_background_sweep(
+    *,
+    board: Optional[str],
+    session: str,
+    goal: Optional[str] = None,
+    project_root: Optional[str] = None,
+    max_candidates: Optional[int] = None,
+    timeout: Optional[int] = None,
+) -> dict[str, Any]:
+    """Start ``hermes kanban sweep`` detached; it posts its report to
+    ``session`` when it finishes. Returns at once."""
+    slug = board or kb.get_current_board()
+    goal = (goal or "").strip() or None
+    live = running_sweep(slug)
+    if live:
+        return {"ran": False, "background": True, "running": True,
+                "since": live.get("started_at"), "delivers_to": live.get("session"),
+                "note": RUNNING_NOTE}
+    root = _resolve_root(slug, project_root)
+    if not root:
+        return {"ran": False, "skipped": "no project root", "hint": _no_root_hint(slug)}
+    budget = int(timeout or DEFAULT_SWEEP_TIMEOUT)
+    token = f"bg-{os.getpid()}-{time.time()}"
+    log_path = sweep_marker_path(slug).parent / f"sweep-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    argv = _hermes_argv() + [
+        "kanban", "--board", slug, "sweep", slug, "--deliver-to", session,
+        "--project-root", root, "--sweep-timeout", str(budget),
+    ]
+    if goal:
+        argv += ["--focus", goal]
+    if max_candidates:
+        argv += ["--max-candidates", str(int(max_candidates))]
+    # Claimed before the spawn, so a second call right behind this one sees
+    # the sweep; the child owns the marker through the shared token.
+    _write_marker(slug, {
+        "token": token, "pid": None, "started_at": time.time(),
+        "deadline": time.time() + budget + SWEEP_GRACE_SECONDS,
+        "session": session, "focus": goal, "log": str(log_path),
+    })
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_TASK", None)
+    env["HERMES_DISCOVERY_SWEEP_TOKEN"] = token
+    try:
+        launcher = _spawn_detached(
+            argv, session=session, title=f"Discovery sweep: {slug}", log_path=log_path, env=env,
+        )
+    except Exception as exc:
+        _clear_marker(slug, token)
+        return {"ran": False, "background": True, "started": False, "error": str(exc)}
+    return {
+        "ran": False, "background": True, "started": True, "launcher": launcher,
+        "delivers_to": session, "log": str(log_path), "focus": goal, "note": BACKGROUND_NOTE,
+    }
+
+
 def read_first_step(
     *,
     board: Optional[str],
@@ -669,57 +1047,54 @@ def read_first_step(
     max_candidates: Optional[int] = None,
     timeout: Optional[int] = None,
     log: Optional[Callable[[str], None]] = None,
+    background_session: Optional[str] = None,
 ) -> dict[str, Any]:
     """The read-first step of an orchestrate cycle, shared by the CLI and the
     ``kanban_orchestrate`` agent tool.
 
     Sweeps when the cycle recommends it (nothing to route and no candidates
-    already waiting) or when ``force`` is set; ``skip`` suppresses it. Then,
-    whether or not it swept, whenever candidates are waiting it adds the
-    ready-to-relay ``report_markdown`` and the ``relay`` instruction. Returns
-    the keys to merge into ``result["discovery"]``.
+    already waiting) or when ``force`` is set; ``skip`` suppresses it. With a
+    ``background_session`` (a Hermes Chat conversation) the sweep is started
+    detached and posts its own report there when it finishes; without one it
+    runs here. A board already being swept is not swept twice. Whenever the
+    step does not hand off to a background sweep and candidates are waiting,
+    the ready-to-relay ``report_markdown`` and the ``relay`` instruction are
+    included. Returns the keys to merge into ``result["discovery"]``.
     """
-    log = log or (lambda _msg: None)
     slug = board or kb.get_current_board()
     info: dict[str, Any] = {}
-    report: Optional[dict[str, Any]] = None
+    due = not skip and (force or recommended)
     if skip:
         info.update(ran=False, skipped="--no-discover")
-    elif not force and not recommended:
+    elif not due:
         info["ran"] = False
     else:
-        root = project_root or kb.read_board_metadata(slug).get("default_workdir")
-        if not root:
-            info.update(
-                ran=False,
-                skipped="no project root",
-                hint=(
-                    f"board {slug!r} has no default workdir to sweep; set one with "
-                    f"`hermes kanban boards set-default-workdir {slug} <path>` "
-                    "or pass a project root"
-                ),
+        live = running_sweep(slug)
+        if live:
+            info.update(ran=False, running=True, since=live.get("started_at"),
+                        delivers_to=live.get("session"), note=RUNNING_NOTE)
+        elif background_session:
+            launched = launch_background_sweep(
+                board=board, session=background_session, goal=goal,
+                project_root=project_root, max_candidates=max_candidates, timeout=timeout,
             )
+            info.update(launched)
+            if launched.get("started"):
+                # The posted report lists every waiting candidate; showing
+                # them now as well would only invite a second, reworded list.
+                return info
         else:
-            kwargs: dict[str, Any] = {}
-            if max_candidates:
-                kwargs["max_candidates"] = int(max_candidates)
-            if timeout:
-                kwargs["timeout"] = int(timeout)
-            if goal:
-                kwargs["goal"] = goal
-            try:
-                with kb.connect_closing(board=board) as conn:
-                    report = discover(conn, board=slug, project_root=root, log=log, **kwargs)
-            except ValueError as exc:
-                info.update(ran=False, error=str(exc))
-            else:
-                info["ran"] = True
-                info.update(report)
+            info.update(run_sweep(
+                board=board, goal=goal, project_root=project_root,
+                max_candidates=max_candidates, timeout=timeout, log=log,
+            ))
+            if info.get("report_markdown"):
+                return info
     with kb.connect_closing(board=board) as conn:
         rows = list_candidates(conn)
     info["waiting"] = len(rows)
     if rows:
-        info["report_markdown"] = format_candidates_markdown(rows, board=slug, report=report)
+        info["report_markdown"] = format_candidates_markdown(rows, board=slug)
         info["relay"] = RELAY_INSTRUCTION
     return info
 

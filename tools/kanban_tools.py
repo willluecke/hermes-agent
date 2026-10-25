@@ -966,6 +966,9 @@ def _handle_orchestrate(args: dict, **kw) -> str:
                 project_root=args.get("project_root") or None,
                 max_candidates=args.get("max_candidates") or None,
                 log=logger.info,
+                # From a Hermes Chat conversation the sweep runs detached and
+                # posts its own list there; wait=true runs it in this call.
+                background_session=None if args.get("wait") else disc.chat_session_id(),
             ))
         return _ok(**result)
     except ValueError as e:
@@ -2004,16 +2007,19 @@ KANBAN_ORCHESTRATE_SCHEMA = {
         "emit_dispatch=true to instead preview the Talos dispatch payloads this "
         "plan would emit (no routing change, no live send; sent is always false). "
         "Read first: when the board has nothing to route, the cycle sweeps the "
-        "board's default workdir read-only from three angles (this takes several "
-        "minutes) and parks the findings as candidates awaiting the user's "
-        "accept or reject; nothing dispatches until the user accepts. "
-        "discover=true forces a sweep, discover=false skips it, focus aims it at "
-        "one goal. Whenever candidates are waiting, the result carries "
-        "discovery.report_markdown: show it to the user exactly as written, "
-        "without rewording, regrouping or renumbering, because each candidate "
-        "line starts with its task id and that is what puts a note field under "
-        "it in Hermes Chat. Use when asked to orchestrate a board or run a "
-        "cycle, or after workers block."
+        "board's default workdir read-only from three angles and parks the "
+        "findings as candidates awaiting the user's accept or reject; nothing "
+        "dispatches until the user accepts. discover=true forces a sweep, "
+        "discover=false skips it, focus aims it at one goal. From a Hermes Chat "
+        "conversation the sweep runs in the background (5 to 10 minutes) and "
+        "posts its candidate list into the conversation itself when it "
+        "finishes: tell the user it started, and do not wait, poll, or restate "
+        "the list. wait=true runs it inside this call instead. When the result "
+        "carries discovery.report_markdown, show it exactly as written, without "
+        "rewording, regrouping or renumbering, because each candidate line "
+        "starts with its task id and that is what puts a note field under it in "
+        "Hermes Chat. Use when asked to orchestrate a board or run a cycle, or "
+        "after workers block."
     ),
     "parameters": {
         "type": "object",
@@ -2061,6 +2067,14 @@ KANBAN_ORCHESTRATE_SCHEMA = {
             "max_candidates": {
                 "type": "integer",
                 "description": "Cap on candidates parked by a sweep. Default 14.",
+            },
+            "wait": {
+                "type": "boolean",
+                "description": (
+                    "Run a due sweep inside this call (several minutes) instead "
+                    "of in the background with the list posted to the "
+                    "conversation."
+                ),
             },
             "direction": {
                 "type": "string",

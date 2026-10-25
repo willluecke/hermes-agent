@@ -738,6 +738,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--work-class", dest="work_class", default=None,
         help="core (requires a frontier model) or peripheral.",
     )
+    p_orch.add_argument(
+        "--wait", dest="wait", action="store_true",
+        help="Run a due sweep in the foreground and print its list. By default "
+             "a sweep started from a Hermes Chat conversation runs in the "
+             "background and posts its list to that conversation itself.",
+    )
+
+    p_sweep = sub.add_parser(
+        "sweep",
+        help="Run the read-only discovery sweep now and park its candidates "
+             "(what orchestrate runs on an empty board)",
+    )
+    p_sweep.add_argument(
+        "board_positional", nargs="?", metavar="board", default=None,
+        help="Board slug. Defaults to the current board.",
+    )
+    p_sweep.add_argument("--focus", dest="focus", default=None,
+                         help="Aim the sweep at one goal.")
+    p_sweep.add_argument("--project-root", dest="project_root", default=None,
+                         help="Repository to sweep (default: the board's default workdir).")
+    p_sweep.add_argument("--max-candidates", dest="max_candidates", type=int, default=None,
+                         help="Cap on candidates parked (default 14).")
+    p_sweep.add_argument("--sweep-timeout", dest="sweep_timeout", type=int, default=None,
+                         help="Seconds allowed per sweep angle (default 1200).")
+    p_sweep.add_argument(
+        "--deliver-to", dest="deliver_to", default=None, metavar="SESSION",
+        help="Post the finished list into this Hermes Chat session "
+             "(hermes-chat-<id>) as the orchestrator's own message.",
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -1257,6 +1286,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "orchestrate": _cmd_orchestrate,
             "candidates": _cmd_candidates,
+            "sweep":    _cmd_sweep,
             "accept":   _cmd_accept,
             "reject":   _cmd_reject,
             "request-review": _cmd_request_review,
@@ -2524,14 +2554,18 @@ def _maybe_discover(args: argparse.Namespace, board: Optional[str], result: dict
     """The read-first step of an orchestrate cycle.
 
     On a board with nothing to route the orchestrator does not report "no
-    work": it sweeps the project read-only, parks what it finds as candidates
-    awaiting acceptance, and reports them. ``--discover`` forces a sweep,
-    ``--no-discover`` suppresses one. The sweep report lands under
-    ``result["discovery"]``; whenever candidates are waiting it also carries
-    ``report_markdown`` (the id-first list the user should read) and a
-    ``relay`` instruction, and the same markdown goes to stderr so stdout
-    stays one JSON document. The step itself is shared with the
-    ``kanban_orchestrate`` agent tool (``kanban_discovery.read_first_step``).
+    work": it sweeps the project read-only and parks what it finds as
+    candidates awaiting acceptance. ``--discover`` forces a sweep,
+    ``--no-discover`` suppresses one.
+
+    Called from a Hermes Chat conversation, a due sweep runs in the
+    background and posts its own id-first list into that conversation when
+    it finishes, so the list never depends on how an agent reads or rewords
+    this output; ``--wait`` runs it here instead. Anywhere else it runs here.
+    When the list is printed here it lands under ``result["discovery"]``
+    (``report_markdown`` and a ``relay`` instruction) and on stderr. The step
+    is shared with the ``kanban_orchestrate`` agent tool
+    (``kanban_discovery.read_first_step``).
     """
     from hermes_cli import kanban_discovery as disc
 
@@ -2548,19 +2582,47 @@ def _maybe_discover(args: argparse.Namespace, board: Optional[str], result: dict
         max_candidates=getattr(args, "max_candidates", None),
         timeout=getattr(args, "sweep_timeout", None),
         log=lambda m: print(m, file=sys.stderr),
+        background_session=None if getattr(args, "wait", False) else disc.chat_session_id(),
     )
     info.update(step)
+    _print_discovery_notes("kanban orchestrate", step)
+
+
+def _print_discovery_notes(prefix: str, step: dict) -> None:
     if step.get("hint"):
-        print(f"kanban orchestrate: {step['hint']}", file=sys.stderr)
+        print(f"{prefix}: {step['hint']}", file=sys.stderr)
     if step.get("error"):
-        print(f"kanban orchestrate: discovery failed: {step['error']}", file=sys.stderr)
+        print(f"{prefix}: discovery failed: {step['error']}", file=sys.stderr)
+    if step.get("note"):
+        print(f"{prefix}: {step['note']}", file=sys.stderr)
     if step.get("report_markdown"):
         print(
-            "kanban orchestrate: relay the list below to the user as written "
+            f"{prefix}: relay the list below to the user as written "
             "(each candidate line starts with its task id):",
             file=sys.stderr,
         )
         print(step["report_markdown"], file=sys.stderr)
+
+
+def _cmd_sweep(args: argparse.Namespace) -> int:
+    """Run the read-first sweep now, in the foreground. With ``--deliver-to``
+    the finished list is posted into that Hermes Chat session; this is what a
+    background sweep started by ``orchestrate`` runs."""
+    from hermes_cli import kanban_discovery as disc
+
+    board = getattr(args, "board_positional", None) or getattr(args, "board", None)
+    info = disc.run_sweep(
+        board=board,
+        goal=getattr(args, "focus", None),
+        project_root=getattr(args, "project_root", None),
+        max_candidates=getattr(args, "max_candidates", None),
+        timeout=getattr(args, "sweep_timeout", None),
+        deliver_to=getattr(args, "deliver_to", None),
+        log=lambda m: print(m, file=sys.stderr),
+    )
+    _print_discovery_notes("kanban sweep", info)
+    print(json.dumps(info, indent=2, sort_keys=True, default=str))
+    return 0 if info.get("ran") else 1
 
 
 def _cmd_candidates(args: argparse.Namespace) -> int:
@@ -2568,6 +2630,13 @@ def _cmd_candidates(args: argparse.Namespace) -> int:
 
     with kb.connect_closing() as conn:
         rows = disc.list_candidates(conn)
+    if rows:
+        print(
+            "kanban candidates: relay the list below to the user as written; "
+            "each candidate line starts with its task id, which is what puts a "
+            "note field under it in Hermes Chat",
+            file=sys.stderr,
+        )
     print(disc.format_candidates_markdown(rows, board=kb.get_current_board()))
     return 0
 
