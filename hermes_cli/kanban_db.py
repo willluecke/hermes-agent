@@ -1524,6 +1524,22 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Task events held for a Hermes Chat conversation until the batch it is
+-- following settles (gateway/kanban_chat_digest.py): one visible turn when
+-- the work is done, instead of a hidden gateway turn per task event.
+CREATE TABLE IF NOT EXISTS kanban_chat_digest (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    title         TEXT NOT NULL DEFAULT '',
+    detail        TEXT NOT NULL DEFAULT '',
+    urgent        INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_digest_chat      ON kanban_chat_digest(platform, chat_id, id);
 """
 
 
@@ -11885,6 +11901,86 @@ def _notify_profile_filter(
     if not clauses:
         return "0", []
     return "(" + ") OR (".join(clauses) + ")", params
+
+
+# ---------------------------------------------------------------------------
+# Hermes Chat digest: task events held until the followed batch settles
+# ---------------------------------------------------------------------------
+
+#: Statuses of a followed task that is still in flight. A blocked task is
+#: settled (it waits on a person) unless it only waits on another task, and a
+#: scheduled task is settled (it was deliberately parked for later).
+CHAT_DIGEST_OPEN_STATUSES = ("triage", "todo", "ready", "running", "review")
+
+
+def chat_digest_add(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    task_id: str,
+    kind: str,
+    title: str = "",
+    detail: str = "",
+    urgent: bool = False,
+) -> int:
+    """Hold one task event for a conversation's next digest turn."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "INSERT INTO kanban_chat_digest "
+            "(platform, chat_id, task_id, kind, title, detail, urgent, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (platform, chat_id, task_id, kind, (title or "")[:300],
+             (detail or "")[:600], 1 if urgent else 0, int(time.time())),
+        )
+    return int(cur.lastrowid)
+
+
+def chat_digest_rows(
+    conn: sqlite3.Connection,
+    *,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+) -> list[dict]:
+    """Held events, oldest first, optionally for one conversation."""
+    sql = (
+        "SELECT id, platform, chat_id, task_id, kind, title, detail, urgent, created_at "
+        "FROM kanban_chat_digest"
+    )
+    args: list = []
+    if platform is not None and chat_id is not None:
+        sql += " WHERE platform = ? AND chat_id = ?"
+        args = [platform, chat_id]
+    sql += " ORDER BY id"
+    return [dict(row) for row in conn.execute(sql, args).fetchall()]
+
+
+def chat_digest_clear(
+    conn: sqlite3.Connection, *, platform: str, chat_id: str, upto_id: int,
+) -> int:
+    """Drop a conversation's held events up to ``upto_id`` (the ones a digest
+    turn just carried); events held after it stay for the next one."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_chat_digest WHERE platform = ? AND chat_id = ? AND id <= ?",
+            (platform, chat_id, int(upto_id)),
+        )
+    return int(cur.rowcount or 0)
+
+
+def open_followed_task_count(conn: sqlite3.Connection, *, platform: str, chat_id: str) -> int:
+    """How many tasks a conversation follows on this board are still in
+    flight: zero means the batch it is following has settled."""
+    marks = ",".join("?" for _ in CHAT_DIGEST_OPEN_STATUSES)
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT t.id) FROM kanban_notify_subs s "
+        "JOIN tasks t ON t.id = s.task_id "
+        "WHERE s.platform = ? AND s.chat_id = ? AND ("
+        f"  t.status IN ({marks}) "
+        "  OR (t.status = 'blocked' AND t.block_kind = 'dependency'))",
+        (platform, chat_id, *CHAT_DIGEST_OPEN_STATUSES),
+    ).fetchone()
+    return int(row[0] or 0)
 
 
 def list_notify_subs(

@@ -280,3 +280,52 @@ def test_apiserver_notifier_skips_ticks_while_the_gateway_drains(
 
     assert posted == []
     assert _unseen_terminal_events(tid, "api_server", "origin-session")
+
+
+def test_hermes_chat_subscription_is_held_then_delivered_once_settled(tmp_path, monkeypatch):
+    """A Hermes Chat conversation gets no hidden self-posted turn per event:
+    the event is held and goes out as one digest once the batch settles."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-digest.db"))
+    kb.init_db()
+    chat = "hermes-chat-c_digest"
+    tid = _create_completed_subscription("api_server", chat)
+
+    import gateway.wake as wake_mod
+    from gateway import kanban_chat_digest as kcd
+
+    async def no_self_post(*a, **k):
+        raise AssertionError("a Hermes Chat subscription must not self-post a hidden turn")
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", no_self_post)
+    delivered = []
+    monkeypatch.setattr(kcd, "deliver", lambda board, item: delivered.append((board, item)) or "queued")
+    monkeypatch.setattr(kcd, "SETTLE_SECONDS", 0)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    # held, and the cursor moved past it
+    assert _unseen_terminal_events(tid, "api_server", chat) == []
+    conn = kb.connect()
+    try:
+        held = kb.chat_digest_rows(conn, platform="api_server", chat_id=chat)
+    finally:
+        conn.close()
+    assert [(r["task_id"], r["kind"]) for r in held] == [(tid, "completed")]
+    assert delivered == []
+
+    # next tick: nothing it follows is in flight, so the digest goes out once
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(delivered) == 1
+    assert delivered[0][1]["chat_id"] == chat
+    assert [r["task_id"] for r in delivered[0][1]["rows"]] == [tid]
+    conn = kb.connect()
+    try:
+        assert kb.chat_digest_rows(conn, platform="api_server", chat_id=chat) == []
+    finally:
+        conn.close()
+
+    # and a third tick sends nothing more
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(delivered) == 1

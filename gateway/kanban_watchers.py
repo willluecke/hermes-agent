@@ -269,6 +269,10 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Hermes Chat digests that could not be delivered wait this long
+        # before the next attempt (keyed by board, platform, chat id).
+        digest_backoff: dict[tuple, float] = getattr(self, "_kanban_digest_backoff", {})
+        self._kanban_digest_backoff = digest_backoff
         notifier_profile = getattr(self, "_kanban_notifier_profile", None)
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
@@ -317,6 +321,8 @@ class GatewayKanbanWatchersMixin:
                         # Fail safe on the shipped default; the sweep itself
                         # treats <= 0 as disabled.
                         _gc_retention_days = 30
+
+                ready_digests: list[dict] = []
 
                 def _collect():
                     deliveries: list[dict] = []
@@ -497,6 +503,16 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: subscription for %s on board %s failed: %s",
                                         sub.get("task_id"), slug, sub_exc,
                                     )
+                            try:
+                                from gateway import kanban_chat_digest as _kcd
+
+                                for _item in _kcd.ready_for_flush(conn):
+                                    ready_digests.append({**_item, "board": slug})
+                            except Exception as dig_exc:
+                                logger.debug(
+                                    "kanban notifier: digest check failed on board %s: %s",
+                                    slug, dig_exc,
+                                )
                         finally:
                             conn.close()
                     return deliveries
@@ -853,6 +869,45 @@ class GatewayKanbanWatchersMixin:
                                 "gateway.kanban.wake.guidance"
                             )
 
+                        from gateway import kanban_chat_digest as _kcd
+
+                        if not _is_push_adapter and wake_agent and _kcd.is_chat_session(sub["chat_id"]):
+                            # A Hermes Chat conversation: a self-posted turn
+                            # would be invisible there and one task event
+                            # would cost a full agent turn. Hold the event
+                            # for the conversation's digest, which goes out
+                            # as one visible queued turn once the batch it is
+                            # following settles (or at once when a person is
+                            # needed). See gateway/kanban_chat_digest.py.
+                            _entries = _kcd.digest_entries(d["events"], task)
+                            if _entries:
+                                try:
+                                    await _to_thread_process_service(
+                                        self._kanban_digest_add, sub, _entries, board_slug,
+                                    )
+                                except Exception as _dg_err:
+                                    logger.warning(
+                                        "kanban notifier: could not hold %s for its digest: %s",
+                                        sub["task_id"], _dg_err,
+                                    )
+                                    await _to_thread_process_service(
+                                        self._kanban_rewind,
+                                        sub,
+                                        d["cursor"],
+                                        d.get("old_cursor", 0),
+                                        board_slug,
+                                    )
+                                    continue
+                            await _to_thread_process_service(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
+                            )
+                            sub_fail_counts.pop(sub_key, None)
+                            if task_terminal:
+                                await _to_thread_process_service(
+                                    self._kanban_unsub, sub, board_slug,
+                                )
+                            continue
+
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
                             # it must succeed BEFORE the cursor advances.
@@ -1063,6 +1118,8 @@ class GatewayKanbanWatchersMixin:
                             await _to_thread_process_service(
                                 self._kanban_unsub, sub, board_slug,
                             )
+                if ready_digests:
+                    await self._kanban_flush_chat_digests(ready_digests)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
@@ -1092,6 +1149,74 @@ class GatewayKanbanWatchersMixin:
             )
         finally:
             conn.close()
+
+    def _kanban_digest_add(self, sub: dict, entries: list, board: Optional[str] = None) -> None:
+        """Sync helper: hold a subscription's events for its chat digest."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            for entry in entries:
+                _kb.chat_digest_add(
+                    conn,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    task_id=sub["task_id"],
+                    kind=entry["kind"],
+                    title=entry.get("title") or "",
+                    detail=entry.get("detail") or "",
+                    urgent=bool(entry.get("urgent")),
+                )
+        finally:
+            conn.close()
+
+    def _kanban_digest_clear(self, item: dict) -> None:
+        """Sync helper: drop the events a delivered digest carried."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=item.get("board"))
+        try:
+            _kb.chat_digest_clear(
+                conn, platform=item["platform"], chat_id=item["chat_id"],
+                upto_id=int(item["upto_id"]),
+            )
+        finally:
+            conn.close()
+
+    async def _kanban_flush_chat_digests(self, ready: list) -> None:
+        """Deliver the Hermes Chat digests that are ready: one visible turn
+        per conversation and board. A digest that cannot be delivered stays
+        and is retried after a backoff."""
+        from gateway import kanban_chat_digest as _kcd
+
+        backoff = getattr(self, "_kanban_digest_backoff", None)
+        if backoff is None:
+            backoff = self._kanban_digest_backoff = {}
+        for item in ready:
+            key = (item.get("board"), item["platform"], item["chat_id"])
+            if backoff.get(key, 0.0) > time.monotonic():
+                continue
+            try:
+                outcome = await asyncio.to_thread(_kcd.deliver, item.get("board") or "", item)
+            except _kcd.DigestRetry as exc:
+                backoff[key] = time.monotonic() + _kcd.RETRY_BACKOFF_SECONDS
+                logger.warning(
+                    "kanban notifier: digest for %s on board %s not delivered, retrying later: %s",
+                    item["chat_id"], item.get("board"), exc,
+                )
+                continue
+            except Exception as exc:
+                backoff[key] = time.monotonic() + _kcd.RETRY_BACKOFF_SECONDS
+                logger.warning(
+                    "kanban notifier: digest for %s on board %s failed: %s",
+                    item["chat_id"], item.get("board"), exc,
+                )
+                continue
+            backoff.pop(key, None)
+            await _to_thread_process_service(self._kanban_digest_clear, item)
+            logger.info(
+                "kanban notifier: digest of %d event(s) %s for %s on board %s%s",
+                len(item["rows"]), outcome, item["chat_id"], item.get("board"),
+                " (needs a decision)" if item.get("urgent") else "",
+            )
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         from hermes_cli import kanban_db as _kb
