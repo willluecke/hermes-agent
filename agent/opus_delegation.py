@@ -79,6 +79,34 @@ def single_model_disabled_toolsets(provider: Any, model: Any) -> list[str]:
     return ["delegation", "opus_worker"]
 
 
+# Providers whose single-model runs are pinned to the built-in ``read_only``
+# toolset (an allowlist: read_file, search_files, web_search, web_extract,
+# vision_analyze, skills_list, skill_view, session_search, current_time,
+# kanban_show, kanban_list, kanban_attachments). Untrusted third-party
+# endpoints whose safety alignment the operator does not rely on belong
+# here; the pin strips terminal execution, file mutation, patch, browser,
+# message posting, cron, memory/decision writes and MCP tools from those
+# runs without touching any other provider.
+SINGLE_MODEL_READ_ONLY_PROVIDERS: frozenset[str] = frozenset(
+    {"custom:abliteration"}
+)
+
+
+def single_model_read_only_toolset(provider: Any) -> list[str] | None:
+    """The allowlist toolset for a single-model parent runtime, or None.
+
+    Returns ``["read_only"]`` when the *requested* provider identity (the
+    ``custom:<name>`` slug the picker sends; the resolved runtime collapses
+    named customs to plain ``custom``) is pinned to the read-only allowlist,
+    else ``None`` so the caller keeps its normal enabled/disabled toolset
+    resolution. Callers pass the request's provider string, so a route or
+    fallback cannot smuggle a pinned runtime out of the sandbox.
+    """
+    if _normalize(provider) in SINGLE_MODEL_READ_ONLY_PROVIDERS:
+        return ["read_only"]
+    return None
+
+
 def parent_runtime_env(
     *,
     provider: Any,

@@ -4087,7 +4087,10 @@ class APIServerAdapter(BasePlatformAdapter):
         reviewed implementation handoff rather than a free model spawn.
         """
         from run_agent import AIAgent
-        from agent.opus_delegation import single_model_disabled_toolsets
+        from agent.opus_delegation import (
+            single_model_disabled_toolsets,
+            single_model_read_only_toolset,
+        )
         from gateway.run import (
             _checkpoint_agent_kwargs,
             _current_max_iterations,
@@ -4345,13 +4348,28 @@ class APIServerAdapter(BasePlatformAdapter):
         # off the *resolved* provider so a route or alias cannot smuggle a
         # different runtime into it. See agent/opus_delegation.py.
         resolved_provider = runtime_kwargs.get("provider") or request_provider or ""
+        # Read-only pin (SINGLE_MODEL_READ_ONLY_PROVIDERS): keyed off the
+        # *requested* provider identity, which keeps the ``custom:<name>``
+        # form (the resolved runtime dict collapses named customs to plain
+        # ``custom``). A pinned provider's runs get the read_only allowlist
+        # as their enabled toolsets, so an untrusted endpoint can inspect but
+        # never mutate — no terminal, file writes, patch, browser, message
+        # posting, cron or memory writes. Non-pinned providers are unchanged.
+        read_only_toolsets = (
+            single_model_read_only_toolset(request_provider)
+            if single_model and request_provider
+            else None
+        )
+        if read_only_toolsets:
+            enabled_toolsets = list(read_only_toolsets)
         disabled_toolsets = (
             single_model_disabled_toolsets(resolved_provider, model)
             if single_model
             else None
         )
-        opus_worker_enabled = "opus_worker" in enabled_toolsets and "opus_worker" not in (
-            disabled_toolsets or []
+        opus_worker_enabled = (
+            "opus_worker" in enabled_toolsets
+            and "opus_worker" not in (disabled_toolsets or [])
         )
 
         max_iterations = _current_max_iterations()
