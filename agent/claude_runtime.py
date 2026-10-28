@@ -1281,7 +1281,10 @@ def run_claude_code_turn(
     if steward:
         from agent.steward_policy import instructions
         runtime_contract=instructions()
-    if steward and getattr(agent,'_claude_code_session',None):
+    if steward and getattr(agent,'_steward_review',None) is not None and getattr(agent,'_claude_code_session',None):
+        # A bound final review needs its own process carrying the binding; an
+        # ordinary steward turn keeps its resident session like any other chat
+        # (2026-10-28: the per-turn rebuild is gone).
         agent._claude_code_session.close()
         agent._claude_code_session=None
     read_only = bool(getattr(agent, "read_only", False))

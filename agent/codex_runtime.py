@@ -1855,9 +1855,16 @@ def run_codex_app_server_turn(
         )
     from agent.steward_policy import steward_agent
     steward = steward_agent(agent)
+    # A bound final review carries its binding in the scoped MCP server's
+    # environment, so each review run spawns its own process. An ordinary
+    # steward turn keeps its resident session like any other chat: the
+    # per-turn fences that once required a fresh process are gone, and
+    # rebuilding every turn showed Will "Session resumed from disk" on every
+    # message (2026-10-28).
+    steward_review_run = steward and getattr(agent, "_steward_review", None) is not None
     resident_codex_session = getattr(agent, "_codex_session", None)
     if resident_codex_session is not None and (
-        steward or not resume_thread_id
+        steward_review_run or not resume_thread_id
         or str(getattr(resident_codex_session, "_thread_id", "") or "")
         != resume_thread_id
     ):
@@ -1982,8 +1989,8 @@ def run_codex_app_server_turn(
             read_only=read_only,
             project_key=str(getattr(agent, "session_project", "") or ""),
             # The gateway binds a final review to the run before the model
-            # runs; the steward's session is rebuilt every turn, so each
-            # review spawns its own scoped MCP server carrying it.
+            # runs; a review run always spawns its own session (above), so
+            # each one gets a scoped MCP server carrying exactly its binding.
             steward_review=getattr(agent, "_steward_review", None),
             reversible_deletion_policy=reversible_deletion_policy,
             workspace_snapshot_policy=workspace_snapshot_policy,

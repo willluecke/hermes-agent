@@ -106,3 +106,25 @@ def test_codex_steward_lane_refuses_a_malformed_binding_instead_of_running_unbou
                                   messages=[{'role': 'user', 'content': 'Internal final review'}],
                                   effective_task_id='hermes-steward-review')
     assert spawned == [] and agent._codex_session is None
+
+
+@pytest.mark.parametrize('session_id,review,sessions_expected', [('hermes-chat-talos', None, 1), ('hermes-steward-review', REVIEW, 2)])
+def test_ordinary_steward_turns_keep_the_resident_session_but_reviews_respawn(tmp_path, monkeypatch, session_id, review, sessions_expected):
+    # 2026-10-28: the per-turn rebuild that showed Will "Session resumed from
+    # disk" on every message is gone; only a bound review spawns its own process.
+    import agent.transports.codex_app_server_session as transport
+    FakeSession.instances.clear()
+    monkeypatch.setattr(transport, 'CodexAppServerSession', FakeSession)
+    agent = _steward(tmp_path, monkeypatch, session_id=session_id, review=review)
+    first = run_codex_app_server_turn(agent, user_message='First', original_user_message='First',
+                                      messages=[{'role': 'user', 'content': 'First'}], effective_task_id=session_id)
+    assert first['completed'] is True
+    history = [{'role': 'user', 'content': 'First'}, {'role': 'assistant', 'content': 'Acknowledged.'}, {'role': 'user', 'content': 'Second'}]
+    second = run_codex_app_server_turn(agent, user_message='Second', original_user_message='Second', messages=history, effective_task_id=session_id)
+    assert second['completed'] is True
+    assert len(FakeSession.instances) == sessions_expected
+    if sessions_expected == 1:
+        session, = FakeSession.instances
+        assert len(session.inputs) == 2, 'the same resident process took both turns'
+        assert 'You are Jim.' not in str(session.inputs[1]), 'the contract is not re-sent on an ordinary turn'
+        assert agent._codex_session is session

@@ -836,3 +836,33 @@ def test_a_review_binding_never_reaches_an_unrestricted_claude_session(monkeypat
     with patch.object(agent, "_spawn_background_review", return_value=None):
         agent.run_conversation("hello")
     assert observed == [None]
+
+
+def test_an_ordinary_claude_steward_turn_keeps_its_resident_session_but_a_review_respawns(monkeypatch, tmp_path):
+    # 2026-10-28: the per-turn rebuild that reopened Jim's session from disk on
+    # every message is gone; only a bound review closes and respawns the process.
+    _steward_workspace(tmp_path, monkeypatch)
+    observed = []
+    closed = []
+
+    def _run_turn(session, prompt):
+        observed.append(session)
+        return ClaudeCodeTurnResult(final_text="ok")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    monkeypatch.setattr(ClaudeCodeSession, "close", lambda self: closed.append(self))
+    agent = _make_agent(session_id="hermes-chat-talos")
+    agent.session_project = "talos-steward"
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        agent.run_conversation("First")
+        agent.run_conversation("Second")
+    assert len(observed) == 2 and observed[0] is observed[1], "the same resident session took both ordinary turns"
+    assert closed == []
+    review = _make_agent(session_id="hermes-steward-review")
+    review.session_project = "talos-steward"
+    review._steward_review = _REVIEW
+    with patch.object(review, "_spawn_background_review", return_value=None):
+        review.run_conversation("Internal final review")
+        review.run_conversation("Internal final review")
+    assert len(observed) == 4 and observed[2] is not observed[3], "a review run spawns its own session"
+    assert observed[2] in closed
