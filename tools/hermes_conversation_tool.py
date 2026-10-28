@@ -253,7 +253,18 @@ def hermes_conversation_tool(action: str, **kwargs: Any) -> str:
                 str(kwargs.get("id") or ""), str(kwargs.get("verb") or "status"), str(kwargs.get("text") or ""),
                 kwargs.get("max_turns"), str(kwargs.get("actor") or ""),
                 **{k: kwargs[k] for k in ("request_key", "model", "effort", "delegation_id", "goal_id", "expected_revision", "reason") if k in kwargs})})
-        raise ValueError("Unknown action; use list, read, send, set_runtime or goal")
+        if action == "reset":
+            # Will, 2026-10-28: "reset your context" is Jim's to act on. The next
+            # steward turn starts a fresh native thread seeded with the instructions,
+            # Will's profile and the Talos state brief; the transcript stays in the chat.
+            if os.environ.get("HERMES_STEWARD") != "1":
+                raise ValueError("reset is the Talos steward's own action; it resets the steward's next turn, not this conversation")
+            from agent.steward_policy import request_reset
+            record = request_reset(str(kwargs.get("reason") or ""), kwargs.get("source"))
+            return json.dumps({"ok": True, "action": action, "result": {
+                "takes_effect": "next turn", "requested_at": record["requested_at"], "reason": record["reason"],
+                "note": "Finish this reply; the next turn starts from the instructions and the Talos state brief."}})
+        raise ValueError("Unknown action; use list, read, send, set_runtime, goal, create or reset")
     except ValueError as exc:
         return json.dumps({"ok": False, "action": action, "error": str(exc)})
 
@@ -275,7 +286,7 @@ HERMES_CONVERSATION_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["list", "read", "send", "set_runtime", "goal", "create"]},
+            "action": {"type": "string", "enum": ["list", "read", "send", "set_runtime", "goal", "create", "reset"]},
             "model": {"type": "string", "description": "Model selector, e.g. claude-code::claude-fable-5-1 or openai-codex::gpt-6-astra."},
             "effort": {"type": "string", "enum": list(EFFORTS)},
             "verb": {"type": "string", "enum": ["set", "status", "pause", "resume", "clear"], "description": "For goal."},
@@ -295,6 +306,7 @@ HERMES_CONVERSATION_SCHEMA = {
 HERMES_CONVERSATION_SCHEMA["description"] += (
     " create(project,title,model,effort,request_key,direction_id?,parent_conversation_id?) makes an empty registered-project thread, "
     "deduplicated by request_key; it queues nothing. goal set accepts request_key,model,effort,delegation_id. "
+    "reset (steward only): the steward's next turn starts a fresh native thread seeded with its instructions and the Talos state brief; the transcript stays in the chat. "
     "Managed mutations require goal_id,expected_revision,request_key. Resume accepts an authorized max_turns total; never adds turns implicitly. "
     "Use talos dispatch for managed work; its reconciler owns create and goal set."
 )

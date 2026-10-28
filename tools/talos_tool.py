@@ -42,6 +42,7 @@ READ_ACTIONS = {
     "state": "/api/state",
     "live": "/api/live",
     "sessions": "/api/sessions",
+    "brief": "/api/brief",
 }
 WRITE_ACTIONS = {
     "admit": ("/api/tasks/admit", ("project_id", "contract", "dedupe_key")),
@@ -85,7 +86,7 @@ def _token() -> str:
     return token
 
 
-def _call(path: str, payload: dict | None = None) -> Any:
+def _call(path: str, payload: dict | None = None, timeout: float = TIMEOUT_SECONDS) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
     req = request.Request(
         _base_url() + path,
@@ -97,7 +98,7 @@ def _call(path: str, payload: dict | None = None) -> Any:
         },
     )
     try:
-        with request.urlopen(req, timeout=TIMEOUT_SECONDS) as response:
+        with request.urlopen(req, timeout=timeout) as response:
             raw = response.read(MAX_RESULT_BYTES + 1)
     except error.HTTPError as exc:
         body = exc.read(4096).decode("utf-8", "replace")

@@ -23,7 +23,7 @@ import time
 from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.continuity import emit_continuity, handoff_disclosure, plural, render_history_blocks
 from agent.turn_time_limit import (
@@ -462,6 +462,7 @@ _CODEX_CONTINUITY_REASONS = {
     "transcript-shortened": "the transcript is shorter than what the thread saw (edited or rolled back)",
     "transcript-diverged": "the transcript was edited or rolled back since the thread's last turn",
     "history-restored": "earlier messages from before this chat's first Hermes turn were restored to its history",
+    "context-reset": "Jim reset his context at Will's request",
     "resume": "the recorded thread could not be resumed",
 }
 
@@ -474,9 +475,17 @@ def _announce_codex_continuity(
     entries: List[tuple],
     reason: str,
     thread_id: str,
+    reset: Optional[dict] = None,
 ) -> None:
     """Show the user every turn that did not simply continue its thread."""
     thread = thread_id[:8]
+    if reset is not None:
+        from agent.steward_policy import reset_text
+        emit_continuity(
+            agent, "codex", "reset", reset_text(reset, "Codex thread", thread),
+            reason="context-reset", thread_id=thread_id,
+        )
+        return
     if rebuilt:
         if not entries:
             return  # A new conversation: nothing was lost.
@@ -1846,6 +1855,13 @@ def run_codex_app_server_turn(
         # Not an edit: the gateway just put the part of the chat that
         # predates its first Hermes turn back in front of the stored rows.
         continuity_reason = "history-restored"
+    from agent.steward_policy import pending_reset, reset_applies
+    context_reset = pending_reset() if reset_applies(agent) else None
+    if context_reset is not None:
+        # Will asked Jim for a fresh start (2026-10-28): no resume and no
+        # transcript handoff; the new thread gets the instructions, Will's
+        # profile and the Talos state brief instead.
+        resume_thread_id, pending_entries, continuity_reason = "", [], "context-reset"
     if pending_entries and resume_thread_id:
         logger.info(
             "codex thread %s is behind this conversation by %d messages; "
@@ -2047,7 +2063,8 @@ def run_codex_app_server_turn(
             # Either nothing could be resumed, or the resume attempt failed and
             # the session fell back to a fresh thread. Both need the whole
             # transcript — the delta was computed for a thread we no longer have.
-            handoff_entries = prior_entries
+            # A requested reset is the one fresh thread that gets nothing.
+            handoff_entries = [] if context_reset is not None else prior_entries
             build_turn_input = _codex_history_handoff
         else:
             handoff_entries = pending_entries
@@ -2067,12 +2084,17 @@ def run_codex_app_server_turn(
             entries=handoff_entries,
             reason=continuity_reason,
             thread_id=str(thread_id or ""),
+            reset=context_reset,
         )
         if steward:
-            from agent.steward_policy import instructions
+            from agent.steward_policy import brief_note, instructions
             contract = instructions()
-            if _steward_contract_due(agent, thread_id, contract):
+            # The brief rides with the contract (thread start, after a
+            # compaction, after a reset) as its own note, so its changing text
+            # never enters the contract digest and never re-sends the contract.
+            if _steward_contract_due(agent, thread_id, contract) or context_reset is not None:
                 turn_input = _with_turn_note(turn_input, contract)
+                turn_input = _with_turn_note(turn_input, brief_note())
             source = getattr(agent, "_turn_source", None)
             if isinstance(source, dict):
                 from agent.steward_policy import source_note
@@ -2095,6 +2117,12 @@ def run_codex_app_server_turn(
         _persist_codex_thread_state(
             agent, thread_id=thread_id, cwd=codex_cwd, entries=prior_entries
         )
+        if context_reset is not None:
+            # The fresh thread is bound and recorded as having seen the whole
+            # prefix, so the next turn resumes it with an empty delta; only now
+            # is the request spent (a crash before this point retries it).
+            from agent.steward_policy import clear_reset
+            clear_reset()
         agent._codex_compactions_announced = 0
         turn_limit = turn_time_limit_seconds()
         turn = agent._codex_session.run_turn(

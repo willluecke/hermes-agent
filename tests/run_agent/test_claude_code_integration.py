@@ -866,3 +866,37 @@ def test_an_ordinary_claude_steward_turn_keeps_its_resident_session_but_a_review
         review.run_conversation("Internal final review")
     assert len(observed) == 4 and observed[2] is not observed[3], "a review run spawns its own session"
     assert observed[2] in closed
+
+
+def test_a_requested_reset_starts_a_fresh_claude_session_with_the_brief_and_no_transcript(monkeypatch, tmp_path):
+    # Will, 2026-10-28: "reset your context" on the Claude lane.
+    import tools.talos_tool as talos
+    from agent import steward_policy
+    _steward_workspace(tmp_path, monkeypatch)
+    monkeypatch.setattr(talos, "_call", lambda path, payload=None, timeout=20: {"text": "Talos brief at now.\nOpen work: 2 waiting.", "at": 1})
+    observed = []
+
+    def _run_turn(session, prompt):
+        observed.append({"session": session, "resume": session.resume, "prompt": prompt, "contract": session.system_prompt})
+        return ClaudeCodeTurnResult(final_text="ok")
+
+    monkeypatch.setattr(ClaudeCodeSession, "run_turn", _run_turn)
+    monkeypatch.setattr(ClaudeCodeSession, "close", lambda self: None)
+    agent = _make_agent(session_id="hermes-chat-talos")
+    agent.session_project = "talos-steward"
+    rows = []
+    agent.tool_progress_callback = lambda event, runtime, text, _none, **payload: rows.append((payload.get("mode"), text))
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        agent.run_conversation("First")
+        assert "Talos brief at now." in observed[0]["prompt"], "a new session gets the brief"
+        agent.run_conversation("Second")
+        assert observed[1]["session"] is observed[0]["session"] and "Talos brief" not in observed[1]["prompt"]
+        steward_policy.request_reset("Will asked")
+        agent.run_conversation("Third")
+    third = observed[2]
+    assert third["session"] is not observed[0]["session"] and third["resume"] is False
+    assert "Talos brief at now." in third["prompt"] and "Third" in third["prompt"]
+    assert "First" not in third["prompt"] and "hermes_conversation_history" not in third["prompt"], "no transcript replay"
+    assert third["contract"] == observed[0]["contract"], "the brief never enters the system prompt"
+    assert steward_policy.pending_reset() is None
+    assert any(mode == "reset" and "Will asked" in text for mode, text in rows)

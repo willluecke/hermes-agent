@@ -193,3 +193,48 @@ def test_steward_jobs_is_a_steward_tool_in_ordinary_turns_only():
               'source': {'conversation_id': 'talos', 'message_id': 'run_1'}}
     with pytest.raises(ValueError): StewardTools(review=review).check('steward_jobs', {'action': 'jobs'})
     assert selected_tools({'HERMES_STEWARD_REVIEW': '{}'}) == ('talos',)
+
+
+# ---- Context reset and the Talos state brief (2026-10-28) -------------------
+
+def test_reset_request_is_a_workspace_file_consumed_once(tmp_path, monkeypatch):
+    from agent import steward_policy
+    monkeypatch.setattr(steward_policy.Path, 'home', classmethod(lambda cls: tmp_path))
+    assert steward_policy.pending_reset() is None
+    record = steward_policy.request_reset('Will: reset your context', {'conversation_id': 'talos', 'message_id': 'turn_x'})
+    assert record['reason'] == 'Will: reset your context' and record['by'] == 'jim' and record['requested_at'] > 0
+    assert steward_policy.pending_reset() == record
+    steward_policy.request_reset('again')                      # two asks are one reset
+    assert steward_policy.pending_reset()['reason'] == 'again'
+    steward_policy.clear_reset(); steward_policy.clear_reset()  # clearing twice is fine
+    assert steward_policy.pending_reset() is None
+    steward_policy.reset_flag_path().write_text('{not json')
+    assert steward_policy.pending_reset()['reason'] == 'unreadable request'  # still a reset
+
+
+def test_reset_applies_only_to_the_ordinary_talos_conversation():
+    from agent.steward_policy import reset_applies
+    ordinary = SimpleNamespace(session_id='hermes-chat-talos', session_project='talos-steward', session_cwd='', _steward_review=None)
+    review = SimpleNamespace(session_id='hermes-steward-review', session_project='talos-steward', session_cwd='', _steward_review={'id': 'x'})
+    other = SimpleNamespace(session_id='hermes-chat-other', session_project='reg-watch', session_cwd='', _steward_review=None)
+    assert reset_applies(ordinary) and not reset_applies(review) and not reset_applies(other)
+
+
+def test_brief_note_carries_the_talos_brief_or_a_notice_and_never_raises(monkeypatch):
+    import tools.talos_tool as talos
+    from agent.steward_policy import brief_note
+    monkeypatch.setattr(talos, '_call', lambda path, payload=None, timeout=20: {'text': 'Talos brief at now.\nOpen work: 1 active.', 'at': 1})
+    note = brief_note()
+    assert note.startswith('Talos state brief (a snapshot of the ledger') and 'Open work: 1 active.' in note
+    def down(path, payload=None, timeout=20): raise ValueError('Talos is unreachable: refused')
+    monkeypatch.setattr(talos, '_call', down)
+    assert brief_note().startswith('Talos state brief unavailable (ValueError: Talos is unreachable')
+    monkeypatch.setattr(talos, '_call', lambda path, payload=None, timeout=20: {'text': ''})
+    assert 'unavailable' in brief_note()
+
+
+def test_the_brief_never_changes_the_contract_digest():
+    from agent.codex_runtime import _steward_contract_due
+    agent = SimpleNamespace(context_compressor=None)
+    assert _steward_contract_due(agent, 'thread-a', 'instructions v1')
+    assert not _steward_contract_due(agent, 'thread-a', 'instructions v1')  # a new brief rides as its own note; the key is the contract alone

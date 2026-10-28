@@ -596,6 +596,7 @@ def make_claude_code_event_bridge(
                 if isinstance(before, int) and isinstance(after, int)
                 else ""
             )
+            agent._claude_compacted_since_brief = True
             emit_continuity(
                 agent, "claude-code", "compacted",
                 f"Claude Code compacted this session's context{sizes}, "
@@ -1287,6 +1288,19 @@ def run_claude_code_turn(
         # (2026-10-28: the per-turn rebuild is gone).
         agent._claude_code_session.close()
         agent._claude_code_session=None
+    from agent.steward_policy import pending_reset, reset_applies
+    context_reset = pending_reset() if reset_applies(agent) else None
+    if context_reset is not None:
+        # Will asked Jim for a fresh start (2026-10-28): a new Claude session,
+        # no resume, no transcript handoff; the instructions, Will's profile and
+        # the Talos state brief are the whole context.
+        durable_resume = False
+        if getattr(agent, '_claude_code_session', None) is not None:
+            try:
+                agent._claude_code_session.close()
+            except Exception:
+                logger.debug("Claude Code session close before reset failed", exc_info=True)
+            agent._claude_code_session = None
     read_only = bool(getattr(agent, "read_only", False))
     if read_only:
         runtime_contract += (
@@ -1384,15 +1398,20 @@ def run_claude_code_turn(
             getattr(agent, "session_id", ""),
             rebuild_reason,
         )
-    _announce_claude_continuity(
-        agent,
-        prior_messages=prior_messages,
-        rebuild_reason=rebuild_reason,
-        resumed_from_disk=bool(durable_resume and not resident_continuity),
-        resume_cause=resume_cause,
-        delta=continuity_delta,
-        session_id=prior_session_id,
-    )
+    if context_reset is not None:
+        from agent.steward_policy import reset_text
+        emit_continuity(agent, "claude-code", "reset", reset_text(context_reset, "Claude session", "(fresh)"),
+                        reason="context-reset", previous_session_id=prior_session_id)
+    else:
+        _announce_claude_continuity(
+            agent,
+            prior_messages=prior_messages,
+            rebuild_reason=rebuild_reason,
+            resumed_from_disk=bool(durable_resume and not resident_continuity),
+            resume_cause=resume_cause,
+            delta=continuity_delta,
+            session_id=prior_session_id,
+        )
 
     with tempfile.TemporaryDirectory(prefix="hermes-claude-images-") as image_dir:
         image_content = (
@@ -1410,7 +1429,9 @@ def run_claude_code_turn(
         )
         if not prompt_text and attached_images:
             prompt_text = "Please inspect the attached image(s)."
-        if resident_continuity or durable_resume:
+        if context_reset is not None:
+            prompt = prompt_text
+        elif resident_continuity or durable_resume:
             prompt = (
                 claude_history_handoff(continuity_delta, prompt_text, lead=CLAUDE_DELTA_LEAD)
                 if continuity_delta
@@ -1426,6 +1447,13 @@ def run_claude_code_turn(
         if steward and isinstance(getattr(agent, "_turn_source", None), dict):
             from agent.steward_policy import source_note
             sections.append(source_note(agent._turn_source))
+        if steward and (session is None or context_reset is not None or getattr(agent, "_claude_compacted_since_brief", False)):
+            # The Talos state brief rides a new session, a reset and the turn
+            # after a compaction, as a prompt section: never in the system
+            # prompt, which would retire the resident CLI on every change.
+            from agent.steward_policy import brief_note
+            sections.append(brief_note())
+            agent._claude_compacted_since_brief = False
         if plugin_user_context and not steward:
             # The pre_llm_call hook's note (the preflight judge, gateway
             # notices) rides the user message here as it does on the default
@@ -1533,6 +1561,9 @@ def run_claude_code_turn(
             session.late_answer_context = late_context
             session.history_fingerprint = prior_fingerprint
             agent._claude_code_session = session
+            if context_reset is not None:
+                from agent.steward_policy import clear_reset
+                clear_reset()
         else:
             # Event callbacks are per outer turn even though the native process
             # is per conversation. Rebind them before sending the next message.

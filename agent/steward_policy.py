@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 import threading
+import time
 
 # The serialized system-origin review session. It is not a hermes-chat-*
 # session, so a review never appears as a message in Will's talos chat.
@@ -185,6 +186,86 @@ class StewardTools:
 
     def completed(self, name, args, result):
         return  # no per-turn budgets remain; review attempts are recorded by the trusted entry point
+
+
+# ---- Context reset and the Talos state brief (2026-10-28) -------------------
+# Will decides in the chat, so "reset your context" is an instruction to Jim:
+# the request is a small file in his workspace, consumed by the next steward
+# turn on either lane, which starts a fresh native thread seeded with the
+# instructions, Will's profile and the Talos state brief and never replays the
+# transcript. The brief also rides every thread start and the turn after a
+# compaction; it is a snapshot of the ledger, not the record.
+RESET_FILE = 'context-reset.json'
+STEWARD_SESSION = 'hermes-chat-talos'
+BRIEF_TIMEOUT = 5
+BRIEF_LIMIT = 4000
+
+
+def reset_flag_path():
+    return Path.home() / '.hermes' / 'talos-steward' / RESET_FILE
+
+
+def request_reset(reason='', source=None):
+    """Ask for a fresh native thread on the steward's next turn. Overwrites any
+    pending request (two asks are one reset); returns the record written."""
+    record = {'version': 1, 'requested_at': time.time(), 'by': 'jim', 'reason': str(reason or '')[:300],
+              'source': source if isinstance(source, dict) else None}
+    path = reset_flag_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(path.name + '.tmp')
+    pending.write_text(json.dumps(record, sort_keys=True))
+    os.replace(pending, path)
+    return record
+
+
+def pending_reset():
+    """The pending reset request, or None. An unreadable file still resets."""
+    try:
+        raw = reset_flag_path().read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raw = ''
+    try:
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            raise ValueError('not an object')
+    except ValueError:
+        record = {'version': 1, 'requested_at': None, 'by': 'unknown', 'reason': 'unreadable request', 'source': None}
+    return record
+
+
+def clear_reset():
+    try:
+        reset_flag_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def reset_applies(agent):
+    """Only the ordinary Talos conversation consumes a reset; a bound review never does."""
+    return (steward_agent(agent) and str(getattr(agent, 'session_id', '') or '') == STEWARD_SESSION
+            and getattr(agent, '_steward_review', None) is None)
+
+
+def reset_text(record, runtime, thread):
+    reason = str((record or {}).get('reason') or '').strip()
+    return (f"Context reset at Jim's request{(' (' + reason[:120] + ')') if reason else ''}: new {runtime} {thread} starts from "
+            "the steward instructions, Will's profile and the Talos state brief; the chat transcript was not replayed.")
+
+
+def brief_note(timeout=BRIEF_TIMEOUT):
+    """The Talos state brief as a turn note, or a one-line notice when Talos is unreachable. Never raises."""
+    try:
+        from tools.talos_tool import _call
+        payload = _call('/api/brief', timeout=timeout)
+        text = str((payload or {}).get('text') or '').strip()[:BRIEF_LIMIT]
+        if not text:
+            raise ValueError('empty brief')
+    except Exception as exc:  # noqa: BLE001 - the turn must run without the brief
+        return (f'Talos state brief unavailable ({type(exc).__name__}: {str(exc)[:120]}). '
+                'Read current state with the talos tool before acting.')
+    return 'Talos state brief (a snapshot of the ledger; read current state with the talos tool before acting):\n' + text
 
 
 PROFILE_LIMIT = 8000  # characters of Will's profile; USER.md is ~2.3 KB today

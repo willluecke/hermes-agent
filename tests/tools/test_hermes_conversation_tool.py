@@ -190,3 +190,17 @@ def test_read_preserves_submitted_message_provenance(monkeypatch):
     ]})
     tail=json.loads(convo.hermes_conversation_tool('read',id='talos'))['result']['tail']
     assert [m['id'] for m in tail]==['turn_original','legacy_id']
+
+
+def test_reset_is_the_stewards_action_and_writes_the_workspace_request(monkeypatch, tmp_path):
+    from agent import steward_policy
+    monkeypatch.setattr(steward_policy.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("HERMES_STEWARD", raising=False)
+    refused = json.loads(convo.hermes_conversation_tool("reset", reason="Will asked"))
+    assert refused["ok"] is False and "steward" in refused["error"]
+    assert steward_policy.pending_reset() is None
+    monkeypatch.setenv("HERMES_STEWARD", "1")
+    result = json.loads(convo.hermes_conversation_tool("reset", reason="Will asked", source={"conversation_id": "talos", "message_id": "turn_x"}))
+    assert result["ok"] is True and result["result"]["takes_effect"] == "next turn"
+    assert steward_policy.pending_reset()["reason"] == "Will asked"
+    assert "reset" in convo.HERMES_CONVERSATION_SCHEMA["parameters"]["properties"]["action"]["enum"]

@@ -128,3 +128,46 @@ def test_ordinary_steward_turns_keep_the_resident_session_but_reviews_respawn(tm
         assert len(session.inputs) == 2, 'the same resident process took both turns'
         assert 'You are Jim.' not in str(session.inputs[1]), 'the contract is not re-sent on an ordinary turn'
         assert agent._codex_session is session
+
+
+def test_a_requested_reset_starts_a_fresh_thread_with_the_brief_and_no_transcript(tmp_path, monkeypatch):
+    # Will, 2026-10-28: "reset your context" starts the next turn on a fresh
+    # thread seeded with the instructions and the Talos state brief only.
+    import agent.transports.codex_app_server_session as transport
+    import tools.talos_tool as talos
+    from agent import steward_policy
+    FakeSession.instances.clear()
+    monkeypatch.setattr(transport, 'CodexAppServerSession', FakeSession)
+    monkeypatch.setattr(talos, '_call', lambda path, payload=None, timeout=20: {'text': 'Talos brief at now.\nOpen work: 2 waiting.', 'at': 1})
+    agent = _steward(tmp_path, monkeypatch, session_id='hermes-chat-talos', review=None)
+    rows = []
+    agent.tool_progress_callback = lambda event, runtime, text, _none, **payload: rows.append((payload.get('mode'), text))
+    run_codex_app_server_turn(agent, user_message='First', original_user_message='First',
+                              messages=[{'role': 'user', 'content': 'First'}], effective_task_id='hermes-chat-talos')
+    assert 'Talos brief at now.' in str(FakeSession.instances[0].inputs[0])  # a new thread gets the brief with the contract
+    steward_policy.request_reset('Will asked')
+    history = [{'role': 'user', 'content': 'First'}, {'role': 'assistant', 'content': 'Acknowledged.'}, {'role': 'user', 'content': 'Second'}]
+    result = run_codex_app_server_turn(agent, user_message='Second', original_user_message='Second', messages=history, effective_task_id='hermes-chat-talos')
+    assert result['completed'] is True
+    assert len(FakeSession.instances) == 2 and FakeSession.instances[1].kwargs['resume_thread_id'] == ''
+    fresh_input = str(FakeSession.instances[1].inputs[0])
+    assert 'hermes_conversation_history' not in fresh_input and 'Acknowledged.' not in fresh_input, 'no transcript replay'
+    assert 'You are Jim.' in fresh_input and 'Talos brief at now.' in fresh_input
+    assert steward_policy.pending_reset() is None, 'the request is spent once the fresh thread is bound'
+    assert any(mode == 'reset' and 'Will asked' in text and 'not replayed' in text for mode, text in rows)
+    history += [{'role': 'assistant', 'content': 'Acknowledged.'}, {'role': 'user', 'content': 'Third'}]
+    run_codex_app_server_turn(agent, user_message='Third', original_user_message='Third', messages=history, effective_task_id='hermes-chat-talos')
+    assert len(FakeSession.instances) == 2 and len(FakeSession.instances[1].inputs) == 2, 'the fresh thread is resumed afterwards'
+    assert 'Talos brief' not in str(FakeSession.instances[1].inputs[1]), 'the brief does not ride an ordinary turn'
+
+
+def test_a_review_run_never_consumes_a_pending_reset(tmp_path, monkeypatch):
+    import agent.transports.codex_app_server_session as transport
+    from agent import steward_policy
+    FakeSession.instances.clear()
+    monkeypatch.setattr(transport, 'CodexAppServerSession', FakeSession)
+    agent = _steward(tmp_path, monkeypatch, session_id='hermes-steward-review', review=REVIEW)
+    steward_policy.request_reset('pending for the talos thread')
+    run_codex_app_server_turn(agent, user_message='Internal final review', original_user_message='Internal final review',
+                              messages=[{'role': 'user', 'content': 'Internal final review'}], effective_task_id='hermes-steward-review')
+    assert steward_policy.pending_reset()['reason'] == 'pending for the talos thread'
