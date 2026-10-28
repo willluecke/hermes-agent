@@ -840,7 +840,9 @@ def claude_code_args(
         # Disable customizations explicitly while retaining our scoped server.
         settings={'disableAllHooks':True,'enabledPlugins':{},'disableClaudeAiConnectors':True,
                   'autoMemoryEnabled':False,'autoDreamEnabled':False}
-        args.extend(['--strict-mcp-config','--tools','','--no-chrome','--disable-slash-commands',
+        # Will, 2026-10-28: the steward has full permissions. Only a bound final
+        # review (one tool, one final) still runs without Claude's native tools.
+        args.extend(['--strict-mcp-config',*(['--tools',''] if steward_review is not None else []),'--no-chrome','--disable-slash-commands',
                      '--settings',json.dumps(settings)])
     if effort:
         args.extend(["--effort", effort])

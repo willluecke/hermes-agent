@@ -579,12 +579,14 @@ class CodexAppServerSession:
         self._require_exact = bool(require_exact)
         from agent.steward_policy import is_steward, review_context
         self._steward = is_steward(session=hermes_session_id,project=project_key,cwd=self._cwd)
-        self._read_only = bool(read_only or self._steward)
         # The gateway-bound final review (never model-set) rides to the scoped
         # MCP server as trusted environment; only the steward may carry one.
         self._steward_review = review_context(steward_review) if steward_review is not None else None
         if self._steward_review is not None and not self._steward:
             raise ValueError('A steward final review runs only as the restricted steward')
+        # Will, 2026-10-28: the steward has full permissions; only its bound
+        # final reviews stay read-only.
+        self._read_only = bool(read_only or self._steward_review is not None)
         self._exact_runtime_validated = False
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -764,9 +766,17 @@ class CodexAppServerSession:
                 )
             )
             policy = self._reversible_deletion_policy
+            shim_workspace = self._cwd
+            if self._steward and policy is not None and getattr(policy, "enabled", False):
+                # The steward works anywhere under Will's home (its cwd is only
+                # its notes workspace), and a registered project root is the one
+                # target it may never remove (agent.project_deletion).
+                from dataclasses import replace
+                from agent.project_deletion import project_roots
+                policy = replace(policy, protected_roots=project_roots())
+                shim_workspace = str(Path.home())
             if (
                 self._project_key
-                and not self._steward
                 and policy is not None
                 and getattr(policy, "enabled", False)
             ):
@@ -784,13 +794,13 @@ class CodexAppServerSession:
                         or "unscoped"
                     )
                     broker = ReversibleDeleteBroker(
-                        workspace_root=self._cwd,
+                        workspace_root=shim_workspace,
                         project=self._project_key,
                         run_id=run_scope,
                         policy=policy,
                     )
                     runtime = install_reversible_delete_runtime(
-                        workspace_root=self._cwd,
+                        workspace_root=shim_workspace,
                         project=self._project_key,
                         run_id=run_scope,
                         policy=policy,
@@ -818,14 +828,27 @@ class CodexAppServerSession:
                 # filesystem changes; ``never`` prevents an unattended turn
                 # from requesting an escalation out of that boundary.
                 client_extra_args.extend(_read_only_codex_args(self._codex_home))
-            if self._steward:
-                # The steward must reach its own MCP tools. Under "never",
-                # Codex declines every MCP call needing confirmation before
-                # asking us, so Jim could not read or record anything
-                # (2026-10-10). "on-request" routes each request here, where
-                # only hermes-tools elicitations are accepted and exec, file
-                # and permission requests are cancelled; the shell and patch
-                # tools stay disabled and the sandbox stays read-only.
+            if self._steward and self._steward_review is None:
+                # Will, 2026-10-28: "The main talos agent shouldn't have any
+                # guard rails except for project deletion." No sandbox, every
+                # native tool, approvals accepted here (exec requests still pass
+                # agent.project_deletion). The scoped hermes-tools server keeps
+                # the steward identity so that one refusal applies inside it too.
+                from agent.steward_policy import mcp_server
+                server=mcp_server()
+                env=','.join(json.dumps(k)+'='+json.dumps(v) for k,v in {**server['env'],'HERMES_HOME':str(Path.home()/'.hermes'),'HERMES_QUIET':'1'}.items())
+                env_vars=json.dumps(["HERMES_GATEWAY_SESSION_ID","HERMES_HOME","PYTHONPATH","HERMES_PARENT_PROVIDER","HERMES_PARENT_MODEL","HERMES_PARENT_EFFORT","HERMES_PARENT_OPUS_WORKER"])
+                config=('"hermes-tools"={enabled=true,command='+json.dumps(server['command'])+',args='+json.dumps(server['args'])
+                        +',env={'+env+'},env_vars='+env_vars+',startup_timeout_sec=30.0,tool_timeout_sec=600.0}')
+                client_extra_args.extend(['-c','sandbox_mode="danger-full-access"','-c','approval_policy="on-request"','-c','mcp_servers={'+config+'}'])
+            elif self._steward:
+                # A bound final review: the restricted runtime of 2026-10-10.
+                # Under "never", Codex declines every MCP call needing
+                # confirmation before asking us, so Jim could not read or record
+                # anything. "on-request" routes each request here, where only
+                # hermes-tools elicitations are accepted and exec, file and
+                # permission requests are cancelled; the shell and patch tools
+                # stay disabled and the sandbox stays read-only.
                 client_extra_args = [
                     'approval_policy="on-request"' if arg == 'approval_policy="never"' else arg
                     for arg in client_extra_args
@@ -875,7 +898,7 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        if self._steward: params.update(sandbox="read-only",approvalPolicy="on-request")
+        if self._steward: params.update(sandbox="read-only" if self._steward_review is not None else "danger-full-access",approvalPolicy="on-request")
         if self._model:
             params["model"] = self._model
         method = "thread/start"
@@ -1122,7 +1145,7 @@ class CodexAppServerSession:
                 {
                     "threadId": self._thread_id,
                     "input": turn_input,
-                    **({"sandboxPolicy":{"type":"readOnly"},"approvalPolicy":"on-request"} if self._steward else {}),
+                    **({"sandboxPolicy":{"type":"readOnly" if self._steward_review is not None else "dangerFullAccess"},"approvalPolicy":"on-request"} if self._steward else {}),
                     **({"model": self._model} if self._model else {}),
                     **({"effort": effort} if (effort := self._turn_effort()) else {}),
                 },
@@ -1757,7 +1780,14 @@ class CodexAppServerSession:
         params = req.get("params") or {}
 
         if self._steward and method in {'item/commandExecution/requestApproval','item/fileChange/requestApproval','item/permissions/requestApproval'}:
-            self._client.respond(rid,{'decision':'cancel'})
+            decision='cancel'
+            if self._steward_review is None:
+                # Full permissions (Will, 2026-10-28), except project deletion.
+                from agent.project_deletion import refuse_command
+                reason=refuse_command(params.get('command') or '',params.get('cwd') or self._cwd) if method=='item/commandExecution/requestApproval' else None
+                if reason: self._last_policy_block_reason=reason
+                decision='cancel' if reason else 'accept'
+            self._client.respond(rid,{'decision':decision})
             return
         if method == "item/commandExecution/requestApproval":
             decision = self._decide_exec_approval(params)

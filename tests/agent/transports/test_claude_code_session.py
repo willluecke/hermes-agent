@@ -2111,10 +2111,11 @@ def test_a_short_cap_keeps_its_short_auth_window():
     assert uncapped._auth_min_validity_seconds() == 2 * 60 * 60 + 10 * 60
 
 
-def test_steward_has_no_native_tools_extensions_or_hooks_but_keeps_scoped_mcp():
+def test_steward_keeps_native_tools_but_no_extensions_or_hooks():
     import json
     args=claude_code_args(model='claude-opus-5-5',session_id='fixture',steward=True,settings_json='{"hooks":{"unsafe":true}}')
-    assert args[args.index('--tools')+1]==''
+    assert '--tools' not in args  # Will, 2026-10-28: full permissions; only a bound review drops the native tools
+    assert args[args.index('--permission-mode')+1]=='bypassPermissions'
     assert args[args.index('--setting-sources')+1]==''
     assert '--strict-mcp-config' in args and '--safe-mode' not in args and '--no-chrome' in args
     assert '--disable-slash-commands' in args

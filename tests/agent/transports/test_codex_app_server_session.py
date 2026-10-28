@@ -2303,7 +2303,7 @@ def test_a_silent_turn_is_still_stopped_by_the_inactivity_watchdog():
     assert result.interrupted and result.should_retire
 
 
-def test_steward_thread_start_asks_so_its_mcp_calls_are_not_declined(tmp_path):
+def test_steward_thread_start_has_full_access_and_asks_so_its_mcp_calls_are_not_declined(tmp_path):
     clients=[]
     def factory(**kwargs):
         client=FakeClient(**kwargs)
@@ -2312,11 +2312,11 @@ def test_steward_thread_start_asks_so_its_mcp_calls_are_not_declined(tmp_path):
     session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
     session.ensure_started()
     method, params = next(r for r in clients[0].requests if r[0] == "thread/start")
-    assert params["sandbox"] == "read-only"
+    assert params["sandbox"] == "danger-full-access"   # Will, 2026-10-28: full permissions
     assert params["approvalPolicy"] == "on-request"
 
 
-def test_steward_native_tools_disabled_but_scoped_mcp_retained(tmp_path):
+def test_steward_keeps_native_tools_and_the_full_hermes_surface(tmp_path):
     import tomllib
     captured={}
     (tmp_path/'config.toml').write_text('[mcp_servers.other]\ncommand="unsafe"\n[mcp_servers.hermes-tools]\ncommand="old-unrestricted"\n')
@@ -2326,20 +2326,38 @@ def test_steward_native_tools_disabled_but_scoped_mcp_retained(tmp_path):
     session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
     session.ensure_started()
     args=captured['extra_args']
-    # The steward asks, so its own MCP calls reach the client (which accepts
-    # only hermes-tools); "never" made Codex decline them unasked.
-    assert 'sandbox_mode="read-only"' in args and 'approval_policy="on-request"' in args
-    assert 'approval_policy="never"' not in args
+    assert 'sandbox_mode="danger-full-access"' in args and 'approval_policy="on-request"' in args
+    assert 'sandbox_mode="read-only"' not in args and 'approval_policy="never"' not in args
+    pairs=[args[i:i+2] for i in range(len(args)-1)]
     for feature in ['shell_tool','unified_exec','apply_patch_freeform','js_repl','multi_agent','hooks','plugins']:
-        assert ['--disable',feature] in [args[i:i+2] for i in range(len(args)-1)]
+        assert ['--disable',feature] not in pairs
+    assert 'web_search="disabled"' not in args and 'tools.view_image=false' not in args
     overlays=[a for a in args if a.startswith('mcp_servers=')]
     assert len(overlays)==1
-    servers=tomllib.loads(overlays[0])['mcp_servers']
-    assert servers['other']['enabled'] is False
-    config=servers['hermes-tools']
+    config=tomllib.loads(overlays[0])['mcp_servers']['hermes-tools']
     assert config['enabled'] is True
-    assert config['env']['HERMES_STEWARD']=='1'
-    assert config['env']['HERMES_TOOLS_MCP_ONLY']=='talos,hermes_conversation'
+    assert config['env']['HERMES_STEWARD']=='1' and 'HERMES_TOOLS_MCP_ONLY' not in config['env']
+    assert 'HERMES_GATEWAY_SESSION_ID' in config['env_vars'] and config['tool_timeout_sec']==600.0
+
+
+def test_steward_approvals_are_accepted_except_project_deletion(tmp_path, monkeypatch):
+    import json
+    captured={}
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return FakeClient(**kwargs)
+    session=CodexAppServerSession(cwd='/tmp',hermes_session_id='hermes-chat-talos',codex_home=str(tmp_path),client_factory=factory)
+    session.ensure_started()
+    registry=tmp_path/'projects.json'; registry.write_text(json.dumps({'talos':str(tmp_path/'talos')})); (tmp_path/'talos').mkdir()
+    monkeypatch.setenv('HERMES_PROJECT_REGISTRY',str(registry)); monkeypatch.setenv('HERMES_TALOS_LEDGER',str(tmp_path/'absent.sqlite3'))
+    responses=[]
+    session._client.respond=lambda rid,body: responses.append((rid,body))
+    session._handle_server_request({'id':1,'method':'item/commandExecution/requestApproval','params':{'command':'python3 -m pytest -q','cwd':str(tmp_path/'talos')}})
+    session._handle_server_request({'id':2,'method':'item/fileChange/requestApproval','params':{'itemId':'x'}})
+    session._handle_server_request({'id':3,'method':'item/permissions/requestApproval','params':{}})
+    session._handle_server_request({'id':4,'method':'item/commandExecution/requestApproval','params':{'command':'rm -rf '+str(tmp_path/'talos'),'cwd':'/tmp'}})
+    assert [b['decision'] for _,b in responses]==['accept','accept','accept','cancel']
+    assert 'Project deletion' in session._last_policy_block_reason
 
 
 _REVIEW_RUN='run_'+'c'*32
@@ -2380,7 +2398,7 @@ def test_ordinary_steward_codex_turns_carry_no_review_binding(tmp_path):
     session.ensure_started()
     config=tomllib.loads(next(a for a in captured['extra_args'] if a.startswith('mcp_servers=')))['mcp_servers']['hermes-tools']
     assert 'HERMES_STEWARD_REVIEW' not in config['env']
-    assert config['env']['HERMES_TOOLS_MCP_ONLY']=='talos,hermes_conversation'
+    assert 'HERMES_TOOLS_MCP_ONLY' not in config['env']
 
 
 def test_a_review_binding_is_refused_outside_the_steward_or_when_malformed(tmp_path):

@@ -65,6 +65,10 @@ class ReversibleDeletionPolicy:
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES
     max_entries: int = DEFAULT_MAX_ENTRIES
     temp_roots: tuple[str, ...] = DEFAULT_TEMP_ROOTS
+    # Registered project roots (agent.project_deletion): a target equal to one,
+    # or above one, is refused outright rather than captured. Will, 2026-10-28:
+    # project deletion is the one thing the Talos steward never does.
+    protected_roots: tuple[str, ...] = ()
 
     @classmethod
     def from_config(cls, raw: Any) -> "ReversibleDeletionPolicy":
@@ -228,6 +232,13 @@ def _is_descendant(path: str, root: str) -> bool:
         return False
 
 
+def _refuse_project_root(target: str, policy: ReversibleDeletionPolicy) -> None:
+    for root_path in policy.protected_roots:
+        root = os.path.realpath(root_path)
+        if target == root or _is_descendant(root, target):
+            raise UnsafeDeleteTarget("registered projects are never deleted")
+
+
 def _canonical_delete_target(raw_path: str, cwd: str) -> str:
     if not raw_path or raw_path.startswith("~"):
         raise UnsafeDeleteTarget("delete target is empty or uses home expansion")
@@ -254,6 +265,7 @@ def validate_delete_target(
         protected_root = os.path.realpath(protected_root_path)
         if target == protected_root or _is_descendant(target, protected_root):
             raise UnsafeDeleteTarget("Hermes recovery storage is protected")
+    _refuse_project_root(target, policy)
     if _is_descendant(target, workspace):
         return target
     for configured_root in policy.temp_roots:
@@ -288,6 +300,7 @@ def validate_expanded_delete_target(
         protected_root = os.path.realpath(protected_root_path)
         if target == protected_root or _is_descendant(target, protected_root):
             raise UnsafeDeleteTarget("Hermes recovery storage is protected")
+    _refuse_project_root(target, policy)
     if _is_descendant(target, workspace):
         return target
     for configured_root in policy.temp_roots:

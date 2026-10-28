@@ -4,29 +4,39 @@ from agent.steward_policy import StewardTools, require_steward_runtime
 from agent.transports.hermes_tools_mcp_server import selected_tools
 
 
-def test_steward_cannot_expand_tool_surface():
-    assert selected_tools({'HERMES_STEWARD':'1','HERMES_TOOLS_MCP_ONLY':'terminal,delegate_task'})==('talos','hermes_conversation','steward_jobs')
+def test_steward_sees_the_full_tool_surface():
+    # Will, 2026-10-28: no guard rails except project deletion. HERMES_STEWARD
+    # keeps the identity for that one refusal; it no longer narrows the tools.
+    from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+    assert selected_tools({'HERMES_STEWARD':'1'})==EXPOSED_TOOLS
+    assert 'terminal' not in EXPOSED_TOOLS  # codex/claude native tools cover the shell and files
+    assert selected_tools({'HERMES_STEWARD_REVIEW':'{}'})==('talos',)
 
 
-@pytest.mark.parametrize('name,args',[('terminal',{}),('delegate_task',{}),('hermes_conversation',{'action':'send','id':'delegate'}),('hermes_conversation',{'action':'goal','verb':'resume'}),('talos',{'action':'unknown'})])
-def test_forbidden_tool_actions_are_refused(name,args):
-    with pytest.raises(ValueError): StewardTools().check(name,args)
+@pytest.mark.parametrize('name,args',[('terminal',{}),('delegate_task',{}),('hermes_conversation',{'action':'send','id':'delegate'}),
+                                      ('hermes_conversation',{'action':'goal','verb':'resume'}),('hermes_conversation',{'action':'create'}),
+                                      ('talos',{'action':'admit'}),('talos',{'action':'project_save'}),('talos',{'action':'grant_revoke'}),
+                                      ('talos',{'action':'routine_create','owner':'agent','body':{'kind':'steward'}}),('steward_jobs',{'action':'anything'})])
+def test_every_former_steward_refusal_is_now_allowed(name,args):
+    StewardTools().check(name,args)
 
 
-def test_dispatch_allows_one_acknowledgement_then_forces_report():
+def test_no_dispatch_or_read_fences_remain():
     policy=StewardTools()
     policy.check('talos',{'action':'dispatch'})
     policy.completed('talos',{'action':'dispatch'},'{}')
-    policy.check('talos',{'action':'delegation','id':'one'})
-    for args in [{'action':'delegation','id':'two'},{'action':'dispatch'},{'action':'live'}]:
-        with pytest.raises(ValueError): policy.check('talos',args)
-
-
-def test_status_reads_cannot_poll_by_varying_limits():
-    policy=StewardTools()
+    for args in [{'action':'delegation','id':'one'},{'action':'delegation','id':'one'},{'action':'dispatch'},{'action':'live'},{'action':'live'}]:
+        policy.check('talos',args)
     policy.check('hermes_conversation',{'action':'read','id':'c','limit':10})
-    with pytest.raises(ValueError): policy.check('hermes_conversation',{'action':'read','id':'c','limit':20})
-    StewardTools().check('hermes_conversation',{'action':'read','id':'c'}) # new user turn
+    policy.check('hermes_conversation',{'action':'read','id':'c','limit':20})
+    def unavailable(*args): raise OSError('lost response')
+    with pytest.raises(OSError): policy.run('talos',{'action':'dispatch'},unavailable)
+    assert policy.run('talos',{'action':'dispatch'},lambda *_:'dispatched')=='dispatched'  # an uncertain error closes nothing
+
+
+def test_review_actions_stay_gateway_bound_in_ordinary_turns():
+    for action in ('review','review_content','review_ack'):
+        with pytest.raises(ValueError,match='review'): StewardTools().check('talos',{'action':action})
 
 
 def test_no_unrestricted_runtime_fallback_or_post_turn_review():
@@ -41,17 +51,6 @@ def test_no_unrestricted_runtime_fallback_or_post_turn_review():
     assert _claude_hook_parity(agent,None,None,[],[],None,'task')==0
 
 
-def test_dispatch_blocks_runtime_change_before_any_remote_read(monkeypatch):
-    from unittest.mock import Mock
-    import tools.hermes_conversation_tool as conversation
-    goal=Mock()
-    monkeypatch.setattr(conversation,'_goal',goal)
-    policy=StewardTools()
-    policy.completed('talos',{'action':'dispatch'},'{}')
-    with pytest.raises(ValueError): policy.check('hermes_conversation',{'action':'set_runtime','id':'delegate'})
-    goal.assert_not_called()
-
-
 def test_jev_preflight_never_runs_for_steward(monkeypatch):
     import importlib.util
     from pathlib import Path
@@ -64,30 +63,6 @@ def test_jev_preflight_never_runs_for_steward(monkeypatch):
     assert module.on_pre_llm_call(session_id='hermes-chat-talos',user_message='Fix delivery') is None
 
 
-def test_uncertain_dispatch_error_still_closes_the_action_budget():
-    policy=StewardTools()
-    def unavailable(*args): raise OSError('lost response')
-    with pytest.raises(OSError): policy.run('talos',{'action':'dispatch'},unavailable)
-    with pytest.raises(ValueError): policy.run('talos',{'action':'dispatch'},unavailable)
-    assert policy.run('talos',{'action':'delegation','id':'d'},lambda *_:'preparing')=='preparing'
-
-
-def test_parallel_dispatches_cannot_pass_the_same_fence():
-    from concurrent.futures import ThreadPoolExecutor
-    import threading
-    policy=StewardTools()
-    start=threading.Barrier(2)
-    calls=[]
-    def invoke():
-        start.wait(timeout=5)
-        try: return policy.run('talos',{'action':'dispatch'},lambda *_:calls.append('one'))
-        except ValueError: return 'refused'
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results=list(pool.map(lambda _:invoke(),range(2)))
-    assert calls==['one']
-    assert results.count('refused')==1
-
-
 WATCH_SAVE={'action':'watch_save','conversation_id':'regwatch','criteria':'Done means the claim is filed and the receipt number is quoted.',
             'source':{'conversation_id':'talos','message_id':'m1'},'active':True}
 
@@ -95,13 +70,12 @@ WATCH_SAVE={'action':'watch_save','conversation_id':'regwatch','criteria':'Done 
 def test_watch_mode_actions_are_steward_actions_in_ordinary_turns():
     policy=StewardTools()
     policy.check('talos',{'action':'watches'})
-    with pytest.raises(ValueError): policy.check('talos',{'action':'watches'})                      # a read: once per turn
-    policy.check('talos',{'action':'watches','conversation_id':'regwatch'})                         # another query is another read
-    with pytest.raises(ValueError): policy.check('talos',{'action':'watches','conversation_id':'regwatch'})
+    policy.check('talos',{'action':'watches'})                                                      # reads repeat freely since 2026-10-28
+    policy.check('talos',{'action':'watches','conversation_id':'regwatch'})
     policy.check('talos',WATCH_SAVE)
     policy.check('talos',{**WATCH_SAVE,'active':False})                                             # a write: start, then stop, in one turn
     policy.completed('talos',{'action':'dispatch'},'{}')
-    with pytest.raises(ValueError): policy.check('talos',WATCH_SAVE)                                # after a dispatch only its acknowledgement remains
+    policy.check('talos',WATCH_SAVE)                                                                # a dispatch no longer ends the turn's actions
 
 
 def test_watch_mode_actions_are_refused_in_review_mode():
@@ -194,20 +168,15 @@ def test_turn_source_is_the_stewards_submitted_message_and_becomes_a_note():
             turn_source(bad, session=kw.get('session', 'hermes-chat-talos'), project=kw.get('project', 'talos-steward'))
 
 
-def test_steward_files_reminders_for_will_and_no_other_routine():
+def test_steward_files_any_routine_it_wants():
     from agent.steward_policy import StewardTools
     reminder = {'action': 'routine_create', 'project_id': 'reg-watch', 'id': 'regwatch-email-warmup', 'owner': 'human',
                 'body': {'title': 'Daily RegWatch email warmup', 'estimated_minutes': 5, 'missed_run_policy': 'retain',
                          'recurrence': {'kind': 'daily', 'at': '09:00', 'timezone': 'America/Los_Angeles'}}}
     assert StewardTools().run('talos', reminder, lambda name, args: 'ok') == 'ok'
-    for broken in ({**reminder, 'owner': 'agent'},                                   # an agent routine runs work
-                   {**reminder, 'body': {**reminder['body'], 'kind': 'steward'}},    # what Jim tried on 2026-10-19
-                   {**reminder, 'body': {**reminder['body'], 'contract': {}}},       # a task contract
-                   {**reminder, 'body': {**reminder['body'], 'missed_run_policy': 'coalesce'}},
-                   {**reminder, 'body': {**reminder['body'], 'title': ' '}},
-                   {k: v for k, v in reminder.items() if k != 'owner'}):
-        with pytest.raises(ValueError):
-            StewardTools().run('talos', broken, lambda name, args: 'ok')
+    for other in ({**reminder, 'owner': 'agent'}, {**reminder, 'body': {**reminder['body'], 'kind': 'steward'}},
+                  {**reminder, 'body': {**reminder['body'], 'contract': {}}}):
+        assert StewardTools().run('talos', other, lambda name, args: 'ok') == 'ok'  # Talos validates bodies itself
     review = {'id': 'final_'+'a'*64, 'content_hash': 'b'*64, 'queue_id': 'jim_final_'+'a'*64, 'review_run_id': 'run_1',
               'source': {'conversation_id': 'talos', 'message_id': 'run_1'}}
     with pytest.raises(ValueError):  # review mode admits only the review actions
@@ -217,9 +186,9 @@ def test_steward_files_reminders_for_will_and_no_other_routine():
 def test_steward_jobs_is_a_steward_tool_in_ordinary_turns_only():
     policy = StewardTools()
     assert policy.run('steward_jobs', {'action': 'jobs'}, lambda name, args: 'ok') == 'ok'
-    with pytest.raises(ValueError): policy.check('steward_jobs', {'action': 'jobs'})   # a read: once per turn
+    policy.check('steward_jobs', {'action': 'jobs'})   # reads repeat freely
     assert policy.run('steward_jobs', {'action': 'job_save', 'id': 'j', 'prompt': 'p', 'reason': 'r'}, lambda name, args: 'ok') == 'ok'
-    with pytest.raises(ValueError): policy.check('steward_jobs', {'action': 'job_delete'})
+    policy.check('steward_jobs', {'action': 'job_delete'})  # a job is not a project; the tool itself has no such action
     review = {'id': 'final_'+'a'*64, 'content_hash': 'b'*64, 'queue_id': 'jim_final_'+'a'*64, 'review_run_id': 'run_1',
               'source': {'conversation_id': 'talos', 'message_id': 'run_1'}}
     with pytest.raises(ValueError): StewardTools(review=review).check('steward_jobs', {'action': 'jobs'})

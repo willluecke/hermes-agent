@@ -1,4 +1,8 @@
-"""Talos is a tool-only orchestrator. This policy is not model advice."""
+"""The Talos steward's runtime policy: identity, review bindings and the one refusal.
+
+Will, 2026-10-28: the steward has full permissions except project deletion.
+This module is not model advice; the model reads docs/steward-instructions.md.
+"""
 import json
 import os
 from pathlib import Path
@@ -49,24 +53,6 @@ def source_note(source):
             + '. Use this durable client turn ID for provenance and deduplication; composer drafts are not submissions.')
 
 
-REMINDER_FIELDS = {'title', 'estimated_minutes', 'missed_run_policy', 'recurrence'}
-
-
-def reminder_check(args):
-    """The steward files reminders for Will and nothing else through routine_create:
-    a human-owned, retained commitment with a title and a recurrence. Agent task,
-    summary or steward routines stay out of reach (Jim tried `kind: steward` for a
-    daily warmup reminder on 2026-10-19 and was refused outright)."""
-    body = args.get('body')
-    if args.get('owner') != 'human' or not isinstance(body, dict) or not isinstance(args.get('project_id'), str):
-        raise ValueError("A steward routine is a reminder for Will: owner 'human', a project_id, and a body with "
-                         "title, recurrence, estimated_minutes and missed_run_policy 'retain'.")
-    unknown = set(body) - REMINDER_FIELDS
-    if unknown or body.get('missed_run_policy') != 'retain' or not isinstance(body.get('title'), str) or not body['title'].strip():
-        raise ValueError('A reminder body carries only title, recurrence, estimated_minutes and missed_run_policy=retain'
-                         + (': not ' + ', '.join(sorted(unknown)) if unknown else '') + '.')
-
-
 def review_request(value):
     """The `steward_review` request field: exactly {id, content_hash, queue_id}."""
     if not isinstance(value, dict) or set(value) != {'id', 'content_hash', 'queue_id'}:
@@ -115,8 +101,15 @@ def review_from_env(env=None):
 
 
 def mcp_server(review=None):
-    env = {'PYTHONPATH':str(Path(__file__).resolve().parents[1]),'HERMES_STEWARD':'1',
-           'HERMES_TOOLS_MCP_ONLY':'talos,hermes_conversation,steward_jobs'}
+    """The steward's hermes-tools MCP server definition.
+
+    Will, 2026-10-28: "The main talos agent shouldn't have any guard rails
+    except for project deletion." An ordinary steward turn therefore sees the
+    whole hermes-tools surface (no HERMES_TOOLS_MCP_ONLY); HERMES_STEWARD only
+    keeps the steward identity so StewardTools can apply that one refusal. A
+    bound final review still sees exactly one tool.
+    """
+    env = {'PYTHONPATH':str(Path(__file__).resolve().parents[1]),'HERMES_STEWARD':'1'}
     if review is not None:
         # A review session sees one tool, bound to one final. The binding is
         # canonical JSON so the subprocess validates exactly what the gateway bound.
@@ -126,12 +119,19 @@ def mcp_server(review=None):
 
 
 class StewardTools:
-    """One instance per native turn, enforced in the isolated MCP subprocess."""
+    """One instance per native turn, enforced in the isolated MCP subprocess.
+
+    Until 2026-10-28 this class fenced the steward: a tool allowlist, one
+    dispatch then one acknowledgement per turn, one read per resource, no
+    sends, goals or runtime changes, reminders only. Will removed all of it:
+    "The main talos agent shouldn't have any guard rails except for project
+    deletion, that's the only thing it can't do." An ordinary turn now refuses
+    exactly two things: the trusted review actions outside a review invocation
+    (they are gateway-bound provenance, not a capability) and project deletion
+    (agent.project_deletion). Review mode is unchanged: one tool, one final.
+    """
     def __init__(self, review=None):
         self.lock = threading.RLock()
-        self.dispatched = False
-        self.confirmed = False
-        self.reads = set()
         # Trusted review binding (gateway-set, never model-set). In review mode
         # only the three review actions exist, for the assigned ID, once each.
         self.review = review_context(review) if review is not None else None
@@ -140,7 +140,7 @@ class StewardTools:
         self.attempted = set()         # review actions whose remote call was attempted
 
     def run(self, name, args, handler):
-        # MCP clients may issue tools concurrently; serialize the dispatch fence
+        # MCP clients may issue tools concurrently; serialize the review fence
         # and all side effects, including uncertain/error responses.
         with self.lock:
             self.check(name,args)
@@ -149,56 +149,18 @@ class StewardTools:
                 # entry point receives this turn's binding and state directly.
                 from tools.talos_tool import review_tool
                 handler = lambda name, args: review_tool(self, **args)
-            try:
-                return handler(name,args)
-            finally:
-                self.completed(name,args,None)
+            return handler(name,args)
 
     def check(self, name, args):
-        action = args.get('action')
+        action = (args or {}).get('action')
         if self.review is not None:
             return self.check_review(name, action, args)
         if action in REVIEW_ACTIONS:
             raise ValueError('Final reviews run only inside a trusted internal review invocation.')
-        if self.dispatched:
-            if name!='talos' or action!='delegation' or self.confirmed:
-                raise ValueError('Dispatch recorded. Report the acknowledgement/link and end this turn.')
-            self.confirmed = True
-        if name=='hermes_conversation':
-            if action not in {'list','read','goal','set_runtime'}:
-                raise ValueError('Steward cannot send extra turns, create goals, or supervise delegates. Use talos dispatch.')
-            if action=='goal' and args.get('verb','status')!='status':
-                raise ValueError('Only the goal controller manages delegated goals.')
-        elif name=='steward_jobs':
-            # Jim's own cron jobs (owner jim): read them, change prompt/schedule/
-            # enabled/name. Will, 2026-10-19: "jim should be able to change anything
-            # that you can change" (the morning-plan job). The tool itself holds the
-            # allowlist, backup, prompt scan and audit; here only the actions.
-            if action not in {'jobs','job_save'}:
-                raise ValueError('steward_jobs offers jobs and job_save only.')
-        elif name=='talos':
-            # watches/watch_save: Jim reviews finals of a thread Will drives himself
-            # (watch mode). A watch is read or saved only in an ordinary turn; review
-            # mode admits nothing but the three review actions (check_review).
-            if action not in {'state','live','projects','project','mandate','mandate_save','directions','direction','direction_save',
-                              'interview_save','dispatch','delegation','delegation_control','hold','sessions','watches','watch_save',
-                              'routine_create'}:
-                raise ValueError('This tool action is not available to the steward.')
-            if action == 'routine_create':
-                reminder_check(args)
-        else:
-            raise ValueError('Steward tools are limited to talos, hermes_conversation and steward_jobs.')
-        if name=='hermes_conversation' and action=='set_runtime':
-            from tools.hermes_conversation_tool import _goal
-            current=_goal(args.get('id'),'status')
-            goal=current.get('goal',current) if isinstance(current,dict) else {}
-            if goal and goal.get('delegation_id') and goal.get('status') in {'active','paused'}:
-                raise ValueError('Managed runtime is pinned; ask Will rather than changing live delegated work.')
-        if action in {'list','read','goal','state','live','projects','project','mandate','directions','direction','delegation','sessions','watches','jobs'}:
-            key=(name,action,args.get('id'),args.get('project_id') or args.get('project'),args.get('conversation_id'))
-            if key in self.reads:
-                raise ValueError('Already read this state this turn. Answer once; do not poll.')
-            self.reads.add(key)
+        from agent.project_deletion import refuse_tool
+        reason = refuse_tool(name, args)
+        if reason:
+            raise ValueError(reason)
 
     def check_review(self, name, action, args):
         """Review mode: the assigned final only, each action at most once, nothing else."""
@@ -222,12 +184,7 @@ class StewardTools:
             raise ValueError('final_sha256 is bound to the assigned record and cannot be changed.')
 
     def completed(self, name, args, result):
-        if self.review is not None:
-            return  # review attempts are recorded by the trusted entry point itself
-        if name=='talos' and args.get('action')=='dispatch':
-            # Even an uncertain dispatch response must be reported, never retried
-            # by supervising the worker or repairing stores in this turn.
-            self.dispatched=True
+        return  # no per-turn budgets remain; review attempts are recorded by the trusted entry point
 
 
 PROFILE_LIMIT = 8000  # characters of Will's profile; USER.md is ~2.3 KB today
