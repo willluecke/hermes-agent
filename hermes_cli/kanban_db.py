@@ -5522,12 +5522,18 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        # Bind a worktree run to its tree (head_sha + changed_paths next to
+        # the base_sha stamped at spawn) before the row closes. Worker
+        # metadata is merged over the run's existing metadata, not replaced.
+        metadata, tree = _bind_run_tree(conn, task_id, metadata)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
+        if tree is not None and run_id is not None:
+            _append_event(conn, task_id, TREE_BOUND_EVENT, tree, run_id=run_id)
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
@@ -6671,6 +6677,9 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        # Same tree binding as complete_task: the handoff to review records
+        # which commit the implementer started from and what changed.
+        metadata, tree = _bind_run_tree(conn, task_id, metadata)
         run_id = _end_run(
             conn,
             task_id,
@@ -6679,6 +6688,8 @@ def request_review(
             summary=summary,
             metadata=metadata,
         )
+        if tree is not None and run_id is not None:
+            _append_event(conn, task_id, TREE_BOUND_EVENT, tree, run_id=run_id)
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
                 conn,
@@ -8060,6 +8071,172 @@ def set_branch_name(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Tree binding: which commit a worktree run started from and what it changed
+# ---------------------------------------------------------------------------
+#
+# Every run that works in a git worktree records, on ``task_runs.metadata``:
+#
+# * ``base_sha`` — ``git rev-parse HEAD`` right after the dispatcher
+#   materializes the worktree (``record_run_base_sha``).
+# * ``head_sha`` + ``changed_paths`` — stamped when the run closes through
+#   ``complete_task`` or ``request_review`` (``_bind_run_tree``), alongside a
+#   ``tree_bound`` task event so the timeline shows the binding. ``changed_paths``
+#   is the sorted union of ``git diff --name-only <base_sha>..HEAD`` and the
+#   paths in ``git status --porcelain``, capped at ``TREE_CHANGED_PATHS_CAP``.
+# * ``tree_error`` — a short reason when git could not answer; the transition
+#   still goes through. Binding never blocks completion.
+#
+# The worker-supplied handoff metadata is merged over the run's existing
+# metadata, never replaced, so ``base_sha`` survives the close. ``dir:`` and
+# ``scratch`` workspaces record nothing.
+
+TREE_BOUND_EVENT = "tree_bound"
+TREE_CHANGED_PATHS_CAP = 500
+
+
+def _git_output(path: Path | str, *args: str, timeout: int = 30) -> str:
+    """stdout of ``git -C path <args>``; raises ``RuntimeError`` with a short reason on failure."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), *args],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"git {args[0] if args else ''}: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        detail = lines[0].strip() if lines else f"exit {result.returncode}"
+        raise RuntimeError(f"git {' '.join(args)}: {detail[:160]}")
+    return result.stdout or ""
+
+
+def _run_metadata(conn: sqlite3.Connection, run_id: int) -> dict:
+    """The run's metadata JSON as a dict (``{}`` when absent or malformed)."""
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if not row or not row["metadata"]:
+        return {}
+    try:
+        meta = json.loads(row["metadata"])
+    except (TypeError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _merge_run_metadata(conn: sqlite3.Connection, run_id: int, extra: Mapping[str, Any]) -> dict:
+    """Merge ``extra`` into the run's metadata, keeping every other key. Caller holds the txn."""
+    merged = {**_run_metadata(conn, run_id), **dict(extra)}
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(merged, ensure_ascii=False), run_id),
+    )
+    return merged
+
+
+def record_run_base_sha(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path | str,
+    workspace_kind: Optional[str],
+) -> Optional[str]:
+    """Stamp ``base_sha`` (the worktree's HEAD) on the task's current run.
+
+    Called once the dispatcher has materialized a ``worktree`` workspace.
+    ``dir:`` and ``scratch`` workspaces, and tasks without a current run,
+    record nothing. A git failure records ``tree_error`` instead and never
+    raises. Returns the recorded sha, or ``None``.
+    """
+    if (workspace_kind or "scratch") != "worktree":
+        return None
+    run_id = _current_run_id(conn, task_id)
+    if run_id is None:
+        return None
+    try:
+        base_sha = _git_output(workspace, "rev-parse", "HEAD").strip()
+        extra: dict[str, Any] = (
+            {"base_sha": base_sha} if base_sha else {"tree_error": "base_sha: empty HEAD"}
+        )
+    except RuntimeError as exc:
+        extra = {"tree_error": f"base_sha: {exc}"[:200]}
+    with write_txn(conn):
+        _merge_run_metadata(conn, run_id, extra)
+    return extra.get("base_sha")
+
+
+def _changed_paths(workspace: Path, base_sha: str) -> list[str]:
+    """Sorted unique paths changed since ``base_sha``: committed and uncommitted, capped."""
+    paths: set[str] = set()
+    for line in _git_output(workspace, "diff", "--name-only", f"{base_sha}..HEAD").splitlines():
+        line = line.strip()
+        if line:
+            paths.add(line)
+    for line in _git_output(workspace, "status", "--porcelain").splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip()
+        if path:
+            paths.add(path)
+    return sorted(paths)[:TREE_CHANGED_PATHS_CAP]
+
+
+def _bind_run_tree(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> tuple[Optional[dict], Optional[dict]]:
+    """Bind the closing run to its tree. Returns ``(metadata, tree)``.
+
+    When the current run carries ``base_sha``, ``metadata`` becomes the run's
+    existing metadata merged with the worker-supplied dict plus ``head_sha``
+    and ``changed_paths`` (or ``tree_error`` when git fails), and ``tree`` is
+    the ``tree_bound`` event payload (``None`` on failure). Runs without
+    ``base_sha`` — no current run, or a ``dir:``/``scratch`` workspace — are
+    returned untouched. Caller holds the write txn; nothing here raises.
+    """
+    run_id = _current_run_id(conn, task_id)
+    if run_id is None:
+        return metadata, None
+    existing = _run_metadata(conn, run_id)
+    base_sha = existing.get("base_sha")
+    if not isinstance(base_sha, str) or not base_sha:
+        return metadata, None
+    merged = dict(existing)
+    if isinstance(metadata, dict):
+        merged.update(metadata)
+    tree: Optional[dict] = None
+    try:
+        trow = conn.execute(
+            "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        workspace_path = (trow["workspace_path"] or "").strip() if trow else ""
+        if not workspace_path:
+            raise RuntimeError("task has no workspace_path")
+        workspace = Path(workspace_path).expanduser()
+        if not workspace.is_dir():
+            raise RuntimeError(f"workspace missing: {workspace}")
+        head_sha = _git_output(workspace, "rev-parse", "HEAD").strip()
+        if not head_sha:
+            raise RuntimeError("head_sha: empty HEAD")
+        changed = _changed_paths(workspace, base_sha)
+        tree = {"base_sha": base_sha, "head_sha": head_sha, "changed_paths": changed}
+        merged["head_sha"] = head_sha
+        merged["changed_paths"] = changed
+        merged.pop("tree_error", None)
+    except Exception as exc:  # any git/IO failure: record, never block the transition
+        merged["tree_error"] = str(exc)[:200]
+        merged.pop("head_sha", None)
+        merged.pop("changed_paths", None)
+    return merged, tree
 
 
 # ---------------------------------------------------------------------------
@@ -10450,6 +10627,8 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            # Tree binding: the run starts at this commit (never raises).
+            record_run_base_sha(conn, claimed.id, workspace, claimed.workspace_kind)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10577,6 +10756,8 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            # Tree binding: the run starts at this commit (never raises).
+            record_run_base_sha(conn, claimed.id, workspace, claimed.workspace_kind)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory

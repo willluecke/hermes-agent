@@ -43,9 +43,24 @@ READ_ACTIONS = {
     "live": "/api/live",
     "sessions": "/api/sessions",
     "brief": "/api/brief",
+    # Will, 2026-11-01: the ledger reads the kanban boards, names one next
+    # action (the verdict), and records batches, agent decisions and the
+    # adversary's reports.
+    "boards": "/api/boards",
+    "verdict": "/api/verdict",
+    "batches": "/api/batches",
+    "agent_decisions": "/api/agent-decisions",
+    "adversary": "/api/adversary",
 }
 WRITE_ACTIONS = {
     "admit": ("/api/tasks/admit", ("project_id", "contract", "dedupe_key")),
+    "decision_reply": ("/api/decisions/reply", ("id", "version", "reply")),
+    "batch_post": ("/api/batches/post", ("items", "request_key")),
+    "batch_answer": ("/api/batches/answer", ("id", "version", "source", "notes")),
+    "agent_decision": ("/api/agent-decisions/record", ("by", "title", "rests_on", "wrong_if", "body", "request_key")),
+    "agent_decision_read": ("/api/agent-decisions/read", ("id", "version", "source")),
+    "adversary_request": ("/api/adversary/request", ("subject_kind", "subject_id", "repo", "brief", "source")),
+    "adversary_settle": ("/api/adversary/settle", ("id", "version", "n", "kind", "reason", "source")),
     "project_save": ("/api/projects/save", ("id", "repo", "body", "mode")),
     "decision_answer": ("/api/decisions/answer", ("id", "version", "answer")),
     "commitment_action": ("/api/commitments/action", ("id", "action")),
@@ -222,6 +237,18 @@ def talos_tool(action: str, **kwargs: Any) -> str:
             path = ("/api/directions?" + parse.urlencode({key: value}) if action == "directions"
                     else "/api/" + {"direction": "directions", "delegation": "delegations"}[action] + "/" + parse.quote(value, safe=""))
             return json.dumps({"ok": True, "action": action, "result": _call(path)})
+        if action == "resolve":
+            if set(kwargs) != {"id"} or not isinstance(kwargs["id"], str):
+                raise ValueError("resolve requires only id (a short id like dir_1a2b3c4d)")
+            return json.dumps({"ok": True, "action": action, "result": _call("/api/resolve?" + parse.urlencode({"id": kwargs["id"]}))})
+        if action == "card":
+            if set(kwargs) != {"board", "id"}:
+                raise ValueError("card requires board and id")
+            return json.dumps({"ok": True, "action": action, "result": _call("/api/cards/" + parse.quote(_ident(kwargs["board"], "board"), safe="") + "/" + parse.quote(_ident(kwargs["id"], "id"), safe=""))})
+        if action == "adversary_report":
+            if set(kwargs) != {"id"}:
+                raise ValueError("adversary_report requires only id")
+            return json.dumps({"ok": True, "action": action, "result": _call("/api/adversary/" + parse.quote(_ident(kwargs["id"], "id"), safe=""))})
         if action == "watches":
             if set(kwargs) - {"conversation_id"}:
                 raise ValueError("watches accepts only an optional conversation_id")
@@ -330,7 +357,7 @@ TALOS_SCHEMA["description"] += (
     "Resume max_turns is an explicitly authorized total, never an increment."
 )
 _props = TALOS_SCHEMA["parameters"]["properties"]
-_props["action"] = {"type": "string", "enum": list(READ_ACTIONS) + list(WRITE_ACTIONS) + list(STEWARD_WRITES) + ["task", "mandate", "mandate_save", "directions", "direction", "delegation", "watches"]}
+_props["action"] = {"type": "string", "enum": list(READ_ACTIONS) + list(WRITE_ACTIONS) + list(STEWARD_WRITES) + ["task", "mandate", "mandate_save", "directions", "direction", "delegation", "watches", "resolve", "card", "adversary_report"]}
 for _field in ("patch", "source", "authorization", "target", "goal"):
     _props[_field] = {"type": "object"}
 for _field in ("request_key", "direction_id", "spec_ref", "supersedes_id"):
@@ -348,6 +375,40 @@ _props.update({
     "owner": {"type": "string", "enum": ["human", "agent"],
               "description": "For routine_create: human for a reminder Will ticks off himself (the steward may file only these); agent for a routine that runs work."},
 })
+_props.update({
+    "items": {"type": "array", "description": "For batch_post: 1 to 12 items {id, kind: card|direction|decision|agent_decision, title, recommendation, because?, board?, project_id?}; the id of a Talos item may be its short form."},
+    "notes": {"type": "array", "description": "For batch_answer: the lines of Will's reply (`<id> (<title>): <his words>`), or {id, note} objects; a bare line with no id answers every item."},
+    "by": {"type": "string", "enum": ["jim", "delegate"], "description": "For agent_decision: who decided on their own judgement."},
+    "title": {"type": "string"},
+    "rests_on": {"type": "array", "items": {"type": "string"}, "description": "For agent_decision: the 1 to 10 facts the decision rests on."},
+    "wrong_if": {"type": "string", "description": "For agent_decision: what would show the decision was wrong."},
+    "subject": {"type": "string"},
+    "subject_kind": {"type": "string", "enum": ["delegation", "card"], "description": "For adversary_request: what the report is about."},
+    "subject_id": {"type": "string", "description": "For adversary_request: the delegation id or the card id."},
+    "board": {"type": "string", "description": "For card and adversary_request (cards): the kanban board slug."},
+    "tree_sha": {"type": "string", "description": "For adversary_request: the commit the result was produced on (the run's head_sha)."},
+    "brief": {"type": "object", "description": "For adversary_request: {intent, falsifier, goal, changed_paths, final_text, interfaces?} with no builder context."},
+    "n": {"type": "integer", "description": "For adversary_settle: the finding number."},
+    "kind": {"type": "string", "enum": ["resolved", "declined"], "description": "For adversary_settle: resolved (fixed or shown false with evidence) or declined (not worth fixing, with the reason)."},
+    "reply": {"type": "string", "description": "For decision_reply: the explanation after Will answered ask."},
+    "note": {"type": "string"},
+    "words": {"type": "string", "description": "For agent_decision_read: Will's reaction, quoted."},
+})
+TALOS_SCHEMA["description"] += (
+    " Since 2026-11-01 the ledger reads the kanban boards and names one next action: boards lists every board with its"
+    " parked candidates (waiting on Will), worker blocks, cards in review and recent done; card(board,id) reads one card"
+    " with its falsifier, check, Talos link and run tree binding; verdict names the steward's single next action and"
+    " counts what waits on Will; resolve(id) turns a short id (dir_/dec_/agd_/bat_ plus eight hex) into the full record."
+    " Picks are answered in batches: batch_post(items,request_key) records the batch you are about to post (one line per"
+    " item starting with its id; the chat puts a note field under each), batch_answer(id,version,source,notes) records"
+    " Will's reply message as his answers (ok|reject|instead|ask|defer per item, his words kept) and grants the picks."
+    " agent_decision(by,title,rests_on,wrong_if,body,request_key,project_id?) records a choice made on the agent's own"
+    " judgement; agent_decision_read(id,version,source,words?) marks it read by Will's message; batches and"
+    " agent_decisions list them. decision_answer takes answer={reason, kind: ok|instead|ask}; decision_reply(id,version,reply)"
+    " answers an ask. adversary_request(subject_kind,subject_id,repo,brief,source,project_id?,board?,tree_sha?) starts a"
+    " fresh read-only adversary on finished code work; adversary lists open reports, adversary_report(id) reads one, and"
+    " adversary_settle(id,version,n,kind,reason,source) resolves or declines a finding; done waits until every finding is settled."
+)
 TALOS_SCHEMA["description"] += (
     " Watch mode: watches(conversation_id?) lists watches, threads Will drives himself whose every final Jim "
     "reviews against Will's criteria; watch_save(conversation_id,criteria,source,active,project_id?) starts or "
