@@ -222,7 +222,7 @@ def test_plan_to_dispatch_maps_only_open_lanes() -> None:
     assert p["direction_id"] == "dir_1" and p["version"] == 2
     assert p["authorization"] == "grant_x"
     assert p["goal"]["model"] == p["target"]["model"]
-    assert p["goal"]["max_turns"] in (1, 6, 12)
+    assert 1 <= p["goal"]["max_turns"] <= 500
     assert "read main.py" in p["goal"]["text"]
 
 
@@ -243,8 +243,11 @@ def test_dispatch_policy_rejects_core_non_frontier() -> None:
 
 
 def test_dispatch_policy_rejects_bad_caps() -> None:
-    with pytest.raises(ValueError):
-        orch.DispatchPolicy(max_turns=5).validate()
+    # 2026-11-01: no 1/6/12 tiers; any integer total from 1 to 500 is a cap.
+    orch.DispatchPolicy(max_turns=5).validate()
+    for bad in (0, 501, True):
+        with pytest.raises(ValueError):
+            orch.DispatchPolicy(max_turns=bad).validate()
     with pytest.raises(ValueError):
         orch.DispatchPolicy(effort="low").validate()
 

@@ -252,7 +252,7 @@ TALOS_FRONTIER_MODELS = frozenset({
     "openai-codex::gpt-6-astra",
     "claude-code::claude-fable-5-1",
 })
-TALOS_MANAGED_TURN_CAPS = frozenset({1, 6, 12})
+TALOS_TURN_CAP_RANGE = (1, 500)  # any total; the 1/6/12 tiers were dropped 2026-11-01 (Will: arbitrary)
 TALOS_EFFORTS = frozenset({"high", "xhigh", "max"})
 TALOS_WORK_CLASSES = frozenset({"core", "peripheral"})
 
@@ -279,11 +279,9 @@ class DispatchPolicy:
             )
         if self.effort not in TALOS_EFFORTS:
             raise ValueError(f"effort must be one of {sorted(TALOS_EFFORTS)}")
-        if self.max_turns not in TALOS_MANAGED_TURN_CAPS:
-            raise ValueError(
-                f"max_turns must be one of {sorted(TALOS_MANAGED_TURN_CAPS)} "
-                "(Talos managed caps)"
-            )
+        low, high = TALOS_TURN_CAP_RANGE
+        if not isinstance(self.max_turns, int) or isinstance(self.max_turns, bool) or not low <= self.max_turns <= high:
+            raise ValueError(f"max_turns must be an integer from {low} to {high}")
         if not self.model or "::" not in self.model:
             raise ValueError("model must be a namespaced 'harness::model' pin")
         if self.work_class == "core" and self.model not in TALOS_FRONTIER_MODELS:

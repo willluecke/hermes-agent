@@ -2105,8 +2105,9 @@ KANBAN_ORCHESTRATE_SCHEMA = {
             },
             "max_turns": {
                 "type": "integer",
-                "enum": [1, 6, 12],
-                "description": "Talos managed turn cap.",
+                "minimum": 1,
+                "maximum": 500,
+                "description": "Talos managed turn cap: the number of judged worker attempts, any total from 1 to 500.",
             },
             "work_class": {
                 "type": "string",
