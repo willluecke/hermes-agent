@@ -339,6 +339,8 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
+_RUN_STREAMED_TEXT_LIMIT = 200_000  # chars of streamed final text kept per run so a stop can return it
+
 logger = logging.getLogger(__name__)
 
 # When this gateway process started: a chat whose newest message is older
@@ -2188,6 +2190,11 @@ class APIServerAdapter(BasePlatformAdapter):
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
+        # Final-answer text streamed so far per run (message.delta), bounded.
+        # A stop keeps it: the words a client already saw ride the
+        # run.cancelled event and the run status as a partial output
+        # (2026-11-02: an interrupted Codex reply vanished from the archive).
+        self._run_streamed_text: Dict[str, str] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -8919,6 +8926,30 @@ class APIServerAdapter(BasePlatformAdapter):
     # Cap on the redacted tool-result text attached to tool.completed events.
     _RUN_TOOL_OUTPUT_EVENT_CHARS = 8_000
 
+    def _stopped_run_partial_text(self, run_id: str, result: Any = None) -> str:
+        """The final-answer text a stopped run had produced, or an empty string.
+
+        Prefers the deltas the run streamed (exactly what a client saw); falls
+        back to an interrupted agent's own final_response when it streamed
+        nothing. A failure message is never a partial answer.
+        """
+        streamed = (self._run_streamed_text.get(run_id) or "").strip()
+        if streamed:
+            return streamed
+        if isinstance(result, dict) and result.get("interrupted") and not result.get("error"):
+            return str(result.get("final_response") or "").strip()
+        return ""
+
+    def _cancelled_run_payload(self, run_id: str, result: Any = None):
+        """The run.cancelled event and status fields for a stopped run, carrying its partial text."""
+        event: Dict[str, Any] = {"event": "run.cancelled", "run_id": run_id, "timestamp": time.time()}
+        fields: Dict[str, Any] = {"last_event": "run.cancelled"}
+        partial = self._stopped_run_partial_text(run_id, result)
+        if partial:
+            event.update({"output": partial, "output_kind": "partial"})
+            fields.update({"output": partial, "output_kind": "partial", "partial": True})
+        return event, fields
+
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
@@ -9611,6 +9642,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 return
             if run_id not in self._run_streams:
                 return
+            streamed = self._run_streamed_text.get(run_id, "")
+            if len(streamed) < _RUN_STREAMED_TEXT_LIMIT:
+                self._run_streamed_text[run_id] = streamed + str(delta)
             try:
                 loop.call_soon_threadsafe(_put_event_if_active, {
                     "event": "message.delta",
@@ -9683,16 +9717,9 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
+                    cancelled_event, cancelled_fields = self._cancelled_run_payload(run_id)
+                    _put_event_if_active(cancelled_event)
+                    self._set_run_status(run_id, "cancelled", **cancelled_fields)
                     return
                 goal_directive = None
                 if goal_command_args is not None:
@@ -10015,16 +10042,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
+                    cancelled_event, cancelled_fields = self._cancelled_run_payload(run_id, result)
+                    _put_event_if_active(cancelled_event)
+                    self._set_run_status(run_id, "cancelled", **cancelled_fields)
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -10219,6 +10239,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._run_streamed_text.pop(run_id, None)
                 self._persist_gateway_active_work()
 
         # Transfer pending -> task as one externally visible state change.
@@ -10762,6 +10783,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._run_streamed_text.pop(run_id, None)
 
         stale_statuses = [
             run_id

@@ -2453,6 +2453,88 @@ class TestStopRun:
                 assert adapter._run_statuses[run_id]["status"] == "cancelled"
 
     @pytest.mark.asyncio
+    async def test_stop_keeps_the_streamed_partial_text(self, adapter):
+        """A stop returns the final-answer text the run had streamed (2026-11-02)."""
+        app = _create_runs_app(adapter)
+        stop_requested = threading.Event()
+        started = threading.Event()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+
+                def _run_conversation(*_args, **kwargs):
+                    # The runs path hands the delta callback to the agent at
+                    # creation, not per call.
+                    cb = kwargs.get("stream_delta_callback") or mock_create.call_args.kwargs.get("stream_delta_callback")
+                    cb("The PR is only ")
+                    cb("the one-time setup.")
+                    started.set()
+                    stop_requested.wait(timeout=5)
+                    return {"final_response": "", "completed": False, "partial": True, "interrupted": True}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "why merge?"})
+                run_id = (await resp.json())["run_id"]
+                assert started.wait(timeout=3)
+                await asyncio.sleep(0.05)
+
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert stop_resp.status == 200
+                stop_requested.set()
+                for _ in range(60):
+                    if adapter._run_statuses[run_id]["status"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.05)
+
+                status = adapter._run_statuses[run_id]
+                assert status["status"] == "cancelled"
+                assert status["output"] == "The PR is only the one-time setup."
+                assert status["output_kind"] == "partial"
+                assert status["partial"] is True
+                assert run_id not in adapter._run_streamed_text
+
+    @pytest.mark.asyncio
+    async def test_stop_without_streamed_text_carries_no_output(self, adapter):
+        """A stop that saw no deltas and no interrupted answer stays a bare cancellation."""
+        app = _create_runs_app(adapter)
+        stop_requested = threading.Event()
+        started = threading.Event()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+
+                def _run_conversation(*_args, **_kwargs):
+                    started.set()
+                    stop_requested.wait(timeout=5)
+                    return {"final_response": "Codex app-server turn failed: boom", "completed": False, "partial": True, "interrupted": True, "error": "boom"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                assert started.wait(timeout=3)
+                await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_requested.set()
+                for _ in range(60):
+                    if adapter._run_statuses[run_id]["status"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.05)
+                status = adapter._run_statuses[run_id]
+                assert status["status"] == "cancelled"
+                assert "output" not in status
+
+    @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):
         """Stop should interrupt the agent and cancel the task."""
         app = _create_runs_app(adapter)
