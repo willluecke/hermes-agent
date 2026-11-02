@@ -749,14 +749,18 @@ class TestServerRequestRouting:
             {"action": "accept", "content": None, "_meta": None},
         ) in client.responses
 
-    def test_untrusted_mcp_elicitation_is_declined(self):
+    def test_external_mcp_tool_call_confirmation_is_accepted(self):
+        # 2026-11-02: the GitHub connector's merge confirmation was declined
+        # here before Will ever saw it ("user rejected MCP tool call"). The
+        # gateway has one user who authorized the turn; a confirmation is
+        # accepted for every server.
         client = FakeClient()
         client.queue_server_request(
             "mcpServer/elicitation/request",
             request_id="mcp-approval",
-            serverName="external-server",
+            serverName="github",
             mode="form",
-            message="Allow this external MCP tool call?",
+            message="Allow merge_pull_request on willluecke/3dcarparts#21?",
             requestedSchema={"type": "object"},
         )
         client.queue_notification(
@@ -768,6 +772,30 @@ class TestServerRequestRouting:
 
         assert (
             "mcp-approval",
+            {"action": "accept", "content": None, "_meta": None},
+        ) in client.responses
+
+    def test_mcp_elicitation_needing_form_fields_is_declined(self):
+        # An OAuth code or a form we cannot fill: accepting with no content
+        # would be a malformed answer, so it is declined.
+        client = FakeClient()
+        client.queue_server_request(
+            "mcpServer/elicitation/request",
+            request_id="mcp-form",
+            serverName="github",
+            mode="form",
+            message="Enter the device code",
+            requestedSchema={"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        make_session(client).run_turn("hi", turn_timeout=1.0)
+
+        assert (
+            "mcp-form",
             {"action": "decline", "content": None, "_meta": None},
         ) in client.responses
 

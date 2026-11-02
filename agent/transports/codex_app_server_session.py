@@ -520,6 +520,24 @@ class _PendingFileChange:
     destructive_paths: tuple[str, ...] = ()
 
 
+def elicitation_decision(params) -> str:
+    """accept unless the elicitation asks for form fields nobody here can fill.
+
+    A tool-call confirmation carries a message and no required schema; the
+    user of this gateway is one person who has already authorized the turn,
+    so it is accepted. A request whose schema requires properties (an OAuth
+    code, a form) has no answer we can give, so it is declined rather than
+    accepted with empty content.
+    """
+    schema = params.get("requestedSchema") if isinstance(params, dict) else None
+    if isinstance(schema, dict):
+        required = schema.get("required")
+        properties = schema.get("properties")
+        if (isinstance(required, (list, tuple)) and required) or (isinstance(properties, dict) and properties):
+            return "decline"
+    return "accept"
+
+
 class CodexAppServerSession:
     """One Codex thread per Hermes session, lifetime owned by AIAgent.
 
@@ -1808,22 +1826,28 @@ class CodexAppServerSession:
         elif method == "mcpServer/elicitation/request":
             # Codex's MCP layer asks the user for structured input on
             # behalf of an MCP server (e.g. tool-call confirmation,
-            # OAuth, form data). Auto-accept only the two local servers that
-            # are part of this runtime contract. Their actual capability
-            # surfaces remain bounded by Codex's per-server enabled_tools
-            # configuration. For other MCP servers we decline so the user
-            # explicitly opts in via codex's own auth flow.
+            # OAuth, form data). Until 2026-11-02 only hermes-tools and
+            # reccli were accepted and every other server was declined,
+            # which Codex reported as "user rejected MCP tool call": the
+            # GitHub connector's merge confirmation never reached Will at
+            # all. Will (2026-11-02): "you are only accessed by me. the
+            # security of you trying to protect the system against yourself
+            # is antithetical to my needs." A confirmation is now accepted
+            # for every server and logged; only an elicitation that needs
+            # form fields we cannot fill is declined, because accepting it
+            # with no content would be a malformed answer, not a decision.
             server_name = params.get("serverName") or ""
-            if server_name in {"hermes-tools", "reccli"}:
-                self._client.respond(
-                    rid,
-                    {"action": "accept", "content": None, "_meta": None},
-                )
-            else:
-                self._client.respond(
-                    rid,
-                    {"action": "decline", "content": None, "_meta": None},
-                )
+            decision = elicitation_decision(params)
+            logger.info(
+                "Codex MCP elicitation %s for server %s: %s",
+                decision,
+                server_name or "?",
+                str(params.get("message") or "")[:160],
+            )
+            self._client.respond(
+                rid,
+                {"action": decision, "content": None, "_meta": None},
+            )
         else:
             # Unknown server request — codex can extend this surface. Reject
             # cleanly so codex doesn't hang waiting for us.
