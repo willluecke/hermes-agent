@@ -411,3 +411,61 @@ class TestInputEcho:
     def test_nothing_matching_leaves_rows_alone(self):
         projected = [{"role": "user", "content": "something else"}]
         assert _without_input_echo(projected, "read agents.md") == projected
+
+
+class TestModelChange:
+    """Codex sizes a thread's context window from the model it was started on
+    and keeps it. Jim's thread, started on gpt-6-astra (272k) and later run on
+    gpt-6.1-sol (500k), compacted at ~230k every other prompt (Will,
+    2026-11-08). A recorded model that differs from the turn's model rebuilds
+    the thread; records without a model are trusted as before."""
+
+    def test_same_model_resumes(self):
+        entries = _entries(("user", "a"), ("assistant", "b"))
+        thread, pending, reason = _codex_resume_plan(
+            thread_id="thread-1",
+            state=_state(entries, model="gpt-6.1-sol"),
+            prior_entries=entries,
+            cwd=CWD,
+            model="gpt-6.1-sol",
+        )
+        assert (thread, pending, reason) == ("thread-1", [], "resume")
+
+    def test_changed_model_rebuilds_with_the_whole_transcript(self):
+        entries = _entries(("user", "a"), ("assistant", "b"))
+        thread, pending, reason = _codex_resume_plan(
+            thread_id="thread-1",
+            state=_state(entries, model="gpt-6-astra"),
+            prior_entries=entries,
+            cwd=CWD,
+            model="gpt-6.1-sol",
+        )
+        assert thread == ""
+        assert pending == entries
+        assert reason == "model-changed"
+
+    def test_record_without_model_is_trusted(self):
+        entries = _entries(("user", "a"), ("assistant", "b"))
+        thread, pending, reason = _codex_resume_plan(
+            thread_id="thread-1",
+            state=_state(entries),
+            prior_entries=entries,
+            cwd=CWD,
+            model="gpt-6.1-sol",
+        )
+        assert (thread, pending, reason) == ("thread-1", [], "resume")
+
+    def test_persisted_record_carries_the_model(self):
+        from types import SimpleNamespace
+
+        from agent.codex_runtime import (
+            _CODEX_CONTINUITY_REASONS,
+            _persist_codex_thread_state,
+        )
+
+        agent = SimpleNamespace(model="gpt-6.1-sol", session_id="", _session_db=None)
+        _persist_codex_thread_state(
+            agent, thread_id="thread-1", cwd=CWD, entries=_entries(("user", "a"))
+        )
+        assert agent._codex_thread_state["model"] == "gpt-6.1-sol"
+        assert "model-changed" in _CODEX_CONTINUITY_REASONS

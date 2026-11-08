@@ -67,7 +67,7 @@ def _stored_codex_app_server_thread_id(agent: Any) -> str:
 
 
 def _persist_codex_thread_state(
-    agent: Any, *, thread_id: str, cwd: str, entries: List[tuple]
+    agent: Any, *, thread_id: str, cwd: str, entries: List[tuple], model: str = ""
 ) -> None:
     """Bind a native Codex thread to this Hermes session *and* to the exact
     transcript prefix that thread has already consumed.
@@ -91,6 +91,12 @@ def _persist_codex_thread_state(
         "cwd": _normalized_codex_cwd(cwd),
         "seen_count": len(entries),
         "fingerprint": _codex_history_fingerprint(entries),
+        # Codex sizes a thread's context window from the model it was started
+        # with and keeps that size for the thread's life. Jim's thread, started
+        # on gpt-6-astra (272k) and later switched to gpt-6.1-sol (500k), kept
+        # compacting at ~230k every other prompt (Will, 2026-11-08). Recording
+        # the model lets the next turn notice the switch and rebuild.
+        "model": str(model or getattr(agent, "model", "") or ""),
         "updated_at": time.time(),
     }
     # Keep the in-process copy current even when there is no session DB, so a
@@ -340,6 +346,7 @@ def _codex_resume_plan(
     state: Dict[str, Any],
     prior_entries: List[tuple],
     cwd: str,
+    model: str = "",
 ) -> tuple:
     """Decide whether a bound native thread may continue this transcript.
 
@@ -363,6 +370,14 @@ def _codex_resume_plan(
         return "", prior_entries, "thread-rebound"
     if str(state.get("cwd") or "") != _normalized_codex_cwd(cwd):
         return "", prior_entries, "cwd-changed"
+    recorded_model = str(state.get("model") or "")
+    if recorded_model and model and recorded_model != model:
+        # The thread's context window is fixed by the model it started on, so
+        # continuing it under another model runs with the wrong budget: the
+        # whole transcript seeds a fresh thread sized for the new model.
+        # Records written before the model was kept (no "model" key) are
+        # trusted as before; nothing can be proven about them either way.
+        return "", prior_entries, "model-changed"
     seen = state.get("seen_count")
     if isinstance(seen, bool) or not isinstance(seen, int) or seen < 0:
         return "", prior_entries, "unusable-seen-count"
@@ -463,6 +478,7 @@ _CODEX_CONTINUITY_REASONS = {
     "transcript-diverged": "the transcript was edited or rolled back since the thread's last turn",
     "history-restored": "earlier messages from before this chat's first Hermes turn were restored to its history",
     "context-reset": "Jim reset his context at Will's request",
+    "model-changed": "the model changed, so the thread was rebuilt with the new model's context window",
     "resume": "the recorded thread could not be resumed",
 }
 
@@ -1846,6 +1862,7 @@ def run_codex_app_server_turn(
         state=codex_thread_state,
         prior_entries=prior_entries,
         cwd=codex_cwd,
+        model=str(getattr(agent, "model", "") or ""),
     )
     if (
         continuity_reason in {"transcript-shortened", "transcript-diverged"}
@@ -2115,7 +2132,11 @@ def run_codex_app_server_turn(
         # The current user message is deliberately excluded: if delivery failed,
         # under-counting replays one message, while over-counting drops it.
         _persist_codex_thread_state(
-            agent, thread_id=thread_id, cwd=codex_cwd, entries=prior_entries
+            agent,
+            thread_id=thread_id,
+            cwd=codex_cwd,
+            entries=prior_entries,
+            model=str(getattr(agent, "model", "") or ""),
         )
         if context_reset is not None:
             # The fresh thread is bound and recorded as having seen the whole
@@ -2275,6 +2296,7 @@ def run_codex_app_server_turn(
         thread_id=thread_id,
         cwd=codex_cwd,
         entries=_codex_dialogue_entries(codex_consumed_messages),
+        model=str(getattr(agent, "model", "") or ""),
     )
 
     # Counter ticks for the agent-improvement loop.
