@@ -39,17 +39,20 @@ class TestLadderContract:
         for level in VALID_REASONING_EFFORTS:
             assert level in EFFORT_LADDER, level
 
-    def test_only_native_codex_sol_terra_accept_ultra(self):
-        """Provider wires clamp ultra; only the verified app-server models
-        may advertise it verbatim."""
+    def test_only_native_codex_ultra_ladders_accept_ultra(self):
+        """Provider wires clamp ultra; only the app-server ladders for models
+        whose Codex model record lists ultra (5.6 sol/terra, GPT-6 astra per
+        ~/.codex/models_cache.json on 2026-11-08) may advertise it verbatim."""
         import agent.reasoning_effort as mod
 
+        ultra_ladders = {
+            "CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS",
+            "CODEX_APP_SERVER_GPT6_ASTRA_EFFORTS",
+        }
         for name in dir(mod):
             if name.endswith("_EFFORTS"):
                 has_ultra = "ultra" in getattr(mod, name)
-                assert has_ultra == (
-                    name == "CODEX_APP_SERVER_GPT56_SOL_TERRA_EFFORTS"
-                ), name
+                assert has_ultra == (name in ultra_ladders), name
 
 
 class TestClampEffort:
