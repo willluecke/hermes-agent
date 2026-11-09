@@ -51,6 +51,7 @@ def test_entries_hold_what_matters_and_flag_what_needs_a_person():
     task = SimpleNamespace(title="Trial cancel still charges", result="")
     entries = kcd.digest_entries([
         _ev("completed", summary="Cancelling in trial now ends it with no invoice\nmore"),
+        _ev("review_requested", summary="Built, not shipped. Commit 88d79c24\nbranch fix/x"),
         _ev("crashed"),
         _ev("timed_out", limit_seconds=60),
         _ev("blocked", reason="waiting on t_parent", kind="dependency"),
@@ -59,11 +60,14 @@ def test_entries_hold_what_matters_and_flag_what_needs_a_person():
         _ev("block_loop_detected", reason="same cause 3x"),
     ], task)
     assert [(e["kind"], e["urgent"]) for e in entries] == [
-        ("completed", False), ("blocked", False), ("blocked", True),
-        ("gave_up", True), ("block_loop_detected", True),
+        ("completed", False), ("review_requested", True), ("blocked", False),
+        ("blocked", True), ("gave_up", True), ("block_loop_detected", True),
     ]
     assert entries[0]["detail"] == "Cancelling in trial now ends it with no invoice"
     assert entries[0]["title"] == "Trial cancel still charges"
+    # Talos, 2026-11-08: a worker finishing a card by requesting review is a
+    # person's decision; it is held and goes out at once with its summary.
+    assert entries[1]["detail"] == "Built, not shipped. Commit 88d79c24"
 
 
 def test_storage_and_the_in_flight_count(board):
@@ -71,6 +75,9 @@ def test_storage_and_the_in_flight_count(board):
     _followed(board, "done one", status="done")
     _followed(board, "waits on a person", status="blocked", block_kind="needs_input")
     _followed(board, "parked for later", status="scheduled")
+    # A card in review waits on the reviewer (this conversation); it must not
+    # hold back the other cards' notices (Talos, 2026-11-08).
+    _followed(board, "awaits the reviewer", status="review")
     waiting = _followed(board, "waits on a task", status="blocked", block_kind="dependency")
     assert kb.open_followed_task_count(board, platform="api_server", chat_id=CHAT) == 2
     first = kb.chat_digest_add(board, platform="api_server", chat_id=CHAT, task_id=running,
@@ -108,6 +115,7 @@ ROWS = [
     {"id": 1, "task_id": "t_00000001", "kind": "completed", "title": "Trial cancel", "detail": "no invoice now"},
     {"id": 2, "task_id": "t_00000002", "kind": "blocked", "title": "Portal", "detail": "needs the portal id"},
     {"id": 3, "task_id": "t_00000003", "kind": "gave_up", "title": "Emails", "detail": "3 failures"},
+    {"id": 4, "task_id": "t_00000004", "kind": "review_requested", "title": "Affiliate links", "detail": "Built, not shipped. Commit 88d79c24"},
 ]
 
 
@@ -115,6 +123,7 @@ def test_digest_text_lists_finished_needs_and_gave_up():
     text = kcd.digest_text("reg-watch", _item(ROWS))
     assert text.startswith("[Kanban] Everything this conversation is following on reg-watch has settled.")
     assert "Finished:\n- t_00000001 Trial cancel: no invoice now" in text
+    assert "Ready for review:\n- t_00000004 Affiliate links: Built, not shipped. Commit 88d79c24" in text
     assert "Needs a decision:\n- t_00000002 Portal: needs the portal id" in text
     assert "Gave up after retries:\n- t_00000003 Emails: 3 failures" in text
     assert "Give Will one short update" in text

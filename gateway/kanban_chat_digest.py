@@ -31,7 +31,11 @@ logger = logging.getLogger(__name__)
 CHAT_SESSION_PREFIX = "hermes-chat-"
 #: Events worth telling the conversation about. ``crashed`` and ``timed_out``
 #: are retried by the dispatcher (``gave_up`` follows when retries run out).
-HELD_KINDS = ("completed", "blocked", "gave_up", "block_loop_detected")
+#: ``review_requested`` is how a worker finishes a card on a board with a
+#: review lane; it was not held, so the Talos thread never heard that its
+#: card was ready and Will had to ask "how about now" (2026-11-08). A review
+#: waits on a person, so it goes out at once like a block.
+HELD_KINDS = ("completed", "review_requested", "blocked", "gave_up", "block_loop_detected")
 #: Blocks that do not need a person: waiting on another task, or a passing
 #: failure the orchestrator reopens.
 QUIET_BLOCK_KINDS = ("dependency", "transient")
@@ -69,6 +73,9 @@ def digest_entries(events: Iterable[Any], task: Any) -> list[dict[str, Any]]:
             detail = _first_line(payload.get("summary")) or _first_line(
                 getattr(task, "result", "") if task is not None else ""
             )
+        elif kind == "review_requested":
+            detail = _first_line(payload.get("summary"))
+            urgent = True
         elif kind == "blocked":
             detail = _first_line(payload.get("reason"))
             urgent = payload.get("kind") not in QUIET_BLOCK_KINDS
@@ -132,6 +139,7 @@ def digest_text(board: str, item: dict[str, Any], *, for_agent: bool = True) -> 
     cannot be queued, as a note for the user."""
     rows = _latest_per_task(item["rows"])
     finished = [r for r in rows if r["kind"] == "completed"]
+    review = [r for r in rows if r["kind"] == "review_requested"]
     needs = [r for r in rows if r["kind"] in ("blocked", "block_loop_detected")]
     gave_up = [r for r in rows if r["kind"] == "gave_up"]
     open_count = int(item.get("open") or 0)
@@ -144,14 +152,16 @@ def digest_text(board: str, item: dict[str, Any], *, for_agent: bool = True) -> 
         )
     lines = [f"[Kanban] {head}"]
     lines += _section("Finished", finished)
+    lines += _section("Ready for review", review)
     lines += _section("Needs a decision", needs)
     lines += _section("Gave up after retries", gave_up)
     lines.append("")
     if for_agent:
         lines.append(
-            "Give Will one short update: what got done, what needs his decision, "
-            "and what failed. The board has the detail. Do not redo finished work "
-            "or dispatch new tasks unless he asks."
+            "Give Will one short update: what got done, what is ready for your "
+            "review, what needs his decision, and what failed. The board has the "
+            "detail. Review what is ready; do not redo finished work or dispatch "
+            "new tasks unless he asks."
         )
     else:
         lines.append(f"Details: `hermes kanban --board {board} show <id>`.")

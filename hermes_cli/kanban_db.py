@@ -12091,7 +12091,11 @@ def _notify_profile_filter(
 #: Statuses of a followed task that is still in flight. A blocked task is
 #: settled (it waits on a person) unless it only waits on another task, and a
 #: scheduled task is settled (it was deliberately parked for later).
-CHAT_DIGEST_OPEN_STATUSES = ("triage", "todo", "ready", "running", "review")
+#: A card in ``review`` is excluded: it waits on the reviewer, who is the
+#: conversation itself, so counting it kept every other completion digest
+#: held back until the review was settled (Talos, 2026-11-08). The review
+#: request itself is delivered as its own urgent digest entry.
+CHAT_DIGEST_OPEN_STATUSES = ("triage", "todo", "ready", "running")
 
 
 def chat_digest_add(
