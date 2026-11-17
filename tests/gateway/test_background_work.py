@@ -627,6 +627,35 @@ def test_a_changed_signature_is_logged_with_the_inputs_that_changed(resident_cac
     assert replacement._resume_reason == "after the effort changed"
 
 
+def test_a_changed_advisor_replaces_the_agent_and_says_so(resident_cache, caplog):
+    # Hermes Chat's Advisor picker: the next turn gets a new agent, whose
+    # Claude process resumes the same session with the new --advisor.
+    import logging
+
+    caplog.set_level(logging.INFO, logger="gateway.platforms.api_server")
+
+    def signature(advisor):
+        options = {"reasoning_effort": "high", **({"advisor": advisor} if advisor else {})}
+        return APIServerAdapter._runtime_request_signature(
+            profile=None, ephemeral_system_prompt="instructions", requested_model="claude-opus-5-5",
+            requested_provider="claude-code", model_options=options, route=None,
+            session_model=None, confirmed_runtime_lock=True, single_model=True, cwd="/work", project="p",
+        )
+
+    session_id = resident_cache.session_id
+    acquire = lambda sig: resident_cache.adapter._create_or_reuse_runtime_agent(
+        cache_key=f"api_server:default:{session_id}", signature=sig, session_id=session_id,
+    )
+    first, _ = acquire(signature(None))
+    same, reused = acquire(signature(None))
+    assert reused is True and same is first
+    caplog.clear()
+    replacement, reused = acquire(signature("claude-fable-5-2"))
+    [line] = _not_reused(caplog)
+    assert reused is False and "reason=settings signature changed (advisor)" in line
+    assert replacement._resume_reason == "after the advisor changed"
+
+
 def test_a_released_agent_records_why_and_the_chats_next_turn_is_told_once(resident_cache, caplog, monkeypatch):
     import logging
 

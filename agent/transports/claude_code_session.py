@@ -771,12 +771,47 @@ class _LateOutputCollector:
         return {"text": text, "complete": False, "is_error": False}
 
 
+# Claude Code's advisor tool (code.claude.com/docs/en/advisor): a stronger
+# model Claude consults at decision points. Hermes enables it per session with
+# the ``--advisor`` launch flag only; ``/advisor`` and the ``advisorModel``
+# setting never apply here (slash commands are disabled, setting sources are
+# pinned) and Hermes never writes a global ``advisorModel``. Accepted: the
+# CLI's family aliases or a full Claude model id.
+_ADVISOR_ALIASES = frozenset({"opus", "fable", "sonnet"})
+_ADVISOR_MODEL_ID_RE = re.compile(r"^claude-[a-z0-9][a-z0-9.-]{0,62}$")
+
+
+def clean_claude_advisor(value: Any) -> Optional[str]:
+    """The advisor model a request names, or None for none or an invalid value."""
+    if not isinstance(value, str):
+        return None
+    advisor = value.strip().lower()
+    if advisor in _ADVISOR_ALIASES or _ADVISOR_MODEL_ID_RE.match(advisor):
+        return advisor
+    return None
+
+
+def launch_advisor(
+    advisor: Any, *, steward: bool = False, read_only: bool = False, no_tools: bool = False
+) -> Optional[str]:
+    """The advisor a Claude process launches with.
+
+    Only when it was passed explicitly, and never for the steward or a
+    read-only or no-tools session (scheduled reviews, consults, bound final
+    reviews): those run under a fixed, minimal policy.
+    """
+    if steward or read_only or no_tools:
+        return None
+    return clean_claude_advisor(advisor)
+
+
 def claude_code_args(
     *,
     model: str,
     session_id: str,
     resume: bool = False,
     effort: Optional[str] = None,
+    advisor: Optional[str] = None,
     system_prompt: str = "",
     additional_dirs: Optional[list[str]] = None,
     read_only: bool = False,
@@ -846,6 +881,9 @@ def claude_code_args(
                      '--settings',json.dumps(settings)])
     if effort:
         args.extend(["--effort", effort])
+    advisor = launch_advisor(advisor, steward=steward, read_only=read_only)
+    if advisor:
+        args.extend(["--advisor", advisor])
     args.extend(["--resume" if resume else "--session-id", session_id])
     if system_prompt.strip():
         args.extend(["--append-system-prompt", system_prompt.strip()])
@@ -877,6 +915,7 @@ class ClaudeCodeSession:
         session_id: Optional[str] = None,
         resume: bool = False,
         effort: Optional[str] = None,
+        advisor: Optional[str] = None,
         system_prompt: str = "",
         additional_dirs: Optional[list[str]] = None,
         read_only: bool = False,
@@ -917,6 +956,10 @@ class ClaudeCodeSession:
         self.additional_dirs = list(additional_dirs or [])
         self.no_tools = bool(no_tools)
         self.read_only = bool(read_only or no_tools)
+        # Part of the frozen launch: a different advisor needs a new process.
+        self.advisor = launch_advisor(
+            advisor, steward=self.steward, read_only=self.read_only
+        )
         self.on_event = on_event
         self.monitor_grace_seconds: float = DEFAULT_MONITOR_GRACE_SECONDS
         self.monitor_drain_quiet_seconds: float = DEFAULT_MONITOR_DRAIN_QUIET_SECONDS
@@ -994,14 +1037,19 @@ class ClaudeCodeSession:
         system_prompt: str,
         read_only: bool = False,
         no_tools: bool = False,
+        advisor: Optional[str] = None,
     ) -> bool:
         """Whether a later turn can safely reuse this frozen CLI process."""
+        wanted_advisor = launch_advisor(
+            advisor, steward=self.steward, read_only=read_only, no_tools=no_tools
+        )
         return bool(
             not self._closed
             and str(Path(self.cwd).expanduser().resolve())
             == str(Path(cwd).expanduser().resolve())
             and self.model == model
             and self.effort == effort
+            and self.advisor == wanted_advisor
             and self.system_prompt == system_prompt
             and self.read_only == bool(read_only or no_tools)
             and self.no_tools == bool(no_tools)
@@ -1158,6 +1206,7 @@ class ClaudeCodeSession:
             session_id=self.session_id,
             resume=bool(self.resume or self._confirmed),
             effort=self.effort,
+            advisor=self.advisor,
             system_prompt=self.system_prompt,
             additional_dirs=self.additional_dirs,
             read_only=self.read_only,

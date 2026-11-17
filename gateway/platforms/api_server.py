@@ -372,6 +372,7 @@ def _local_time(epoch: Optional[float]) -> str:
 # disk" row: "after the effort changed".
 _SIGNATURE_INPUT_WORDS = {
     "model_options": "the effort",
+    "advisor": "the advisor",
     "requested_model": "the model",
     "requested_provider": "the model",
     "route": "the model",
@@ -623,6 +624,20 @@ def _request_reasoning_config(model_options: Any) -> Optional[Dict[str, Any]]:
     if enabled is True:
         return {"enabled": True}
     return None
+
+
+def _request_claude_advisor(model_options: Any) -> Optional[str]:
+    """The Claude Code advisor a request names (``model_options.advisor``).
+
+    Hermes Chat sends it for a Claude subscription conversation whose user
+    picked one; the claude-code runtime launches with ``--advisor`` from it
+    (never for the steward or read-only sessions). Absent or invalid is none.
+    """
+    if not isinstance(model_options, dict):
+        return None
+    from agent.transports.claude_code_session import clean_claude_advisor
+
+    return clean_claude_advisor(model_options.get("advisor"))
 
 
 def _request_service_tier(model_options: Any) -> Any:
@@ -3509,13 +3524,19 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import GatewayRunner, _load_gateway_config
 
         config = _load_gateway_config()
+        # The advisor is its own input so a changed one is named as such in
+        # the agent-cache log and the chat's "Session resumed from disk" row.
+        options = dict(model_options) if isinstance(model_options, dict) else {}
+        advisor = _request_claude_advisor(options)
+        options.pop("advisor", None)
         payload = {
             "version": 1,
             "profile": profile or "default",
             "ephemeral_system_prompt": ephemeral_system_prompt or "",
             "requested_model": requested_model or "",
             "requested_provider": requested_provider or "",
-            "model_options": model_options or {},
+            "model_options": options,
+            "advisor": advisor or "",
             "route": route or {},
             "session_model": session_model or "",
             "confirmed_runtime_lock": bool(confirmed_runtime_lock),
@@ -4432,6 +4453,9 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        # Request-scoped like reasoning_config, and only ever explicit: an
+        # agent built without one (workers, delegations) launches no advisor.
+        agent.claude_advisor = _request_claude_advisor(model_options)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,

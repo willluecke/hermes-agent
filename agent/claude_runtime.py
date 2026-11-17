@@ -100,6 +100,23 @@ def _claude_code_effort(reasoning_config: Any) -> Optional[str]:
     return _CLAUDE_EFFORT_MAP.get(effort)
 
 
+def _claude_code_advisor(agent: Any, *, steward: bool, read_only: bool) -> Optional[str]:
+    """The advisor this agent's Claude process launches with (``--advisor``).
+
+    Set only from an explicit request (the gateway's ``model_options.advisor``,
+    which Hermes Chat sends for a conversation whose user picked one); an
+    agent built any other way, such as a kanban worker, a Talos delegation or
+    a consult, has none. The steward and read-only sessions never get one.
+    Like effort it is part of the resident process's identity, so a change
+    restarts the CLI and the next turn resumes the same Claude session.
+    """
+    from agent.transports.claude_code_session import launch_advisor
+
+    return launch_advisor(
+        getattr(agent, "claude_advisor", None), steward=steward, read_only=read_only
+    )
+
+
 def _fingerprint_text(content: Any) -> str:
     """Render content the way the session store replays it.
 
@@ -1313,6 +1330,7 @@ def run_claude_code_turn(
     if not steward and _sends_batching_reminder(model):
         runtime_contract += FABLE_PLANNING_NOTE
     effort = _claude_code_effort(getattr(agent, "reasoning_config", None))
+    advisor = _claude_code_advisor(agent, steward=bool(steward), read_only=read_only)
     resident_first_event_timeout = resolve_timeout(
         "claude_code.resident_first_event",
         default=DEFAULT_RESIDENT_FIRST_EVENT_TIMEOUT,
@@ -1334,6 +1352,7 @@ def run_claude_code_turn(
             effort=effort,
             system_prompt=runtime_contract,
             read_only=read_only,
+            advisor=advisor,
         )
         and resident_continues
     )
@@ -1355,7 +1374,7 @@ def run_claude_code_turn(
     agent._resume_reason = None
     agent._claude_session_retired_reason = None
     resume_cause = (
-        "the model or effort changed"
+        "the model, effort or advisor changed"
         if session is not None and resident_continues and not resident_continuity
         else known_cause or "the CLI process was not running"
     )
@@ -1543,6 +1562,7 @@ def run_claude_code_turn(
                 session_id=prior_session_id if durable_resume else None,
                 resume=durable_resume,
                 effort=effort,
+                advisor=advisor,
                 system_prompt=runtime_contract,
                 read_only=read_only,
                 on_event=bridge,
