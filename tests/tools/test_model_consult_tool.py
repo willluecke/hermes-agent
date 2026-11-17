@@ -122,14 +122,96 @@ def native_route(monkeypatch):
 
 def test_inventory_discovers_native_subscription_before_api_routes(native_route):
     result = json.loads(consult.model_consult_tool("list"))
-    native, api = result["providers"]
+    native, codex, api = result["providers"]
     assert native["provider"] == "claude-code"
     assert native["authenticated"] is True
     assert native["billing"] == "subscription"
     assert native["transport"] == "native_cli"
     assert native["preferred"] is True
     assert native["models"]
+    assert codex["provider"] == "openai-codex"
+    assert codex["billing"] == "subscription"
     assert api["provider"] == "openrouter"
+
+
+def test_codex_picker_model_uses_native_login_without_api_fallback(monkeypatch):
+    monkeypatch.setattr(consult, "_native_codex_row", lambda: {
+        "slug": "openai-codex", "authenticated": True,
+        "models": ["gpt-6.1-sol"], "billing": "subscription",
+    })
+    monkeypatch.setattr(consult, "_call_provider", lambda **kw: pytest.fail("API fallback"))
+    calls = []
+
+    def native_call(**kwargs):
+        calls.append(kwargs)
+        return "Codex advice", {"provider": "openai-codex", "model": kwargs["model"], "usage": {"input_tokens": 42}}
+
+    monkeypatch.setattr(consult, "_call_native_codex", native_call)
+    result = json.loads(consult.model_consult_tool(
+        "consult", model="gpt-6.1-sol", prompt="Advise briefly.",
+        context="Only this context.", effort="high",
+    ))
+    assert result["ok"] is True
+    assert result["provider"] == "openai-codex"
+    assert result["usage"] == {"input_tokens": 42}
+    assert calls == [{"model": "gpt-6.1-sol", "prompt": "Advise briefly.",
+                      "context": "Only this context.", "timeout_seconds": 120, "effort": "high"}]
+
+
+def test_codex_api_key_login_is_not_reported_as_subscription(monkeypatch):
+    import hermes_cli.codex_models as models
+
+    monkeypatch.setattr(consult.shutil, "which", lambda name: "/fake/codex")
+    monkeypatch.setattr(models, "get_codex_app_server_model_ids", lambda **kwargs: ["gpt-6-luna"])
+    monkeypatch.setattr(consult.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout="Logged in using API key",
+    ))
+    result = json.loads(consult.model_consult_tool("list", provider="openai-codex"))
+    assert result["authenticated"] is False
+    assert result["billing"] == "subscription"
+    attempted = json.loads(consult.model_consult_tool(
+        "consult", provider="openai-codex", model="gpt-6-luna", prompt="Advise",
+    ))
+    assert attempted["ok"] is False
+    assert "login" in attempted["error"].lower()
+
+
+def test_native_codex_adapter_is_fresh_read_only_and_bounded(monkeypatch):
+    import agent.transports.codex_app_server_session as native
+    sessions = []
+
+    class Session:
+        def __init__(self, **kwargs):
+            self.options = kwargs
+            self.closed = False
+            sessions.append(self)
+
+        def run_turn(self, text, **kwargs):
+            self.text = text
+            self.turn_options = kwargs
+            return SimpleNamespace(final_text="One answer", interrupted=False,
+                                   error=None, tool_iterations=0,
+                                   token_usage_last={"input_tokens": 25}, token_usage_total={})
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(native, "CodexAppServerSession", Session)
+    answer, route = consult._call_native_codex(
+        model="gpt-6.1-sol", prompt="What next?", context="A short brief.",
+        effort="high", timeout_seconds=30,
+    )
+    assert answer == "One answer"
+    assert route["usage"] == {"input_tokens": 25}
+    assert sessions[0].options["read_only"] is True
+    assert sessions[0].options["require_exact"] is True
+    assert sessions[0].options["model"] == "gpt-6.1-sol"
+    assert sessions[0].options["effort"] == "high"
+    assert "A short brief." in sessions[0].text
+    assert "What next?" in sessions[0].text
+    assert sessions[0].turn_options["absolute_turn_timeout"] == 30
+    assert sessions[0].closed
+    assert not Path(sessions[0].options["cwd"]).exists()
 
 
 def test_unavailable_native_route_is_visible_without_claiming_login(native_route, monkeypatch):
@@ -220,11 +302,12 @@ def test_real_native_adapter_receives_no_tools_in_isolated_context(native_route,
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/isolated-claude-test-config")
     result = json.loads(consult.model_consult_tool("consult", provider="claude-code",
-        model="claude-fable-5", prompt="Advise", context="A parts marketplace."))
+        model="claude-fable-5", prompt="Advise", context="A parts marketplace.", effort="high"))
     assert result["ok"] is True
     assert result["response"] == "Native advice"
     args, options = created[0]
     assert args[args.index("--model") + 1] == "claude-fable-5"
+    assert args[args.index("--effort") + 1] == "high"
     assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--setting-sources") + 1] == ""
     assert "--safe-mode" in args and "--strict-mcp-config" in args
@@ -233,6 +316,19 @@ def test_real_native_adapter_receives_no_tools_in_isolated_context(native_route,
     assert "CLAUDE_CODE_USE_BEDROCK" not in options["env"]
     assert options["env"]["CLAUDE_CONFIG_DIR"] == "/tmp/isolated-claude-test-config"
     assert not Path(options["cwd"]).exists()
+    assert result["effort"] == "high"
+    assert result["usage"] == {}
+
+
+def test_effort_is_rejected_for_api_routes(monkeypatch):
+    monkeypatch.setattr(consult, "_provider_row", lambda provider: {
+        "slug": provider, "authenticated": True, "models": ["z-ai/glm-5.3"],
+    })
+    monkeypatch.setattr(consult, "_call_provider", lambda **kwargs: pytest.fail("must not ignore effort"))
+    result = json.loads(consult.model_consult_tool("consult", provider="openrouter",
+        model="z-ai/glm-5.3", prompt="Advise", effort="high"))
+    assert result["ok"] is False
+    assert "native Claude" in result["error"]
 
 
 @pytest.mark.parametrize("outcome", ["error", "interrupted", "exception", "empty"])

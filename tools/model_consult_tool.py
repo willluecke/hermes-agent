@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only advice, preferring native Claude subscription authentication."""
+"""Read-only advice through an explicitly selected authenticated model."""
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -17,7 +19,7 @@ _MAX_RESPONSE_CHARS = 40_000
 _DEFAULT_TIMEOUT_SECONDS = 120
 _CLAUDE_ALIASES = ("fable", "opus", "sonnet", "haiku")
 _ADVISOR_SYSTEM = (
-    "You are a read-only advisor consulted by another engineering agent. "
+    "You are a read-only advisor consulted by another assistant. "
     "Answer the requested question directly and concisely using only the supplied "
     "context. You have no tools. Do not claim to have edited files, run tools, "
     "or performed external actions."
@@ -64,6 +66,33 @@ def _native_claude_row() -> dict[str, Any]:
     }
 
 
+def _native_codex_row() -> dict[str, Any]:
+    """The picker uses Codex app-server models and the ChatGPT login."""
+    from hermes_cli.codex_models import get_codex_app_server_model_ids
+
+    binary = shutil.which("codex")
+    authenticated = False
+    if binary:
+        try:
+            status = subprocess.run(
+                [binary, "login", "status"], capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+            authenticated = status.returncode == 0 and "chatgpt" in status.stdout.lower()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        models = get_codex_app_server_model_ids(force_refresh=False) if binary else []
+    except Exception:
+        models = []
+    return {
+        "slug": "openai-codex", "authenticated": authenticated,
+        "models": list(dict.fromkeys(models)),
+        "transport": "native_cli", "billing": "subscription",
+        "note": "Uses the Codex ChatGPT login in a fresh read-only session; no API-key fallback.",
+    }
+
+
 def _clean_text(value: Any, name: str, limit: int, *, required: bool = False) -> str:
     text = str(value or "").strip()
     if required and not text:
@@ -90,13 +119,14 @@ def _api_inventory_rows() -> list[dict[str, Any]]:
 
 def _inventory_rows() -> list[dict[str, Any]]:
     native = _native_claude_row()
+    codex = _native_codex_row()
     try:
         api_rows = _api_inventory_rows()
     except Exception:
         # API discovery must not conceal a working subscription route.
         native["note"] += " API provider discovery is temporarily unavailable."
         api_rows = []
-    return [native, *(row for row in api_rows if row.get("slug") != "claude-code")]
+    return [native, codex, *(row for row in api_rows if row.get("slug") not in {"claude-code", "openai-codex"})]
 
 
 def _provider_row(provider: str) -> dict[str, Any]:
@@ -108,6 +138,11 @@ def _provider_row(provider: str) -> dict[str, Any]:
                 "Claude subscription authentication or CLI is unavailable. Restore the "
                 "native Claude login and retry; no paid API fallback was attempted."
             )
+        return row
+    if normalized == "openai-codex":
+        row = _native_codex_row()
+        if not row["authenticated"]:
+            raise ValueError("Codex ChatGPT login is unavailable. No paid API fallback was attempted.")
         return row
     row = next(
         (
@@ -124,7 +159,8 @@ def _provider_row(provider: str) -> dict[str, Any]:
 
 def _list_models(provider: str = "") -> dict[str, Any]:
     provider = str(provider or "").strip().lower()
-    rows = [_native_claude_row()] if provider == "claude-code" else _inventory_rows()
+    rows = ([_native_claude_row()] if provider == "claude-code" else
+            [_native_codex_row()] if provider == "openai-codex" else _inventory_rows())
 
     def describe(row: dict[str, Any]) -> dict[str, Any]:
         result = {
@@ -144,7 +180,7 @@ def _list_models(provider: str = "") -> dict[str, Any]:
             ),
             None,
         )
-        if row is None or (row.get("authenticated") is False and provider != "claude-code"):
+        if row is None or (row.get("authenticated") is False and provider not in {"claude-code", "openai-codex"}):
             raise ValueError(f"provider '{provider}' is not authenticated in Hermes")
         return {
             "ok": True,
@@ -155,9 +191,9 @@ def _list_models(provider: str = "") -> dict[str, Any]:
         "providers": [
             describe(row)
             for row in rows
-            if row.get("slug") and (row.get("authenticated") is not False or row.get("slug") == "claude-code")
+            if row.get("slug") and (row.get("authenticated") is not False or row.get("slug") in {"claude-code", "openai-codex"})
         ],
-        "routing_policy": "Claude uses claude-code by default, never automatic paid API fallback. An API-only list does not describe native subscription availability.",
+        "routing_policy": "Claude and Codex use their native subscription routes by default, never automatic paid API fallback. An API-only list does not describe native subscription availability.",
     }
 
 
@@ -167,7 +203,8 @@ def _advisor_prompt(prompt: str, context: str) -> str:
 
 def _call_native_claude(
     *, model: str, prompt: str, context: str, timeout_seconds: int,
-) -> tuple[str, dict[str, str]]:
+    effort: str = "",
+) -> tuple[str, dict[str, Any]]:
     from agent.transports.claude_code_session import ClaudeCodeSession
 
     # A fresh, no-tools consultation is neither the parent's execution thread
@@ -175,6 +212,7 @@ def _call_native_claude(
     with TemporaryDirectory(prefix="hermes-consult-") as cwd:
         session = ClaudeCodeSession(
             cwd=cwd, model=model, system_prompt=_ADVISOR_SYSTEM, no_tools=True,
+            effort=effort or None,
             inactivity_timeout=timeout_seconds, absolute_timeout=timeout_seconds,
         )
         try:
@@ -192,6 +230,45 @@ def _call_native_claude(
         return result.final_text.strip(), {
             "provider": "claude-code", "model": model,
             "transport": "native_cli", "billing": "subscription",
+            "usage": result.usage,
+        }
+
+
+def _call_native_codex(
+    *, model: str, prompt: str, context: str, timeout_seconds: int,
+    effort: str = "",
+) -> tuple[str, dict[str, Any]]:
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+
+    # A fresh temporary workspace keeps this consult separate from the parent
+    # conversation. Read-only mode disables external tools and write access.
+    with TemporaryDirectory(prefix="hermes-consult-") as cwd:
+        effective_effort = effort or "medium"
+        session = CodexAppServerSession(
+            cwd=cwd, model=model, effort=effective_effort,
+            read_only=True, require_exact=True, project_key="general",
+            first_event_timeout=min(timeout_seconds, 60),
+        )
+        try:
+            result = session.run_turn(
+                f"{_ADVISOR_SYSTEM}\n\n{_advisor_prompt(prompt, context)}",
+                turn_timeout=timeout_seconds,
+                absolute_turn_timeout=timeout_seconds,
+                post_compaction_grace=0,
+            )
+        except Exception:
+            raise RuntimeError("Native Codex consultation could not start. No paid API fallback was attempted; check the Codex login and logs.") from None
+        finally:
+            session.close()
+        if result.interrupted or result.error:
+            raise RuntimeError("Native Codex consultation failed (login, model access, quota, or timeout). No paid API fallback was attempted; check the Codex logs.")
+        if result.tool_iterations:
+            raise RuntimeError("Native Codex consultation attempted to use tools; its answer was discarded.")
+        return result.final_text.strip(), {
+            "provider": "openai-codex", "model": model,
+            "transport": "native_cli", "billing": "subscription",
+            "effort": effective_effort,
+            "usage": result.token_usage_last or result.token_usage_total or {},
         }
 
 
@@ -232,11 +309,15 @@ def _consult(
     context: str = "",
     timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
     allow_paid_claude: bool = False,
+    effort: str = "",
 ) -> dict[str, Any]:
     provider = _clean_text(provider, "provider", 64).lower()
     model = _clean_text(model, "model", 256, required=True)
     prompt = _clean_text(prompt, "prompt", _MAX_PROMPT_CHARS, required=True)
     context = _clean_text(context, "context", _MAX_CONTEXT_CHARS)
+    effort = _clean_text(effort, "effort", 16).lower()
+    if effort and effort not in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+        raise ValueError("effort must be low, medium, high, xhigh, max, or ultra")
     timeout_seconds = max(10, min(int(timeout_seconds or _DEFAULT_TIMEOUT_SECONDS), 300))
 
     if not isinstance(allow_paid_claude, bool):
@@ -245,12 +326,20 @@ def _consult(
     requested_provider = provider
     if native_model and (not allow_paid_claude or provider in {"", "auto", "claude-code", "claude"}):
         provider, model = "claude-code", native_model
+    elif provider in {"codex", "openai-codex"} or (
+        provider in {"", "auto"} and re.fullmatch(r"gpt-[a-z0-9]+(?:[.-][a-z0-9]+)*", model.lower())
+    ):
+        provider = "openai-codex"
     elif provider in {"", "auto"}:
         raise ValueError("Select an authenticated provider from action='list' for this model")
     elif not native_model and (provider in {"claude-code", "claude"} or ("claude" in model.lower() and not allow_paid_claude)):
         raise ValueError("Use an exact native Claude model ID or alias; paid Claude API routing requires explicit user approval and allow_paid_claude=true")
 
     row = _provider_row(provider)
+    if provider == "claude-code" and effort in {"xhigh", "ultra"}:
+        raise ValueError("Claude consultation effort must be low, medium, high, or max")
+    if effort and provider not in {"claude-code", "openai-codex"}:
+        raise ValueError("effort is supported only for native Claude or Codex consultation")
     models = [str(candidate) for candidate in row.get("models") or []]
     if provider != "claude-code" and model not in models:
         raise ValueError(
@@ -258,13 +347,15 @@ def _consult(
             f"'{provider}'; call model_consult with action='list' first"
         )
 
-    call = _call_native_claude if provider == "claude-code" else _call_provider
+    call = (_call_native_claude if provider == "claude-code" else
+            _call_native_codex if provider == "openai-codex" else _call_provider)
     answer, route = call(
-        **({} if provider == "claude-code" else {"provider": provider}),
+        **({"provider": provider} if provider not in {"claude-code", "openai-codex"} else {}),
         model=model,
         prompt=prompt,
         context=context,
         timeout_seconds=timeout_seconds,
+        **({"effort": effort} if provider in {"claude-code", "openai-codex"} else {}),
     )
     if not answer:
         raise RuntimeError("the consulted model returned no text")
@@ -279,6 +370,8 @@ def _consult(
         "truncated": truncated,
         "requested_provider": requested_provider or "auto",
         **{key: route[key] for key in ("transport", "billing") if key in route},
+        **({"effort": route.get("effort") or effort} if route.get("effort") or effort else {}),
+        **({"usage": route["usage"]} if "usage" in route else {}),
     }
 
 
@@ -298,6 +391,7 @@ def model_consult_tool(action: str, **kwargs: Any) -> str:
                     kwargs.get("timeout_seconds") or _DEFAULT_TIMEOUT_SECONDS
                 ),
                 allow_paid_claude=kwargs.get("allow_paid_claude", False),
+                effort=str(kwargs.get("effort") or ""),
             )
         else:
             raise ValueError("action must be 'list' or 'consult'")
@@ -310,7 +404,7 @@ MODEL_CONSULT_SCHEMA = {
     "name": "model_consult",
     "description": (
         "List native subscription and authenticated API routes, or consult one model. "
-        "Claude (including Fable/Opus) is subscription-first through native Claude Code, "
+        "Claude uses native Claude Code and Codex uses the ChatGPT subscription by default, "
         "even if an API catalog omits it. Never infer native availability from an API-only "
         "list, switch to OpenRouter, or substitute another model after a native failure. "
         "Paid Claude API use requires explicit user approval and allow_paid_claude=true. "
@@ -325,17 +419,21 @@ MODEL_CONSULT_SCHEMA = {
             "action": {"type": "string", "enum": ["list", "consult"]},
             "provider": {
                 "type": "string",
-                "description": "Use claude-code for Claude subscription advice (also the default for Claude). Other models require a listed provider, e.g. openrouter.",
+                "description": "Use claude-code for Claude or openai-codex for ChatGPT subscription advice (also their defaults). Direct API models require an exact listed provider, e.g. openrouter.",
             },
             "model": {
                 "type": "string",
-                "description": "Exact listed API model ID; native Claude also accepts exact claude-* IDs and native aliases fable, opus, sonnet, haiku. The CLI verifies access.",
+                "description": "Exact model ID listed for the chosen provider; native Claude also accepts exact claude-* IDs and native aliases fable, opus, sonnet, haiku. The CLI verifies access.",
             },
             "allow_paid_claude": {
                 "type": "boolean", "default": False,
                 "description": "Only set true if the user explicitly approved metered Claude API usage on the specified provider. Never set merely because native login, quota, model access, or a tool list failed.",
             },
             "prompt": {"type": "string"},
+            "effort": {
+                "type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "description": "Native Claude or Codex consultation effort. Codex defaults to medium when omitted; Claude uses the CLI default.",
+            },
             "context": {
                 "type": "string",
                 "description": "Only the bounded context the advisor needs.",
