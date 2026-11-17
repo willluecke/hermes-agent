@@ -269,7 +269,9 @@ def _codex_dialogue_entries(history: List[Dict[str, Any]]) -> List[tuple]:
     Tool and system rows are excluded deliberately: they are projected
     differently depending on which runtime produced them, so including them
     would make the fingerprint below report divergence for transcripts that
-    are in fact identical dialogue.
+    are in fact identical dialogue. Verification continuation prompts are
+    also excluded: Codex consumes them, but the durable transcript strips
+    them before the next turn reloads its history.
     """
     try:
         from agent.memory_manager import sanitize_context
@@ -279,6 +281,8 @@ def _codex_dialogue_entries(history: List[Dict[str, Any]]) -> List[tuple]:
     entries: List[tuple] = []
     for message in history:
         if not isinstance(message, dict):
+            continue
+        if message.get("_pre_verify_synthetic") or message.get("_verification_stop_synthetic"):
             continue
         role = str(message.get("role") or "").lower()
         if role not in {"user", "assistant"}:

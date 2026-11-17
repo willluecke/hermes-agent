@@ -247,6 +247,51 @@ class TestHandoffWindow:
 
 
 class TestFingerprintSurvivesStorage:
+    def test_verify_nudge_is_not_recorded_as_durable_dialogue(self):
+        """A native follow-up sees the synthetic nudge, but storage strips it.
+
+        Recording that nudge in seen_count makes the next real turn look like
+        a shortened transcript and needlessly retires the Codex thread.
+        """
+        from hermes_state import SessionDB
+        from run_agent import AIAgent
+
+        tmp = tempfile.mkdtemp(prefix="codex_continuity_verify_")
+        db = SessionDB(Path(tmp) / "state.db")
+        sid = "sess-codex-verify-continuity"
+        db.create_session(session_id=sid, source="api_server", model="codex")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://stub.invalid",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        live = [
+            {"role": "user", "content": "Audit this change"},
+            {"role": "assistant", "content": "I found one issue"},
+            {"role": "user", "content": "Check the fix", "_pre_verify_synthetic": True},
+            {"role": "assistant", "content": "The fix passes"},
+            {"role": "user", "content": "Confirm the result", "_verification_stop_synthetic": True},
+            {"role": "assistant", "content": "Confirmed"},
+        ]
+        assert agent._flush_messages_to_session_db(live) is not False
+        reloaded = db.get_messages_as_conversation(sid)
+        assert [m["content"] for m in reloaded] == [
+            "Audit this change", "I found one issue", "The fix passes", "Confirmed"
+        ]
+
+        seen = _codex_dialogue_entries(live)
+        current = _codex_dialogue_entries(reloaded)
+        thread, pending, reason = _codex_resume_plan(
+            thread_id="thread-1", state=_state(seen),
+            prior_entries=current, cwd=CWD,
+        )
+        assert (thread, pending, reason) == ("thread-1", [], "resume")
+
     def test_fingerprint_is_stable_across_a_real_persist_and_reload(self):
         """The guard is only safe if the fingerprint computed from the live
         message list still matches the one computed from the transcript the
