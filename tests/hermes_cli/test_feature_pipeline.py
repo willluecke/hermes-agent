@@ -555,6 +555,10 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
         assert kb.block_task(conn, cards[0], expected_run_id=run.current_run_id)  # a plain `kanban block`
     fp.answer(root_id=root, answer="Keep going", card=cards[0], board="proj")
     assert [d["answer"] for d in _status(root)["decisions"]] == ["CSV", "Keep going"], "both replies survive"
+    with kb.connect_closing(board="proj") as conn:  # and once more while it is ready, which opens no run
+        assert kb.block_task(conn, cards[0], kind="capability")
+    fp.answer(root_id=root, answer="Still going", card=cards[0], board="proj")
+    assert [d["answer"] for d in _status(root)["decisions"]] == ["CSV", "Keep going", "Still going"]
 
 
 def test_a_question_must_fit_the_chat_notice_whole(home):
