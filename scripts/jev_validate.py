@@ -10,9 +10,9 @@ Rule:
   * ship   - at least 100 labelled cases with 30 in each class, precision at
              the operating threshold of 0.8 or more, and better than the
              agent's own answer on the same cases;
-  * drop   - no better than the base rate, or more than half of all logged
-             scores within 0.1 of the threshold (the threshold, not Jev, is
-             then making the call);
+  * drop   - no better than the base rate, or, once at least 100 scores are
+             logged, more than half of them within 0.1 of the threshold (the
+             threshold, not Jev, is then making the call);
   * shadow - anything else: keep logging and labelling.
 
 The near-threshold check needs no labels, so it can retire a question early.
@@ -41,6 +41,8 @@ MIN_LABELLED = 100
 MIN_PER_CLASS = 30
 SHIP_PRECISION = 0.8
 MAX_NEAR_SHARE = 0.5
+# The near-threshold rule needs a sample: one score at 0.5 is not evidence.
+MIN_SCORES_FOR_NEAR = 100
 
 
 def load_scores(lines: Iterable[str], question: str) -> List[Dict[str, Any]]:
@@ -141,8 +143,10 @@ def evaluate(
 
 def verdict(report: Dict[str, Any]) -> tuple:
     near = report.get("near_threshold_share")
-    if near is not None and near > MAX_NEAR_SHARE:
+    if near is not None and report.get("scores", 0) >= MIN_SCORES_FOR_NEAR and near > MAX_NEAR_SHARE:
         return "drop", f"{near:.0%} of scores sit within {NEAR_BAND} of the threshold, so the threshold decides, not Jev"
+    if report.get("scores", 0) < MIN_SCORES_FOR_NEAR and not report["labelled"]:
+        return "shadow", f"only {report.get('scores', 0)} logged scores; the near-threshold check needs {MIN_SCORES_FOR_NEAR}"
     if report["labelled"] < MIN_LABELLED or min(report["positives"], report["negatives"]) < MIN_PER_CLASS:
         return "shadow", f"needs {MIN_LABELLED} labelled cases with {MIN_PER_CLASS} in each class"
     precision, base = report["precision"], report["base_rate"]

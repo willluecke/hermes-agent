@@ -29,10 +29,16 @@ def test_scores_come_from_preflight_fields_and_guard_answers():
 
 
 def test_a_question_whose_scores_crowd_the_threshold_is_dropped_without_labels():
-    scores = [{"key": f"t{i}", "score": 0.42} for i in range(6)] + [{"key": "t9", "score": 0.9}]
+    scores = [{"key": f"t{i}", "score": 0.42} for i in range(60)] + [{"key": f"u{i}", "score": 0.9} for i in range(40)]
     report = jv.evaluate(scores, {}, 0.4)
     assert report["near_threshold_share"] > 0.5
     assert report["verdict"] == "drop" and "threshold decides" in report["reason"]
+
+
+def test_a_handful_of_scores_is_not_enough_to_drop_a_question():
+    """2026-11-17: one logged design-freedom score at 0.5 read as a drop."""
+    report = jv.evaluate([{"key": "t1", "score": 0.5}], {}, 0.5)
+    assert report["verdict"] == "shadow" and "needs 100" in report["reason"]
 
 
 def test_too_few_labels_keep_a_question_in_shadow():
