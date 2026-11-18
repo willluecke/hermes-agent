@@ -1152,8 +1152,10 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
                                     "on the board")
             if task is None or task.status != "blocked":
                 raise PipelineError(f"card {card} is not waiting on Will")
+            # The current block's own reason; a block without one gives the
+            # reply a slot of its own rather than an earlier block's question.
             runs = kb.list_runs(conn, card)
-            asked = next((r.summary for r in reversed(runs) if getattr(r, "summary", None)), "") or ""
+            asked = (getattr(runs[-1], "summary", None) or "") if runs else ""
             kb.add_comment(conn, card, STATE_AUTHOR, f"Will (through the chat): {text}")
             record(conn, root_id, {"type": "will_answer", "card": card, "question": asked, "answer": text})
             resumed = kb.unblock_task(conn, card)  # back to the lane it was blocked in

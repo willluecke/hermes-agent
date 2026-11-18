@@ -550,6 +550,11 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
         fp.answer(root_id=root, answer="retry", card=cards[1], board="proj")
     assert _status(root)["decisions"] == [{"question": f"On card {cards[0]}: CSV or JSON export?", "answer": "CSV"}], \
         "his reply to a region reaches later fix cards and Astra through the decisions"
+    with kb.connect_closing(board="proj") as conn:  # the same card blocks again, this time with no reason
+        run = kb.claim_task(conn, cards[0], claimer="opus")
+        assert kb.block_task(conn, cards[0], expected_run_id=run.current_run_id)  # a plain `kanban block`
+    fp.answer(root_id=root, answer="Keep going", card=cards[0], board="proj")
+    assert [d["answer"] for d in _status(root)["decisions"]] == ["CSV", "Keep going"], "both replies survive"
 
 
 def test_a_question_must_fit_the_chat_notice_whole(home):
