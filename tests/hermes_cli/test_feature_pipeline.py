@@ -567,6 +567,15 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
     answers = _status(root)["decisions"]
     assert [d["answer"] for d in answers] == ["CSV", "Keep going", "Still going", "Retry now"]
     assert answers[-1]["question"] == f"On card {cards[0]}: spawn failed twice"
+    fp.answer(root_id=root, answer="Retry tomorrow instead", card=cards[0], board="proj")  # before the next claim
+    assert [d["answer"] for d in _status(root)["decisions"]][-1] == "Retry tomorrow instead"
+    assert len(_status(root)["decisions"]) == 4, "a correction replaces his answer to the same block"
+    with kb.connect_closing(board="proj") as conn:
+        assert kb.get_task(conn, cards[0]).status == "ready"
+        assert kb.list_comments(conn, cards[0])[-1].body.startswith("Will (through the chat), correcting")
+        kb.claim_task(conn, cards[0], claimer="opus")
+    with pytest.raises(fp.PipelineError, match="not waiting on Will"):
+        fp.answer(root_id=root, answer="too late", card=cards[0], board="proj")
 
 
 def test_a_question_must_fit_the_chat_notice_whole(home):

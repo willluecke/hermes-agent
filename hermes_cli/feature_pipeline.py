@@ -1153,20 +1153,29 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
             if task is not None and task.status == "triage":
                 raise PipelineError(f"card {card} went to triage after repeated blocks; Will should look at it "
                                     "on the board")
-            if task is None or task.status != "blocked":
-                raise PipelineError(f"card {card} is not waiting on Will")
             # The event that blocked the card now: a worker's or person's block,
             # or the dispatcher giving up after failed spawns. Its id keys the
             # reply, so only a second answer to the same block replaces one.
-            blocks = [e for e in kb.list_events(conn, card)
-                      if getattr(e, "kind", "") in ("blocked", "gave_up", "block_loop_detected")]
+            card_events = kb.list_events(conn, card)
+            blocks = [e for e in card_events if getattr(e, "kind", "") in ("blocked", "gave_up", "block_loop_detected")]
             latest = blocks[-1] if blocks else None
+            block_id = getattr(latest, "id", None)
+            # Will may correct his answer until the card's next worker claims it.
+            amending = (
+                task is not None and task.status in ("ready", "todo") and latest is not None
+                and any(e.get("type") == "will_answer" and e.get("card") == card and e.get("block_event") == block_id
+                        for e in events)
+                and not any(getattr(e, "kind", "") == "claimed" and e.id > block_id for e in card_events)
+            )
+            if task is None or (task.status != "blocked" and not amending):
+                raise PipelineError(f"card {card} is not waiting on Will")
             details = (getattr(latest, "payload", None) or {}) if latest is not None else {}
             asked = str(details.get("reason") or details.get("error") or "")
-            kb.add_comment(conn, card, STATE_AUTHOR, f"Will (through the chat): {text}")
+            prefix = "Will (through the chat), correcting his last answer" if amending else "Will (through the chat)"
+            kb.add_comment(conn, card, STATE_AUTHOR, f"{prefix}: {text}")
             record(conn, root_id, {"type": "will_answer", "card": card, "question": asked,
-                                   "block_event": getattr(latest, "id", None), "answer": text})
-            resumed = kb.unblock_task(conn, card)  # back to the lane it was blocked in
+                                   "block_event": block_id, "answer": text})
+            resumed = True if amending else kb.unblock_task(conn, card)  # back to the lane it was blocked in
             return {"ok": True, "resumed": bool(resumed),
                     "next": "Tell Will his answer went to that card; its worker resumes with it."}
         with kb.write_txn(conn):
