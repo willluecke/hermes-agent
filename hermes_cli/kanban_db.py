@@ -8442,6 +8442,11 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+#: Comment authors whose PR links are not a worker's PR. The feature
+#: pipeline's state records quote Will's request, his answers and reviewers'
+#: findings verbatim, so "audit the change in <PR URL>" must not read as a
+#: worker that already opened one (hermes_cli/feature_pipeline.STATE_AUTHOR).
+_RESPAWN_GUARD_IGNORED_AUTHORS = ("feature-pipeline",)
 
 
 @dataclass
@@ -10010,9 +10015,11 @@ def check_respawn_guard(
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
+        if c["author"] in _RESPAWN_GUARD_IGNORED_AUTHORS:
+            continue
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             return "active_pr"
 

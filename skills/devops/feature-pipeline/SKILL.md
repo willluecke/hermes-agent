@@ -58,7 +58,8 @@ Cards are still open. Reply with one line and stop.
 ## Landing
 
 - Commit everything on your branch first.
-- Then follow the project's CLAUDE.md or AGENTS.md. Where they say nothing more specific, go to the project's main checkout. Land only on `status.target.branch`, the branch it was on when the pipeline started: if it is on another branch now, or `git status` there shows local changes in the files the plan touched, leave it alone and name your branch in the summary. Otherwise run `git merge --no-ff <your branch>` there and rerun the checks.
+- Bring your branch up to date in your own worktree: merge the current tip of `status.target.branch` into it, resolve any conflicts there, and rerun the checks. Conflicts are never resolved in the main checkout.
+- Then follow the project's CLAUDE.md or AGENTS.md. Where they say nothing more specific, go to the project's main checkout. Land only on `status.target.branch`, the branch it was on when the pipeline started: if it is on another branch now, or `git status` there shows local changes in the files the plan touched, leave it alone and name your branch in the summary. Otherwise run `git merge --ff-only <your branch>` there. If that refuses because the target moved again, update your branch in your worktree once more and retry.
 - Push or deploy when the project's rules say that finished, tested work is pushed or deployed.
 - Never restart the Hermes gateway or hermes-sync from a pipeline card. You run inside the gateway, and the restart would kill you. Say in the summary that a drained rollout is needed.
 

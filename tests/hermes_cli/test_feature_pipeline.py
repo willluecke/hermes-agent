@@ -512,7 +512,8 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
     assert fp.answer(root_id=root, answer="CSV", card=cards[0], board="proj")["resumed"] is True
     with kb.connect_closing(board="proj") as conn:
         assert kb.get_task(conn, cards[0]).status == "ready"
-        assert any("Will (through the chat): CSV" in c.body for c in kb.list_comments(conn, cards[0]))
+        assert any(c.body == "Will (through the chat): CSV" and c.author == fp.STATE_AUTHOR
+                   for c in kb.list_comments(conn, cards[0]))
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (cards[1],))
     with pytest.raises(fp.PipelineError, match="went to triage"):
@@ -550,6 +551,18 @@ def test_every_card_is_routed_to_the_checkout_its_branch_was_pinned_in(home):
     root, cards = _launched_root()
     with kb.connect_closing(board="proj") as conn:
         assert {kb.get_task(conn, card).workspace_path for card in [root, *cards]} == {str(home["repo"])}
+
+
+def test_a_pr_link_in_wills_request_does_not_hold_the_root(home):
+    """Astra, 2026-11-18: the dispatcher's respawn guard read a PR URL quoted in
+    the start record as a worker's open PR and held the root for a day."""
+    root = fp.start(project="proj", request="Audit the checkout change in https://github.com/example/shop/pull/42",
+                    conversation_id="c1")["root"]
+    with kb.connect_closing(board="proj") as conn:
+        assert kb.check_respawn_guard(conn, root) is None
+        kb.add_comment(conn, root, "default", "Opened https://github.com/example/shop/pull/43")
+        assert kb.check_respawn_guard(conn, root) == "active_pr", "a worker's own PR link still holds it"
+    assert fp.STATE_AUTHOR in kb._RESPAWN_GUARD_IGNORED_AUTHORS
 
 
 def test_resolve_board_fills_a_missing_working_directory_and_refuses_unknown_projects(home):

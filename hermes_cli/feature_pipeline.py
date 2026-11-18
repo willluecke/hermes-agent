@@ -1138,7 +1138,7 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
                                     "on the board")
             if task is None or task.status != "blocked":
                 raise PipelineError(f"card {card} is not waiting on Will")
-            kb.add_comment(conn, card, "will", f"Will (through the chat): {text}")
+            kb.add_comment(conn, card, STATE_AUTHOR, f"Will (through the chat): {text}")
             record(conn, root_id, {"type": "will_answer", "card": card, "answer": text})
             resumed = kb.unblock_task(conn, card)  # back to the lane it was blocked in
             return {"ok": True, "resumed": bool(resumed),
