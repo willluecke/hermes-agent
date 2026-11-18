@@ -503,13 +503,25 @@ class TestHermesHomeLeakGuard:
     def test_runtime_context_is_whitelisted_for_mcp_child(self):
         """Codex must forward per-turn identity into the stdio MCP process.
         The HERMES_PARENT_* keys carried the parent runtime to the Opus
-        worker, which was retired on 2026-11-17, so they are gone."""
+        worker, which was retired on 2026-11-17, so they are gone. A kanban
+        worker's identity is forwarded so a Codex-runtime worker (the Astra
+        reviewer of a feature-pipeline region, 2026-11-18) gets the kanban
+        tools on its own card."""
         entry = _build_hermes_tools_mcp_entry()
 
         assert entry["env_vars"] == [
             "HERMES_GATEWAY_SESSION_ID",
             "HERMES_HOME",
             "PYTHONPATH",
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_WORKSPACE",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_BRANCH",
+            "HERMES_PROFILE",
         ]
 
     def test_whitelist_carries_no_credential_keys(self):

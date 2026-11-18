@@ -70,7 +70,9 @@ _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
 # The GPT-6.1 Sol / GPT-6 Sol / GPT-6 Luna trio (2026-09-29) is served by the
 # ChatGPT backend only to Codex 0.160+; an older CLI gets HTTP 400 "not
 # supported when using Codex with a ChatGPT account" for them (2026-10-02).
-_LOCAL_CATALOG_REQUIRED_MODELS = {"gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"}
+# GPT-6.2 Astra and Sol (released 2026-11-17) are served only to Codex 0.170+;
+# 0.160 got "not supported when using Codex with a ChatGPT account" (2026-11-18).
+_LOCAL_CATALOG_REQUIRED_MODELS = {"gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6.2-astra", "gpt-6.2-sol"}
 
 
 def _add_forward_compat_models(model_ids: List[str]) -> List[str]:

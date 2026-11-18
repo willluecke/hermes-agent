@@ -39,6 +39,11 @@ HELD_KINDS = ("completed", "review_requested", "blocked", "gave_up", "block_loop
 #: Blocks that do not need a person: waiting on another task, or a passing
 #: failure the orchestrator reopens.
 QUIET_BLOCK_KINDS = ("dependency", "transient")
+#: A feature pipeline's region and fix cards finish through Astra's review and
+#: the pipeline reports its own progress, so their routine events stay out of
+#: the chat. Their blocks and give-ups still go out: those need Will.
+PIPELINE_WORK_SKILL = "feature-pipeline-region"
+PIPELINE_QUIET_KINDS = ("completed", "review_requested")
 #: How long the newest held event must sit before a settled batch is sent,
 #: so the dispatcher can promote parents and spawn follow-ups first.
 SETTLE_SECONDS = 90
@@ -62,10 +67,11 @@ def _first_line(text: Any, limit: int = 200) -> str:
 def digest_entries(events: Iterable[Any], task: Any) -> list[dict[str, Any]]:
     """The held entries for one subscription's claimed events."""
     title = (getattr(task, "title", "") or "") if task is not None else ""
+    pipeline_work = PIPELINE_WORK_SKILL in (getattr(task, "skills", None) or [])
     entries: list[dict[str, Any]] = []
     for ev in events:
         kind = getattr(ev, "kind", "")
-        if kind not in HELD_KINDS:
+        if kind not in HELD_KINDS or (pipeline_work and kind in PIPELINE_QUIET_KINDS):
             continue
         payload = getattr(ev, "payload", None) or {}
         urgent = False
@@ -77,8 +83,10 @@ def digest_entries(events: Iterable[Any], task: Any) -> list[dict[str, Any]]:
             detail = _first_line(payload.get("summary"))
             urgent = True
         elif kind == "blocked":
-            detail = _first_line(payload.get("reason"))
             urgent = payload.get("kind") not in QUIET_BLOCK_KINDS
+            # A block that needs a person carries its question in the reason;
+            # keep all that the digest stores (a pipeline question is one line).
+            detail = _first_line(payload.get("reason"), 600 if urgent else 200)
         elif kind == "gave_up":
             detail = _first_line(payload.get("error"))
             urgent = True

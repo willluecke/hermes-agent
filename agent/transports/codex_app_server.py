@@ -99,7 +99,11 @@ class CodexAppServerClient:
         # Codex sandbox on, but add the Kanban root as the only extra writable
         # root. Without this, codex-runtime workers finish their actual work
         # but crash/block when kanban_complete/kanban_block writes SQLite.
-        if spawn_env.get("HERMES_KANBAN_TASK"):
+        # An explicitly read-only session (a consult, or the feature
+        # pipeline's plan review started from inside a worker) keeps its
+        # read-only sandbox: appending workspace-write after it would win.
+        read_only = 'sandbox_mode="read-only"' in app_server_args
+        if spawn_env.get("HERMES_KANBAN_TASK") and not read_only:
             kanban_db = spawn_env.get("HERMES_KANBAN_DB")
             kanban_root = (
                 os.path.dirname(kanban_db)

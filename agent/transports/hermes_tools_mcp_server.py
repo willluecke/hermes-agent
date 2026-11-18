@@ -137,6 +137,9 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "talos",
     "hermes_conversation",
     "steward_jobs",
+    # Feature-system builds and audits: chat agents start them, the root
+    # card's Opus orchestrator (a kanban worker) drives them.
+    "feature_pipeline",
     "typesafe_decide",
     # Stateless stand-in for `todo` on the Codex and Claude lanes: returns the
     # criteria in the todo result shape so the verify judge can use them.

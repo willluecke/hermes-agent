@@ -1101,6 +1101,11 @@ class Task:
     # model (pre-existing behaviour). Solves the "model from provider A,
     # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    # Model and provider for the task's REVIEW runs (2026-11-18, the feature
+    # pipeline: Opus builds a region, Astra reviews it). NULL = the review
+    # run uses ``model_override``/``provider_override`` like the build run.
+    review_model_override: Optional[str] = None
+    review_provider_override: Optional[str] = None
     # Per-task reasoning effort for the worker (one of
     # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
     # off). When set, the dispatcher passes ``--reasoning <level>`` so the
@@ -1208,6 +1213,16 @@ class Task:
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
+            review_model_override=(
+                row["review_model_override"]
+                if "review_model_override" in keys and row["review_model_override"]
+                else None
+            ),
+            review_provider_override=(
+                row["review_provider_override"]
+                if "review_provider_override" in keys and row["review_provider_override"]
                 else None
             ),
             reasoning_effort=(
@@ -1383,6 +1398,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- worker resolves the model against the right backend instead of the
     -- profile's configured provider. NULL = profile provider.
     provider_override    TEXT,
+    -- Model and provider for review runs of this task. NULL = review runs
+    -- use model_override/provider_override like the build run.
+    review_model_override    TEXT,
+    review_provider_override TEXT,
     -- Per-task reasoning effort for the worker (minimal|low|medium|high|
     -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
     -- passes --reasoning <level> so the worker runs at that depth regardless
@@ -2659,6 +2678,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "provider_override", "provider_override TEXT"
         )
 
+    if "review_model_override" not in cols:
+        # Model for review runs (2026-11-18). NULL = review runs use the
+        # build run's model, the behaviour existing rows had.
+        _add_column_if_missing(
+            conn, "tasks", "review_model_override", "review_model_override TEXT"
+        )
+    if "review_provider_override" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_provider_override", "review_provider_override TEXT"
+        )
+
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
@@ -3205,6 +3235,8 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    review_model_override: Optional[str] = None,
+    review_provider_override: Optional[str] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3254,6 +3286,12 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    # The review model is written with the row, so a card is never
+    # dispatchable without the reviewer it was made for (feature pipeline).
+    review_model_override = (review_model_override or "").strip() or None
+    review_provider_override = (review_provider_override or "").strip() or None
+    if review_provider_override and not review_model_override:
+        raise ValueError("review_provider_override requires a review_model_override")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3523,8 +3561,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        review_model_override, review_provider_override
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3550,6 +3589,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        review_model_override,
+                        review_provider_override,
                     ),
                 )
                 for pid in parents:
@@ -3806,6 +3847,60 @@ def set_model_override(
     # Task-mutation observer (RFC #58548), fired AFTER the txn commits.
     notify_task_updated(conn, task_id, ("model_override", "provider_override"))
     return True
+
+
+def set_review_model_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    model: Optional[str],
+    provider: Optional[str] = None,
+) -> bool:
+    """Set (or clear) the model and provider for the task's review runs.
+
+    The feature pipeline (2026-11-18) has Opus build a region and Astra
+    review it. The build run keeps ``model_override``; a run claimed from
+    ``review`` uses this one instead. Same rules as :func:`set_model_override`:
+    ``model=None`` clears both, a provider without a model is rejected, and it
+    takes effect on the next review dispatch. Returns True on success.
+    """
+    model = (model or "").strip() or None
+    provider = (provider or "").strip() or None
+    if provider and not model:
+        raise ValueError("review_provider_override requires a review_model_override")
+    if not model:
+        provider = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set review model override on archived task {task_id}")
+        conn.execute(
+            "UPDATE tasks SET review_model_override = ?, review_provider_override = ? WHERE id = ?",
+            (model, provider, task_id),
+        )
+        _append_event(
+            conn, task_id, "review_model_override_set",
+            {"model": model, "provider": provider},
+        )
+    notify_task_updated(conn, task_id, ("review_model_override", "review_provider_override"))
+    return True
+
+
+def review_spawn_task(task: Task) -> Task:
+    """The task as a review run should be spawned: the review model, when set,
+    replaces the build model for this spawn only."""
+    if not task.review_model_override:
+        return task
+    from dataclasses import replace as _replace
+
+    return _replace(
+        task,
+        model_override=task.review_model_override,
+        provider_override=task.review_provider_override,
+    )
 
 
 def set_reasoning_effort(
@@ -6291,6 +6386,7 @@ def block_task(
     kind: Optional[str] = None,
     handoff: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
+    count_recurrence: bool = True,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6327,6 +6423,11 @@ def block_task(
     downstream / retry workers via :func:`build_worker_context`, so a
     successor resumes at the frontier instead of re-deriving the dead end.
     Must be a dict or ``None``.
+
+    ``count_recurrence=False`` is for a block only a person clears, each time
+    with a new answer (a feature pipeline's question for Will): the
+    unblock-loop counter is left as it is, so a second question lands in
+    ``blocked`` instead of ``triage``.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -6417,6 +6518,8 @@ def block_task(
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
+        if not count_recurrence:
+            recurrences = min(prev_recurrences, BLOCK_RECURRENCE_LIMIT - 1)
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -10767,6 +10870,9 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # A task may name its own reviewer model (the feature pipeline's
+        # Astra review of an Opus-built region).
+        claimed = review_spawn_task(claimed)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

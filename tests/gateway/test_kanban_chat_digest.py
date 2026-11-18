@@ -70,6 +70,26 @@ def test_entries_hold_what_matters_and_flag_what_needs_a_person():
     assert entries[1]["detail"] == "Built, not shipped. Commit 88d79c24"
 
 
+def test_a_pipeline_region_reaches_the_chat_only_when_it_needs_will():
+    """Feature pipeline, 2026-11-18: regions finish through Astra's review and
+    the pipeline posts its own notes, so a region's review request and
+    completion stay quiet; its question or failure still goes out at once."""
+    region = SimpleNamespace(title="Region 1/2: notes page", result="", skills=["feature-pipeline-region"])
+    entries = kcd.digest_entries([
+        _ev("review_requested", summary="built"),
+        _ev("completed", summary="approved"),
+        _ev("blocked", reason="which export format?", kind="needs_input"),
+        _ev("gave_up", error="3 failures"),
+    ], region)
+    assert [(e["kind"], e["urgent"]) for e in entries] == [("blocked", True), ("gave_up", True)]
+    root = SimpleNamespace(title="Feature pipeline (build): notes", result="", skills=["feature-pipeline"])
+    assert [e["kind"] for e in kcd.digest_entries([_ev("completed", summary="done")], root)] == ["completed"]
+    question = "Question for Will: " + "which export format, CSV or JSON? " * 16
+    entry = kcd.digest_entries([_ev("blocked", reason=question, kind="needs_input")], root)[0]
+    assert entry["detail"] == question.strip()[:600] and len(entry["detail"]) > 200, \
+        "a question for Will is kept as far as the digest stores it, not cut at 200 characters"
+
+
 def test_storage_and_the_in_flight_count(board):
     running = _followed(board, "running one")
     _followed(board, "done one", status="done")

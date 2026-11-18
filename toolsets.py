@@ -61,6 +61,7 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory", "decision_log", "model_consult", "talos", "hermes_conversation",
+    "feature_pipeline",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -312,6 +313,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "feature_pipeline": {
+        "description": "Planned, reviewed feature-system builds and audits on the project's kanban board",
+        "tools": ["feature_pipeline"],
+        "includes": []
+    },
+
     "hermes_conversation": {
         "description": "Read and drive existing Hermes Chat conversations through the sync store's queued turns",
         "tools": ["hermes_conversation"],
@@ -545,6 +552,7 @@ TOOLSETS = {
             "browser_exec",
             # Planning, memory and durable decisions
             "todo", "memory", "decision_log", "model_consult", "talos", "hermes_conversation",
+            "feature_pipeline",
             # Session history search
             "session_search",
             # Local time lookup

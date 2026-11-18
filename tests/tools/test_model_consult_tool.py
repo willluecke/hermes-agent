@@ -176,6 +176,20 @@ def test_codex_api_key_login_is_not_reported_as_subscription(monkeypatch):
     assert "login" in attempted["error"].lower()
 
 
+def test_codex_chatgpt_login_reported_on_stderr_counts_as_subscription(monkeypatch):
+    """`codex login status` prints its line on stderr (0.160 and 0.170, 2026-11-18)."""
+    import hermes_cli.codex_models as models
+
+    monkeypatch.setattr(consult.shutil, "which", lambda name: "/fake/codex")
+    monkeypatch.setattr(models, "get_codex_app_server_model_ids", lambda **kwargs: ["gpt-6.2-astra"])
+    monkeypatch.setattr(consult.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=0, stdout="", stderr="Logged in using ChatGPT\n",
+    ))
+    result = json.loads(consult.model_consult_tool("list", provider="openai-codex"))
+    assert result["authenticated"] is True
+    assert "gpt-6.2-astra" in [model["id"] if isinstance(model, dict) else model for model in result.get("models", [])] or result.get("models") == ["gpt-6.2-astra"]
+
+
 def test_native_codex_adapter_is_fresh_read_only_and_bounded(monkeypatch):
     import agent.transports.codex_app_server_session as native
     sessions = []

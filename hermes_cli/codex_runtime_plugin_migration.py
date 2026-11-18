@@ -706,6 +706,11 @@ def _build_hermes_tools_mcp_entry() -> dict:
             "HERMES_GATEWAY_SESSION_ID",
             "HERMES_HOME",
             "PYTHONPATH",
+            # A kanban worker's identity, so a Codex-runtime worker (an Astra
+            # reviewer of a feature-pipeline region) gets the kanban tools on
+            # its own card instead of falling back to the CLI. Unset outside
+            # workers, so nothing is forwarded there.
+            *KANBAN_WORKER_ENV,
         ],
     }
     if env:
@@ -715,6 +720,19 @@ def _build_hermes_tools_mcp_entry() -> dict:
     out["startup_timeout_sec"] = 30.0
     out["tool_timeout_sec"] = 600.0
     return out
+
+
+KANBAN_WORKER_ENV = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_PROFILE",
+)
 
 
 def migrate(

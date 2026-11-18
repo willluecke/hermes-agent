@@ -78,7 +78,11 @@ def _native_codex_row() -> dict[str, Any]:
                 [binary, "login", "status"], capture_output=True, text=True,
                 timeout=10, check=False,
             )
-            authenticated = status.returncode == 0 and "chatgpt" in status.stdout.lower()
+            # `codex login status` prints "Logged in using ChatGPT" on stderr
+            # (0.160 and 0.170 both, checked 2026-11-18); reading stdout alone
+            # reported every Codex consult as "login unavailable".
+            output = f"{getattr(status, 'stdout', '') or ''}\n{getattr(status, 'stderr', '') or ''}".lower()
+            authenticated = status.returncode == 0 and "chatgpt" in output
         except (OSError, subprocess.TimeoutExpired):
             pass
     try:

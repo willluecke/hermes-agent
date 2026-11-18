@@ -494,6 +494,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Provider the model belongs to (worker is spawned with "
              "--provider <name>). Cleared together with the model.",
     )
+    p_set_model.add_argument(
+        "--review", action="store_true",
+        help="Set the model for the task's review runs instead of its build "
+             "runs (an Opus-built card reviewed by Astra).",
+    )
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -2048,9 +2053,11 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     if model is not None and model.lower() in {"none", "-", "null", ""}:
         model = None
     provider = getattr(args, "provider", None)
+    review = bool(getattr(args, "review", False))
     try:
         with kb.connect_closing() as conn:
-            ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
+            setter = kb.set_review_model_override if review else kb.set_model_override
+            ok = setter(conn, args.task_id, model, provider=provider)
     except (ValueError, RuntimeError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
@@ -2059,7 +2066,8 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         return 1
     if model:
         label = f"{provider}:{model}" if provider else model
-        print(f"Set model override on {args.task_id}: {label} "
+        which = "review model" if review else "model override"
+        print(f"Set {which} on {args.task_id}: {label} "
               "(applies on next dispatch)")
     else:
         print(f"Cleared model override on {args.task_id} "

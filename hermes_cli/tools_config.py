@@ -113,6 +113,7 @@ CONFIGURABLE_TOOLSETS = [
     ("model_consult",   "Model Consultation",           "read-only advice from another authenticated model"),
     ("talos",           "Talos Runtime",                "project ledger reads and bounded, ledger-validated actions"),
     ("hermes_conversation", "Hermes Conversations",     "read existing chats and queue turns into them"),
+    ("feature_pipeline", "Feature Pipeline",          "planned, Astra-reviewed feature-system builds and audits"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),

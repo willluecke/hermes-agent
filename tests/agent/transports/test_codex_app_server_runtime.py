@@ -265,6 +265,48 @@ class TestSpawnEnvIsolation:
         assert all("danger" not in part for part in cmd)
 
 
+    def test_an_explicit_read_only_session_stays_read_only_inside_a_worker(self, monkeypatch):
+        """A read-only consult or plan review started from a kanban worker
+        (the feature pipeline's Astra review, 2026-11-18) must not get the
+        worker's workspace-write sandbox appended after its read-only one:
+        the later -c override wins."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = self.stdout = self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_root")
+        monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/kanban/boards/proj/kanban.db")
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", extra_args=["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"'])
+        client._closed = True
+
+        cmd = captured["cmd"]
+        assert 'sandbox_mode="read-only"' in cmd
+        assert 'sandbox_mode="workspace-write"' not in cmd
+        assert not any("writable_roots" in part for part in cmd)
+
+
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(
     inherit_credentials=True) instead of a raw os.environ.copy().
