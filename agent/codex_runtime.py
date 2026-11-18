@@ -1756,36 +1756,6 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
-def _agent_opus_worker_enabled(agent: Any) -> bool:
-    """Whether this parent runtime may still reach the governed Opus worker.
-
-    Codex spawns the hermes-tools MCP server as a separate process that builds
-    its own tool list, so a toolset denial on this agent is invisible there.
-    Resolve the parent's effective state here and let it travel with the
-    session (see agent/opus_delegation.py). Fails closed on any resolution
-    error — an unknown state must not be read as permission.
-    """
-    try:
-        from toolsets import resolve_toolset, validate_toolset
-
-        disabled = set(getattr(agent, "disabled_toolsets", None) or [])
-        if "opus_worker" in disabled:
-            return False
-        enabled = getattr(agent, "enabled_toolsets", None)
-        if not enabled:
-            # No allowlist means every registered toolset is available.
-            return True
-        for name in enabled:
-            if name == "opus_worker":
-                return True
-            if validate_toolset(name) and "opus_code_worker" in resolve_toolset(name):
-                return True
-        return False
-    except Exception:
-        logger.debug("opus_worker parent-state lookup failed", exc_info=True)
-        return False
-
-
 def run_codex_app_server_turn(
     agent,
     *,
@@ -2021,7 +1991,6 @@ def run_codex_app_server_turn(
             effort=requested_effort(getattr(agent, "reasoning_config", None)),
             ultracode=_codex_ultracode(agent),
             parent_provider=str(getattr(agent, "provider", "") or ""),
-            opus_worker_enabled=_agent_opus_worker_enabled(agent),
             require_exact=require_exact,
             read_only=read_only,
             project_key=str(getattr(agent, "session_project", "") or ""),

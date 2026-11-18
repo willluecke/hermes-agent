@@ -38,11 +38,16 @@ A slow or failed call fails **open**: the turn proceeds without advice.
 
 1. **`pre_llm_call`: budget read.** One Jev call asks: how hard, how
    objectively checkable, what kind (answer / build / operate / research…),
-   how ambiguous, is it a build. In `mode: feedback` an advisory note is added
-   to the user message **only** when P(ambiguous) ≥ 0.6, the plan is
-   `candidates` (hard + checkable → "make 3 candidates, pick with
-   typesafe_decide") or `criteria_only`, or as the once-per-session build
-   criteria nudge. Otherwise the row says `note withheld`. The injection
+   how ambiguous, is it a build, and (logged only, in shadow) does the request
+   leave real design freedom. In `mode: feedback` a note is added to the user
+   message **only** when P(ambiguous) ≥ 0.6, the plan is `look_beyond` (build
+   or research, P(hard) ≥ 0.7, not a continuation: commit to one design, then
+   look for what a materially different approach would handle, adopt or reject
+   each idea with a reason via `acceptance_criteria`'s `ideas`), or as the
+   once-per-session build criteria nudge. Every note opens with a label saying
+   Jev wrote it and Will did not (2026-11-17: a thread called the old
+   three-candidates note "as requested"). The missing-evidence question is
+   asked only on the trial arms. Otherwise the row says `note withheld`. The injection
    rate over the last 50 judged turns (gateway-wide, in memory, reset by a
    restart) is in each `preflight` log record as `injection_rate`, not on
    the row. Carried criteria open for 3+
@@ -136,7 +141,9 @@ re-ran it and it held), `overclaim` (contradicted / stale / missing),
 days = real / (real + false) and shows on the verify row. `maybe_tune` runs
 hourly and moves `verify_fail_threshold` / `claims_flag_threshold` within
 bounds only when that threshold's own basis reaches 50 labels; it writes
-`~/.hermes/system-one-preflight.tuning.json` only when a threshold moves.
+`~/.hermes/system-one-preflight.tuning.json` only when a threshold moves, and
+only with `tuning: auto`; the default `log` records recommendations without
+applying them (2026-11-17).
 Each pass is a `tune` log record with the basis counts and `changes`. The
 basis is outcome labels, and none arrive since 2026-09-30 (it stood at 18),
 so the tuning cannot move a threshold unless labels come back.
@@ -153,7 +160,7 @@ so the tuning cannot move a threshold unless labels come back.
 | `verify_send_back` | `on` | `off` = flag-only: one verdict row, never a send-back |
 | `verify_max_send_backs` | 1 | Send-backs per turn |
 | `criteria_nudge` | `on` | Once-per-session "register criteria" note on build turns |
-| `drift_check` | `off` | Every N tool calls: which criterion is this work for? |
+| `drift_check` | `shadow` | Every N tool calls: which criterion is this work for? `shadow` logs without steering |
 | `fidelity_check` | `on` | Entailment check on registered criteria |
 | `fidelity_coverage_threshold` | 0 | 0 disables the "add more criteria" steer |
 | `manifest_required` | `on` | A build turn that ran checks and over-claims must register a manifest |
@@ -192,3 +199,14 @@ live runs: use `~/coding-projects/command-center/bin/gateway-idle-restart`.
 - Studies (2026-09-20) found no repeatable decision-quality gain from the
   per-turn loop; the evidence-support read itself was accurate. Treat it as
   a cheap check on over-claiming, not a proven quality lever.
+
+## Validating a Jev question (2026-11-17)
+
+New questions run in shadow first. `scripts/jev_validate.py --question
+preflight:p_design_freedom --threshold 0.5 [--labels labels.jsonl]` reports
+the share of logged scores within 0.1 of the threshold and, with labels
+(`{"key": <turn or tool call id>, "label": bool, "self": bool?}`), the base
+rate, precision and recall. Ship needs 100 labelled cases with 30 per class,
+precision ≥ 0.8 and better than the agent's own answer; drop when it is no
+better than the base rate or more than half the scores sit within 0.1 of the
+threshold.

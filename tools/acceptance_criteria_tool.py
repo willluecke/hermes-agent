@@ -19,6 +19,13 @@ Criteria are a running list across requests: what is still open carries
 until the judge rates it met. Leaving the list any other way is one explicit
 act: ``retire`` names each item with a reason the user sees as its own row.
 The tool refuses a retirement without a reason.
+
+``ideas`` records the look-beyond pass the preflight suggests on hard build
+or research work (2026-11-17): what a materially different approach would
+handle that the committed design does not, each idea adopted or rejected
+with a one-line reason. The preflight logs the counts; an adopted idea is
+also registered as a criterion, so the fidelity check reads it against the
+request. A call that carries only ideas leaves the criteria list alone.
 """
 
 from __future__ import annotations
@@ -32,16 +39,56 @@ MAX_ITEMS = 12
 MAX_CHARS = 400
 STATUSES = ("pending", "in_progress", "completed")
 MAX_REASON_CHARS = 300
+IDEA_DECISIONS = ("adopt", "reject")
+MAX_IDEAS = 12
 
 
 def _reason(value: Any) -> str:
     return str(value or "").strip()[:MAX_REASON_CHARS] if isinstance(value, (str, int, float)) else ""
 
 
+def _ideas(raw: Any) -> Any:
+    """The look-beyond ideas, or an error string."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return "ideas must be a list of {idea, decision, reason} objects"
+    ideas: List[Dict[str, str]] = []
+    for value in raw:
+        if not isinstance(value, dict):
+            return "ideas items must be {idea, decision, reason} objects"
+        idea = str(value.get("idea") or "").strip()
+        decision = str(value.get("decision") or "").strip().lower()
+        reason = _reason(value.get("reason"))
+        if not idea:
+            return "each idea needs its text"
+        if decision not in IDEA_DECISIONS:
+            return f"idea \"{idea[:80]}\" needs decision adopt or reject"
+        if not reason:
+            return f"idea \"{idea[:80]}\" needs a one-line reason"
+        ideas.append({"idea": idea[:MAX_CHARS], "decision": decision, "reason": reason})
+        if len(ideas) >= MAX_IDEAS:
+            break
+    return ideas
+
+
 def acceptance_criteria(args: Dict[str, Any]) -> str:
     args = args if isinstance(args, dict) else {}
     raw = args.get("criteria")
     raw_retire = args.get("retire")
+    ideas = _ideas(args.get("ideas"))
+    if isinstance(ideas, str):
+        return json.dumps({"error": ideas})
+    if raw is None and not raw_retire and ideas:
+        adopted = sum(1 for idea in ideas if idea["decision"] == "adopt")
+        # No "todos" key: an ideas-only call must not replace the criteria.
+        return json.dumps({
+            "ideas": ideas,
+            "note": (
+                f"{len(ideas)} look-beyond ideas recorded: {adopted} adopted, {len(ideas) - adopted} rejected. "
+                "Register each adopted idea as an acceptance criterion if it is not one yet."
+            ),
+        }, ensure_ascii=False)
     retire: List[Dict[str, str]] = []
     if raw_retire is not None:
         if not isinstance(raw_retire, list):
@@ -82,9 +129,14 @@ def acceptance_criteria(args: Dict[str, Any]) -> str:
         notes.append(f"{len(items)} acceptance criteria registered. Each will be judged against the diff and check output before this turn finishes.")
     if retire:
         notes.append(f"{len(retire)} criteria retired with a stated reason; the user sees each.")
+    if ideas:
+        adopted = sum(1 for idea in ideas if idea["decision"] == "adopt")
+        notes.append(f"{len(ideas)} look-beyond ideas recorded: {adopted} adopted, {len(ideas) - adopted} rejected.")
     result: Dict[str, Any] = {"todos": items, "note": " ".join(notes)}
     if retire:
         result["retire"] = retire
+    if ideas:
+        result["ideas"] = ideas
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -105,7 +157,11 @@ ACCEPTANCE_CRITERIA_SCHEMA = {
         "this turn's work to prove. To drop any the user no longer wants, pass retire: [{content, "
         "reason}], one entry per criterion (list them all to clear the list); every "
         "retirement is shown to the user with its reason, so never retire silently or "
-        "without one."
+        "without one. After a look-beyond pass (what would a materially different "
+        "approach handle that your design does not?), pass ideas: [{idea, decision, "
+        "reason}] with decision adopt or reject and a one-line reason; register each "
+        "adopted idea as a criterion too. A call with only ideas leaves the criteria "
+        "list unchanged."
     ),
     "parameters": {
         "type": "object",
@@ -139,6 +195,19 @@ ACCEPTANCE_CRITERIA_SCHEMA = {
                     "required": ["reason"],
                 },
                 "description": "Criteria to drop, one entry each, with a reason the user will see. List every carried criterion to clear the list.",
+            },
+            "ideas": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "idea": {"type": "string", "description": "A gap or idea a materially different approach would handle."},
+                        "decision": {"type": "string", "enum": list(IDEA_DECISIONS)},
+                        "reason": {"type": "string", "description": "One line: why it is adopted or rejected."},
+                    },
+                    "required": ["idea", "decision", "reason"],
+                },
+                "description": "The look-beyond pass, at most 12 ideas. No quota: an empty pass is fine and needs no call.",
             },
         },
         "required": [],

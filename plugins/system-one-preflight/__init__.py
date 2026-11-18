@@ -216,25 +216,54 @@ KIND_CRITERIA = {
 }
 HARD_THRESHOLD = 0.5
 CHECKABLE_THRESHOLD = 0.7
-CANDIDATES_WHEN_HARD = 3
+# Every note this plugin writes for the model can arrive inside the user's own
+# turn: the Claude hook channel and the Codex turn input both append it there,
+# and a verify send-back is delivered as a user turn. On 2026-11-17 a Codex
+# thread answered the old three-candidates note with "as requested". Each note
+# now opens by saying who wrote it.
+AUTOMATED_LABEL = (
+    "[Automated note from Jev, the preflight's fast scoring model. Will did not "
+    "write or request it; never describe it as his request.]"
+)
 BUDGET_TEMPLATE = (
-    "Preflight from Jev, a fast typed judge whose read is advisory, not an "
-    "instruction: P(hard or very hard) = {hard}; P(objectively checkable) = "
-    "{checkable}; P(the request is ambiguous enough to ask first) = {ambiguous}. "
+    "Jev's read of this request: P(hard or very hard) = {hard}; P(objectively "
+    "checkable) = {checkable}; P(ambiguous enough to ask first) = {ambiguous}. "
     "{plan}"
 )
-PLAN_CANDIDATES = (
-    "This looks hard and checkable, so before choosing an approach produce "
-    "{k} independent candidate solutions (parallel subagents where available), "
-    "then select with the typesafe_decide tool: one noul question per candidate "
-    "per acceptance criterion, keep the candidate whose weakest criterion scores "
-    "highest (a sum only counts criteria, and a candidate that fails one "
-    "mandatory criterion is out), and never pick among your own candidates by "
-    "reasoning alone."
+# The look-beyond pass (Will and Fable, 2026-11-17) replaced "produce 3
+# independent candidate solutions, then select with typesafe_decide". A fixed
+# count invented differences, alternatives written to lose turned the vote
+# into a rubber stamp, and Jev can read a plan but cannot tell whether it
+# would work. One committed design comes first; other approaches are mined for
+# what the design misses and folded in deliberately, never competed against it.
+LOOK_BEYOND_KINDS = ("build", "research")
+LOOK_BEYOND_HARD_THRESHOLD = 0.7
+PLAN_LOOK_BEYOND = (
+    "This reads as hard build or research work. What tends to help here: settle "
+    "on the one design you would commit to first. Then take a short look beyond "
+    "it: what would a materially different approach handle that this design "
+    "does not? The output is a list of gaps or ideas, not competing designs, and "
+    "there is no quota; finding nothing worth adopting is a fine result. Adopt "
+    "or reject each idea with a one-line reason, and record them with the "
+    "acceptance_criteria tool's ideas field. An adopted idea also becomes an "
+    "acceptance criterion; if the criteria check says it does not follow from "
+    "Will's request, offer it to him instead of building it. Two approaches "
+    "that cannot be combined are a real fork: the cheapest check that tells "
+    "them apart settles it, not a judge. The real tests and any independent "
+    "audit run on the final result, not the first draft."
 )
 PLAN_ASK = (
-    "If the ambiguity is real, ask the user one focused clarifying question "
-    "before acting. Otherwise proceed and state the assumption you made."
+    "Jev also reads this request as possibly ambiguous. If a material ambiguity "
+    "is real, one focused question to Will before acting can save a wrong turn; "
+    "otherwise proceed and state the assumption you made."
+)
+# Shadow question (Fable, 2026-11-17): asked and logged on every feedback
+# turn, never acted on, until labelled turns show it separates requests with
+# real design freedom from the rest (scripts/jev_validate.py).
+DESIGN_FREEDOM_QUESTION = (
+    "Does the active request leave open materially different approaches to "
+    "building or answering it, where choosing the wrong one would be costly "
+    "to reverse?"
 )
 # Self-tuning: the sync store recommends thresholds from labelled turns; the
 # plugin applies them only within these bounds, only above a label count,
@@ -257,7 +286,7 @@ CRITERIA_NUDGE = (
 # 2026-09-30 the follow-up said "the live results from my previous message
 # stand", and that was all the user saw of a finished piece of work.
 VERIFY_TEMPLATE = (
-    "Preflight judge (Jev, advisory) reviewed your diff, the evidence ledger and "
+    AUTOMATED_LABEL + " The preflight judge reviewed your diff, the evidence ledger and "
     "your result manifest before you finish. {findings} Fix what is unmet and run "
     "the checks again after your last edit, call report_results again citing "
     "those commands as you ran them, or say precisely why a criterion does not "
@@ -269,7 +298,7 @@ VERIFY_TEMPLATE = (
 # Said when report_results is called, before the final message is written:
 # the mechanical findings the gate would send back afterwards.
 MANIFEST_PREVIEW_NOTE = (
-    "Checked by code as you registered them, before your final message: {count} of "
+    AUTOMATED_LABEL + " Checked by code as you registered them, before your final message: {count} of "
     "{total} result claims would not hold at the end as they stand. {items} Run those "
     "checks again after your last edit, each as the plain check (no ';', '&&', "
     "redirect or echo around it), call report_results again citing them as you ran "
@@ -376,7 +405,7 @@ ROW_ID_FINDING = (
 MAX_CHECK_CHARS = 2_000
 CHECK_COMMAND_RE = evidence.CHECK_COMMAND_RE
 GUARD_FEEDBACK_TEMPLATE = (
-    "Preflight from Jev before running {tool}: P(destructive or far-reaching: "
+    AUTOMATED_LABEL + " Preflight from Jev before running {tool}: P(destructive or far-reaching: "
     "{risk_name}) = {risk}; P(within what the user asked for) = {scope}. This "
     "call was held once so you can confirm with the user first. Ask them a "
     "direct question naming the exact action, or explain why it is in scope, "
@@ -438,7 +467,7 @@ LINGERING_NOTE = (
     "giving a reason the user will see. Do not leave them open silently."
 )
 RETIRE_REFUSED_NOTE = (
-    "Retire refused for {items}: no such carried or registered criterion. Use the "
+    AUTOMATED_LABEL + " Retire refused for {items}: no such carried or registered criterion. Use the "
     "criterion's text as registered, or its id."
 )
 # Drift check: every DRIFT_EVERY tool calls, one choice question asks which
@@ -455,14 +484,14 @@ DRIFT_NONE_TEXT = (
 )
 DRIFT_QUESTION = "Which acceptance criterion are the recent tool calls working toward?"
 DRIFT_TEMPLATE = (
-    "Drift check from Jev, a fast typed judge whose read is advisory: the last "
+    AUTOMATED_LABEL + " Drift check: the last "
     "{n} tool calls served none of your acceptance criteria (P(none) = {p:.2f}). "
     "Return to the earliest criterion still open: \"{target}\". If it is already "
     "done, update the list with the acceptance_criteria tool (or todo) so the "
     "check can follow your progress, then continue."
 )
 DRIFT_NO_CRITERIA_TEMPLATE = (
-    "Drift check: {n} tool calls into a build request and no acceptance criteria "
+    AUTOMATED_LABEL + " Drift check: {n} tool calls into a build request and no acceptance criteria "
     "are registered. Register them now with the acceptance_criteria tool (or "
     "todo), one checkable statement each in the order the request asked for, "
     "then continue with the first."
@@ -535,13 +564,13 @@ MAX_CONTINUATION_CHARS = 80
 # feedback turns is logged so a note that is still a constant shows up as one.
 INJECTION_WINDOW = 50
 FIDELITY_EXCLUDED_TEMPLATE = (
-    "Criteria check from Jev, a fast typed judge whose read is advisory: {n} of "
+    AUTOMATED_LABEL + " Criteria check: {n} of "
     "your acceptance criteria do not follow from what the user asked and will "
     "not be judged: {items}. Replace each with a criterion the request entails, "
     "or leave it out."
 )
 FIDELITY_COVERAGE_TEMPLATE = (
-    "Criteria check from Jev, a fast typed judge whose read is advisory: your "
+    AUTOMATED_LABEL + " Criteria check: your "
     "acceptance criteria may not cover everything the request asks for "
     "(P(cover) = {p:.2f}). Add one checkable criterion for each deliverable, "
     "constraint or ordering in the request that has none, with the "
@@ -663,8 +692,14 @@ def claims_flag_threshold() -> float:
 
 
 def tuning_mode() -> str:
-    value = _switch("tuning", "auto")
-    return value if value in ("auto", "off") else "auto"
+    """``log`` (the default) computes and logs recommendations without applying
+    them; ``auto`` applies them; ``off`` skips the pass. Fable, 2026-11-17: the
+    1.0 precision rested on 18 mechanical flags, so nothing is applied until
+    real labels justify it."""
+    value = _switch("tuning", "log")
+    if value in ("on", "true", "yes"):
+        return "log"
+    return value if value in ("auto", "log", "off") else "log"
 
 
 def tuning_interval_seconds() -> float:
@@ -726,8 +761,18 @@ def _tuned() -> Dict[str, Any]:
     return _tuned_cache["data"]
 
 
+def drift_check_mode() -> str:
+    """``on`` judges and steers; ``shadow`` judges and logs without steering or
+    a visible row (Fable, 2026-11-17: 94 events are too few to judge it);
+    ``off`` skips it."""
+    value = _switch("drift_check", "on")
+    if value in ("off", "false", "0", "no"):
+        return "off"
+    return "shadow" if value in ("shadow", "log") else "on"
+
+
 def drift_check_enabled() -> bool:
-    return _on("drift_check")
+    return drift_check_mode() != "off"
 
 
 def drift_every() -> int:
@@ -999,19 +1044,39 @@ def _fmt(value: Optional[float]) -> str:
     return "unknown" if value is None else f"{value:.2f}"
 
 
-def budget(p_hard: Optional[float], p_checkable: Optional[float]) -> Dict[str, Any]:
-    """Map the budget answers to a plan: how many candidates, and whether the finish loop applies.
+def budget(
+    p_hard: Optional[float],
+    p_checkable: Optional[float],
+    kind: Optional[str] = None,
+    continuation: bool = False,
+) -> Dict[str, Any]:
+    """Map the budget answers to a plan, and whether the finish loop applies.
 
     Reads the probability mass on the two hardest levels, never the weighted
-    score (the vendor documents score as threshold-passage only).
+    score (the vendor documents score as threshold-passage only). The
+    look-beyond note goes to build or research requests Jev rates hard at
+    ``LOOK_BEYOND_HARD_THRESHOLD`` or above, never to a turn that only
+    continues work already proposed.
     """
     hard = p_hard is not None and p_hard >= HARD_THRESHOLD
     checkable = p_checkable is not None and p_checkable >= CHECKABLE_THRESHOLD
-    if hard and checkable:
-        return {"k": CANDIDATES_WHEN_HARD, "finish_loop": True, "plan": "candidates"}
-    if hard:
-        return {"k": 1, "finish_loop": False, "plan": "criteria_only"}
-    return {"k": 1, "finish_loop": True, "plan": "direct"}
+    if (
+        not continuation
+        and kind in LOOK_BEYOND_KINDS
+        and p_hard is not None
+        and p_hard >= LOOK_BEYOND_HARD_THRESHOLD
+    ):
+        return {"finish_loop": checkable or not hard, "plan": "look_beyond"}
+    if hard and not checkable:
+        return {"finish_loop": False, "plan": "criteria_only"}
+    return {"finish_loop": True, "plan": "direct"}
+
+
+def automated(text: Optional[str]) -> Optional[str]:
+    """``text`` opened by the automated-note label, exactly once."""
+    if not text:
+        return text
+    return text if text.startswith(AUTOMATED_LABEL) else f"{AUTOMATED_LABEL} {text}"
 
 
 def budget_context(
@@ -1035,8 +1100,8 @@ def budget_context(
         return None
     ask = p_ambiguous is not None and p_ambiguous >= ambiguity_threshold()
     parts: List[str] = []
-    if plan.get("plan") == "candidates":
-        parts.append(PLAN_CANDIDATES.format(k=plan.get("k", CANDIDATES_WHEN_HARD)))
+    if plan.get("plan") == "look_beyond":
+        parts.append(PLAN_LOOK_BEYOND)
     if ask:
         parts.append(PLAN_ASK)
     if not parts:
@@ -1055,7 +1120,7 @@ def continuation_request(text: str) -> bool:
 def budget_note_reason(p_ambiguous: Optional[float], plan: Dict[str, Any]) -> str:
     """Why the note goes out this turn, or an empty string to withhold it.
 
-    Candidates are rare and actionable; ambiguity at or above
+    The look-beyond plan is rare and actionable; ambiguity at or above
     ``ambiguity_threshold`` is what a clarifying question answers. Nothing
     else sends it: not the criteria-first plan (criteria for a request Jev
     cannot check are process, and "write the acceptance criteria first"
@@ -1063,8 +1128,8 @@ def budget_note_reason(p_ambiguous: Optional[float], plan: Dict[str, Any]) -> st
     first turns, not a read that stands out from the session's mean, and not
     the unsure band. The plan still goes to the log and the verdict row.
     """
-    if plan.get("plan") == "candidates":
-        return "candidates"
+    if plan.get("plan") == "look_beyond":
+        return "look_beyond"
     if p_ambiguous is not None and p_ambiguous >= ambiguity_threshold():
         return "ambiguous"
     return ""
@@ -1193,7 +1258,7 @@ def run_tune(session_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
         "verify_fail_threshold": verify_fail_threshold(),
         "claims_flag_threshold": claims_flag_threshold(),
     }
-    changes = apply_recommendation(calibration, current)
+    changes = apply_recommendation(calibration, current) if tuning_mode() == "auto" else {}
     recommendation = calibration.get("recommendation") if isinstance(calibration.get("recommendation"), dict) else {}
     precision = claims_precision()
     write_log(
@@ -1236,7 +1301,7 @@ def run_tune(session_id: str) -> Optional[Dict[str, Dict[str, Any]]]:
 def maybe_tune(session_id: str) -> bool:
     """Start a tuning pass in the background at most once per interval."""
     global _last_tune_check
-    if tuning_mode() != "auto":
+    if tuning_mode() not in ("auto", "log"):
         return False
     now = time.time()
     with _tune_lock:
@@ -1267,7 +1332,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         memo = _turn_memo[memo_key]
         if memo.get("context"):
             return {"context": memo["context"]}
-        return {"context": REMINDER} if memo.get("injected") else None
+        return {"context": automated(REMINDER)} if memo.get("injected") else None
 
     history = kwargs.get("conversation_history") or []
     user_message = kwargs.get("user_message")
@@ -1282,13 +1347,18 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     p_build: Optional[float] = None
     p_hard: Optional[float] = None
     p_checkable: Optional[float] = None
+    p_design_freedom: Optional[float] = None
     kind: Optional[str] = None
     jev_model = ""
     error = ""
-    questions: Dict[str, Dict[str, Any]] = {
-        "missing_verification": {"type": "noul", "instructions": VERIFICATION_QUESTION}
-    }
+    questions: Dict[str, Dict[str, Any]] = {}
+    if arm != "feedback":
+        # The trial arms gate their reminder on it. The feedback arm stopped
+        # asking (Fable, 2026-11-17): it averaged 0.81 over real turns and
+        # carried almost no information.
+        questions["missing_verification"] = {"type": "noul", "instructions": VERIFICATION_QUESTION}
     if arm == "feedback":
+        questions["design_freedom"] = {"type": "noul", "instructions": DESIGN_FREEDOM_QUESTION}
         questions["ambiguous"] = {"type": "noul", "instructions": AMBIGUITY_QUESTION}
         questions["is_build"] = {"type": "noul", "instructions": BUILD_QUESTION}
         questions["difficulty"] = {"type": "score", "instructions": DIFFICULTY_QUESTION, "criteria": DIFFICULTY_LEVELS}
@@ -1314,14 +1384,15 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         p_build = _noul(answers, "is_build")
         p_hard = _level_mass(answers, "difficulty", (2, 3))
         p_checkable = _noul(answers, "checkable")
+        p_design_freedom = _noul(answers, "design_freedom")
         kind = _choice(answers, "kind")
-        if p_missing is None:
+        if (p_ambiguous if arm == "feedback" else p_missing) is None:
             error = "no noul in answer"
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"[:300]
     latency_ms = int((time.monotonic() - started) * 1000)
     context: Optional[str] = None
-    plan = budget(p_hard, p_checkable)
+    plan = budget(p_hard, p_checkable, kind, continuation_request(_text_of(user_message)))
     drift_state(session_id)["build"] = bool(p_build is not None and p_build >= BUILD_THRESHOLD) or kind == "build"
     note_reason = ""
     injection_rate: Dict[str, int] = {}
@@ -1372,6 +1443,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     else:
         injected = decide(p_missing, arm)
         context = REMINDER if injected else None
+    context = automated(context)
     write_log(
         {
             "event": "preflight",
@@ -1386,8 +1458,9 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "p_build": p_build,
             "p_hard": p_hard,
             "p_checkable": p_checkable,
+            "p_design_freedom": p_design_freedom,
             "kind": kind,
-            "k": plan["k"],
+            "plan": plan["plan"],
             "threshold": threshold(),
             "injected": injected,
             "note_reason": note_reason,
@@ -1404,7 +1477,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             session_id,
             "budget",
             f"Jev budget: hard {_fmt(p_hard)} · checkable {_fmt(p_checkable)} · kind {kind or 'unknown'} · "
-            f"ambiguous {_fmt(p_ambiguous)} · build {_fmt(p_build)} · k={plan['k']}"
+            f"ambiguous {_fmt(p_ambiguous)} · build {_fmt(p_build)} · plan {plan['plan']}"
             + (" · note sent" if injected else " · note withheld")
             + (f" ({note_reason})" if injected and note_reason else ""),
             # The injection rate stays in the record and the decision below;
@@ -1416,8 +1489,9 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
                 "ambiguous": p_ambiguous,
                 "build": p_build,
                 "missing": p_missing,
+                "design_freedom": p_design_freedom,
             },
-            decision={"k": plan["k"], "finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected, "note_reason": note_reason, "injection_rate": injection_rate},
+            decision={"finish_loop": plan["finish_loop"], "plan": plan["plan"], "injected": injected, "note_reason": note_reason, "injection_rate": injection_rate},
             model=jev_model,
             latency_ms=latency_ms,
         )
@@ -1430,7 +1504,7 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
             "p_hard": p_hard,
             "p_checkable": p_checkable,
             "kind": kind,
-            "k": plan["k"],
+            "plan": plan["plan"],
             "arm": arm,
             "context": context,
         }
@@ -1646,6 +1720,46 @@ def parse_todos(text: str) -> Optional[List[Dict[str, str]]]:
             todo["reason"] = _clip(reason, 300)
         todos.append(todo)
     return todos
+
+
+def parse_ideas(text: str) -> Optional[List[Dict[str, str]]]:
+    """``ideas`` from the criteria tool's result: the look-beyond pass, each
+    adopted or rejected with a reason. None when the call carried none."""
+    payload = evidence.tool_result_payload(text)
+    items = payload.get("ideas") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    ideas: List[Dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        idea = str(item.get("idea") or "").strip()
+        decision = str(item.get("decision") or "").strip().lower()
+        if not idea or decision not in ("adopt", "reject"):
+            continue
+        ideas.append({"idea": _clip(idea, 300), "decision": decision, "reason": _clip(str(item.get("reason") or "").strip(), 300)})
+    return ideas
+
+
+def record_ideas(session_id: str, turn_id: str, ideas: List[Dict[str, str]], *, replay: bool = False) -> Dict[str, Any]:
+    """Log one look-beyond pass: how many ideas it listed, adopted and rejected.
+
+    Joined with the turn's fidelity and verify rows by session and turn, this
+    is what shows within a few weeks whether the pass earns its cost.
+    """
+    adopted = sum(1 for idea in ideas if idea["decision"] == "adopt")
+    record = {
+        "event": "look_beyond",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "listed": len(ideas),
+        "adopted": adopted,
+        "rejected": len(ideas) - adopted,
+        "ideas": ideas,
+        "replay": replay,
+    }
+    write_log(record)
+    return record
 
 
 def parse_retirements(text: str) -> Dict[str, Any]:
@@ -2056,14 +2170,41 @@ _FENCE_RE = re.compile(r"```.*?```", re.S)
 _LINE_LEAD_RE = re.compile(r"^[\s>*#\-•]+|^\d+[.)]\s+")
 
 
+# Advice to the reader is not a claim about what was done or observed (Fable,
+# 2026-11-17): the claim check flagged "Force-close the app and reopen it" as
+# unsupported. A sentence that opens with an instruction verb, or with an
+# if-clause followed by one, is skipped; so is a question.
+_ADVICE_VERBS = (
+    r"try|tap|open|close|force-close|reload|refresh|restart|relaunch|reopen|run|use|set|check|click|press|"
+    r"send|ask|tell|reply|say|pick|choose|let|keep|make|add|remove|update|install|sign|log|go|wait|read|"
+    r"see|note|consider|remember|switch|turn|enable|disable|start|stop|give|paste|copy|share|swipe|scroll|"
+    r"drag|type|enter|select|visit|follow|watch|expect|avoid|leave|delete|rename|pull|push|review|confirm"
+)
+# A verb that is really a noun ("Use of the advisor is zero", "Review was
+# skipped") is followed by "of" or a form of "be"/"have"; that reads as a report.
+_NOT_A_NOUN = r"(?!\s+(?:of|is|was|are|were|has|have|had)\b)"
+_ADVICE_RE = re.compile(
+    rf"^(?:(?:please|just|now|then|so|first|next|finally|also|instead)[,\s]+)*(?:{_ADVICE_VERBS})\b{_NOT_A_NOUN}"
+    rf"|^if\b[^,]{{0,200}},\s*(?:(?:please|just|then)\s+)*(?:{_ADVICE_VERBS})\b{_NOT_A_NOUN}",
+    re.IGNORECASE,
+)
+
+
+def advice_sentence(sentence: str) -> bool:
+    """Whether ``sentence`` tells the reader what to do rather than reporting something."""
+    text = (sentence or "").strip().lstrip("*_`\"'(").strip()
+    return bool(text) and (text.endswith("?") or bool(_ADVICE_RE.match(text)))
+
+
 def claim_sentences(text: str) -> List[str]:
     """The sentences of a draft final message worth a claim question: code
-    blocks dropped, list markers stripped, anything under
-    ``CLAIM_SENTENCE_MIN_WORDS`` words skipped, the first ``CLAIM_SENTENCE_CAP`` kept."""
+    blocks dropped, list markers stripped, advice and questions skipped,
+    anything under ``CLAIM_SENTENCE_MIN_WORDS`` words skipped, the first
+    ``CLAIM_SENTENCE_CAP`` kept."""
     out: List[str] = []
     for piece in _SENTENCE_SPLIT_RE.split(_FENCE_RE.sub(" ", text or "")):
         sentence = " ".join(_LINE_LEAD_RE.sub("", piece).split())
-        if len(sentence.split()) < CLAIM_SENTENCE_MIN_WORDS:
+        if len(sentence.split()) < CLAIM_SENTENCE_MIN_WORDS or advice_sentence(sentence):
             continue
         out.append(sentence[:CLAIM_SENTENCE_CHARS])
         if len(out) >= CLAIM_SENTENCE_CAP:
@@ -2481,10 +2622,14 @@ def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay
         if not state["build"] or state["criteria_nudged"] or not criteria_nudge_enabled():
             return None
         state["criteria_nudged"] = True
+        shadow = drift_check_mode() == "shadow"
         write_log({
             "event": "drift", "session_id": session_id, "rule": "no_criteria",
-            "calls": state["total"], "window": window, "criteria": 0, "steer": True,
+            "calls": state["total"], "window": window, "criteria": 0, "steer": not shadow,
+            "shadow": shadow,
         })
+        if shadow:
+            return None
         emit_verdict(
             session_id, "drift",
             f"Jev drift (after {state['total']} calls): no acceptance criteria on a build turn · steer",
@@ -2525,15 +2670,18 @@ def check_drift(session_id: str, tool_name: str, args: Dict[str, Any], *, replay
         error = f"{exc.__class__.__name__}: {exc}"[:300]
     latency_ms = int((time.monotonic() - started) * 1000)
     drifting = bool(not error and p_none is not None and p_none >= drift_threshold())
-    steer = drifting and state["steers"] < drift_max_steers()
+    shadow = drift_check_mode() == "shadow"
+    steer = drifting and not shadow and state["steers"] < drift_max_steers()
     target = _first_open_criterion(todos)
     write_log({
         "event": "drift", "session_id": session_id, "rule": "jev", "calls": state["total"],
         "window": window, "criteria": len(todos), "chosen": chosen, "p_none": p_none,
         "probabilities": probabilities, "threshold": drift_threshold(), "drifting": drifting,
         "steer": steer, "target": target["id"] if target else None,
-        "latency_ms": latency_ms, "error": error,
+        "shadow": shadow, "latency_ms": latency_ms, "error": error,
     })
+    if shadow:
+        return None
     label = "none" if chosen == DRIFT_NONE else (f"criterion {chosen[1:]}" if chosen and chosen in keys else "unknown")
     action = "unavailable" if error else "steer" if steer else "drifting, steer budget spent" if drifting else "on track"
     emit_verdict(
@@ -2591,6 +2739,12 @@ def on_post_tool_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if tool_name in ("todo", "acceptance_criteria"):
         # `acceptance_criteria` is the bridge's stateless stand-in for the todo
         # tool on the Codex and Claude lanes; it answers in the same shape.
+        ideas = parse_ideas(text) if tool_name == "acceptance_criteria" else None
+        if ideas:
+            try:
+                record_ideas(session_id, str(kwargs.get("turn_id") or ""), ideas, replay=bool(kwargs.get("replay")))
+            except Exception:
+                logger.debug("system-one-preflight: look-beyond ideas not logged", exc_info=True)
         todos = parse_todos(text)
         if todos is not None:
             todos, retire_notes = apply_retirements(session_id, todos, parse_retirements(text))

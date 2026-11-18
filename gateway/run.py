@@ -30573,7 +30573,7 @@ def _warm_agent_runtime() -> Optional[int]:
     11:31 smoke). The other imports ``_create_agent`` makes are warmed too.
     """
     import run_agent  # noqa: F401  (its import registers the built-in tools)
-    import agent.opus_delegation  # noqa: F401
+    import agent.single_model  # noqa: F401
     import hermes_cli.tools_config  # noqa: F401
     from tools.registry import registry
 

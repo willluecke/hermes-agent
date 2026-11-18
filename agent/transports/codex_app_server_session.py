@@ -39,7 +39,6 @@ from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
 from agent.turn_time_limit import DEFAULT_TURN_TIME_LIMIT_SECONDS
-from agent.opus_delegation import parent_runtime_env
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
@@ -559,7 +558,6 @@ class CodexAppServerSession:
         effort: Optional[str] = None,
         ultracode: bool = False,
         parent_provider: Optional[str] = None,
-        opus_worker_enabled: bool = False,
         require_exact: bool = False,
         read_only: bool = False,
         permission_profile: Optional[str] = None,
@@ -593,7 +591,6 @@ class CodexAppServerSession:
         # ``disabled_toolsets``, so the governed Opus decision has to travel
         # with it. Absent metadata keeps the child's config-derived fallback.
         self._parent_provider = str(parent_provider or "").strip().lower()
-        self._opus_worker_enabled = bool(opus_worker_enabled)
         self._require_exact = bool(require_exact)
         from agent.steward_policy import is_steward, review_context
         self._steward = is_steward(session=hermes_session_id,project=project_key,cwd=self._cwd)
@@ -772,17 +769,6 @@ class CodexAppServerSession:
             client_extra_args: list[str] = []
             if self._hermes_session_id:
                 client_env["HERMES_GATEWAY_SESSION_ID"] = self._hermes_session_id
-            # Whitelisted in the managed Codex MCP entry's ``env_vars`` so the
-            # restricted stdio MCP child validates the real parent authority
-            # instead of exposing Opus off a stale config snapshot.
-            client_env.update(
-                parent_runtime_env(
-                    provider=self._parent_provider,
-                    model=self._model,
-                    effort=self._effort,
-                    opus_worker_enabled=self._opus_worker_enabled,
-                )
-            )
             policy = self._reversible_deletion_policy
             shim_workspace = self._cwd
             if self._steward and policy is not None and getattr(policy, "enabled", False):
@@ -855,7 +841,7 @@ class CodexAppServerSession:
                 from agent.steward_policy import mcp_server
                 server=mcp_server()
                 env=','.join(json.dumps(k)+'='+json.dumps(v) for k,v in {**server['env'],'HERMES_HOME':str(Path.home()/'.hermes'),'HERMES_QUIET':'1'}.items())
-                env_vars=json.dumps(["HERMES_GATEWAY_SESSION_ID","HERMES_HOME","PYTHONPATH","HERMES_PARENT_PROVIDER","HERMES_PARENT_MODEL","HERMES_PARENT_EFFORT","HERMES_PARENT_OPUS_WORKER"])
+                env_vars=json.dumps(["HERMES_GATEWAY_SESSION_ID","HERMES_HOME","PYTHONPATH"])
                 config=('"hermes-tools"={enabled=true,command='+json.dumps(server['command'])+',args='+json.dumps(server['args'])
                         +',env={'+env+'},env_vars='+env_vars+',startup_timeout_sec=30.0,tool_timeout_sec=600.0}')
                 client_extra_args.extend(['-c','sandbox_mode="danger-full-access"','-c','approval_policy="on-request"','-c','mcp_servers={'+config+'}'])

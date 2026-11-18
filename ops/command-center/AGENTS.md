@@ -22,8 +22,7 @@ historical evidence; Hermes/Sol remains the decision authority.
 
 1. Ordinary conversation that does not concern a software project does not
    require RecCli and must not prompt the user to choose a project.
-2. Before substantive project analysis, a durable project decision, or any
-   `opus_code_worker` delegation, resolve the project from the user's request
+2. Before substantive project analysis or a durable project decision, resolve the project from the user's request
    and `~/.reccli/projects.json`.
 3. If exactly one registered project matches, call
    `mcp__reccli__load_project_context` with that project's absolute path before
@@ -32,8 +31,7 @@ historical evidence; Hermes/Sol remains the decision authority.
    not guess. If it is a new project, initialize RecCli at the project root
    before treating it as a registered implementation target.
 5. A failed or unavailable context load must be surfaced explicitly. Do not
-   record a durable project decision or call `opus_code_worker` until the load
-   succeeds. Read-only investigation may continue when clearly labeled as
+   record a durable project decision until the load succeeds. Read-only investigation may continue when clearly labeled as
    lacking project history.
 6. Use `mcp__reccli__search_history` or `mcp__reccli__search_by_file` only when
    the initial context does not answer the historical question. RecCli output

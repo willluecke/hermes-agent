@@ -24,7 +24,7 @@ from tools.registry import registry
 before = registry._generation
 warmed = gateway.run._warm_agent_runtime()
 # Everything the first request does: _create_agent's imports and the agent's tool list.
-import run_agent, agent.opus_delegation, hermes_cli.tools_config, agent.claude_runtime  # noqa
+import run_agent, agent.single_model, hermes_cli.tools_config, agent.claude_runtime  # noqa
 import model_tools
 model_tools.get_tool_definitions(quiet_mode=True)
 print(json.dumps({"before": before, "warmed": warmed, "after_first_agent": registry._generation}))

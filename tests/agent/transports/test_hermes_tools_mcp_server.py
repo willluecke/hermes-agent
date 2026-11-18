@@ -207,7 +207,7 @@ class TestSelectedTools:
         from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS, READ_ONLY_TOOLS, _tool_annotations
         assert READ_ONLY_TOOLS <= set(EXPOSED_TOOLS)
         assert "typesafe_decide" in READ_ONLY_TOOLS
-        assert _tool_annotations("opus_code_worker") is None
+        assert "opus_code_worker" not in EXPOSED_TOOLS, "delegation to Opus was retired on 2026-11-17"
         assert _tool_annotations("kanban_complete") is None
 
 class TestMain:

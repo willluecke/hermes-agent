@@ -501,20 +501,15 @@ class TestHermesHomeLeakGuard:
         assert env.get("HERMES_HOME") == real_path
 
     def test_runtime_context_is_whitelisted_for_mcp_child(self):
-        """Codex must forward per-turn identity and the parent runtime into
-        the stdio MCP process. The child builds its own tool list, so without
-        HERMES_PARENT_* it would decide the governed Opus handoff from a
-        config snapshot instead of the runtime actually in charge."""
+        """Codex must forward per-turn identity into the stdio MCP process.
+        The HERMES_PARENT_* keys carried the parent runtime to the Opus
+        worker, which was retired on 2026-11-17, so they are gone."""
         entry = _build_hermes_tools_mcp_entry()
 
         assert entry["env_vars"] == [
             "HERMES_GATEWAY_SESSION_ID",
             "HERMES_HOME",
             "PYTHONPATH",
-            "HERMES_PARENT_PROVIDER",
-            "HERMES_PARENT_MODEL",
-            "HERMES_PARENT_EFFORT",
-            "HERMES_PARENT_OPUS_WORKER",
         ]
 
     def test_whitelist_carries_no_credential_keys(self):

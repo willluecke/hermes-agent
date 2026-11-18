@@ -1,5 +1,7 @@
 # Persistent Agent Operations
 
+> **Retired 2026-11-17.** Will retired delegation to Opus: the `opus_code_worker` tool, its `opus_worker` toolset, `agent/opus_delegation.py` and the `HERMES_PARENT_*` environment are gone. Opus now takes part as a per-conversation Claude advisor or through read-only `model_consult`. The Opus worker material below is kept as history.
+
 > **Command-center runbook.** The canonical, reusable persistent-agent pattern
 > lives in
 > [Build a Process-Driven Persistent Agent](../website/docs/guides/process-driven-persistent-agent.md).

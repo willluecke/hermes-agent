@@ -23,17 +23,6 @@ Scope (what we expose):
   - model_consult                        — read-only cross-provider advice
   - typesafe_decide                      — TypeSafe Jev typed decisions (noul /
                                            choice / score with probabilities)
-  - opus_code_worker                     — governed Claude Code implementation
-                                           handoff. Registration is NOT
-                                           unconditional: this process builds
-                                           its own tool list and cannot see the
-                                           parent's disabled_toolsets, so the
-                                           parent's non-secret provider/model/
-                                           effort/Opus-enabled state arrives
-                                           through the managed MCP env
-                                           whitelist (HERMES_PARENT_*) and is
-                                           validated before the tool is
-                                           exposed. See agent/opus_delegation.py.
   - text_to_speech                       — TTS
   - kanban_* (complete/block/comment/    — kanban worker + orchestrator
     heartbeat/show/list/create/            handoff (stateless: read env var,
@@ -155,7 +144,6 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     # Its counterpart at the end of the turn: the result claims, each tied to
     # evidence ledger rows, so code can check them before the verify judge.
     "report_results",
-    "opus_code_worker",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server

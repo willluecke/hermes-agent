@@ -60,7 +60,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory", "decision_log", "model_consult", "talos", "hermes_conversation", "opus_code_worker",
+    "todo", "memory", "decision_log", "model_consult", "talos", "hermes_conversation",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -318,12 +318,6 @@ TOOLSETS = {
         "includes": []
     },
 
-    "opus_worker": {
-        "description": "Governed native Claude Code Opus 5 implementation worker",
-        "tools": ["opus_code_worker"],
-        "includes": []
-    },
-
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["project_list", "project_create", "project_switch"],
@@ -549,8 +543,8 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "browser_exec",
-            # Planning, memory, durable decisions, and governed implementation
-            "todo", "memory", "decision_log", "model_consult", "talos", "hermes_conversation", "opus_code_worker",
+            # Planning, memory and durable decisions
+            "todo", "memory", "decision_log", "model_consult", "talos", "hermes_conversation",
             # Session history search
             "session_search",
             # Local time lookup

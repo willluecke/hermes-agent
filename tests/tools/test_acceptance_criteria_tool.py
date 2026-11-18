@@ -65,5 +65,18 @@ def test_retire_needs_a_reason_and_is_echoed_for_the_plugin():
     assert [item["content"] for item in result["todos"]] == ["Flat header renders"] and result["retire"][0]["reason"] == "user dropped the redesign"
     assert "error" in json.loads(module.acceptance_criteria({"retire": "Docs updated"}))
     schema = module.ACCEPTANCE_CRITERIA_SCHEMA["parameters"]
-    assert schema["required"] == [] and set(schema["properties"]) == {"criteria", "retire"}, "one way out of the list"
+    assert schema["required"] == [] and set(schema["properties"]) == {"criteria", "retire", "ideas"}, "one way out of the list; ideas never remove a criterion"
     assert "never retire silently" in module.ACCEPTANCE_CRITERIA_SCHEMA["description"]
+
+
+def test_look_beyond_ideas_need_a_decision_and_a_reason_and_ride_with_or_without_criteria():
+    """2026-11-17: the look-beyond pass records each idea as adopted or rejected with a reason."""
+    from tools.acceptance_criteria_tool import acceptance_criteria
+
+    only = json.loads(acceptance_criteria({"ideas": [{"idea": "cache it", "decision": "Adopt", "reason": "faster"}]}))
+    assert "todos" not in only and only["ideas"] == [{"idea": "cache it", "decision": "adopt", "reason": "faster"}]
+    both = json.loads(acceptance_criteria({"criteria": ["A"], "ideas": [{"idea": "x", "decision": "reject", "reason": "scope"}]}))
+    assert both["todos"][0]["content"] == "A" and both["ideas"][0]["decision"] == "reject"
+    assert "error" in json.loads(acceptance_criteria({"ideas": [{"idea": "x", "decision": "maybe", "reason": "y"}]}))
+    assert "error" in json.loads(acceptance_criteria({"ideas": [{"idea": "x", "decision": "adopt"}]}))
+    assert "error" in json.loads(acceptance_criteria({"ideas": "x"}))

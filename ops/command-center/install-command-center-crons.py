@@ -113,7 +113,7 @@ def main() -> None:
     monthly_prompt = replace_once(
         monthly["prompt"],
         "You are GPT-5.5; delegate the actual review to Fable via delegate_task.",
-        "You are the command-center Codex decision authority; delegate one bounded independent review to the Claude Opus 5 subscription worker through opus_code_worker.",
+        "You are the command-center Codex decision authority; get one bounded independent read-only review from Claude Opus through model_consult (provider claude-code, model opus).",
         monthly["name"],
     )
     monthly_prompt = replace_one_of(

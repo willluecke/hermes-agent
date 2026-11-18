@@ -1144,10 +1144,9 @@ class TestServerRequestRouting:
         session.close()
         assert session._reversible_delete_broker is None
 
-    def test_parent_runtime_reaches_the_managed_mcp_child(self, tmp_path):
-        """Codex restricts the environment of stdio MCP children, so the
-        non-secret parent runtime must be set on the app-server process for
-        the whitelisted HERMES_PARENT_* keys to reach hermes-tools."""
+    def test_no_parent_runtime_env_reaches_the_mcp_child(self, tmp_path):
+        """The HERMES_PARENT_* keys existed only to authorize the Opus worker,
+        retired on 2026-11-17; the session id still travels."""
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         clients = []
@@ -1164,41 +1163,12 @@ class TestServerRequestRouting:
             model="gpt-6-astra",
             effort="high",
             parent_provider="openai-codex",
-            opus_worker_enabled=True,
         )
         session.ensure_started()
 
         env = clients[0].env
-        assert env["HERMES_PARENT_PROVIDER"] == "openai-codex"
-        assert env["HERMES_PARENT_MODEL"] == "gpt-6-astra"
-        assert env["HERMES_PARENT_EFFORT"] == "high"
-        assert env["HERMES_PARENT_OPUS_WORKER"] == "1"
         assert env["HERMES_GATEWAY_SESSION_ID"] == "session-astra"
-        # Non-secret by construction — no credential travels with it.
-        assert not [key for key in env if "KEY" in key.upper()]
-        session.close()
-
-    def test_parent_runtime_reports_a_denied_opus_worker(self, tmp_path):
-        """A parent that denied opus_worker must say so rather than stay
-        silent — silence is read as 'no metadata' and falls back to config."""
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        clients = []
-
-        session = CodexAppServerSession(
-            cwd=str(workspace),
-            client_factory=lambda **kwargs: clients.append(
-                FakeClient(**kwargs)
-            ) or clients[-1],
-            model="gpt-5.5",
-            effort="high",
-            parent_provider="openai-codex",
-            opus_worker_enabled=False,
-        )
-        session.ensure_started()
-
-        assert clients[0].env["HERMES_PARENT_OPUS_WORKER"] == "0"
-        assert clients[0].env["HERMES_PARENT_MODEL"] == "gpt-5.5"
+        assert not [key for key in env if key.startswith("HERMES_PARENT_")]
         session.close()
 
     def test_unknown_parent_runtime_propagates_nothing(self, tmp_path):

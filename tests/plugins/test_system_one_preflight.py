@@ -130,18 +130,18 @@ def test_shadow_mode_asks_jev_logs_and_injects_nothing(harness):
 def test_jev_mode_injects_the_fixed_reminder_only_above_threshold(harness):
     harness["settings"]["mode"] = "jev"
     harness["jev"].p = 0.9
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) == {"context": preflight.REMINDER}
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) == {"context": preflight.automated(preflight.REMINDER)}
     harness["jev"].p = 0.2
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="x", conversation_history=[]) is None
     harness["settings"]["threshold"] = 0.1
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="x", conversation_history=[]) == {"context": preflight.REMINDER}
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="x", conversation_history=[]) == {"context": preflight.automated(preflight.REMINDER)}
     assert [row["injected"] for row in harness["records"]("preflight")] == [True, False, True]
 
 
 def test_always_mode_reminds_even_when_jev_fails_and_logs_the_error(harness):
     harness["settings"]["mode"] = "always"
     harness["jev"].raise_exc = RuntimeError("timed out")
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) == {"context": preflight.REMINDER}
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[]) == {"context": preflight.automated(preflight.REMINDER)}
     [record] = harness["records"]("preflight")
     assert record["p_missing"] is None and record["injected"] is True
     assert "timed out" in record["error"]
@@ -176,7 +176,7 @@ def test_a_repeated_hook_within_one_turn_reuses_the_decision(harness):
     harness["settings"]["mode"] = "jev"
     first = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[])
     second = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="x", conversation_history=[])
-    assert first == second == {"context": preflight.REMINDER}
+    assert first == second == {"context": preflight.automated(preflight.REMINDER)}
     assert len(harness["jev"].calls) == 1
     assert len(harness["records"]("preflight")) == 1
 
@@ -317,21 +317,24 @@ def test_feedback_mode_asks_the_budget_questions_and_stays_quiet_when_jev_sees_n
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="What time is it in Lisbon?", conversation_history=[])
     assert result is None
     questions = feedback["jev"].calls[0]["questions"]
-    assert set(questions) == {"missing_verification", "ambiguous", "is_build", "difficulty", "checkable", "kind"}
+    # The missing-evidence question is asked only on the trial arms now; the
+    # design-freedom question is asked and logged in shadow (2026-11-17).
+    assert set(questions) == {"design_freedom", "ambiguous", "is_build", "difficulty", "checkable", "kind"}
     assert questions["difficulty"]["type"] == "score" and questions["difficulty"]["criteria"] == preflight.DIFFICULTY_LEVELS
     assert questions["checkable"]["type"] == "noul" and set(questions["checkable"]["criteria"]) == {"true", "false"}
     assert questions["kind"]["type"] == "choice" and "build" in questions["kind"]["criteria"]
     [record] = feedback["records"]("preflight")
     assert record["arm"] == "feedback" and record["injected"] is False
-    assert record["p_ambiguous"] == 0.1 and record["p_missing"] == 0.1
-    assert record["p_hard"] == pytest.approx(0.1) and record["p_checkable"] == 0.1 and record["kind"] == "answer" and record["k"] == 1
+    assert record["p_ambiguous"] == 0.1 and record["p_missing"] is None and record["p_design_freedom"] == 0.1
+    assert record["p_hard"] == pytest.approx(0.1) and record["p_checkable"] == 0.1 and record["kind"] == "answer" and record["plan"] == "direct"
     # The budget is visible in the turn even when no note goes to the model.
     [event] = emitted
     assert event["event"] == "judge.verdict" and event["stage"] == "budget" and event["judge"] == "jev"
-    assert event["decision"] == {"k": 1, "finish_loop": True, "plan": "direct", "injected": False, "note_reason": "", "injection_rate": {"n": 1, "injected": 0}}
+    assert event["decision"] == {"finish_loop": True, "plan": "direct", "injected": False, "note_reason": "", "injection_rate": {"n": 1, "injected": 0}}
     assert event["text"].endswith("· note withheld") and "of last" not in event["text"]
     assert event["answers"]["hard"] == pytest.approx(0.1) and event["answers"]["kind"] == "answer"
-    assert event["model"] == "jev-1.13.0" and "k=1" in event["text"]
+    assert event["model"] == "jev-1.13.0" and "plan direct" in event["text"]
+    assert event["answers"]["design_freedom"] == 0.1
 
 
 def test_feedback_mode_feeds_the_numbers_back_when_the_request_is_ambiguous(feedback):
@@ -339,33 +342,60 @@ def test_feedback_mode_feeds_the_numbers_back_when_the_request_is_ambiguous(feed
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="fix it", conversation_history=[])
     assert result is not None
     note = result["context"]
-    assert "advisory" in note and "ambiguous enough to ask first) = 0.82" in note
-    assert "ask the user one focused clarifying question" in note
+    # Labelled as automated so no model reads it as the user's request (2026-11-17).
+    assert note.startswith(preflight.AUTOMATED_LABEL) and "Will did not write or request it" in note
+    assert "ambiguous enough to ask first) = 0.82" in note
+    assert "one focused question to Will before acting" in note and "as requested" not in note
     assert preflight.REMINDER not in note
     [record] = feedback["records"]("preflight")
     assert record["injected"] is True and record["p_ambiguous"] == 0.82
 
 
-def test_feedback_mode_budget_asks_for_candidates_when_hard_and_checkable(feedback, emitted):
+def test_feedback_mode_suggests_the_look_beyond_pass_on_hard_build_work(feedback, emitted):
+    """Will and Fable, 2026-11-17: one committed design, then a pass for what a
+    different approach would handle; no candidate count and no plan ranking."""
     feedback["jev"].hard = 0.8
     feedback["jev"].checkable = 0.9
     feedback["jev"].kind = "build"
     result = preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="make the importer idempotent", conversation_history=[])
     note = result["context"]
+    assert note.startswith(preflight.AUTOMATED_LABEL)
     assert "P(hard or very hard) = 0.80" in note and "P(objectively checkable) = 0.90" in note
-    assert "3 independent candidate solutions" in note and "typesafe_decide" in note
-    assert "never pick among your own candidates by reasoning alone" in note
-    assert "clarifying question" not in note
+    assert "one design you would commit to first" in note and "what would a materially different approach handle" in note
+    assert "no quota" in note and "ideas field" in note and "offer it to him instead of building it" in note
+    assert "cheapest check that tells them apart" in note
+    assert "candidate" not in note and "typesafe_decide" not in note and "clarifying question" not in note
     [record] = feedback["records"]("preflight")
-    assert record["k"] == 3 and record["kind"] == "build" and record["p_hard"] == pytest.approx(0.8)
+    assert record["plan"] == "look_beyond" and record["kind"] == "build" and record["p_hard"] == pytest.approx(0.8)
     [event] = emitted
-    assert event["decision"] == {"k": 3, "finish_loop": True, "plan": "candidates", "injected": True, "note_reason": "candidates", "injection_rate": {"n": 1, "injected": 1}}
-    assert event["text"].endswith("· note sent (candidates)")
-    # Hard but not checkable: one candidate, no finish loop, and no note.
+    assert event["decision"] == {"finish_loop": True, "plan": "look_beyond", "injected": True, "note_reason": "look_beyond", "injection_rate": {"n": 1, "injected": 1}}
+    assert event["text"].endswith("· note sent (look_beyond)")
+    # Research counts; a turn that only continues proposed work never gets it.
+    feedback["jev"].kind = "research"
+    assert "look beyond" in preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="compare the three hosting options", conversation_history=[])["context"]
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="yes, do it", conversation_history=[]) is None
+    assert feedback["records"]("preflight")[-1]["plan"] == "direct"
+    # Below the hardness bar, or another kind of request: no note.
+    feedback["jev"].kind = "build"
+    feedback["jev"].hard = 0.6
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t4", user_message="rename the flag", conversation_history=[]) is None
+    feedback["jev"].hard = 0.8
+    feedback["jev"].kind = "answer"
     feedback["jev"].checkable = 0.2
-    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="write a poem about the importer", conversation_history=[]) is None
-    assert feedback["records"]("preflight")[-1]["k"] == 1 and feedback["records"]("preflight")[-1]["injected"] is False
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t5", user_message="write a poem about the importer", conversation_history=[]) is None
+    assert feedback["records"]("preflight")[-1]["plan"] == "criteria_only" and feedback["records"]("preflight")[-1]["injected"] is False
     assert emitted[-1]["decision"]["plan"] == "criteria_only" and emitted[-1]["decision"]["finish_loop"] is False
+
+
+def test_the_design_freedom_question_is_logged_and_never_changes_the_note(feedback):
+    feedback["jev"].guard = {"design_freedom": 0.97}
+    assert preflight.on_pre_llm_call(session_id="s1", turn_id="t1", user_message="What time is it in Lisbon?", conversation_history=[]) is None
+    assert feedback["records"]("preflight")[-1]["p_design_freedom"] == 0.97
+    feedback["jev"].guard = {"design_freedom": 0.02}
+    feedback["jev"].hard = 0.8
+    feedback["jev"].kind = "build"
+    assert "look beyond" in preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="make the importer idempotent", conversation_history=[])["context"]
+    assert feedback["records"]("preflight")[-1]["p_design_freedom"] == 0.02
 
 
 def test_feedback_mode_no_longer_feeds_back_on_the_unsure_band_or_on_missing_evidence_alone(feedback):
@@ -376,7 +406,7 @@ def test_feedback_mode_no_longer_feeds_back_on_the_unsure_band_or_on_missing_evi
     feedback["jev"].ambiguous = 0.05
     feedback["jev"].p = 0.9  # evidence missing: averaged 0.81 over real turns, so it no longer triggers on its own
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t2", user_message="x", conversation_history=[]) is None
-    assert feedback["records"]("preflight")[-1]["p_missing"] == 0.9, "still asked and logged for the trial arms"
+    assert feedback["records"]("preflight")[-1]["p_missing"] is None, "asked only on the trial arms (2026-11-17)"
     feedback["jev"].p = 0.05
     assert preflight.on_pre_llm_call(session_id="s1", turn_id="t3", user_message="x", conversation_history=[]) is None
     feedback["jev"].raise_exc = RuntimeError("down")
@@ -387,9 +417,13 @@ def test_budget_reads_level_mass_not_the_weighted_score():
     answers = {"difficulty": {"type": "score", "score": 1.9, "probabilities": {"0": 0.05, "1": 0.45, "2": 0.45, "3": 0.05}}}
     assert preflight._level_mass(answers, "difficulty", (2, 3)) == pytest.approx(0.5)
     assert preflight._level_mass({"difficulty": {"type": "noul", "noul": 0.9}}, "difficulty", (2, 3)) is None
-    assert preflight.budget(0.5, 0.7) == {"k": 3, "finish_loop": True, "plan": "candidates"}
-    assert preflight.budget(0.49, 0.99) == {"k": 1, "finish_loop": True, "plan": "direct"}
-    assert preflight.budget(None, None) == {"k": 1, "finish_loop": True, "plan": "direct"}
+    assert preflight.budget(0.7, 0.9, "build") == {"finish_loop": True, "plan": "look_beyond"}
+    assert preflight.budget(0.7, 0.2, "research") == {"finish_loop": False, "plan": "look_beyond"}
+    assert preflight.budget(0.69, 0.9, "build") == {"finish_loop": True, "plan": "direct"}
+    assert preflight.budget(0.9, 0.9, "build", continuation=True) == {"finish_loop": True, "plan": "direct"}
+    assert preflight.budget(0.9, 0.9, "operate") == {"finish_loop": True, "plan": "direct"}
+    assert preflight.budget(0.5, 0.2, "answer") == {"finish_loop": False, "plan": "criteria_only"}
+    assert preflight.budget(None, None) == {"finish_loop": True, "plan": "direct"}
 
 
 def test_feedback_mode_repeats_the_same_note_within_a_turn(feedback):
@@ -550,7 +584,7 @@ def test_verify_judge_fails_open_and_respects_its_switches(feedback, repo):
 def test_build_requests_get_the_criteria_nudge_until_todos_exist(feedback):
     feedback["jev"].guard = {"is_build": 0.9}
     result = preflight.on_pre_llm_call(session_id="s3", turn_id="t1", user_message="Add a --json flag to the CLI", conversation_history=[])
-    assert result == {"context": preflight.CRITERIA_NUDGE}
+    assert result == {"context": preflight.automated(preflight.CRITERIA_NUDGE)}
     preflight.on_post_tool_call(tool_name="todo", args={}, result=TODOS_RESULT, session_id="s3")
     assert preflight.on_pre_llm_call(session_id="s3", turn_id="t2", user_message="now the tests", conversation_history=[]) is None
     feedback["jev"].guard = {"is_build": 0.1}
@@ -604,6 +638,22 @@ def test_claim_sentences_drop_code_and_short_lines_and_cap_at_twelve():
     assert len(sentences) == preflight.CLAIM_SENTENCE_CAP
     assert not any("code block" in s or s == "Short one." for s in sentences)
     assert preflight.claim_sentences("") == [] and preflight.claim_sentences("Done, everything passes.") == []
+
+
+def test_advice_to_the_reader_is_not_checked_as_a_claim():
+    """Fable, 2026-11-17: "Force-close the app and reopen it" was flagged as an unsupported claim."""
+    text = (
+        "Vercel deployed the commit and all 523 unit tests pass. "
+        "Force-close the Home Screen app and reopen it so it picks up the new build. "
+        "If a tap still opens the old way, force-close the app and open it again. "
+        "Tell me whether the tap target feels right on the phone. "
+        "Do you want the same control in the sidebar rows too? "
+        "Use of the advisor is zero across all 159 conversations."
+    )
+    assert preflight.claim_sentences(text) == [
+        "Vercel deployed the commit and all 523 unit tests pass.",
+        "Use of the advisor is zero across all 159 conversations.",
+    ]
 
 
 def test_the_judge_quotes_only_the_unsupported_sentence_and_sends_back_once(feedback, repo, emitted):
@@ -708,7 +758,12 @@ def test_yaml_off_switches_the_mode_the_guard_and_tuning(harness):
     harness["settings"].update({"mode": False, "tool_guard": False, "tuning": False})
     assert preflight.current_mode() == "off" and preflight.tool_guard_mode() == "off" and preflight.tuning_mode() == "off"
     harness["settings"].update({"mode": True, "tool_guard": True, "tuning": True})
-    assert preflight.current_mode() == "shadow" and preflight.tool_guard_mode() == "shadow" and preflight.tuning_mode() == "auto"
+    # Self-tuning only logs unless set to "auto" explicitly (Fable, 2026-11-17).
+    assert preflight.current_mode() == "shadow" and preflight.tool_guard_mode() == "shadow" and preflight.tuning_mode() == "log"
+    harness["settings"]["tuning"] = None
+    assert preflight.tuning_mode() == "log"
+    harness["settings"]["tuning"] = "auto"
+    assert preflight.tuning_mode() == "auto"
 
 
 def test_the_runtimes_shared_consumer_sees_one_send_back_then_a_ship(feedback, repo, monkeypatch):
@@ -1760,7 +1815,7 @@ def test_report_results_says_at_once_which_claims_the_gate_would_refuse(feedback
         _item("the docs build", ["mkdocs build"], predicate="exit_zero", id="r4"),
     ], steerable=True)
     message = result["message"]
-    assert message.startswith("Checked by code as you registered them, before your final message: 3 of 4 result claims would not hold")
+    assert message.startswith(preflight.AUTOMATED_LABEL + " Checked by code as you registered them, before your final message: 3 of 4 result claims would not hold")
     assert '"the suite passes": the gate cannot re-run it, so it would count as unverified: `pytest -q > /tmp/out.log 2>&1; echo done` is not a plain check.' in message
     assert '"the service is healthy": ran before later edits: `curl -s http://x/health`.' in message
     assert '"the docs build": no command this turn matches `mkdocs build`.' in message
@@ -1795,7 +1850,7 @@ def test_on_the_default_loop_the_registration_note_rides_in_report_results_own_r
     assert _manifest_live(items) is None
     transformed = json.loads(preflight.on_transform_tool_result(tool_name="report_results", result=payload, session_id="s1"))
     assert transformed["manifest"] == items
-    assert transformed["preflight"].startswith("Checked by code as you registered them, before your final message: 1 of 1")
+    assert transformed["preflight"].startswith(preflight.AUTOMATED_LABEL + " Checked by code as you registered them, before your final message: 1 of 1")
     assert preflight.on_transform_tool_result(tool_name="report_results", result=payload, session_id="s1") is None, "said once"
 
 
@@ -2032,7 +2087,7 @@ def test_the_budget_note_follows_the_thresholds_alone_and_reports_its_rate(feedb
     for turn in range(6, 10):
         assert preflight.on_pre_llm_call(session_id="s1", turn_id=f"t{turn}", user_message="x", conversation_history=[]) is None
         record = feedback["records"]("preflight")[-1]
-        assert record["note_reason"] == "" and record["injected"] is False and record["k"] == 1
+        assert record["note_reason"] == "" and record["injected"] is False and record["plan"] == "criteria_only"
     assert emitted[-1]["decision"]["plan"] == "criteria_only" and emitted[-1]["decision"]["finish_loop"] is False
     # The build criteria nudge counts as an injection with its own reason.
     feedback["jev"].hard = 0.1
@@ -2229,7 +2284,7 @@ def test_the_judge_skips_a_turn_that_is_not_a_build_and_ran_nothing(feedback, re
 
 def test_the_criteria_nudge_goes_out_once_per_session(feedback):
     feedback["jev"].guard = {"is_build": 0.9}
-    assert preflight.on_pre_llm_call(session_id="s5", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) == {"context": preflight.CRITERIA_NUDGE}
+    assert preflight.on_pre_llm_call(session_id="s5", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) == {"context": preflight.automated(preflight.CRITERIA_NUDGE)}
     assert preflight.on_pre_llm_call(session_id="s5", turn_id="t2", user_message="Now add --csv too", conversation_history=[]) is None, "criteria cleared with the new request, and the reminder is not repeated"
     assert preflight.on_pre_llm_call(session_id="s6", turn_id="t1", user_message="Add a --json flag", conversation_history=[]) is not None, "a new session gets it once"
 
@@ -2398,3 +2453,58 @@ def test_a_hook_call_without_a_session_is_ignored(feedback, emitted):
     assert len(feedback["records"]("criteria")) == before, "nothing is logged under an empty session"
     assert [item["id"] for item in preflight.active_criteria("s1")] == ["p1", "p2", "p3"], "the real session's list is untouched"
     assert preflight.on_transform_tool_result(tool_name="acceptance_criteria", session_id="", result="{}") is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-17: look-beyond ideas, labelled notes, log-only drift and tuning
+# ---------------------------------------------------------------------------
+
+def test_every_note_the_model_reads_says_it_is_automated_and_not_from_will():
+    for template in (
+        preflight.GUARD_FEEDBACK_TEMPLATE, preflight.RETIRE_REFUSED_NOTE, preflight.DRIFT_TEMPLATE,
+        preflight.DRIFT_NO_CRITERIA_TEMPLATE, preflight.FIDELITY_EXCLUDED_TEMPLATE,
+        preflight.FIDELITY_COVERAGE_TEMPLATE, preflight.VERIFY_TEMPLATE, preflight.MANIFEST_PREVIEW_NOTE,
+    ):
+        assert template.startswith(preflight.AUTOMATED_LABEL)
+    assert "Will did not write or request it" in preflight.AUTOMATED_LABEL
+    assert preflight.automated(preflight.automated("x")) == preflight.automated("x"), "labelled once"
+    assert preflight.automated(None) is None
+
+
+def test_look_beyond_ideas_are_logged_and_an_ideas_only_call_keeps_the_criteria(drift):
+    from tools.acceptance_criteria_tool import acceptance_criteria
+
+    _turn()
+    _register()
+    ideas = [
+        {"idea": "cache the parsed index", "decision": "adopt", "reason": "cuts the cold start"},
+        {"idea": "rewrite the parser in Rust", "decision": "reject", "reason": "outside the request"},
+    ]
+    result = acceptance_criteria({"ideas": ideas})
+    assert "todos" not in json.loads(result)
+    preflight.on_post_tool_call(session_id="s1", turn_id="t1", tool_name="acceptance_criteria", args={"ideas": ideas}, result=result)
+    assert [item["content"] for item in preflight._session_todos["s1"]] == ["The --json flag prints valid JSON", "Existing tests still pass"]
+    [record] = drift["records"]("look_beyond")
+    assert record["listed"] == 2 and record["adopted"] == 1 and record["rejected"] == 1 and record["turn_id"] == "t1"
+    assert record["ideas"][1] == {"idea": "rewrite the parser in Rust", "decision": "reject", "reason": "outside the request"}
+
+
+def test_drift_in_shadow_judges_and_logs_but_never_steers_or_shows_a_row(drift, emitted):
+    drift["settings"]["drift_check"] = "shadow"
+    assert preflight.drift_check_mode() == "shadow" and preflight.drift_check_enabled() is True
+    _turn()
+    _register()
+    assert _reads(3) == [None, None, None]
+    assert preflight.on_pre_tool_call(tool_name="read_file", args={"path": "src/3.py"}, session_id="s1", turn_id="t1", tool_call_id="c9") is None
+    [record] = drift["records"]("drift")
+    assert record["drifting"] is True and record["steer"] is False and record["shadow"] is True
+    assert not [event for event in emitted if event.get("stage") == "drift"]
+
+
+def test_tuning_in_log_mode_records_the_recommendation_and_applies_nothing(tuner, feedback):
+    feedback["settings"]["tuning"] = "log"
+    assert preflight.run_tune("s1") == {}
+    [record] = feedback["records"]("tune")
+    assert record["changes"] == {} and record["recommendation"]["verify_fail_threshold"] == 0.35
+    assert not tuner["state"].exists() and tuner["calls"]["post"] == []
+    assert preflight.verify_fail_threshold() == 0.2

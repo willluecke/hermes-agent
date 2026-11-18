@@ -338,3 +338,13 @@ def test_the_process_environment_still_answers_when_dotenv_is_silent(monkeypatch
     monkeypatch.setenv("TYPESAFE_PROVIDER", "openrouter")
     config.invalidate_env_cache()
     assert provider_chain() == ("openrouter",)
+
+
+def test_the_description_says_jev_reads_and_never_judges_designs():
+    """Fable, 2026-11-17: Jev answers reading questions; it does not predict code or rank the agent's own plans."""
+    from tools.typesafe_tool import TYPESAFE_SCHEMA
+
+    text = TYPESAFE_SCHEMA["description"]
+    assert "reading questions" in text and "Include source text you did not write" in text
+    assert "Do not use it to predict what code will do, to rank your own plans or ideas, or in place of a check you can run" in text
+    assert "A score within 0.1 of your threshold is no answer" in text

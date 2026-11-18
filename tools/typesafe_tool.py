@@ -326,15 +326,18 @@ TYPESAFE_SCHEMA = {
     "name": "typesafe_decide",
     "description": (
         "Ask TypeSafe's Jev decision model typed questions about a piece of state "
-        "(text, a log, a ticket, JSON). It never writes prose: every question comes "
-        "back as a typed answer with calibrated probabilities in under a second, "
-        "far cheaper than reasoning the decision out in text. Use it to classify, "
-        "route, score, or check a yes/no fact. Question types: noul (returns the "
-        "probability the answer is yes), choice (picks one option from criteria "
-        "{key: description}, with per-option probabilities and confidence), score "
-        "(places the state on ordered criteria levels, with confidence). Reached "
-        "through TypeSafe directly or through OpenRouter, as configured; the "
-        "result names which one answered."
+        "(text, a log, a ticket, JSON). Jev reads the text you give it and returns "
+        "probabilities in under a second; it never writes prose. Use it for reading "
+        "questions: does this text entail that, which category is this, does this "
+        "output show a failure. Include source text you did not write (the user's "
+        "words, tool or command output), not only your own summary. Do not use it to "
+        "predict what code will do, to rank your own plans or ideas, or in place of "
+        "a check you can run. A score within 0.1 of your threshold is no answer. "
+        "Question types: noul (returns the probability the answer is yes), choice "
+        "(picks one option from criteria {key: description}, with per-option "
+        "probabilities and confidence), score (places the state on ordered criteria "
+        "levels, with confidence). Reached through TypeSafe directly or through "
+        "OpenRouter, as configured; the result names which one answered."
     ),
     "parameters": {
         "type": "object",
