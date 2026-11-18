@@ -371,8 +371,14 @@ def test_decisions_keep_each_question_and_only_the_latest_answer_to_it():
         {"type": "will_answer", "answer": "Yes, undo"},
         {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "answer": "CSV"},
         {"type": "will_answer", "card": "t_r1", "question": "Which date format?", "answer": "ISO"},
+        {"type": "will_answer", "card": "t_r2", "answer": "tabs"},
+        {"type": "will_answer", "card": "t_r2", "answer": "UTF-8"},
+        {"type": "will_answer", "card": "t_r3", "question": "log\n" * 1500 + "Retry?", "answer": "yes"},
+        {"type": "will_answer", "card": "t_r3", "question": "log\n" * 1500 + "Skip?", "answer": "no"},
     ]
-    assert fp.decisions(events) == [
+    assert [d["answer"] for d in fp.decisions(events)] == ["Yes, undo", "CSV", "ISO", "tabs", "UTF-8", "yes", "no"], \
+        "replies without a recorded question, and long questions that differ only at the end, stay apart"
+    assert fp.decisions(events)[:3] == [
         {"question": "Undo?", "answer": "Yes, undo"},
         {"question": "On card t_r1: CSV or JSON?", "answer": "CSV"},
         {"question": "On card t_r1: Which date format?", "answer": "ISO"},

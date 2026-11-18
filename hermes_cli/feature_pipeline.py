@@ -378,9 +378,11 @@ def decisions(events: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         elif event.get("type") == "will_answer" and event.get("answer"):
             card = event.get("card")
             if card:
-                card_question = str(event.get("question") or "its question")
-                key = ("card", card, card_question)
-                pair = {"question": f"On card {card}: {card_question}", "answer": str(event["answer"])}
+                recorded = str(event.get("question") or "")
+                # A reply recorded without its question cannot be matched to
+                # another, so it keeps a slot of its own.
+                key = ("card", card, recorded) if recorded else ("card-event", index)
+                pair = {"question": f"On card {card}: {recorded or 'its question'}", "answer": str(event["answer"])}
             else:
                 key = ("ask", asked_at)
                 pair = {"question": question, "answer": str(event["answer"])}
@@ -1153,7 +1155,7 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
             runs = kb.list_runs(conn, card)
             asked = next((r.summary for r in reversed(runs) if getattr(r, "summary", None)), "") or ""
             kb.add_comment(conn, card, STATE_AUTHOR, f"Will (through the chat): {text}")
-            record(conn, root_id, {"type": "will_answer", "card": card, "question": asked[:2000], "answer": text})
+            record(conn, root_id, {"type": "will_answer", "card": card, "question": asked, "answer": text})
             resumed = kb.unblock_task(conn, card)  # back to the lane it was blocked in
             return {"ok": True, "resumed": bool(resumed),
                     "next": "Tell Will his answer went to that card; its worker resumes with it."}
