@@ -576,6 +576,17 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
         kb.claim_task(conn, cards[0], claimer="opus")
     with pytest.raises(fp.PipelineError, match="not waiting on Will"):
         fp.answer(root_id=root, answer="too late", card=cards[0], board="proj")
+    with kb.connect_closing(board="proj") as conn:  # Astra's review run fails to spawn and gives up
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked', current_run_id = NULL, claim_lock = NULL WHERE id = ?",
+                         (cards[1],))
+            kb._append_event(conn, cards[1], "gave_up", {"error": "review spawn failed", "retry_status": "review"})
+    fp.answer(root_id=root, answer="Review it again", card=cards[1], board="proj")
+    with kb.connect_closing(board="proj") as conn:
+        with kb.write_txn(conn):  # back in the review lane, as unblock_task restores it
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (cards[1],))
+    fp.answer(root_id=root, answer="Review it tomorrow", card=cards[1], board="proj")
+    assert _status(root)["decisions"][-1]["answer"] == "Review it tomorrow", "corrected while waiting for review"
 
 
 def test_a_question_must_fit_the_chat_notice_whole(home):

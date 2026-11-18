@@ -1162,7 +1162,7 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
             block_id = getattr(latest, "id", None)
             # Will may correct his answer until the card's next worker claims it.
             amending = (
-                task is not None and task.status in ("ready", "todo") and latest is not None
+                task is not None and task.status in ("ready", "todo", "review") and latest is not None
                 and any(e.get("type") == "will_answer" and e.get("card") == card and e.get("block_event") == block_id
                         for e in events)
                 and not any(getattr(e, "kind", "") == "claimed" and e.id > block_id for e in card_events)
