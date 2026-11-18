@@ -379,9 +379,12 @@ def decisions(events: List[Dict[str, Any]]) -> List[Dict[str, str]]:
             card = event.get("card")
             if card:
                 recorded = str(event.get("question") or "")
-                # A reply recorded without its question cannot be matched to
-                # another, so it keeps a slot of its own.
-                key = ("card", card, recorded) if recorded else ("card-event", index)
+                # One slot per block of the card: answering the same block
+                # again amends, any new block (whatever its kind) is a new
+                # question. A reply recorded without its block keeps a slot
+                # of its own.
+                block = event.get("block_event")
+                key = ("card", card, block) if block is not None else ("card-event", index)
                 pair = {"question": f"On card {card}: {recorded or 'its question'}", "answer": str(event["answer"])}
             else:
                 key = ("ask", asked_at)
@@ -1152,14 +1155,17 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
                                     "on the board")
             if task is None or task.status != "blocked":
                 raise PipelineError(f"card {card} is not waiting on Will")
-            # The current block's own reason, from its blocked event (a block
-            # of a card that is not running opens no run). A block without a
-            # reason gives the reply a slot of its own rather than an earlier
-            # block's question.
-            blocks = [e for e in kb.list_events(conn, card) if getattr(e, "kind", "") == "blocked"]
-            asked = str(((getattr(blocks[-1], "payload", None) or {}).get("reason") or "")) if blocks else ""
+            # The event that blocked the card now: a worker's or person's block,
+            # or the dispatcher giving up after failed spawns. Its id keys the
+            # reply, so only a second answer to the same block replaces one.
+            blocks = [e for e in kb.list_events(conn, card)
+                      if getattr(e, "kind", "") in ("blocked", "gave_up", "block_loop_detected")]
+            latest = blocks[-1] if blocks else None
+            details = (getattr(latest, "payload", None) or {}) if latest is not None else {}
+            asked = str(details.get("reason") or details.get("error") or "")
             kb.add_comment(conn, card, STATE_AUTHOR, f"Will (through the chat): {text}")
-            record(conn, root_id, {"type": "will_answer", "card": card, "question": asked, "answer": text})
+            record(conn, root_id, {"type": "will_answer", "card": card, "question": asked,
+                                   "block_event": getattr(latest, "id", None), "answer": text})
             resumed = kb.unblock_task(conn, card)  # back to the lane it was blocked in
             return {"ok": True, "resumed": bool(resumed),
                     "next": "Tell Will his answer went to that card; its worker resumes with it."}

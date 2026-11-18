@@ -367,14 +367,14 @@ def test_decisions_keep_each_question_and_only_the_latest_answer_to_it():
     events = [
         {"type": "ask", "question": "Undo?"},
         {"type": "will_answer", "answer": "No"},
-        {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "answer": "JSON"},
+        {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "block_event": 11, "answer": "JSON"},
         {"type": "will_answer", "answer": "Yes, undo"},
-        {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "answer": "CSV"},
-        {"type": "will_answer", "card": "t_r1", "question": "Which date format?", "answer": "ISO"},
+        {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "block_event": 11, "answer": "CSV"},
+        {"type": "will_answer", "card": "t_r1", "question": "Which date format?", "block_event": 14, "answer": "ISO"},
         {"type": "will_answer", "card": "t_r2", "answer": "tabs"},
         {"type": "will_answer", "card": "t_r2", "answer": "UTF-8"},
-        {"type": "will_answer", "card": "t_r3", "question": "log\n" * 1500 + "Retry?", "answer": "yes"},
-        {"type": "will_answer", "card": "t_r3", "question": "log\n" * 1500 + "Skip?", "answer": "no"},
+        {"type": "will_answer", "card": "t_r3", "question": "same text", "block_event": 20, "answer": "yes"},
+        {"type": "will_answer", "card": "t_r3", "question": "same text", "block_event": 21, "answer": "no"},
     ]
     assert [d["answer"] for d in fp.decisions(events)] == ["Yes, undo", "CSV", "ISO", "tabs", "UTF-8", "yes", "no"], \
         "replies without a recorded question, and long questions that differ only at the end, stay apart"
@@ -559,6 +559,14 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
         assert kb.block_task(conn, cards[0], kind="capability")
     fp.answer(root_id=root, answer="Still going", card=cards[0], board="proj")
     assert [d["answer"] for d in _status(root)["decisions"]] == ["CSV", "Keep going", "Still going"]
+    with kb.connect_closing(board="proj") as conn:  # the dispatcher gives up after failed spawns
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (cards[0],))
+            kb._append_event(conn, cards[0], "gave_up", {"error": "spawn failed twice"})
+    fp.answer(root_id=root, answer="Retry now", card=cards[0], board="proj")
+    answers = _status(root)["decisions"]
+    assert [d["answer"] for d in answers] == ["CSV", "Keep going", "Still going", "Retry now"]
+    assert answers[-1]["question"] == f"On card {cards[0]}: spawn failed twice"
 
 
 def test_a_question_must_fit_the_chat_notice_whole(home):
