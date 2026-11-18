@@ -363,6 +363,30 @@ def test_start_needs_a_git_checkout_with_a_commit(home, tmp_path):
         fp.start(project="empty", request="Build notes.", conversation_id="c1")
 
 
+def test_decisions_keep_each_question_and_only_the_latest_answer_to_it():
+    events = [
+        {"type": "ask", "question": "Undo?"},
+        {"type": "will_answer", "answer": "No"},
+        {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "answer": "JSON"},
+        {"type": "will_answer", "answer": "Yes, undo"},
+        {"type": "will_answer", "card": "t_r1", "question": "CSV or JSON?", "answer": "CSV"},
+        {"type": "will_answer", "card": "t_r1", "question": "Which date format?", "answer": "ISO"},
+    ]
+    assert fp.decisions(events) == [
+        {"question": "Undo?", "answer": "Yes, undo"},
+        {"question": "On card t_r1: CSV or JSON?", "answer": "CSV"},
+        {"question": "On card t_r1: Which date format?", "answer": "ISO"},
+    ]
+
+
+def test_a_build_needs_a_branch_to_land_on(home):
+    repo = str(home["repo"])
+    subprocess.run(["git", "-C", repo, "checkout", "-q", "--detach"], check=True)
+    with pytest.raises(fp.PipelineError, match="detached HEAD"):
+        fp.start(project="proj", request="Build notes.", conversation_id="c1")
+    assert fp.start(project="proj", request="Audit notes.", conversation_id="c1", kind="audit")["root"]
+
+
 def test_start_needs_the_review_lane(home, monkeypatch):
     monkeypatch.setattr("hermes_cli.kanban_db.review_dispatch_enabled", lambda: False)
     with pytest.raises(fp.PipelineError, match="review lane is off"):
@@ -518,6 +542,8 @@ def test_wills_reply_to_a_stuck_region_reaches_that_card(home):
             conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (cards[1],))
     with pytest.raises(fp.PipelineError, match="went to triage"):
         fp.answer(root_id=root, answer="retry", card=cards[1], board="proj")
+    assert _status(root)["decisions"] == [{"question": f"On card {cards[0]}: CSV or JSON export?", "answer": "CSV"}], \
+        "his reply to a region reaches later fix cards and Astra through the decisions"
 
 
 def test_a_question_must_fit_the_chat_notice_whole(home):

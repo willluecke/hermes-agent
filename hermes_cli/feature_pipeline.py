@@ -362,24 +362,33 @@ def _plan_rounds(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def decisions(events: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Will's answers to the root's questions, each with its question.
+    """Will's answers, each with its question: the root's questions and those
+    of stuck region or fix cards.
 
-    An amended answer replaces the earlier one for the same question; the
-    event history keeps both.
+    An amended answer replaces the earlier one to the same question; the
+    event history keeps both. Answers to different questions never replace
+    each other.
     """
     pairs: List[Dict[str, str]] = []
-    question = ""
-    answered = False
-    for event in events:
+    slot: Dict[tuple, int] = {}
+    question, asked_at = "", -1
+    for index, event in enumerate(events):
         if event.get("type") == "ask":
-            question, answered = str(event.get("question") or ""), False
-        elif event.get("type") == "will_answer" and not event.get("card") and event.get("answer"):
-            pair = {"question": question, "answer": str(event["answer"])}
-            if answered and pairs:
-                pairs[-1] = pair
+            question, asked_at = str(event.get("question") or ""), index
+        elif event.get("type") == "will_answer" and event.get("answer"):
+            card = event.get("card")
+            if card:
+                card_question = str(event.get("question") or "its question")
+                key = ("card", card, card_question)
+                pair = {"question": f"On card {card}: {card_question}", "answer": str(event["answer"])}
             else:
+                key = ("ask", asked_at)
+                pair = {"question": question, "answer": str(event["answer"])}
+            if key in slot:
+                pairs[slot[key]] = pair
+            else:
+                slot[key] = len(pairs)
                 pairs.append(pair)
-            answered = True
     return pairs
 
 
@@ -810,6 +819,9 @@ def start(*, project: str, request: str, conversation_id: str, kind: str = "buil
     target = {"branch": "" if branch == "HEAD" else branch, "base": _git(repo, "rev-parse", "HEAD")}
     if not repo or not target["base"]:
         raise PipelineError(f"project {project!r} has no git checkout with a commit; region worktrees need one")
+    if kind == "build" and not target["branch"]:
+        raise PipelineError(f"project {project!r} is on a detached HEAD; a build needs a branch to land on "
+                            "(an audit can run from it)")
     linked = _git(repo, "rev-parse", "--path-format=absolute", "--git-dir") != _git(
         repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if linked or Path(workdir).resolve() != Path(repo).resolve():
@@ -1138,8 +1150,10 @@ def answer(*, root_id: str, answer: str, card: Optional[str] = None, board: Opti
                                     "on the board")
             if task is None or task.status != "blocked":
                 raise PipelineError(f"card {card} is not waiting on Will")
+            runs = kb.list_runs(conn, card)
+            asked = next((r.summary for r in reversed(runs) if getattr(r, "summary", None)), "") or ""
             kb.add_comment(conn, card, STATE_AUTHOR, f"Will (through the chat): {text}")
-            record(conn, root_id, {"type": "will_answer", "card": card, "answer": text})
+            record(conn, root_id, {"type": "will_answer", "card": card, "question": asked[:2000], "answer": text})
             resumed = kb.unblock_task(conn, card)  # back to the lane it was blocked in
             return {"ok": True, "resumed": bool(resumed),
                     "next": "Tell Will his answer went to that card; its worker resumes with it."}
