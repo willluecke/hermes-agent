@@ -2286,3 +2286,13 @@ def test_usage_limit_detail_needs_claudes_flags_not_just_the_words():
         {"type": "text", "text": "The docs say you've hit your usage limit when a 429 comes back."}]}}
     assert _usage_limit_detail(ordinary) is None, "an answer about limits is not a limit"
 
+
+def test_the_hermes_tools_server_never_imports_from_its_working_directory():
+    """2026-11-18: Claude Code starts MCP servers in the session's cwd, and
+    `python -m` puts that first on sys.path, so a hermes-agent worktree ran
+    its own copy of the tools (the feature pipeline launched on stale code)."""
+    args = claude_code_args(model="claude-opus-5-5", session_id="00000000-0000-4000-8000-000000000002")
+    config = json.loads(args[args.index("--mcp-config") + 1])
+    server = config["mcpServers"]["hermes-tools"]
+    assert server["args"][:2] == ["-P", "-m"] and server["env"]["PYTHONPATH"]
+

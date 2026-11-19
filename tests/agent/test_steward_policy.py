@@ -238,3 +238,10 @@ def test_the_brief_never_changes_the_contract_digest():
     agent = SimpleNamespace(context_compressor=None)
     assert _steward_contract_due(agent, 'thread-a', 'instructions v1')
     assert not _steward_contract_due(agent, 'thread-a', 'instructions v1')  # a new brief rides as its own note; the key is the contract alone
+
+
+def test_steward_tools_server_never_imports_from_its_working_directory():
+    from agent.steward_policy import mcp_server
+
+    assert mcp_server()["args"][:2] == ["-P", "-m"]
+

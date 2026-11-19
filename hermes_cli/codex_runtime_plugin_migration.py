@@ -696,7 +696,9 @@ def _build_hermes_tools_mcp_entry() -> dict:
 
     out: dict[str, Any] = {
         "command": sys.executable,
-        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        # -P keeps a hermes-agent worktree's own copy from shadowing the
+        # install the server belongs to (see claude_code_session).
+        "args": ["-P", "-m", "agent.transports.hermes_tools_mcp_server"],
         # Codex starts stdio MCP servers with a restricted environment. These
         # non-secret runtime values must be explicitly whitelisted so the
         # callback can bind its work to the originating Hermes turn and

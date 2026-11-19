@@ -864,7 +864,11 @@ def claude_code_args(
         "mcpServers": {
             "hermes-tools": {
                 "command": sys.executable,
-                "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+                # -P: never import from the directory the server starts
+                # in. Claude Code starts it in the session's cwd, and in a
+                # hermes-agent worktree that would run the code under change
+                # (feature pipeline t_4c69f013 launched on a stale copy).
+                "args": ["-P", "-m", "agent.transports.hermes_tools_mcp_server"],
                 "env": {"PYTHONPATH": repo_root},
             }
         }

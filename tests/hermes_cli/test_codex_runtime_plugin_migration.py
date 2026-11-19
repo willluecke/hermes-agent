@@ -524,6 +524,10 @@ class TestHermesHomeLeakGuard:
             "HERMES_PROFILE",
         ]
 
+    def test_server_never_imports_from_its_working_directory(self):
+        """-P: a hermes-agent worktree's own copy must not shadow the install."""
+        assert _build_hermes_tools_mcp_entry()["args"][:2] == ["-P", "-m"]
+
     def test_whitelist_carries_no_credential_keys(self):
         """The propagated parent runtime is non-secret by construction."""
         entry = _build_hermes_tools_mcp_entry()

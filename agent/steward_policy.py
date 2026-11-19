@@ -116,7 +116,7 @@ def mcp_server(review=None):
         # canonical JSON so the subprocess validates exactly what the gateway bound.
         env[REVIEW_ENV] = json.dumps(review_context(review), sort_keys=True, separators=(',', ':'))
         env['HERMES_TOOLS_MCP_ONLY'] = 'talos'
-    return {'command':sys.executable,'args':['-m','agent.transports.hermes_tools_mcp_server'],'env':env}
+    return {'command':sys.executable,'args':['-P','-m','agent.transports.hermes_tools_mcp_server'],'env':env}
 
 
 class StewardTools:
