@@ -87,11 +87,48 @@ def test_the_definition_is_measured_on_the_plan():
 def test_parse_verdict_takes_the_last_json_verdict_after_prose():
     text = 'Looked at {"not": "this"} first.\n' + _verdict("changes", "item i3 has no test")
     assert fp.parse_verdict(text)["findings"][0]["issue"] == "item i3 has no test"
-    assert fp.parse_verdict('{"verdict": "approve", "findings": [{"issue": "x"}]}') == {"verdict": "approve", "findings": []}
+    approved = fp.parse_verdict('{"verdict": "approve", "findings": [{"issue": "x"}]}')
+    assert approved["verdict"] == "approve" and approved["findings"] == []
+    assert [n["issue"] for n in approved["notes"]] == ["x"], "what an approval still lists travels as notes"
     with pytest.raises(fp.PipelineError):
         fp.parse_verdict("no json here")
     with pytest.raises(fp.PipelineError):
         fp.parse_verdict('{"verdict": "changes", "findings": []}')
+
+
+def _levelled(verdict, *findings):
+    return json.dumps({"verdict": verdict, "findings": [
+        {"item": item, "level": level, "issue": issue, "fix": "do it"} for item, level, issue in findings]})
+
+
+def test_only_plan_level_findings_block_approval():
+    """2026-11-18: a plan review ran 15 rounds on ever-narrower code details."""
+    mixed = fp.parse_verdict(_levelled("changes", ("i1", "plan", "the plan omits the sync path"),
+                                       ("i3", "code", "the comment query scans the whole history")))
+    assert mixed["verdict"] == "changes" and [f["issue"] for f in mixed["findings"]] == ["the plan omits the sync path"]
+    assert [n["issue"] for n in mixed["notes"]] == ["the comment query scans the whole history"]
+    details = fp.parse_verdict(_levelled("changes", ("i3", "code", "redaction misses URL passwords")))
+    assert details["verdict"] == "approve" and details["findings"] == [], "code details alone do not block"
+    assert details["notes"][0]["issue"] == "redaction misses URL passwords"
+    unlabelled = fp.parse_verdict('{"verdict": "changes", "findings": [{"item": "i1", "issue": "unclear"}]}')
+    assert unlabelled["verdict"] == "changes", "a finding without a level blocks"
+    assert "Give every finding a level" in fp.REVIEW_INSTRUCTIONS and "Give every finding a level" in fp.AUDIT_REVIEW_INSTRUCTIONS
+
+
+def test_plan_level_findings_that_stop_shrinking_go_to_will():
+    def leveled(n, digest, count):
+        return {"type": "plan_round", "round": n, "digest": digest, "verdict": "changes", "levels": True,
+                "findings": [{"item": "plan", "issue": f"distinct issue {n} {k}"} for k in range(count)]}
+
+    history = [leveled(1, "d1", 5), leveled(2, "d2", 3), leveled(3, "d3", 3)]
+    verdict = fp.parse_verdict(_levelled("changes", *[("plan", "plan", f"new problem {k}") for k in range(3)]))
+    stuck = fp.decide_round(history + [leveled(4, "d4", 3)], "d5", verdict)
+    assert stuck["action"] == "escalate" and "no new low in three rounds" in stuck["reason"]
+    better = fp.parse_verdict(_levelled("changes", ("plan", "plan", "one left")))
+    assert fp.decide_round(history + [leveled(4, "d4", 3)], "d5", better)["action"] == "revise", "a new low resets it"
+    legacy = [{**r, "levels": False} for r in history + [leveled(4, "d4", 3)]]
+    assert fp.decide_round(legacy, "d5", verdict)["action"] == "revise", "rounds from before levels are not counted"
+    assert not fp.no_progress([11, 7, 6]) and fp.no_progress([4, 4, 4, 4]) and not fp.no_progress([5, 3, 3, 2])
 
 
 def _round(n, digest, *issues):
@@ -180,6 +217,26 @@ def _launched_root(plan=PLAN):
     fp.plan_review(root_id=root, plan=plan, board="proj", run_id=run, reviewer=FakeAstra(_verdict("approve")))
     cards = [r["card"] for r in fp.launch(root_id=root, board="proj", run_id=run)["regions"]]
     return root, cards
+
+
+def test_approval_notes_reach_the_regions_they_concern_and_every_round_keeps_its_plan(home):
+    root = fp.start(project="proj", request="Build the notes feature: page, API and store.", conversation_id="c1")["root"]
+    run = _claim(root)
+    astra = FakeAstra(_levelled("changes", ("i3", "plan", "item i3 has no check for an empty body")),
+                      _levelled("changes", ("i3", "code", "return 400, not 500, on an empty body"),
+                                ("i1", "code", "keep the page usable while loading"),
+                                ("plan", "code", "redact secrets in every log line")))
+    fp.plan_review(root_id=root, plan={**PLAN, "items": PLAN["items"][:2]}, board="proj", run_id=run, reviewer=astra)
+    assert _status(root)["last_round"]["plan"]["items"][0]["id"] == "i1", "a revise round keeps the plan it reviewed"
+    approved = fp.plan_review(root_id=root, plan=PLAN, board="proj", run_id=run, reviewer=astra)
+    assert approved["action"] == "approve"
+    cards = [r["card"] for r in fp.launch(root_id=root, board="proj", run_id=run)["regions"]]
+    with kb.connect_closing(board="proj") as conn:
+        page_body, api_body = (kb.get_task(conn, c).body for c in cards)
+    assert "Notes from Astra's plan review" in page_body and "keep the page usable while loading" in page_body
+    assert "return 400" not in page_body, "a note on another region's item stays there"
+    assert "return 400, not 500, on an empty body" in api_body and "keep the page usable" not in api_body
+    assert all("redact secrets in every log line" in body for body in (page_body, api_body)), "plan-wide notes go everywhere"
 
 
 def test_a_build_runs_from_start_to_finish(home):

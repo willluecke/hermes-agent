@@ -15,6 +15,8 @@ import pytest
 from agent.claude_runtime import make_claude_code_event_bridge
 from agent.transports.claude_code_session import (
     CLAUDE_AUTH_ERROR_CODE,
+    CLAUDE_USAGE_LIMIT_ERROR_CODE,
+    _usage_limit_detail,
     _ClaudeTranscriptPromptProbe,
     ClaudeCodeError,
     ClaudeCodeSession,
@@ -2237,3 +2239,50 @@ def test_api_key_alone_does_not_satisfy_preflight_without_token_file(monkeypatch
     native_probe.assert_called_once()  # the old fallback chain still runs
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in native_probe.call_args.kwargs["env"]
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in claude_subscription_env()
+
+
+def test_a_usage_limit_ends_the_turn_as_a_rate_limit_not_an_answer():
+    """Feature pipeline t_4c69f013, 2026-11-18: the Opus orchestrator hit the
+    5-hour limit, Claude Code answered with the limit message, and the kanban
+    worker "finished" until the card gave up."""
+    session_id = "00000000-0000-4000-8000-000000000001"
+    forwarded = []
+    session = ClaudeCodeSession(
+        cwd="/tmp", model="claude-opus-5-5", session_id=session_id, resume=True,
+        on_event=forwarded.append,
+    )
+    _install_fake_process(
+        session,
+        _fake_process(30002),
+        [
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "error": "rate_limit",
+                "apiError": "usage_limit_reached",
+                "isApiErrorMessage": True,
+                "message": {"content": [
+                    {"type": "text", "text": "You've hit your 5-hour limit \u00b7 resets 8:40pm (America/Los_Angeles)"},
+                ]},
+            }
+        ],
+    )
+
+    with patch.object(session, "close"):
+        result = session.run_turn("continue")
+
+    assert result.error_code == CLAUDE_USAGE_LIMIT_ERROR_CODE
+    assert "resets 8:40pm" in result.error
+    assert result.final_text == ""
+    assert result.should_retire is True
+
+
+def test_usage_limit_detail_needs_claudes_flags_not_just_the_words():
+    assert _usage_limit_detail({"type": "result", "is_error": True,
+                                "result": "Claude usage limit reached. Your limit resets at 9pm."})
+    assert _usage_limit_detail({"type": "assistant", "apiError": "usage_limit_reached",
+                                "message": {"content": []}}) == "Claude usage limit reached"
+    ordinary = {"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "The docs say you've hit your usage limit when a 429 comes back."}]}}
+    assert _usage_limit_detail(ordinary) is None, "an answer about limits is not a limit"
+

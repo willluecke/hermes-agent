@@ -133,6 +133,11 @@ CLAUDE_AUTH_ERROR_CODE = "claude_authentication_failed"
 CLAUDE_AUTH_REMEDIATION = (
     "Run `claude auth login --claudeai` on command-center, then retry."
 )
+# The Claude plan's usage limit (the 5-hour window, or a weekly one). Claude
+# Code answers with an ordinary-looking assistant message, so without this a
+# kanban worker that hit the limit "finished" and the card was counted as
+# failed until it gave up (feature pipeline t_4c69f013, 2026-11-18).
+CLAUDE_USAGE_LIMIT_ERROR_CODE = "claude_usage_limit"
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +354,38 @@ def _auth_failure_detail(event: dict[str, Any]) -> Optional[str]:
         )
     ):
         return detail or "Claude Max authentication failed"
+    return None
+
+
+def _usage_limit_detail(event: dict[str, Any]) -> Optional[str]:
+    """The Claude plan's usage-limit message, when this event is one.
+
+    Claude Code marks it on the assistant message (``error: "rate_limit"``,
+    ``apiError: "usage_limit_reached"``, ``isApiErrorMessage``); an error
+    result carrying the same text counts too. Returns the message, which
+    names the reset time.
+    """
+    raw_error = str(event.get("error") or "").strip().lower()
+    api_error = str(event.get("apiError") or event.get("api_error") or "").strip().lower()
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    text = "\n".join(
+        str(block.get("text") or "").strip()
+        for block in (message.get("content") or [])
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and str(block.get("text") or "").strip()
+    )
+    detail = text or str(event.get("result") or "").strip()
+    flagged = bool(event.get("isApiErrorMessage") or event.get("is_error"))
+    lowered = detail.lower()
+    if api_error == "usage_limit_reached" or raw_error == "rate_limit" or (
+        flagged
+        and (
+            "usage limit" in lowered
+            or ("hit your" in lowered and "limit" in lowered)
+        )
+    ):
+        return detail or "Claude usage limit reached"
     return None
 
 
@@ -1972,6 +2009,14 @@ class ClaudeCodeSession:
                 result.prompt_acknowledged = True
                 result.error_code = CLAUDE_AUTH_ERROR_CODE
                 result.error = f"{auth_failure.rstrip('.')}. {CLAUDE_AUTH_REMEDIATION}"
+                result.should_retire = True
+                break
+            usage_limit = _usage_limit_detail(event)
+            if usage_limit:
+                result.prompt_acknowledged = True
+                result.error_code = CLAUDE_USAGE_LIMIT_ERROR_CODE
+                result.error = usage_limit
+                result.final_text = ""
                 result.should_retire = True
                 break
             if not stream_synchronized:

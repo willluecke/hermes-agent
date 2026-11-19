@@ -1436,6 +1436,29 @@ def _flush_one_shot_session_store(cli) -> None:
         logger.debug("one-shot end_session failed", exc_info=True)
 
 
+def _kanban_rate_limit_exit(result) -> Optional[int]:
+    """The exit code a kanban worker should end with after a rate-limited turn.
+
+    When the turn failed only because the provider rate-limited it or ran out
+    of quota (a Claude plan's 5-hour window included), the worker exits with
+    the dispatcher's EX_TEMPFAIL sentinel. The dispatcher then releases the
+    card to ``ready`` without counting a failure, so a quota window cannot
+    trip the circuit breaker and give up on the card. None otherwise, and
+    always None outside a kanban worker.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if not isinstance(result, dict) or not result.get("failed"):
+        return None
+    if result.get("failure_reason") not in ("rate_limit", "billing"):
+        return None
+    try:
+        from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+    except Exception:
+        return None
+    return KANBAN_RATE_LIMIT_EXIT_CODE
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
@@ -16677,6 +16700,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Expose the flag for post-turn hooks (e.g. goal continuation)
             # so they can skip themselves when the turn was user-cancelled.
             self._last_turn_interrupted = _interrupted_this_turn
+            # And the turn's result, so single-query mode can give a kanban
+            # worker the right exit code (see _kanban_rate_limit_exit).
+            self._last_turn_result = result if isinstance(result, dict) else None
             if _interrupted_this_turn:
                 pending_message = result.get("interrupt_message") or interrupt_msg
                 # #60920: Don't append the interruption marker to response so it
@@ -21216,6 +21242,7 @@ def main(
         os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
+        _rate_limit_exit = None
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
@@ -21396,17 +21423,7 @@ def main(
                         # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                            _exit_code = _kanban_rate_limit_exit(result) or 1
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -21433,8 +21450,11 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _rate_limit_exit = _kanban_rate_limit_exit(getattr(cli, "_last_turn_result", None))
         finally:
             _finalize_single_query(cli)
+        if _rate_limit_exit:
+            sys.exit(_rate_limit_exit)
         return
     
     # Run interactive mode

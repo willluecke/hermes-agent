@@ -338,7 +338,8 @@ REVIEW_INSTRUCTIONS = (
     "order and dependencies are sound. Otherwise list each problem. Raise only "
     "problems that would make the result wrong, incomplete or unverifiable; "
     "style preferences and optional extras are not findings. Do not raise a "
-    "problem an earlier round settled, and treat Will's decisions as final."
+    "problem an earlier round settled, and treat Will's decisions as final. "
+    + "{levels}"
 )
 AUDIT_REVIEW_INSTRUCTIONS = (
     "You are GPT-6.2 Astra, reviewing an audit plan that Claude Opus wrote for "
@@ -347,13 +348,30 @@ AUDIT_REVIEW_INSTRUCTIONS = (
     "anything. Approve only if the plan covers every part of the feature system "
     "the request names, and every item names the evidence that would establish "
     "its findings. Otherwise list each gap. Do not raise a gap an earlier round "
-    "settled, and treat Will's decisions as final."
+    "settled, and treat Will's decisions as final. "
+    + "{levels}"
 )
+#: Will, 2026-11-18, after a plan review ran 15 rounds without converging:
+#: Astra kept finding new, narrower edge cases of the code the plan would
+#: produce. Those belong to the builders and their Astra reviewers, so a plan
+#: review now separates the two, and only plan-level findings block approval.
+LEVELS = (
+    "Give every finding a level. \"plan\": the plan itself is wrong. It misses part of "
+    "the request, an item cannot be built as described against the real code, an "
+    "item's check cannot prove that item, or the order or split into regions cannot "
+    "work. \"code\": something the builder must get right while writing the code, "
+    "such as an edge case, an error path, a query's cost or a redaction option. "
+    "Approve when no plan-level findings remain, and still list the code-level "
+    "ones: they go to the builders and their reviewers as notes."
+)
+REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS.replace("{levels}", LEVELS)
+AUDIT_REVIEW_INSTRUCTIONS = AUDIT_REVIEW_INSTRUCTIONS.replace("{levels}", LEVELS)
+FINDING_LEVELS = ("plan", "code")
 VERDICT_FORMAT = (
     "End your answer with the verdict as JSON, nothing after it: "
     "{\"verdict\": \"approve\" | \"changes\", \"findings\": [{\"item\": "
-    "\"<item id or plan>\", \"issue\": \"<what is wrong>\", \"fix\": "
-    "\"<what to change>\"}]}"
+    "\"<item id or plan>\", \"level\": \"plan\" | \"code\", \"issue\": "
+    "\"<what is wrong>\", \"fix\": \"<what to change>\"}]}"
 )
 
 
@@ -437,19 +455,44 @@ def parse_verdict(text: str) -> Dict[str, Any]:
     verdict = str(data.get("verdict") or "").strip().lower()
     if verdict not in VERDICTS:
         raise PipelineError(f"the reviewer's verdict must be approve or changes, got {verdict!r}")
-    findings = []
+    listed = []
     for finding in (data.get("findings") or [])[:MAX_FINDINGS]:
         if isinstance(finding, dict) and str(finding.get("issue") or "").strip():
-            findings.append({
+            level = str(finding.get("level") or "").strip().lower()
+            listed.append({
                 "item": str(finding.get("item") or "plan").strip()[:40],
+                # A finding without a level is treated as plan-level: it blocks.
+                "level": level if level in FINDING_LEVELS else "plan",
                 "issue": str(finding.get("issue")).strip()[:600],
                 "fix": str(finding.get("fix") or "").strip()[:600],
             })
         elif isinstance(finding, str) and finding.strip():
-            findings.append({"item": "plan", "issue": finding.strip()[:600], "fix": ""})
-    if verdict == "changes" and not findings:
+            listed.append({"item": "plan", "level": "plan", "issue": finding.strip()[:600], "fix": ""})
+    if verdict == "changes" and not listed:
         raise PipelineError("the reviewer asked for changes without naming any")
-    return {"verdict": verdict, "findings": findings if verdict == "changes" else []}
+    blocking = [f for f in listed if f["level"] == "plan"]
+    if verdict == "approve" or not blocking:
+        # Nothing plan-level left: approved, and every listed point is a note.
+        return {"verdict": "approve", "findings": [], "notes": listed}
+    return {"verdict": "changes", "findings": blocking, "notes": [f for f in listed if f["level"] == "code"]}
+
+
+def plan_level_counts(rounds: List[Dict[str, Any]]) -> List[int]:
+    """Plan-level finding counts of the rounds that recorded levels.
+
+    Rounds from before levels existed counted code details too, so they are
+    left out of the progress test rather than mistaken for regressions.
+    """
+    return [len(r.get("findings") or []) for r in rounds if r.get("levels") and r.get("verdict") == "changes"]
+
+
+def no_progress(counts: Sequence[int]) -> bool:
+    """True when the last three rounds made no new low in plan-level findings.
+
+    A progress test, not a round cap (Will rejects arbitrary caps): any round
+    that gets below every earlier count resets it.
+    """
+    return len(counts) >= 4 and min(counts[-3:]) >= min(counts[:-3])
 
 
 def decide_round(events: List[Dict[str, Any]], digest: str, verdict: Dict[str, Any],
@@ -468,7 +511,12 @@ def decide_round(events: List[Dict[str, Any]], digest: str, verdict: Dict[str, A
         if stuck:
             return {"action": "escalate",
                     "reason": "Astra has raised the same finding three rounds running: " + "; ".join(stuck[:3])}
-    return {"action": "revise", "reason": f"Astra asked for {len(verdict['findings'])} change(s)"}
+        counts = plan_level_counts(rounds) + [len(verdict["findings"])]
+        if no_progress(counts):
+            return {"action": "escalate",
+                    "reason": "plan-level findings made no new low in three rounds ("
+                              + ", ".join(str(n) for n in counts[-4:]) + ")"}
+    return {"action": "revise", "reason": f"Astra asked for {len(verdict['findings'])} plan-level change(s)"}
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +949,9 @@ def plan_review(*, root_id: str, plan: Any, context: str = "", board: Optional[s
             "type": "plan_round", "round": round_no, "digest": digest,
             "verdict": verdict["verdict"], "findings": verdict["findings"],
             "action": decision["action"], "reason": decision["reason"],
-            "plan": canonical if decision["action"] == "approve" else None,
+            # The plan this round reviewed, kept every round so a restarted
+            # orchestrator can resume from it instead of planning again.
+            "plan": canonical, "notes": verdict.get("notes") or [], "levels": True,
             "feature_system": measured, "usage": answer.get("usage") or {},
         })
     if decision["action"] == "approve":
@@ -935,6 +985,22 @@ def _decision_lines(events: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def approval_notes(events: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """The code-level notes Astra attached to the plan it approved."""
+    rounds = _plan_rounds(events)
+    if rounds and rounds[-1].get("action") == "approve":
+        return list(rounds[-1].get("notes") or [])
+    return []
+
+
+def region_notes(notes: Sequence[Dict[str, str]], region: Sequence[str], item_ids: Iterable[str]) -> List[Dict[str, str]]:
+    """The notes a region's builder must handle: those on its own items, and
+    those on the plan as a whole or on no item the plan has."""
+    known = set(item_ids)
+    mine = set(region)
+    return [n for n in notes if n.get("item") in mine or n.get("item") not in known]
+
+
 def _region_body(kind: str, request: str, plan: Dict[str, Any], region: List[str], number: int, total: int,
                  events: Optional[List[Dict[str, Any]]] = None) -> str:
     by_id = {item["id"]: item for item in plan["items"]}
@@ -947,6 +1013,12 @@ def _region_body(kind: str, request: str, plan: Dict[str, Any], region: List[str
                   f"  check: {item['check']}"]
         if item["depends_on"]:
             lines.append(f"  after: {', '.join(item['depends_on'])}")
+    notes = region_notes(approval_notes(events or []), region, by_id)
+    if notes:
+        lines += ["", "Notes from Astra's plan review. Handle each one in the code; your Astra reviewer checks them:"]
+        for note in notes:
+            fix = f" Fix: {note['fix']}" if note.get("fix") else ""
+            lines.append(f"- [{note.get('item') or 'plan'}] {note.get('issue', '')}{fix}")
     lines += ["", f"The whole plan: {plan['summary']}", "", "Follow the feature-pipeline-region skill."]
     if kind == "audit":
         lines.append("This is an audit: change no files. Report findings with evidence (file:line or command output).")

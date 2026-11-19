@@ -31,6 +31,7 @@ from agent.turn_time_limit import (
     turn_time_limit_seconds,
 )
 from agent.transports.claude_code_session import (
+    CLAUDE_USAGE_LIMIT_ERROR_CODE,
     TURN_TIME_LIMIT_ERROR_CODE as CLAUDE_TURN_TIME_LIMIT_ERROR_CODE,
     FABLE_PLANNING_NOTE,
     HERMES_MONITOR_NOTE,
@@ -1714,6 +1715,14 @@ def run_claude_code_turn(
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
         "error": turn.error,
         **({"error_code": turn.error_code} if turn.error_code else {}),
+        # A hit usage limit is a provider rate limit, not a broken task: the
+        # CLI maps this to the kanban rate-limit exit so the card waits for
+        # quota instead of counting a failure.
+        **(
+            {"failed": True, "failure_reason": "rate_limit"}
+            if turn.error_code == CLAUDE_USAGE_LIMIT_ERROR_CODE
+            else {}
+        ),
         **(
             {"watchdog_retries": turn.watchdog_retries}
             if turn.watchdog_retries

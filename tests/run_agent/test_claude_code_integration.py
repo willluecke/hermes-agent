@@ -900,3 +900,27 @@ def test_a_requested_reset_starts_a_fresh_claude_session_with_the_brief_and_no_t
     assert third["contract"] == observed[0]["contract"], "the brief never enters the system prompt"
     assert steward_policy.pending_reset() is None
     assert any(mode == "reset" and "Will asked" in text for mode, text in rows)
+
+
+def test_a_usage_limited_claude_turn_is_a_rate_limit_failure(monkeypatch):
+    """The CLI turns this into the kanban rate-limit exit, so a card waits for
+    quota instead of giving up (2026-11-18)."""
+    from agent.transports.claude_code_session import CLAUDE_USAGE_LIMIT_ERROR_CODE
+
+    monkeypatch.setattr(
+        ClaudeCodeSession,
+        "run_turn",
+        lambda self, prompt: ClaudeCodeTurnResult(
+            final_text="",
+            error="You've hit your 5-hour limit \u00b7 resets 8:40pm (America/Los_Angeles)",
+            error_code=CLAUDE_USAGE_LIMIT_ERROR_CODE,
+        ),
+    )
+    agent = _make_agent()
+    with patch.object(agent, "_spawn_background_review", return_value=None):
+        result = agent.run_conversation("work kanban task t_x")
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "rate_limit"
+    assert result["completed"] is False
+

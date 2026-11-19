@@ -22,7 +22,7 @@ If `status` says this card is not a feature pipeline (no start record), the run 
 
 ## planning
 
-1. Read before you plan: the request, the code in your worktree (the project at HEAD), and the project's CLAUDE.md or AGENTS.md.
+1. Read before you plan: the request, the code in your worktree (the project at HEAD), and the project's CLAUDE.md or AGENTS.md. If `status.last_round` holds a plan, or a comment on your card carries your previous run's plan, start from it and settle that round's findings instead of planning from scratch.
 2. Write the plan as `{summary, items: [{id, goal, files, check, depends_on}]}`.
    - One item is one deliverable a single worker can finish and prove.
    - `files` are the repo-relative files or directories the item changes (for an audit, reads). Items that share files land in the same region, so list them honestly and narrowly.
@@ -30,6 +30,7 @@ If `status` says this card is not a feature pipeline (no start record), the run 
    - `depends_on` only for real ordering; dependent items share a region.
    - Cover the whole request, including the tests and docs the project's rules require.
 3. Call `feature_pipeline` action `plan_review` with the whole plan. Put in `context` the facts Astra needs that are not in the code. Astra reads the code itself.
+   Astra marks each finding plan-level or code-level. Only plan-level findings block approval. Code-level ones come back as notes, and the pipeline writes them onto the region cards they concern, so settle plan-level findings in the plan and leave code-level ones to the builders.
 4. Act on the returned `action`:
    - `revise`: settle every finding and call `plan_review` again with the whole plan. If a finding is wrong, keep the plan and explain why in `context`; Astra decides again.
    - `escalate`: call `feature_pipeline` action `ask` with one short question for Will that names the disputed finding and both positions. That parks your card; stop.

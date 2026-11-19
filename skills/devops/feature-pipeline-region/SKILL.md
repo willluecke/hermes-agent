@@ -20,11 +20,12 @@ You build one region of an approved plan: the items listed on your card. An Opus
 
 ## If you are the reviewer
 
-The review lane loads this skill next to `sdlc-review`. If you were claimed from review, you are the reviewer: follow `sdlc-review`, not the build steps below, and never build or commit. Check that the commits on the card's branch deliver every item on the card, run each item's check yourself, and confirm that nothing outside the items' files changed without a reason in the handoff. For an audit, check that each finding's evidence holds. Then approve with `kanban_complete`, or request changes with `kanban_request_changes` and one concrete point per problem. If only Will can settle something, do not block: approve what is right and put the open question in your summary, and the orchestrator asks him.
+The review lane loads this skill next to `sdlc-review`. If you were claimed from review, you are the reviewer: follow `sdlc-review`, not the build steps below, and never build or commit. Check that the commits on the card's branch deliver every item on the card, run each item's check yourself, and confirm that nothing outside the items' files changed without a reason in the handoff. Check that every note from Astra's plan review on the card was handled. For an audit, check that each finding's evidence holds. Then approve with `kanban_complete`, or request changes with `kanban_request_changes` and one concrete point per problem. If only Will can settle something, do not block: approve what is right and put the open question in your summary, and the orchestrator asks him.
 
 ## Build
 
 1. Call `kanban_show` for your card. It has your items (goal, files, check), the whole plan's summary, and your earlier runs. If Astra requested changes, the review is in that run history: settle every point.
+   If the card lists notes from Astra's plan review, handle each one in the code and say how in your handoff.
 2. Work only in your worktree: your current directory, on the card's own branch (`git branch --show-current`), which starts from the commit the plan was reviewed against. Stay inside your items' files. If an item cannot be done without touching another file, say so in the handoff.
 3. Run each item's check and fix until it passes.
 4. Commit on your branch with `git add -A` and `git commit`. Uncommitted work never reaches the integration.
