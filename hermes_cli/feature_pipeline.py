@@ -1085,14 +1085,20 @@ def launch(*, root_id: str, board: Optional[str] = None, run_id: Optional[int] =
             regions = group_regions(plan["items"])
             kind = begin.get("kind", "build")
             digest = plan_digest(plan)
+            # Regions start where the plan was reviewed: the integration
+            # branch's tip, which is the start commit unless the orchestrator
+            # brought its branch up to date with the target before planning.
+            repo = begin.get("repo") or _board_repo(board)
+            base = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{_branch(root, root_id)}") \
+                or (begin.get("target") or {}).get("base", "")
             cards = []
             for number, region in enumerate(regions, 1):
                 first = next(item for item in plan["items"] if item["id"] == region[0])
                 cards.append(_work_card(
                     conn, key=f"{STATE_AUTHOR}:{root_id}:{digest}:region:{number}",
-                    repo=begin.get("repo") or _board_repo(board),
+                    repo=repo,
                     branch=f"fp/{begin.get('token') or root_id}/region-{number}-{digest[:8]}",
-                    base=(begin.get("target") or {}).get("base", ""),
+                    base=base,
                     title=f"Region {number}/{len(regions)}: {_short(first['goal'], 60)}",
                     body=_region_body(kind, begin.get("request", ""), plan, region, number, len(regions), events),
                     root=root, conversation_id=begin.get("conversation_id", ""), board=board,

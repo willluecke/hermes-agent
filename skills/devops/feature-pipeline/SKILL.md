@@ -70,6 +70,8 @@ The phases are the same. Regions read and report and change no files, so there i
 
 ## Rules
 
+- Call `plan_review`, `launch`, `fix`, `ask` and `finish` through the `feature_pipeline` tool, whatever the plan's size. Never import the pipeline's Python module from your worktree: the worktree holds the code under change, so you would run a different pipeline than the one you are in.
+
 - Building is the regions' job. You change code only to resolve a merge conflict or to land.
 - The chat gets its notes from the pipeline; do not post your own.
 - Never start another pipeline.

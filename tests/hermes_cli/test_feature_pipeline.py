@@ -480,6 +480,23 @@ def test_every_card_starts_from_the_commit_the_plan_was_reviewed_against(home):
         assert git("rev-parse", branch(fix_card)) == git("rev-parse", integration), "a fix starts from the integration"
 
 
+def test_regions_start_from_the_integration_branch_when_it_moved_before_launch(home):
+    """2026-11-18: a fix landed on the target while t_4c69f013 was planning;
+    the orchestrator's branch took it, and its regions must too."""
+    repo = str(home["repo"])
+    git = lambda *a: subprocess.run(["git", "-C", repo, *a], check=True, capture_output=True, text=True).stdout.strip()
+    root = fp.start(project="proj", request="Build notes.", conversation_id="c1")["root"]
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "a fix on main")
+    with kb.connect_closing(board="proj") as conn:
+        integration = kb.get_task(conn, root).branch_name
+    git("branch", "-f", integration, "main")  # the orchestrator brought its branch up to date
+    run = _claim(root)
+    fp.plan_review(root_id=root, plan=PLAN, board="proj", run_id=run, reviewer=FakeAstra(_verdict("approve")))
+    cards = [r["card"] for r in fp.launch(root_id=root, board="proj", run_id=run)["regions"]]
+    with kb.connect_closing(board="proj") as conn:
+        assert {git("rev-parse", kb.get_task(conn, c).branch_name) for c in cards} == {git("rev-parse", "main")}
+
+
 def test_pin_branch_refuses_what_it_cannot_verify(home):
     with pytest.raises(fp.PipelineError, match="not available"):
         fp.pin_branch("/dev/null", "fp/x/integration", "nonempty")
