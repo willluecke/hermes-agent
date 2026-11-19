@@ -25,6 +25,7 @@ If `status` says this card is not a feature pipeline (no start record), the run 
 1. Read before you plan: the request, the code in your worktree (the project at HEAD), and the project's CLAUDE.md or AGENTS.md. If `status.last_round` holds a plan, or a comment on your card carries your previous run's plan, start from it and settle that round's findings instead of planning from scratch.
 2. Write the plan as `{summary, items: [{id, goal, files, check, depends_on}]}`.
    - One item is one deliverable a single worker can finish and prove.
+   - `goal` says what the item delivers and how its caller or user sees it, in a few sentences. Stop there: the algorithm, queries, data structures and edge-case handling are the builder's call, and the region's Astra reviewer checks them in the code. A plan that spells out implementation gives the plan review more to argue with and grows every round.
    - `files` are the repo-relative files or directories the item changes (for an audit, reads). Items that share files land in the same region, so list them honestly and narrowly.
    - `check` is the exact command that proves the item (a test, build or request), or for an audit the evidence that settles it.
    - `depends_on` only for real ordering; dependent items share a region.
@@ -32,7 +33,7 @@ If `status` says this card is not a feature pipeline (no start record), the run 
 3. Call `feature_pipeline` action `plan_review` with the whole plan. Put in `context` the facts Astra needs that are not in the code. Astra reads the code itself.
    Astra marks each finding plan-level or code-level. Only plan-level findings block approval. Code-level ones come back as notes, and the pipeline writes them onto the region cards they concern, so settle plan-level findings in the plan and leave code-level ones to the builders.
 4. Act on the returned `action`:
-   - `revise`: settle every finding and call `plan_review` again with the whole plan. If a finding is wrong, keep the plan and explain why in `context`; Astra decides again.
+   - `revise`: settle every finding and call `plan_review` again with the whole plan. Settle a plan-level finding by changing what an item delivers, its files, its check or the order, never by writing implementation into the plan; code-level points already travel to the builders as notes. If a finding is wrong, keep the plan and explain why in `context`; Astra decides again.
    - `escalate`: call `feature_pipeline` action `ask` with one short question for Will that names the disputed finding and both positions. That parks your card; stop.
    - `approve`: call `feature_pipeline` action `launch`. That ends your run: reply with one line and stop.
 

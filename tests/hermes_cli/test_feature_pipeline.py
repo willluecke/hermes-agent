@@ -154,6 +154,63 @@ def test_a_finding_raised_three_rounds_running_goes_to_will():
     assert other["action"] == "revise"
 
 
+# Astra's own wordings for one concern on one step in rounds 20, 21 and 22 of
+# the 2026-11-18 run inspector plan: log tails cut inside a private key.
+PRIVATE_KEY_WORDINGS = (
+    "Code-level redaction gap. The new worker-log reader can seek into the middle of a multiline private key. "
+    "Dropping the first partial line still leaves complete lines of key material.",
+    "Code-level. A poll can read a log window entirely inside a multiline private key. This happens when the "
+    "opening marker has scrolled past 16 KiB and the worker has yet to write the closing marker.",
+    "Code-level. A non-base64 line does not establish that a log tail is outside a private key. An encrypted PEM "
+    "can contain Proc-Type: and DEK-Info: headers between the BEGIN marker and the encoded key.",
+)
+
+
+def _topical(n, digest, item, topic, issue):
+    return {"type": "plan_round", "round": n, "digest": digest, "verdict": "changes", "levels": True,
+            "findings": [{"item": item, "level": "plan", "topic": topic, "issue": issue}]}
+
+
+def test_the_same_concern_reworded_three_rounds_running_goes_to_will():
+    """2026-11-18: one concern came back three rounds running in wordings that shared 17-27% of their words."""
+    first, second, third = PRIVATE_KEY_WORDINGS
+    assert not fp._same({"item": "k", "issue": first}, {"item": "k", "issue": second}), "the word test alone misses it"
+    assert not fp._same({"item": "k", "issue": second}, {"item": "k", "issue": third})
+    topic = "log tail inside a private key"
+    history = [_topical(1, "d1", "kanban-resolvers", topic, first),
+               _topical(2, "d2", "kanban-resolvers", "Log tail inside a private-key!", second)]
+    verdict = fp.parse_verdict(json.dumps({"verdict": "changes", "findings": [
+        {"item": "kanban-resolvers", "level": "plan", "topic": topic, "issue": third, "fix": "redact the tail"}]}))
+    assert verdict["findings"][0]["topic"] == topic, "parse_verdict keeps the topic"
+    stuck = fp.decide_round(history, "d3", verdict)
+    assert stuck["action"] == "escalate" and "three rounds" in stuck["reason"], "topics match across case and punctuation"
+    elsewhere = [history[0], _topical(2, "d2", "session-resolvers", topic, second)]
+    assert fp.decide_round(elsewhere, "d3", verdict)["action"] == "revise", "the same topic on another step is another concern"
+    fresh = fp.parse_verdict(json.dumps({"verdict": "changes", "findings": [
+        {"item": "kanban-resolvers", "level": "plan", "topic": "comment query cost", "issue": third, "fix": "x"}]}))
+    assert fp.decide_round(history, "d3", fresh)["action"] == "revise", "a new topic is a new concern"
+
+
+def test_reviews_judge_what_a_plan_delivers_and_name_each_concern():
+    for text in (fp.REVIEW_INSTRUCTIONS, fp.AUDIT_REVIEW_INSTRUCTIONS):
+        assert "A plan stops at what each item delivers" in text
+        assert "a missing implementation detail is code-level" in text
+        assert "reuse that round's topic exactly" in text
+    assert '"topic"' in fp.VERDICT_FORMAT
+    earlier = [{"type": "plan_round", "round": 1, "digest": "d1", "verdict": "changes", "levels": True,
+                "findings": [{"item": "i1", "level": "plan", "topic": "missing migration", "issue": "no migration"}],
+                "notes": [{"item": "i2", "level": "code", "topic": "query cost", "issue": "scans the table"}]}]
+    prompt = fp.review_prompt(kind="build", request="r", plan={"summary": "s", "items": []}, events=earlier)
+    assert '"topic": "missing migration"' in prompt
+    assert '"topic": "query cost"' in prompt, "earlier rounds show their notes, so Astra can reuse their topics"
+
+
+def test_the_planner_is_told_to_stop_at_goals_files_checks_and_order():
+    skill = (Path(fp.__file__).resolve().parents[1] / "skills" / "devops" / "feature-pipeline" / "SKILL.md").read_text()
+    assert "Stop there: the algorithm, queries, data structures and edge-case handling are the builder's call" in skill
+    assert "never by writing implementation into the plan" in skill
+
+
 # --- the pipeline on a board ---------------------------------------------------
 
 @pytest.fixture

@@ -308,7 +308,27 @@ def finding_text(finding: Any) -> str:
     return str(finding or "").strip()
 
 
+def finding_topic(finding: Any) -> str:
+    """The reviewer's topic for a finding, normalized for comparison ("" when none)."""
+    if not isinstance(finding, dict):
+        return ""
+    return " ".join(_WORD_RE.findall(str(finding.get("topic") or "").lower()))
+
+
 def _same(a: Any, b: Any) -> bool:
+    """Whether two findings raise the same concern.
+
+    Astra names each concern with a short topic and reuses it when it raises
+    the concern again, so the same topic on the same plan step is a repeat
+    however the issue is worded. On 2026-11-18 one concern (log tails cut
+    inside a private key) came back three rounds running in wordings that
+    shared 17-27% of their words, under the 80% the word test needs. Findings
+    without topics (older rounds, fix-loop findings) keep the word test.
+    """
+    ta, tb = finding_topic(a), finding_topic(b)
+    if ta and tb and ta == tb and isinstance(a, dict) and isinstance(b, dict) \
+            and str(a.get("item") or "plan") == str(b.get("item") or "plan"):
+        return True
     wa, wb = _words(finding_text(a)), _words(finding_text(b))
     return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= REPEAT_SIMILARITY
 
@@ -361,8 +381,16 @@ LEVELS = (
     "item's check cannot prove that item, or the order or split into regions cannot "
     "work. \"code\": something the builder must get right while writing the code, "
     "such as an edge case, an error path, a query's cost or a redaction option. "
+    "A plan stops at what each item delivers, the files it touches, how it is "
+    "checked and what it depends on; how to write the code is the builder's, and "
+    "a reviewer checks the code once it is built. So a missing implementation "
+    "detail is code-level unless deciding it now changes another item, the request "
+    "or a check. "
     "Approve when no plan-level findings remain, and still list the code-level "
-    "ones: they go to the builders and their reviewers as notes."
+    "ones: they go to the builders and their reviewers as notes. "
+    "Give every finding a topic, a few words naming the concern. When you raise a "
+    "concern an earlier round already raised, reuse that round's topic exactly, "
+    "however you word the issue this time."
 )
 REVIEW_INSTRUCTIONS = REVIEW_INSTRUCTIONS.replace("{levels}", LEVELS)
 AUDIT_REVIEW_INSTRUCTIONS = AUDIT_REVIEW_INSTRUCTIONS.replace("{levels}", LEVELS)
@@ -370,8 +398,9 @@ FINDING_LEVELS = ("plan", "code")
 VERDICT_FORMAT = (
     "End your answer with the verdict as JSON, nothing after it: "
     "{\"verdict\": \"approve\" | \"changes\", \"findings\": [{\"item\": "
-    "\"<item id or plan>\", \"level\": \"plan\" | \"code\", \"issue\": "
-    "\"<what is wrong>\", \"fix\": \"<what to change>\"}]}"
+    "\"<item id or plan>\", \"level\": \"plan\" | \"code\", \"topic\": "
+    "\"<a few words naming the concern>\", \"issue\": \"<what is wrong>\", "
+    "\"fix\": \"<what to change>\"}]}"
 )
 
 
@@ -423,7 +452,8 @@ def review_prompt(*, kind: str, request: str, plan: Dict[str, Any], events: List
     parts = [instructions, VERDICT_FORMAT, f"Will's request:\n{request.strip()}"]
     if rounds:
         shown = rounds[-EARLIER_ROUNDS_SHOWN:]
-        earlier = [{"round": r.get("round"), "verdict": r.get("verdict"), "findings": r.get("findings") or []}
+        earlier = [{"round": r.get("round"), "verdict": r.get("verdict"), "findings": r.get("findings") or [],
+                    **({"notes": r["notes"]} if r.get("notes") else {})}
                    for r in shown]
         parts.append(f"Earlier rounds ({len(shown)} of {len(rounds)}):\n" + json.dumps(earlier, indent=1))
     answered = decisions(events)
@@ -459,13 +489,17 @@ def parse_verdict(text: str) -> Dict[str, Any]:
     for finding in (data.get("findings") or [])[:MAX_FINDINGS]:
         if isinstance(finding, dict) and str(finding.get("issue") or "").strip():
             level = str(finding.get("level") or "").strip().lower()
-            listed.append({
+            entry = {
                 "item": str(finding.get("item") or "plan").strip()[:40],
                 # A finding without a level is treated as plan-level: it blocks.
                 "level": level if level in FINDING_LEVELS else "plan",
                 "issue": str(finding.get("issue")).strip()[:600],
                 "fix": str(finding.get("fix") or "").strip()[:600],
-            })
+            }
+            topic = str(finding.get("topic") or "").strip()[:80]
+            if topic:
+                entry["topic"] = topic
+            listed.append(entry)
         elif isinstance(finding, str) and finding.strip():
             listed.append({"item": "plan", "level": "plan", "issue": finding.strip()[:600], "fix": ""})
     if verdict == "changes" and not listed:
