@@ -964,6 +964,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    # --- worktrees (read-only lifecycle audit) ---
+    p_wt = sub.add_parser(
+        "worktrees",
+        help="Read-only audit of task worktrees: what landed, what is still only on a task branch",
+        description=(
+            "Lists every worktree task whose checkout or branch still exists, with "
+            "its git state (landed / unlanded N commits / dirty / unknown), whether "
+            "the checkout is nested inside another worktree, and the disposition "
+            "recorded at completion (decision + reason). Also lists t_* worktrees "
+            "of the board's repositories that no task on this board points at. "
+            "Never changes anything; `hermes kanban gc` removes what has landed."
+        ),
+    )
+    p_wt.add_argument("--json", action="store_true", help="Emit the full report as JSON")
+    p_wt.add_argument(
+        "--all", action="store_true", dest="include_settled",
+        help="Also list tasks whose checkout and branch are both gone",
+    )
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1304,6 +1323,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "worktrees": _cmd_worktrees,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -3318,6 +3338,60 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_worktrees(args: argparse.Namespace) -> int:
+    """Print the read-only worktree lifecycle audit for the current board."""
+    with kb.connect_closing() as conn:
+        report = kb.audit_task_worktrees(
+            conn, include_settled=bool(getattr(args, "include_settled", False)),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    tasks, orphans = report["tasks"], report["orphans"]
+
+    def _state(row: dict) -> str:
+        state = row.get("state") or "unknown"
+        if state == "unlanded":
+            return f"unlanded:{row.get('unlanded_commits')}" + (",pushed" if row.get("pushed") else "")
+        if state == "dirty":
+            return f"dirty:{row.get('dirty_files')}"
+        if state == "landed" and row.get("landed_via") == "patch-equivalent":
+            return "landed(cherry)"
+        return state
+
+    def _where(row: dict) -> str:
+        path = row.get("path") or ""
+        repo = row.get("repo") or ""
+        if not row.get("checkout", True) or not path:
+            return "(no checkout)"
+        if repo and path.startswith(repo.rstrip("/") + "/"):
+            path = path[len(repo.rstrip("/")) + 1:]
+        return path + ("  [nested]" if row.get("nested") else "")
+
+    print(f"Board {report['board']}: {len(tasks)} task worktree(s), {len(orphans)} orphan(s)")
+    if tasks:
+        print(f"\n{'TASK':12s} {'STATUS':9s} {'STATE':19s} {'DECISION':9s} {'BRANCH':34s} WHERE")
+        for row in tasks:
+            print(
+                f"{row['task_id']:12s} {str(row['status']):9s} {_state(row):19s} "
+                f"{str(row.get('decision') or '-'):9s} {str(row.get('branch') or '-'):34s} {_where(row)}"
+            )
+            if row.get("reason"):
+                print(f"{'':12s} reason: {str(row['reason'])[:160]}")
+            if row.get("state") == "unlanded" and row.get("contained_in"):
+                print(f"{'':12s} copies on: {', '.join(row['contained_in'])}")
+    if orphans:
+        print(f"\nOrphans (no task on this board points at them):")
+        for row in orphans:
+            print(f"  {_state(row):19s} {str(row.get('branch') or '(detached)'):34s} {row['path']}")
+    counts: dict = {}
+    for row in tasks + orphans:
+        counts[row.get("state") or "unknown"] = counts.get(row.get("state") or "unknown", 0) + 1
+    if counts:
+        print("\n" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    return 0
+
+
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         if kb.get_task(conn, args.task_id) is None:
@@ -3595,28 +3669,52 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
+    """Remove scratch workspaces of archived tasks, landed worktrees and
+    landed auto-generated branches of finished tasks, prune old events, and
     delete old worker logs."""
     import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
+    removed_branches = 0
     with kb.connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
+            "SELECT id, status, workspace_kind, workspace_path, branch_name FROM tasks "
+            "WHERE status IN ('archived', 'done')"
         ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook
-            # (e.g. tasks archived before that hook existed). Same safety
-            # predicate: only clean, fully-pushed worktrees are removed.
+        for row in rows:
+            if row["workspace_kind"] != "worktree":
+                continue
+            # Backstop for finished worktree tasks whose work landed after
+            # they finished (merged or cherry-picked later), or that predate
+            # the completion hook. Landed only: gc never releases or removes
+            # anything that still holds unlanded work.
+            if conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
+                "WHERE l.parent_id = ? AND t.status NOT IN "
+                "('done', 'archived', 'failed', 'cancelled') LIMIT 1",
+                (row["id"],),
+            ).fetchone():
+                continue  # children may still read this workspace
             wt_path = row["workspace_path"]
             if wt_path and Path(wt_path).is_dir():
-                kb._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
+                outcome = kb._cleanup_worktree_workspace(
+                    row["id"], wt_path, row["branch_name"], release_unlanded=False,
+                )
+                if outcome and outcome.get("action") == "removed":
+                    outcome["source"] = "gc"
+                    kb._record_worktree_disposition(conn, row["id"], outcome)
                     removed_ws += 1
-            continue
-        if row["workspace_kind"] != "scratch":
+                continue
+            branch = (row["branch_name"] or "").strip() or f"wt/{row['id']}"
+            root = kb._task_repo_root(wt_path)
+            if root is not None:
+                outcome = kb.reap_landed_task_branch(row["id"], branch, root)
+                if outcome:
+                    outcome["source"] = "gc"
+                    kb._record_worktree_disposition(conn, row["id"], outcome)
+                    removed_branches += 1
+    for row in rows:
+        if row["status"] != "archived" or row["workspace_kind"] != "scratch":
             continue
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
         try:
@@ -3641,7 +3739,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
-    print(f"GC complete: {removed_ws} workspace(s), "
+    print(f"GC complete: {removed_ws} workspace(s), {removed_branches} landed task branch(es), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
 

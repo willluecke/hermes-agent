@@ -6,7 +6,9 @@ startup pruner explicitly skips ``t_*`` worktrees ("dispatcher-driven
 lifecycle"), and ``kanban gc`` only swept scratch. A completed or archived
 task's linked worktree is now removed when — and only when — it provably
 holds no work: clean working tree and every commit reachable from a
-remote-tracking ref. Any doubt preserves the worktree.
+remote-tracking ref. Any doubt preserves the worktree. Since 2026-11-24 a
+clean tree with unpushed commits loses its checkout but keeps its branch
+(see test_kanban_worktree_lifecycle.py).
 """
 
 from __future__ import annotations
@@ -98,13 +100,17 @@ def test_dirty_worktree_preserved(repo: Path) -> None:
     assert (wt / "wip.txt").exists()
 
 
-def test_unpushed_commits_preserved(repo: Path) -> None:
+def test_unpushed_commits_keep_their_branch(repo: Path) -> None:
+    """Unpushed work survives on its branch; only the clean checkout goes
+    (test_kanban_worktree_lifecycle.py covers the release in detail)."""
     wt = _make_worktree(repo, "t_cccc3333")
     (wt / "work.txt").write_text("committed but not pushed\n", encoding="utf-8")
     _git("-C", str(wt), "add", "work.txt")
     _git("-C", str(wt), "commit", "-m", "local work")
+    head = _git("-C", str(wt), "rev-parse", "HEAD").strip()
     kb._cleanup_worktree_workspace("t_cccc3333", str(wt))
-    assert wt.is_dir()
+    assert _branch_exists(repo, "wt/t_cccc3333")
+    assert _git("-C", str(repo), "rev-parse", "wt/t_cccc3333").strip() == head
 
 
 def test_custom_branch_survives_worktree_removal(repo: Path) -> None:

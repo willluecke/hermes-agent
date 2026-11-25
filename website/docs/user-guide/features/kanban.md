@@ -65,7 +65,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
-  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+  - `worktree` — a git worktree under `.worktrees/<id>/` of the repository's **main** checkout for coding tasks, even when the board's `default_workdir` points at a linked worktree (that worktree's HEAD is still the new branch's starting point). Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Settled on completion**; see [Worktree lifecycle](#worktree-lifecycle).
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
@@ -802,7 +802,8 @@ hermes kanban notify-unsubscribe <id>
 hermes kanban context <id>                             # what a worker sees
 hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-column idea
         [--author NAME] [--json]                       #   into a full spec and promote to todo
-hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
+hermes kanban worktrees [--json] [--all]               # read-only: task worktrees, landed or not, recorded decisions
+hermes kanban gc [--event-retention-days N]            # workspaces, landed task worktrees/branches, old events, old logs
         [--log-retention-days N]
 ```
 
@@ -973,6 +974,20 @@ EOF
 ```
 
 The remediation worker spawns with the original card's summary and metadata (changed files, decisions) already in context, plus the fresh evidence you put in the body.
+
+### Worktree lifecycle
+
+Nothing merges a task branch after its worker finishes, so every `worktree` task is settled at completion (and at archive), and what happened is written down as a `worktree_disposition` event on the task:
+
+| Tree at completion | Checkout | Branch |
+|---|---|---|
+| **Landed**: clean, and every commit is on the upstream default branch, the local default branch or the branch the main checkout has out, reachable or cherry-picked/squash-merged | removed | `wt/*` and `fp/*` deleted, custom names kept |
+| **Unlanded**: clean, some commits are only on the task branch (a pushed copy such as `origin/wt/t_x`, or an archive branch, preserves the work but does not land it) | removed for the kanban-owned `.worktrees/<task-id>` tree, kept for a path you named or when the decision is `keep` | kept, with every commit |
+| **Dirty**: uncommitted or untracked files | kept | kept |
+
+A worker whose tree is unlanded or dirty must say what should happen to it. `kanban_complete` refuses the completion until it passes `worktree={"decision": "merge" | "keep" | "discard", "reason": "...", "into": "<branch, PR or task, optional>"}`: `merge` means the work should land and nobody has merged it yet, `keep` leaves the checkout for a person, `discard` means it is not needed. The reviewer completing a review-lane card is not asked; it does not commit. A removed checkout comes back with `git worktree add .worktrees/<id> <branch>`, and the dispatcher recreates it the same way if the task reopens.
+
+`hermes kanban worktrees` (add `--json`, or `--all` for settled tasks too) is the read-only report: per task, the state (`landed`, `unlanded:N`, `,pushed` when the branch is on a remote, `dirty:N`), the recorded decision and reason, other refs holding copies, and `[nested]` when a checkout sits inside another worktree. It also lists `t_*` worktrees of the board's repositories that no task on the board points at. `hermes kanban gc` removes only what has landed since: checkouts and auto-generated branches of finished tasks whose work was merged or cherry-picked after the fact. It never removes unlanded work; deciding about that stays with a person, using the report.
 
 ### Reconciling colliding worker branches
 
@@ -1155,6 +1170,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
 | `archived` | — | Hidden from the default board. If the task was still running, carries the `run_id` of the run that was reclaimed as a side effect. |
+| `worktree_disposition` | `{path, branch, head, state, unlanded_commits, landed_via, landed_in, pushed, contained_in, dirty_files, action, branch_action, decision?, reason?, into?, source?}` | A `worktree` task's tree was settled at completion, archive or `kanban gc`. `action` is `removed` (landed), `released` (checkout removed, branch kept), `preserved` or `none` (branch-only gc); `decision`/`reason`/`into` are the worker's. See [Worktree lifecycle](#worktree-lifecycle). |
 
 **Edits** (human-driven changes that aren't transitions):
 

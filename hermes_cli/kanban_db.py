@@ -6015,9 +6015,11 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    ``scratch`` workspaces are removed; ``worktree`` workspaces are removed only
-    when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` workspaces are intentionally preserved.
+    ``scratch`` workspaces are removed; ``worktree`` workspaces are settled by
+    :func:`_cleanup_worktree_workspace` (landed: removed; clean but unlanded:
+    checkout released, branch kept; dirty: preserved) and the outcome is
+    recorded as a ``worktree_disposition`` event; ``dir`` workspaces are
+    intentionally preserved.
     """
     try:
         row = conn.execute(
@@ -6056,7 +6058,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # worktree so a lingering worker never has its cwd deleted out
             # from under it. Both steps stay best-effort.
             _cleanup_worker_tmux(conn, task_id)
-            _cleanup_worktree_workspace(task_id, path, row["branch_name"])
+            _record_worktree_disposition(conn, task_id, _cleanup_worktree_workspace(
+                task_id, path, row["branch_name"],
+                disposition=_latest_worktree_disposition(conn, task_id),
+            ))
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         import shutil
@@ -6088,42 +6093,337 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
-def _cleanup_worktree_workspace(
-    task_id: str, path: str, branch_name: Optional[str] = None
-) -> None:
-    """Remove a finished task's linked git worktree when it holds no work.
+# ---------------------------------------------------------------------------
+# Worktree lifecycle: what happens to a finished task's checkout and branch
+# ---------------------------------------------------------------------------
+#
+# Will, 2026-11-24: a RegWatch board left ~90 task worktrees behind, nested
+# inside a stray ``.worktrees/kanban-main`` checkout, and nobody could tell
+# which ones held work. Completion now settles every worktree task the same
+# way and writes down what it did:
+#
+# * landed: the tree is clean and every commit is on the upstream default
+#   branch, the local default branch or the main checkout's branch, either
+#   reachable or patch-equivalent (cherry-picked, squash-merged). Checkout
+#   removed, auto-generated branch deleted. A pushed task branch, an archive
+#   branch or any side branch only preserves work: still unlanded.
+# * unlanded: clean, but some commits exist only on the task branch. The
+#   checkout of a kanban-owned tree (``<repo>/.worktrees/<task-id>``) is
+#   removed and the branch is kept, so nothing is lost and no checkout piles
+#   up. The worker's disposition ``keep`` keeps the checkout as well.
+# * dirty: uncommitted or untracked files. Never removed.
+#
+# Each outcome is a ``worktree_disposition`` event with the branch, head,
+# unlanded commit count and the worker's decision, which ``hermes kanban
+# worktrees`` reads back.
 
-    Mirrors the safety judgment of the CLI startup pruner
-    (``cli._prune_stale_worktrees``): removal requires a clean working tree
-    AND every commit reachable from a remote-tracking ref. Any doubt — dirty
-    files, unpushed commits, unresolvable repo, failing git — preserves the
-    worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
-    with it; custom branches are kept. Best-effort like the scratch path.
-    """
+WORKTREE_DISPOSITION_EVENT = "worktree_disposition"
+#: What a worker says should happen to work that has not landed.
+#: merge: it should land, nobody has merged it yet. keep: leave the checkout
+#: for a person. discard: not needed (superseded, exploratory, abandoned).
+WORKTREE_DECISIONS = ("merge", "keep", "discard")
+#: Branch namespaces Hermes generates for task cards (kanban, feature
+#: pipeline). Only these are ever deleted, and only once landed; they never
+#: count as the place another task's work landed.
+_AUTO_TASK_BRANCH_PREFIXES = ("wt/", "fp/")
+_UNLANDED_CHERRY_CAP = 200
+_TASK_TREE_NAME_RE = re.compile(r"^t_[0-9a-f]+$")
+
+
+def _git_text(cwd: Path | str, *args: str, timeout: int = 30) -> Optional[str]:
+    """stdout of a git command, or ``None`` when it fails in any way."""
     try:
-        from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+            check=False,
+        )
     except Exception:
-        return  # CLI safety predicates unavailable — preserve
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout or ""
+
+
+def _is_auto_task_branch(branch: Optional[str]) -> bool:
+    return bool(branch) and str(branch).startswith(_AUTO_TASK_BRANCH_PREFIXES)
+
+
+def _is_kanban_owned_worktree(path: Path, task_id: str) -> bool:
+    """True for the tree the dispatcher made for this task: ``.worktrees/<id>``."""
+    return path.name == task_id and path.parent.name == ".worktrees"
+
+
+def _integration_refs(cwd: Path, main_root: Optional[Path]) -> list[str]:
+    """Refs that count as "landed": the upstream default branch, the local
+    default branch, and the branch the main checkout has out (where the
+    person works). A task branch, its pushed copy, an archive branch or any
+    other side branch only preserves work; it does not land it.
+    """
+    refs: list[str] = []
+    for candidate in ("origin/HEAD", "origin/main", "origin/master"):
+        if _git_text(cwd, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}", timeout=10):
+            refs.append(candidate)
+            break
+    for candidate in ("main", "master"):
+        if _git_text(cwd, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}", timeout=10):
+            refs.append(candidate)
+            break
+    if main_root is not None:
+        current = (_git_text(main_root, "branch", "--show-current", timeout=10) or "").strip()
+        if current and current not in refs and not _is_auto_task_branch(current):
+            refs.append(current)
+    return refs
+
+
+def _commits_missing_from(cwd: Path, rev: str, refs: list[str]) -> Optional[list[str]]:
+    """Commits of ``rev`` reachable from none of ``refs``; ``None`` on error."""
+    out = _git_text(cwd, "rev-list", rev, "--not", *refs, "--", timeout=60)
+    if out is None:
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _patch_landed_shas(cwd: Path, rev: str, bases: list[str]) -> tuple[set[str], list[str]]:
+    """Commits of ``rev`` with a patch-equivalent commit on one of ``bases``
+    (cherry-picked or squash-merged), and the bases that had any."""
+    landed: set[str] = set()
+    used: list[str] = []
+    for base in bases:
+        out = _git_text(cwd, "cherry", base, rev, timeout=60)
+        if out is None:
+            continue
+        found = False
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "-":
+                landed.add(parts[1])
+                found = True
+        if found:
+            used.append(base)
+    return landed, used
+
+
+def _refs_containing(cwd: Path, rev: str, skip: Iterable[str]) -> list[str]:
+    """Up to three non-task refs that hold ``rev`` (where copies live)."""
+    out = _git_text(
+        cwd, "for-each-ref", "--contains", rev, "--format=%(refname:short)",
+        "refs/heads", "refs/remotes", "refs/tags", timeout=30,
+    ) or ""
+    skip_set = {b for b in skip if b}
+    found: list[str] = []
+    for ref in out.splitlines():
+        ref = ref.strip()
+        bare = ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+        if not ref or ref in skip_set or bare in skip_set or _is_auto_task_branch(bare) or ref.endswith("/HEAD"):
+            continue
+        found.append(ref)
+        if len(found) == 3:
+            break
+    return found
+
+
+def _main_checkout_root(path: Path) -> Optional[Path]:
+    """The main working tree of the repository ``path`` belongs to."""
+    common = _git_common_dir(path)
+    if common is None or common.name != ".git":
+        return None
+    return common.parent
+
+
+def task_worktree_state(
+    checkout: Optional[Path | str],
+    *,
+    branch: Optional[str] = None,
+    repo: Optional[Path | str] = None,
+) -> dict:
+    """Read-only verdict on a task's checkout (or, without one, its branch).
+
+    ``state`` is one of ``landed``, ``unlanded``, ``dirty``, ``missing`` (no
+    checkout and no branch) or ``unknown`` (git could not answer; treat as
+    holding work). Never raises.
+    """
+    info: dict = {
+        "state": "unknown",
+        "head": None,
+        "unlanded_commits": None,
+        "landed_via": None,
+        "dirty_files": 0,
+        "dirty_sample": [],
+        "pushed": False,
+        "landed_in": [],
+        "contained_in": [],
+    }
+    try:
+        wp = Path(checkout).expanduser() if checkout else None
+        has_checkout = bool(wp and wp.is_dir() and _git_common_dir(wp) is not None)
+        if has_checkout:
+            cwd: Optional[Path] = wp
+            rev = "HEAD"
+        else:
+            cwd = Path(repo).expanduser() if repo else None
+            if cwd is None or not branch or not _git_branch_exists(cwd, branch):
+                info["state"] = "missing"
+                return info
+            rev = f"refs/heads/{branch}"
+        head = (_git_text(cwd, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", timeout=10) or "").strip()
+        if not head:
+            return info
+        info["head"] = head
+        dirty = False
+        if has_checkout:
+            from cli import _worktree_is_dirty  # same "dirty" as the CLI pruners
+
+            dirty = bool(_worktree_is_dirty(str(cwd)))
+            if dirty:
+                porcelain = _git_text(cwd, "status", "--porcelain", timeout=30) or ""
+                lines = [ln for ln in porcelain.splitlines() if ln.strip()]
+                info["dirty_files"] = len(lines) or 1
+                info["dirty_sample"] = [ln[3:] for ln in lines[:10]]
+        own = [branch or ""]
+        if has_checkout:
+            own.append((_git_text(cwd, "branch", "--show-current", timeout=10) or "").strip())
+        # The task's own branch never counts, even when it is what the main
+        # checkout has out.
+        targets = [t for t in _integration_refs(cwd, _main_checkout_root(cwd)) if t not in own]
+        unlanded = _commits_missing_from(cwd, rev, targets) if targets else None
+        if unlanded is None and targets:
+            info["state"] = "dirty" if dirty else "unknown"
+            return info
+        if unlanded is None:  # nothing to land on: every commit is unlanded
+            unlanded = [ln.strip() for ln in (_git_text(cwd, "rev-list", "--max-count=1000", rev, timeout=60) or "").splitlines() if ln.strip()]
+        landed_via: Optional[str] = "reachable"
+        landed_in: list[str] = []
+        if not unlanded:
+            landed_in = [t for t in targets if _git_text(cwd, "merge-base", "--is-ancestor", rev, t, timeout=30) is not None]
+        else:
+            landed_via = None
+            if targets and len(unlanded) <= _UNLANDED_CHERRY_CAP:
+                patched, used = _patch_landed_shas(cwd, rev, targets)
+                remaining = set(unlanded) - patched
+                if not remaining:
+                    landed_via, landed_in = "patch-equivalent", used
+                unlanded = [sha for sha in unlanded if sha in remaining]
+        info["unlanded_commits"] = len(unlanded)
+        info["landed_via"] = landed_via
+        info["landed_in"] = landed_in
+        if unlanded:
+            # Off-box copy? Pushed task branches are safe, just not integrated.
+            off_box = _git_text(cwd, "rev-list", "--count", rev, "--not", "--remotes", timeout=30)
+            has_remote = bool((_git_text(cwd, "for-each-ref", "--count=1", "refs/remotes", timeout=10) or "").strip())
+            info["pushed"] = bool(has_remote and off_box is not None and off_box.strip() == "0")
+            info["contained_in"] = _refs_containing(cwd, rev, own)
+        info["state"] = "dirty" if dirty else ("landed" if not unlanded else "unlanded")
+    except Exception:
+        pass
+    return info
+
+
+def _latest_worktree_disposition(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """The worker's ``metadata.worktree`` from the task's most recent runs."""
+    try:
+        rows = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL "
+            "ORDER BY id DESC LIMIT 5",
+            (task_id,),
+        ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        try:
+            meta = json.loads(row["metadata"] or "{}")
+        except Exception:
+            continue
+        disposition = meta.get("worktree") if isinstance(meta, dict) else None
+        if isinstance(disposition, dict) and disposition.get("decision") in WORKTREE_DECISIONS:
+            return disposition
+    return None
+
+
+def _record_worktree_disposition(
+    conn: Optional[sqlite3.Connection], task_id: str, outcome: Optional[dict]
+) -> None:
+    if conn is None or not outcome:
+        return
+    try:
+        with write_txn(conn):
+            _append_event(conn, task_id, WORKTREE_DISPOSITION_EVENT, outcome)
+    except Exception:
+        _log.debug("could not record worktree disposition for %s", task_id, exc_info=True)
+
+
+def _cleanup_worktree_workspace(
+    task_id: str,
+    path: str,
+    branch_name: Optional[str] = None,
+    *,
+    disposition: Optional[dict] = None,
+    release_unlanded: bool = True,
+) -> Optional[dict]:
+    """Settle a finished task's linked git worktree; return what was done.
+
+    Landed trees are removed with their auto-generated branch. A clean tree
+    with unlanded commits loses only its checkout (and only when it is the
+    kanban-owned ``.worktrees/<task-id>`` tree, ``release_unlanded`` is set
+    and the disposition is not ``keep``); its branch keeps every commit.
+    Dirty trees and anything git cannot vouch for are preserved. No
+    ``--force``: git re-checks the tree at removal time, so a tree dirtied
+    after our check (TOCTOU) fails safe. Best-effort; never raises.
+
+    The return value is the ``worktree_disposition`` event payload, or
+    ``None`` when there was nothing to settle (no checkout, not a worktree).
+    """
     try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
-            return
+            return None
         common = _git_common_dir(wp)
         if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
+            return None  # not a linked worktree of a normal repo — never guess
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+            return None  # never remove the main checkout
+        branch = (branch_name or "").strip() or None
+        current = (_git_text(wp, "branch", "--show-current", timeout=10) or "").strip() or None
+        branch = branch or current or f"wt/{task_id}"
+        state = task_worktree_state(wp, branch=branch)
+        decision = (disposition or {}).get("decision")
+        outcome: dict = {
+            "path": str(wp),
+            "branch": branch,
+            "head": state.get("head"),
+            "state": state.get("state"),
+            "unlanded_commits": state.get("unlanded_commits"),
+            "landed_via": state.get("landed_via"),
+            "pushed": bool(state.get("pushed")),
+            "landed_in": state.get("landed_in") or [],
+            "contained_in": state.get("contained_in") or [],
+            "dirty_files": state.get("dirty_files", 0),
+            "action": "preserved",
+            "branch_action": "kept",
+        }
+        if state.get("dirty_sample"):
+            outcome["dirty_sample"] = state["dirty_sample"]
+        if disposition:
+            for key in ("decision", "reason", "into"):
+                if disposition.get(key):
+                    outcome[key] = str(disposition[key])[:500]
+
+        landed = state.get("state") == "landed"
+        release = (
+            state.get("state") == "unlanded"
+            and release_unlanded
+            and decision != "keep"
+            and _is_kanban_owned_worktree(wp, task_id)
+        )
+        if not (landed or release):
             _log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
+                "Preserving worktree for task %s (%s) at %s",
+                task_id, state.get("state"), wp,
             )
-            return
-        # No --force: the dirty/unpushed checks above run before removal, so
-        # git's own dirty guard re-verifies at removal time. If the tree
-        # became dirty between our check and the removal (TOCTOU), removal
-        # fails safe and the worktree is preserved.
+            return outcome
         result = subprocess.run(
             ["git", "-C", str(repo_root), "worktree", "remove", str(wp)],
             capture_output=True,
@@ -6136,19 +6436,169 @@ def _cleanup_worktree_workspace(
                 "git worktree remove failed for task %s at %s: %s",
                 task_id, wp, (result.stderr or result.stdout or "").strip(),
             )
-            return
-        _log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            subprocess.run(
-                ["git", "-C", str(repo_root), "branch", "-D", branch],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=30,
-                check=False,
-            )
+            outcome["remove_error"] = (result.stderr or result.stdout or "").strip()[:300]
+            return outcome
+        outcome["action"] = "removed" if landed else "released"
+        _log.debug("Removed worktree workspace (%s): %s", outcome["action"], wp)
+        if landed and _is_auto_task_branch(branch):
+            deleted = _git_text(repo_root, "branch", "-D", branch, timeout=30)
+            if deleted is not None:
+                outcome["branch_action"] = "deleted"
+        return outcome
     except Exception:
-        pass  # best-effort — never block completion
+        return None  # best-effort — never block completion
+
+
+def _task_repo_root(workspace_path: Optional[str], board: Optional[str] = None) -> Optional[Path]:
+    """Main checkout of the repository a worktree task belongs to.
+
+    Works after the checkout is gone: the nearest existing ancestor of the
+    recorded path still sits inside the repository. Falls back to the board's
+    ``default_workdir``.
+    """
+    candidates: list[Path] = []
+    if workspace_path:
+        candidates.append(_nearest_existing_path(Path(workspace_path).expanduser()))
+    try:
+        default = (read_board_metadata(board or get_current_board()).get("default_workdir") or "").strip()
+    except Exception:
+        default = ""
+    if default:
+        candidates.append(Path(default).expanduser())
+    for candidate in candidates:
+        if candidate.is_dir():
+            root = _main_checkout_root(candidate)
+            if root is not None and root.is_dir():
+                return root
+    return None
+
+
+def audit_task_worktrees(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    include_settled: bool = False,
+) -> dict:
+    """Read-only report of every worktree task's checkout, branch and record.
+
+    One row per worktree task whose checkout or branch still exists (all of
+    them with ``include_settled``), plus ``orphans``: ``t_<hex>`` worktrees
+    of the board's repositories that no task on this board points at. Never
+    mutates git or the board.
+    """
+    rows = conn.execute(
+        "SELECT id, title, status, assignee, workspace_path, branch_name, completed_at "
+        "FROM tasks WHERE workspace_kind = 'worktree' ORDER BY created_at"
+    ).fetchall()
+    tasks: list[dict] = []
+    repos: dict[str, Path] = {}
+    known_paths: set[str] = set()
+    for row in rows:
+        path = row["workspace_path"]
+        branch = (row["branch_name"] or "").strip() or f"wt/{row['id']}"
+        root = _task_repo_root(path, board)
+        if root is not None:
+            repos[str(root)] = root
+        if path:
+            known_paths.add(str(Path(path).expanduser().resolve(strict=False)))
+        state = task_worktree_state(path, branch=branch, repo=root)
+        if state["state"] == "missing" and not include_settled:
+            continue
+        ev = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"], WORKTREE_DISPOSITION_EVENT),
+        ).fetchone()
+        try:
+            recorded = json.loads(ev["payload"]) if ev and ev["payload"] else None
+        except Exception:
+            recorded = None
+        checkout = bool(path and Path(path).expanduser().is_dir())
+        nested = False
+        if checkout and root is not None:
+            # Inside the repository but not directly in its .worktrees/: it
+            # sits inside another checkout (e.g. kanban-main/.worktrees/t_x).
+            resolved = Path(path).expanduser().resolve(strict=False)
+            main = root.resolve(strict=False)
+            nested = main in resolved.parents and resolved.parent != main / ".worktrees"
+        tasks.append({
+            "task_id": row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "assignee": row["assignee"],
+            "path": path,
+            "checkout": checkout,
+            "nested": nested,
+            "branch": branch,
+            "repo": str(root) if root else None,
+            "completed_at": row["completed_at"],
+            "decision": (recorded or {}).get("decision"),
+            "reason": (recorded or {}).get("reason"),
+            "recorded_action": (recorded or {}).get("action"),
+            **state,
+        })
+    orphans: list[dict] = []
+    for root in repos.values():
+        listing = _git_text(root, "worktree", "list", "--porcelain", timeout=30) or ""
+        current: dict = {}
+        entries: list[dict] = []
+        for line in listing.splitlines() + [""]:
+            if not line.strip():
+                if current:
+                    entries.append(current)
+                current = {}
+                continue
+            key, _, value = line.partition(" ")
+            current[key] = value
+        for entry in entries:
+            wt_path = entry.get("worktree")
+            if not wt_path or not _TASK_TREE_NAME_RE.match(Path(wt_path).name):
+                continue
+            if str(Path(wt_path).resolve(strict=False)) in known_paths:
+                continue
+            branch = (entry.get("branch") or "").removeprefix("refs/heads/") or None
+            orphans.append({
+                "path": wt_path,
+                "repo": str(root),
+                "branch": branch,
+                "prunable": "prunable" in entry,
+                **task_worktree_state(wt_path, branch=branch, repo=root),
+            })
+    return {"board": board or get_current_board(), "tasks": tasks, "orphans": orphans}
+
+
+def reap_landed_task_branch(
+    task_id: str, branch: Optional[str], repo: Path | str
+) -> Optional[dict]:
+    """Delete a finished task's auto-generated branch once its work landed.
+
+    For tasks whose checkout is already gone (released at completion) and
+    whose branch has since been merged or cherry-picked. Unlanded branches
+    are left alone. Returns the event payload when it deleted something.
+    """
+    if not _is_auto_task_branch(branch):
+        return None
+    root = Path(repo).expanduser()
+    state = task_worktree_state(None, branch=branch, repo=root)
+    if state.get("state") != "landed":
+        return None
+    # A branch still checked out somewhere is not ours to delete.
+    listing = _git_text(root, "worktree", "list", "--porcelain", timeout=30) or ""
+    if f"branch refs/heads/{branch}" in listing.splitlines():
+        return None
+    if _git_text(root, "branch", "-D", str(branch), timeout=30) is None:
+        return None
+    return {
+        "path": None,
+        "branch": branch,
+        "head": state.get("head"),
+        "state": "landed",
+        "unlanded_commits": 0,
+        "landed_via": state.get("landed_via"),
+        "dirty_files": 0,
+        "action": "none",
+        "branch_action": "deleted",
+    }
 
 
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
@@ -6187,9 +6637,10 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue  # still has active children
             # All children done — safe to clean up parent workspace
             if row["workspace_kind"] == "worktree":
-                _cleanup_worktree_workspace(
-                    parent_id, row["workspace_path"], row["branch_name"]
-                )
+                _record_worktree_disposition(conn, parent_id, _cleanup_worktree_workspace(
+                    parent_id, row["workspace_path"], row["branch_name"],
+                    disposition=_latest_worktree_disposition(conn, parent_id),
+                ))
                 continue
             import shutil
             wp = Path(row["workspace_path"])
@@ -7975,8 +8426,37 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _task_worktree_home(repo_root: Path) -> tuple[Path, str]:
+    """Where a task's ``.worktrees/<id>`` goes, and the commit it starts from.
+
+    A linked worktree is one checkout of a shared repository, not a
+    repository of its own. Task trees anchored on one used to land inside it
+    (``<linked>/.worktrees/<id>``): RegWatch's board pointed at a stray
+    ``.worktrees/kanban-main`` checkout and grew 46 trees nested in it, which
+    then blocked removing that checkout. Task trees always go under the main
+    checkout; the new branch still starts from the anchor's HEAD, so a board
+    that points at a linked worktree to pin a base branch keeps that base.
+    """
+    if not _is_linked_worktree_checkout(repo_root):
+        return repo_root, "HEAD"
+    main_root = _main_checkout_root(repo_root)
+    head = (_git_text(repo_root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", timeout=10) or "").strip()
+    if main_root is None or not head or not main_root.is_dir():
+        return repo_root, "HEAD"
+    try:
+        main_root = main_root.resolve()
+    except Exception:
+        pass
+    return main_root, head
+
+
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, start_point: str = "HEAD"
+) -> None:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    A new branch starts at ``start_point`` (default: ``repo_root``'s HEAD).
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
@@ -7989,7 +8469,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), start_point or "HEAD",
         ]
     result = subprocess.run(
         cmd,
@@ -8044,8 +8524,9 @@ def _resolve_worktree_workspace(
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        home, start = _task_worktree_home(repo_root)
+        target = home / ".worktrees" / task.id
+        _ensure_git_worktree(home, target, branch_name, start)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -8067,11 +8548,20 @@ def _resolve_worktree_workspace(
         # branch — silent cross-task provenance corruption, and unsafe
         # when siblings run concurrently. Fall back to a fresh worktree
         # of our own under the same repo.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        if _TASK_TREE_NAME_RE.match(requested.name):
+            # A sibling task's tree: start where its anchor starts, never
+            # from the sibling's own commits.
+            fallback_root = _repo_root_for_worktree_target(requested.parent)
+        else:
+            # An anchor checkout: a board or project pointing at a linked
+            # worktree (create_task copies default_workdir into the path).
+            # Start from its HEAD, like the no-path route above.
+            fallback_root = requested_resolved
         if fallback_root is not None:
+            fallback_root, start = _task_worktree_home(fallback_root)
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, start)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -8090,6 +8580,18 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
+    if (
+        not requested.exists()
+        and _is_kanban_owned_worktree(requested, task.id)
+        and _is_linked_worktree_checkout(repo_root)
+    ):
+        # The derived ``<anchor>/.worktrees/<id>`` of a linked-worktree
+        # anchor (a project or inherited path): place it under the main
+        # checkout instead of nesting it in the linked one.
+        home, start = _task_worktree_home(repo_root)
+        target = home / ".worktrees" / task.id
+        _ensure_git_worktree(home, target, branch_name, start)
+        return target, branch_name
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 

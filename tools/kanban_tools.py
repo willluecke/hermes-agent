@@ -652,6 +652,90 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+def _is_review_lane_run(conn, task) -> bool:
+    """True when the caller is reviewing the task, not building it.
+
+    A reviewer's run follows a run that ended in ``review_requested``; a task
+    still parked in ``review`` is being approved directly. Reviewers never
+    commit, so they are not asked what should happen to the builder's branch.
+    """
+    if getattr(task, "status", None) == "review":
+        return True
+    try:
+        row = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (task.id,),
+        ).fetchone()
+    except Exception:
+        return False
+    return bool(row) and row["outcome"] == "review_requested"
+
+
+def _worktree_disposition_gate(kb, conn, task, raw) -> tuple[Optional[dict], Optional[str]]:
+    """Validate ``worktree`` and refuse a completion that would strand work.
+
+    Returns ``(disposition, error)``. The gate applies to a builder finishing
+    a ``worktree`` task whose tree holds unlanded commits or uncommitted
+    files: without a disposition nothing records why that branch exists or
+    what should become of it, which is how RegWatch reached ~90 worktrees
+    nobody could safely remove (2026-11-24).
+    """
+    disposition = None
+    if raw is not None:
+        if not isinstance(raw, dict):
+            return None, (
+                "worktree must be an object like "
+                '{"decision": "merge", "reason": "..."}'
+            )
+        decision = str(raw.get("decision") or "").strip().lower()
+        reason = str(raw.get("reason") or "").strip()
+        if decision not in kb.WORKTREE_DECISIONS or not reason:
+            return None, (
+                "worktree needs decision one of "
+                f"{list(kb.WORKTREE_DECISIONS)} and a non-empty reason. "
+                "Your task is still in flight (no state change)."
+            )
+        disposition = {"decision": decision, "reason": redact_sensitive_text(reason, force=True)[:500]}
+        into = str(raw.get("into") or "").strip()
+        if into:
+            disposition["into"] = into[:200]
+    if (
+        disposition is not None
+        or task is None
+        or getattr(task, "workspace_kind", None) != "worktree"
+        or not getattr(task, "workspace_path", None)
+        or _is_review_lane_run(conn, task)
+    ):
+        return disposition, None
+    branch = (task.branch_name or "").strip() or f"wt/{task.id}"
+    state = kb.task_worktree_state(task.workspace_path, branch=branch)
+    if state.get("state") not in ("unlanded", "dirty"):
+        return None, None
+    held = []
+    if state.get("unlanded_commits"):
+        held.append(
+            f"{state['unlanded_commits']} commit(s) that are on no other branch "
+            "and not cherry-picked into the main branch"
+        )
+    if state.get("dirty_files"):
+        sample = ", ".join(state.get("dirty_sample") or [])
+        held.append(
+            f"{state['dirty_files']} uncommitted file(s)" + (f" ({sample})" if sample else "")
+        )
+    return None, (
+        f"kanban_complete blocked: your worktree {task.workspace_path} on branch "
+        f"{branch} holds {' and '.join(held) or 'work that has not landed'}. "
+        "Nothing merges a task branch after you finish, so say what should "
+        "happen to it: retry kanban_complete with the same summary plus "
+        'worktree={"decision": "merge", "reason": "<one sentence>", "into": '
+        '"<branch, PR or task id, optional>"}. decision is "merge" (this work '
+        'should land), "keep" (leave the checkout for a person) or "discard" '
+        "(not needed). Commit what belongs to the task first: uncommitted "
+        "files are never deleted. Your task is still in flight (no state change)."
+    )
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -752,6 +836,14 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            disposition, worktree_err = _worktree_disposition_gate(
+                kb, conn, task, args.get("worktree"),
+            )
+            if worktree_err:
+                return tool_error(worktree_err)
+            if disposition:
+                metadata = dict(metadata or {})
+                metadata["worktree"] = disposition
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -1863,7 +1955,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. In a git "
+        "worktree whose commits have not landed on another branch, also "
+        "pass ``worktree`` to say what should happen to them; completion "
+        "is refused without it."
     ),
     "parameters": {
         "type": "object",
@@ -1871,6 +1966,32 @@ KANBAN_COMPLETE_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "worktree": {
+                "type": "object",
+                "description": (
+                    "What should happen to this task's branch. Required when "
+                    "your worktree has commits that are on no other branch "
+                    "(and not cherry-picked into main), or uncommitted files; "
+                    "not needed once your work is merged or pushed. "
+                    "decision: 'merge' (this work should land; nobody has "
+                    "merged it yet), 'keep' (leave the checkout for a person "
+                    "to look at), or 'discard' (not needed: superseded, "
+                    "exploratory, or abandoned). reason: one sentence a "
+                    "person can act on. into: optional branch, PR or task id "
+                    "that should receive it. After completion the kernel "
+                    "removes the checkout unless it is dirty or you chose "
+                    "'keep'; the branch and its commits are always kept, and "
+                    "this decision is recorded on the task. Commit what "
+                    "belongs to the task first: uncommitted files are never "
+                    "deleted and keep the checkout around."
+                ),
+                "properties": {
+                    "decision": {"type": "string", "enum": ["merge", "keep", "discard"]},
+                    "reason": {"type": "string"},
+                    "into": {"type": "string"},
+                },
+                "required": ["decision", "reason"],
             },
             "summary": {
                 "type": "string",
