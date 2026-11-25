@@ -7365,9 +7365,13 @@ class AIAgent:
         # already translates OpenAI-style image_url/input_image parts into
         # native Anthropic ``{"type": "image", "source": ...}`` blocks. When
         # the active model supports vision we let the adapter do its job and
-        # skip this legacy text-fallback preprocessor entirely.
+        # skip this legacy text-fallback preprocessor entirely. A ``file://``
+        # image from the sync store still has to become bytes first: the
+        # remote API cannot open a path on this host (agent/local_images.py).
         if self._model_supports_vision():
-            return api_messages
+            from agent.local_images import inline_local_images
+
+            return inline_local_images(api_messages)
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
         # compat): replace each image part with a vision_analyze text note.
@@ -7385,10 +7389,13 @@ class AIAgent:
         """Strip native image parts when the active model lacks vision.
 
         Runs on the chat.completions / codex_responses paths. Vision-capable
-        models pass through unchanged (provider and any downstream translator
-        handle the image parts natively). Non-vision models get each image
-        replaced by a cached vision_analyze text description so the turn
-        doesn't fail with "model does not support image input".
+        models get the image parts natively (provider and any downstream
+        translator handle them), with ``file://`` images from the sync store
+        inlined as ``data:`` URLs, since a remote provider cannot read a path
+        on this host (OpenRouter: HTTP 400 "Invalid URL format: file:").
+        Non-vision models get each image replaced by a cached vision_analyze
+        text description so the turn doesn't fail with "model does not
+        support image input".
         """
         if not any(
             isinstance(msg, dict) and self._content_has_image_parts(msg.get("content"))
@@ -7397,7 +7404,9 @@ class AIAgent:
             return api_messages
 
         if self._model_supports_vision():
-            return api_messages
+            from agent.local_images import inline_local_images
+
+            return inline_local_images(api_messages)
 
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:

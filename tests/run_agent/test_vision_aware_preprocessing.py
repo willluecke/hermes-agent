@@ -188,3 +188,47 @@ class TestModelSupportsVision:
              patch("agent.models_dev.get_model_capabilities", return_value=None):
             assert agent._model_supports_vision() is True
 
+
+
+# ─── file:// images from the sync store (2026-11-25) ─────────────────────────
+#
+# OpenRouter answered HTTP 400 "Invalid URL format: file:" when a RegWatch
+# screenshot reached it as a path. Every native provider path now sends the
+# bytes instead.
+
+
+def _file_image_msg(tmp_path, monkeypatch):
+    root = tmp_path / "conversation-images"
+    (root / "c1").mkdir(parents=True)
+    shot = root / "c1" / "IMG_0212.png"
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+    from agent import local_images
+
+    monkeypatch.setattr(local_images, "local_image_roots", lambda config=None: [str(root)])
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "fix the map"},
+            {"type": "image_url", "image_url": {"url": f"file://{shot}"}},
+        ],
+    }
+
+
+class TestFileImagesAreInlined:
+    def test_chat_completions_and_responses_paths_send_bytes(self, tmp_path, monkeypatch):
+        agent = _make_agent()
+        agent.provider = "openrouter"
+        agent.model = "thinkingmachines/inkling-2-small"
+        msg = _file_image_msg(tmp_path, monkeypatch)
+        with patch.object(agent, "_model_supports_vision", return_value=True):
+            out = agent._prepare_messages_for_non_vision_model([msg])
+        url = out[0]["content"][1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        assert msg["content"][1]["image_url"]["url"].startswith("file://")
+
+    def test_anthropic_path_sends_bytes(self, tmp_path, monkeypatch):
+        agent = _make_agent()
+        msg = _file_image_msg(tmp_path, monkeypatch)
+        with patch.object(agent, "_model_supports_vision", return_value=True):
+            out = agent._prepare_anthropic_messages_for_api([msg])
+        assert out[0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")

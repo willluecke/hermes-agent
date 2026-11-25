@@ -1861,9 +1861,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
+        from agent.local_images import inline_local_images
+
         return _bt.build_kwargs(
             model=agent.model,
-            messages=api_messages,
+            messages=inline_local_images(api_messages),
             tools=tools_for_api,
             max_tokens=agent.max_tokens or 4096,
             region=region,

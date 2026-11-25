@@ -101,3 +101,102 @@ def local_image_path(url: str, config: Optional[dict[str, Any]] = None) -> str:
     if _image_type(real, head) is None:
         raise ValueError("local image must be a PNG, JPEG, WebP or GIF file whose bytes match its suffix")
     return real
+
+
+# ---------------------------------------------------------------------------
+# Sending a local image to a provider
+# ---------------------------------------------------------------------------
+#
+# The Claude and Codex runtimes read a ``file://`` image from disk. The native
+# agent path (OpenRouter and every other chat-completions, Responses or
+# Anthropic-API provider) sends message parts to a remote API, which cannot
+# open a path on this host: OpenRouter answered ``HTTP 400 Invalid URL format:
+# file:`` for a RegWatch screenshot on 2026-11-25, and because Hermes Chat
+# re-attaches an earlier screenshot on later turns, every following message in
+# that chat failed the same way. The API-bound copy of the messages now
+# carries the image's bytes as a ``data:`` URL instead.
+
+_INLINE_CACHE: dict = {}
+_INLINE_CACHE_MAX = 32
+
+
+def _data_url_for(path: str) -> str:
+    """``data:<type>;base64,...`` for a vetted local image, memoized by file state."""
+    import base64
+
+    stat = os.stat(path)
+    key = (path, stat.st_size, stat.st_mtime_ns)
+    cached = _INLINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with open(path, "rb") as handle:
+        data = handle.read()
+    media_type = _image_type(path, data[:16]) or "image/png"
+    url = f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
+    if len(_INLINE_CACHE) >= _INLINE_CACHE_MAX:
+        _INLINE_CACHE.pop(next(iter(_INLINE_CACHE)))
+    _INLINE_CACHE[key] = url
+    return url
+
+
+def _part_image_url(part: dict) -> Optional[str]:
+    ref = part.get("image_url")
+    if isinstance(ref, dict):
+        ref = ref.get("url")
+    return ref if isinstance(ref, str) else None
+
+
+def inline_local_images(messages: list, config: Optional[dict[str, Any]] = None) -> list:
+    """Return ``messages`` with every ``file://`` image part made sendable.
+
+    A part whose path passes :func:`local_image_path` becomes a ``data:`` URL
+    in the same shape (``image_url`` object or Responses-style string). One
+    that does not (outside the roots, gone, not an image) becomes a text part
+    saying so, because a remote provider rejects the whole request over a
+    single unreadable URL. Only changed messages are copied; the caller's list
+    and dicts are never mutated, so the stored history keeps its paths. With
+    no ``file://`` image anywhere the same list object comes back.
+    """
+    if not isinstance(messages, list):
+        return messages
+
+    def _has_file_image(content: Any) -> bool:
+        return isinstance(content, list) and any(
+            isinstance(p, dict)
+            and p.get("type") in ("image_url", "input_image")
+            and is_file_url(_part_image_url(p) or "")
+            for p in content
+        )
+
+    if not any(isinstance(m, dict) and _has_file_image(m.get("content")) for m in messages):
+        return messages
+
+    out: list = []
+    for msg in messages:
+        if not (isinstance(msg, dict) and _has_file_image(msg.get("content"))):
+            out.append(msg)
+            continue
+        parts: list = []
+        for part in msg["content"]:
+            url = _part_image_url(part) if isinstance(part, dict) else None
+            if not (
+                isinstance(part, dict)
+                and part.get("type") in ("image_url", "input_image")
+                and is_file_url(url or "")
+            ):
+                parts.append(part)
+                continue
+            try:
+                data_url = _data_url_for(local_image_path(url, config))
+            except (ValueError, OSError) as exc:
+                name = os.path.basename(unquote(urlparse(url).path or "")) or "image"
+                parts.append({"type": "text", "text": f"[An attached image ({name}) could not be read on this host: {exc}.]"})
+                continue
+            new_part = dict(part)
+            if isinstance(part.get("image_url"), dict):
+                new_part["image_url"] = {**part["image_url"], "url": data_url}
+            else:
+                new_part["image_url"] = data_url
+            parts.append(new_part)
+        out.append({**msg, "content": parts})
+    return out

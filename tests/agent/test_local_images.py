@@ -80,3 +80,86 @@ def test_the_default_config_carries_the_key():
 
     assert DEFAULT_CONFIG["agent"]["local_image_roots"] == ["~/.hermes/conversation-images"]
     assert local_images.CONFIG_KEY == "local_image_roots"
+
+
+# ---------------------------------------------------------------------------
+# inline_local_images: what a remote provider receives
+# ---------------------------------------------------------------------------
+#
+# 2026-11-25: OpenRouter answered HTTP 400 "Invalid URL format: file:" for a
+# RegWatch screenshot, and every later turn re-attached it and failed too.
+
+
+def _shot(root, name="IMG_0212.png", data=PNG):
+    (root / "c1").mkdir(exist_ok=True)
+    path = root / "c1" / name
+    path.write_bytes(data)
+    return path
+
+
+def test_a_file_image_becomes_a_data_url_and_the_history_keeps_its_path(roots):
+    import base64
+
+    config, root = roots
+    path = _shot(root)
+    url = f"file://{path}"
+    history = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "fix the map"},
+            {"type": "image_url", "image_url": {"url": url, "detail": "high"}},
+        ]},
+    ]
+    out = local_images.inline_local_images(history, config)
+    sent = out[0]["content"][1]
+    assert sent["image_url"]["url"] == "data:image/png;base64," + base64.b64encode(PNG).decode()
+    assert sent["image_url"]["detail"] == "high"
+    assert out[0]["content"][0] == {"type": "text", "text": "fix the map"}
+    # the stored history is untouched
+    assert history[0]["content"][1]["image_url"]["url"] == url
+
+
+def test_responses_style_string_image_url_is_inlined_too(roots):
+    config, root = roots
+    path = _shot(root, "photo.jpg", JPEG)
+    out = local_images.inline_local_images(
+        [{"role": "user", "content": [{"type": "input_image", "image_url": f"file://{path}"}]}], config,
+    )
+    assert out[0]["content"][0]["image_url"].startswith("data:image/jpeg;base64,")
+
+
+def test_an_unreadable_file_image_becomes_a_text_note_not_a_400(roots, tmp_path):
+    config, root = roots
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(PNG)
+    out = local_images.inline_local_images([
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"file://{root}/c1/gone.png"}},
+            {"type": "image_url", "image_url": {"url": f"file://{outside}"}},
+        ]},
+    ], config)
+    parts = out[0]["content"]
+    assert [p["type"] for p in parts] == ["text", "text"]
+    assert "gone.png" in parts[0]["text"] and "does not exist" in parts[0]["text"]
+    assert "outside the configured image roots" in parts[1]["text"]
+
+
+def test_remote_and_data_urls_pass_through_and_no_file_image_means_no_copy(roots):
+    config, _root = roots
+    messages = [
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    assert local_images.inline_local_images(messages, config) is messages
+
+
+def test_only_messages_with_file_images_are_copied(roots):
+    config, root = roots
+    path = _shot(root)
+    plain = {"role": "assistant", "content": "earlier reply"}
+    with_image = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"file://{path}"}}]}
+    out = local_images.inline_local_images([plain, with_image], config)
+    assert out[0] is plain
+    assert out[1] is not with_image
