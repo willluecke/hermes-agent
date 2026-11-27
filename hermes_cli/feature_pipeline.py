@@ -1,9 +1,12 @@
 """The feature pipeline: planned, reviewed, region-by-region builds and audits.
 
 Will, 2026-11-18: "Always have it as a plan that is executed, not just an
-agent toddling across the map." Every build or audit of a *feature system*
-(:data:`FEATURE_SYSTEM_DEFINITION`) runs as one pipeline on the project's
-kanban board:
+agent toddling across the map." Until 2026-11-27 every build or audit of a
+*feature system* (:data:`FEATURE_SYSTEM_DEFINITION`) was routed here. Will,
+2026-11-27: the planning "creates more confusion and takes several times
+longer than a tighter model iteration loop could", so the agent he talks to
+now does that work itself, and a pipeline runs only when he asks for one by
+name. When it does, it runs as one pipeline on the project's kanban board:
 
 1. **Plan.** An Opus orchestrator (the root card) writes a structured plan:
    items with a goal, the files they touch, and a check that proves them.
@@ -90,11 +93,9 @@ FEATURE_SYSTEM_DEFINITION = (
     "times, checkout, the HR workspace) when the work builds or audits it as a "
     "whole: it spans two or more layers (interface, server or API, data store, "
     "background jobs, integrations) or two or more repos, or its plan has three "
-    "or more items that touch separate files. An individual aspect is a change "
-    "inside one layer of one feature: a bug fix, a control, a label, a "
-    "threshold, one endpoint; it is done directly, without the pipeline. A "
-    "message that starts with 'system:' always uses the pipeline; one that "
-    "starts with 'aspect:' never does."
+    "or more items that touch separate files. Neither size nor a 'system:' "
+    "prefix sends work to the pipeline: it runs only when Will asks for the "
+    "feature pipeline by name."
 )
 
 

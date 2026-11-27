@@ -137,8 +137,9 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "talos",
     "hermes_conversation",
     "steward_jobs",
-    # Feature-system builds and audits: chat agents start them, the root
-    # card's Opus orchestrator (a kanban worker) drives them.
+    # Opt-in planned builds and audits (2026-11-27): a chat agent starts one
+    # only when Will asks for the feature pipeline by name; the root card's
+    # Opus orchestrator (a kanban worker) drives it.
     "feature_pipeline",
     "typesafe_decide",
     # Stateless stand-in for `todo` on the Codex and Claude lanes: returns the

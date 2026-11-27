@@ -74,6 +74,22 @@ def test_regions_join_items_that_share_files_or_depend_on_each_other():
     assert fp.group_regions(whole) == [["a", "b"]], "the repo root overlaps everything"
 
 
+def test_the_pipeline_is_opt_in_and_routes_no_work_to_itself():
+    # Will, 2026-11-27: feature-system work is done by the agent he talks to;
+    # the pipeline runs only when he asks for it by name.
+    from tools.feature_pipeline_tool import FEATURE_PIPELINE_SCHEMA
+
+    description = FEATURE_PIPELINE_SCHEMA["description"]
+    assert description.startswith(
+        "Planned, reviewed builds and audits, run only when Will asks for the feature pipeline by name."
+    )
+    assert "never start a pipeline on your own judgement" in description
+    for text in (description, fp.FEATURE_SYSTEM_DEFINITION):
+        assert "always uses the pipeline" not in text
+        assert "'aspect:'" not in text
+    assert "only when Will asks for the feature pipeline by name" in fp.FEATURE_SYSTEM_DEFINITION
+
+
 def test_the_definition_is_measured_on_the_plan():
     measured = fp.feature_system(fp.validate_plan(PLAN))
     assert measured["feature_system"] and measured["subsystems"] == ["server/api", "src/app"]
