@@ -4414,10 +4414,25 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_reasoning_config(model)
         )
 
+        # OpenRouter provider routing from config.yaml (``provider_routing``),
+        # the same keys the messaging gateway passes. Read here rather than
+        # from the runner's startup copy so a config edit applies on the next
+        # agent build (the runtime signature hashes the config). Until
+        # 2026-11-27 /v1/runs dropped this section, so Hermes Chat runs could
+        # not be routed at all (Will wanted Gemini kept on one Google backend
+        # so its prompt cache is not split between AI Studio and Vertex).
+        provider_routing = GatewayRunner._load_provider_routing()
+
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
             **_checkpoint_agent_kwargs(user_config),
+            "providers_allowed": provider_routing.get("only"),
+            "providers_ignored": provider_routing.get("ignore"),
+            "providers_order": provider_routing.get("order"),
+            "provider_sort": provider_routing.get("sort"),
+            "provider_require_parameters": provider_routing.get("require_parameters", False),
+            "provider_data_collection": provider_routing.get("data_collection"),
             "max_iterations": max_iterations,
             "quiet_mode": True,
             "verbose_logging": False,
