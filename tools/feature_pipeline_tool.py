@@ -87,8 +87,13 @@ def feature_pipeline_tool(action: str, **kwargs: Any) -> str:
             conversation = str(kwargs.get("conversation_id") or "").strip() or _session_conversation()
             if not conversation:
                 raise ValueError("conversation_id is required: this chat's id, so the pipeline can report back")
-            result = fp.start(project=str(kwargs.get("project") or ""), request=str(kwargs.get("request") or ""),
-                              conversation_id=conversation, kind=str(kwargs.get("kind") or "build"))
+            result = fp.start(
+                project=str(kwargs.get("project") or ""),
+                request=str(kwargs.get("request") or ""),
+                conversation_id=conversation,
+                kind=str(kwargs.get("kind") or "build"),
+                budget_minutes=kwargs.get("budget_minutes"),
+            )
             return json.dumps(result, ensure_ascii=False)
         root_id = str(kwargs.get("root_id") or "").strip() or _worker_card()
         if not root_id:
@@ -111,7 +116,12 @@ def feature_pipeline_tool(action: str, **kwargs: Any) -> str:
             result = fp.plan_review(root_id=root_id, plan=kwargs.get("plan"), context=str(kwargs.get("context") or ""),
                                     board=board, run_id=run)
         elif action == "launch":
-            result = fp.launch(root_id=root_id, board=board, run_id=run)
+            result = fp.launch(
+                root_id=root_id,
+                board=board,
+                run_id=run,
+                budget_minutes=kwargs.get("budget_minutes"),
+            )
         elif action == "fix":
             result = fp.fix(root_id=root_id, findings=kwargs.get("findings"), board=board, run_id=run)
         elif action == "ask":
@@ -146,6 +156,7 @@ FEATURE_PIPELINE_SCHEMA = {
             "request": {"type": "string", "description": "start: Will's request, verbatim and complete."},
             "conversation_id": {"type": "string", "description": "start: this Hermes Chat conversation id, for notes and wakes."},
             "kind": {"type": "string", "enum": list(fp.KINDS), "description": "start: build (default) or audit."},
+            "budget_minutes": {"type": "number", "description": "start/launch: optional target wall-clock budget in minutes; sizes waves and sets per-region max_runtime_seconds."},
             "root_id": {"type": "string", "description": "The pipeline's root card; the orchestrator's own card by default."},
             "board": {"type": "string", "description": "Optional board slug; found automatically."},
             "answer": {"type": "string", "description": "answer: Will's reply, verbatim."},

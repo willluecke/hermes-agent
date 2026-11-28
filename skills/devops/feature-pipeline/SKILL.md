@@ -28,7 +28,7 @@ If `status` says this card is not a feature pipeline (no start record), the run 
    - `goal` says what the item delivers and how its caller or user sees it, in a few sentences. Stop there: the algorithm, queries, data structures and edge-case handling are the builder's call, and the region's Astra reviewer checks them in the code. A plan that spells out implementation gives the plan review more to argue with and grows every round.
    - `files` are the repo-relative files or directories the item changes (for an audit, reads). Items that share files land in the same region, so list them honestly and narrowly.
    - `check` is the exact command that proves the item (a test, build or request), or for an audit the evidence that settles it.
-   - `depends_on` only for real ordering; dependent items share a region.
+   - `depends_on` only for real ordering; disjoint dependent items run in sequential waves (each wave's cards run in parallel after prerequisites finish) rather than collapsing into one worker.
    - Cover the whole request, including the tests and docs the project's rules require.
 3. Call `feature_pipeline` action `plan_review` with the whole plan. Put in `context` the facts Astra needs that are not in the code. Astra reads the code itself.
    Astra marks each finding plan-level or code-level. Only plan-level findings block approval. Code-level ones come back as notes, and the pipeline writes them onto the region cards they concern, so settle plan-level findings in the plan and leave code-level ones to the builders.

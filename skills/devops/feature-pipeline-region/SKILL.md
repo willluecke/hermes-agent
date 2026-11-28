@@ -26,7 +26,7 @@ The review lane loads this skill next to `sdlc-review`. If you were claimed from
 
 1. Call `kanban_show` for your card. It has your items (goal, files, check), the whole plan's summary, and your earlier runs. If Astra requested changes, the review is in that run history: settle every point.
    If the card lists notes from Astra's plan review, handle each one in the code and say how in your handoff.
-2. Work only in your worktree: your current directory, on the card's own branch (`git branch --show-current`), which starts from the commit the plan was reviewed against. Stay inside your items' files. If an item cannot be done without touching another file, say so in the handoff.
+2. Work only in your worktree: your current directory, on the card's own branch (`git branch --show-current`), which starts from the commit the plan was reviewed against. If your card lists prerequisite regions (from an earlier wave), run `git merge --no-ff <branch>` for each listed prerequisite branch into your worktree before editing. Stay inside your items' files. If an item cannot be done without touching another file, say so in the handoff. If your card carries a time budget, watch the clock and hand off cleanly before the cutoff rather than timing out.
 3. Run each item's check and fix until it passes.
 4. Commit on your branch with `git add -A` and `git commit`. Uncommitted work never reaches the integration.
 5. Call `kanban_request_review` with a summary of what you did per item, and metadata `{changed_files, checks: [{command, result}]}`. That ends your run.

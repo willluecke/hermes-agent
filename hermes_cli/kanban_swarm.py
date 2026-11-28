@@ -141,6 +141,9 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    verifier_max_runtime_seconds: Optional[int] = None,
+    synthesizer_max_runtime_seconds: Optional[int] = None,
+    budget_metadata: Optional[dict[str, Any]] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
     activation_summary = (
@@ -163,18 +166,24 @@ def create_swarm(
             workspace_path=workspace_path,
             priority=priority,
             idempotency_key=idempotency_key,
+            verifier_max_runtime_seconds=verifier_max_runtime_seconds,
+            synthesizer_max_runtime_seconds=synthesizer_max_runtime_seconds,
+            budget_metadata=budget_metadata,
         )
         root = kb.get_task(conn, created.root_id)
         if root is not None and root.status == "blocked":
+            root_meta: dict[str, Any] = {
+                "kind": "kanban_swarm_v1",
+                "goal": goal.strip(),
+                "worker_count": len(created.worker_ids),
+            }
+            if budget_metadata:
+                root_meta["budget"] = budget_metadata
             if not _activate_root_inline(
                 conn,
                 created.root_id,
                 summary=activation_summary,
-                metadata={
-                    "kind": "kanban_swarm_v1",
-                    "goal": goal.strip(),
-                    "worker_count": len(created.worker_ids),
-                },
+                metadata=root_meta,
             ):
                 raise RuntimeError("could not activate the completed swarm topology")
             activated = True
@@ -212,6 +221,9 @@ def _create_swarm_uncommitted(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    verifier_max_runtime_seconds: Optional[int] = None,
+    synthesizer_max_runtime_seconds: Optional[int] = None,
+    budget_metadata: Optional[dict[str, Any]] = None,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
@@ -302,6 +314,7 @@ def _create_swarm_uncommitted(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["requesting-code-review"],
+        max_runtime_seconds=verifier_max_runtime_seconds,
     )
 
     synthesizer_body = (
@@ -321,6 +334,7 @@ def _create_swarm_uncommitted(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
+        max_runtime_seconds=synthesizer_max_runtime_seconds,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
@@ -331,7 +345,113 @@ def _create_swarm_uncommitted(
         key="topology",
         value=created.as_dict() | {"goal": goal},
     )
+    if budget_metadata:
+        post_blackboard_update(
+            conn,
+            root,
+            author=created_by,
+            key="budget",
+            value=budget_metadata,
+        )
     return created
+
+
+def create_timeboxed_surface_swarm(
+    conn: sqlite3.Connection,
+    *,
+    goal: str,
+    surface_items: list[str],
+    worker_profile: str,
+    verifier_assignee: str,
+    synthesizer_assignee: str,
+    target_minutes: float,
+    unit_minutes: float = 0.45,
+    serial_setup_minutes: float = 1.0,
+    reserve_minutes: Optional[float] = None,
+    max_agents: int = 12,
+    straggler_factor: float = 1.25,
+    worker_skills: Optional[list[str]] = None,
+    item_instruction: str = "Inspect every assigned item and return structured findings with evidence.",
+    tenant: Optional[str] = None,
+    created_by: str = "swarm-orchestrator",
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    priority: int = 0,
+    idempotency_key: Optional[str] = None,
+) -> tuple[SwarmCreated, dict[str, Any]]:
+    """Size ``x`` parallel workers from ``w`` surface items and budget ``y``, then create the swarm.
+
+    Partitions ``surface_items`` evenly across the calculated worker count,
+    stamps per-worker/verifier/synthesizer ``max_runtime_seconds`` with explicit
+    partial-handoff instructions, and records the full budget + any cut-list
+    exclusions on the swarm root blackboard.
+    """
+    from hermes_cli.kanban_work_budget import (
+        format_deadline_directive,
+        plan_surface_swarm,
+    )
+
+    cleaned = [str(item).strip() for item in surface_items if str(item or "").strip()]
+    if not cleaned:
+        raise ValueError("surface_items must contain at least one non-empty item")
+
+    plan = plan_surface_swarm(
+        len(cleaned),
+        target_minutes,
+        unit_minutes=unit_minutes,
+        serial_setup_minutes=serial_setup_minutes,
+        reserve_minutes=reserve_minutes,
+        max_agents=max_agents,
+        straggler_factor=straggler_factor,
+    )
+    covered_items = cleaned[: plan.covered_units] if plan.covered_units > 0 else cleaned
+    deferred_items = cleaned[len(covered_items):]
+
+    deadline_note = format_deadline_directive(plan.worker_max_runtime_seconds)
+    skills = list(worker_skills or [])
+    specs: list[SwarmWorkerSpec] = []
+    total_shards = len(plan.shards)
+    for idx, (start, end) in enumerate(plan.shards, start=1):
+        chunk = covered_items[start:end]
+        bullet_list = "\n".join(f"- {entry}" for entry in chunk)
+        body = (
+            f"Shard {idx}/{total_shards} ({len(chunk)} item(s) of {len(cleaned)} total).\n\n"
+            f"{item_instruction}\n\n"
+            f"{deadline_note}\n\n"
+            f"Assigned surface items:\n{bullet_list}\n"
+        )
+        specs.append(
+            SwarmWorkerSpec(
+                profile=worker_profile,
+                title=f"Shard {idx}/{total_shards} ({len(chunk)} items): {goal.splitlines()[0][:50]}",
+                body=body,
+                skills=skills,
+                priority=priority,
+                max_runtime_seconds=plan.worker_max_runtime_seconds,
+            )
+        )
+
+    budget_dict = plan.as_dict()
+    if deferred_items:
+        budget_dict["deferred_items"] = deferred_items
+
+    created = create_swarm(
+        conn,
+        goal=goal,
+        workers=specs,
+        verifier_assignee=verifier_assignee,
+        synthesizer_assignee=synthesizer_assignee,
+        tenant=tenant,
+        created_by=created_by,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        priority=priority,
+        idempotency_key=idempotency_key,
+        verifier_max_runtime_seconds=plan.verifier_max_runtime_seconds,
+        synthesizer_max_runtime_seconds=plan.synthesizer_max_runtime_seconds,
+        budget_metadata=budget_dict,
+    )
+    return created, budget_dict
 
 
 def post_blackboard_update(

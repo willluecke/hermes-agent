@@ -252,12 +252,28 @@ def feature_system(plan: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def group_regions(items: Sequence[Dict[str, Any]]) -> List[List[str]]:
-    """Item ids grouped into regions: overlapping files or a dependency join a region.
+def group_regions(
+    items: Sequence[Dict[str, Any]],
+    *,
+    split_dependencies: bool = False,
+) -> List[List[str]]:
+    """Item ids grouped into regions.
+
+    By default (``split_dependencies=False``), items whose files overlap or that
+    depend on each other share one region (preserving legacy callers/tests).
+    When ``split_dependencies=True``, only overlapping files merge into the same
+    region while disjoint ``depends_on`` edges become DAG waves scheduled via
+    Kanban parent links (:func:`group_regions_dag`).
 
     Regions are ordered by their first item in the plan. Inside a region,
     every item comes after the items it depends on.
     """
+    if split_dependencies:
+        from hermes_cli.kanban_work_budget import group_regions_dag
+
+        regions, _deps, _waves = group_regions_dag(items)
+        return regions
+
     ids = [item["id"] for item in items]
     order = {item_id: index for index, item_id in enumerate(ids)}
     parent = {i: i for i in ids}
@@ -288,6 +304,18 @@ def group_regions(items: Sequence[Dict[str, Any]]) -> List[List[str]]:
     for item_id in sequence:
         regions.setdefault(find(item_id), []).append(item_id)
     return sorted(regions.values(), key=lambda region: min(order[i] for i in region))
+
+
+def group_regions_dag(items: Sequence[Dict[str, Any]]) -> tuple[List[List[str]], List[List[int]], List[int]]:
+    """File-disjoint region DAG: ``(regions, region_deps, region_waves)``.
+
+    Items with overlapping files share one region; disjoint ``depends_on`` edges
+    become sequential execution waves so independent downstream work fans out in
+    parallel instead of collapsing into ``Region 1/1``.
+    """
+    from hermes_cli.kanban_work_budget import group_regions_dag as _group_dag
+
+    return _group_dag(items)
 
 
 # ---------------------------------------------------------------------------
@@ -884,13 +912,27 @@ def _require(current: str, allowed: Sequence[str], action: str) -> None:
         raise PipelineError(f"{action}: {hint}")
 
 
-def start(*, project: str, request: str, conversation_id: str, kind: str = "build") -> Dict[str, Any]:
+def start(
+    *,
+    project: str,
+    request: str,
+    conversation_id: str,
+    kind: str = "build",
+    budget_minutes: Optional[float] = None,
+) -> Dict[str, Any]:
     """Create the root card: an Opus orchestrator on the project's board."""
     from hermes_cli import kanban_db as kb
 
     kind = str(kind or "build").strip().lower()
     if kind not in KINDS:
         raise PipelineError("kind must be build or audit")
+    if budget_minutes is not None:
+        try:
+            budget_minutes = float(budget_minutes)
+        except (TypeError, ValueError):
+            raise PipelineError("budget_minutes must be a positive number") from None
+        if budget_minutes <= 0:
+            raise PipelineError("budget_minutes must be a positive number")
     request = str(request or "").strip()
     if not request:
         raise PipelineError("request is required: Will's words, in full")
@@ -936,14 +978,20 @@ def start(*, project: str, request: str, conversation_id: str, kind: str = "buil
             model_override=ORCHESTRATOR[0], provider_override=ORCHESTRATOR[1], reasoning_effort=EFFORT,
             board=board,
         )
-        record(conn, root_id, {
+        start_event = {
             "type": "start", "kind": kind, "project": project, "board": board, "token": token,
             "repo": repo, "conversation_id": str(conversation_id or ""), "request": request, "target": target,
-        })
+        }
+        if budget_minutes is not None:
+            start_event["budget_minutes"] = round(budget_minutes, 2)
+        record(conn, root_id, start_event)
         follow(conn, root_id, conversation_id)
-    return {"ok": True, "board": board, "root": root_id, "kind": kind,
-            "next": "Tell Will it started. The Opus orchestrator writes the plan and Astra reviews it "
-                    "before anything is built; notes arrive in this chat."}
+    out = {"ok": True, "board": board, "root": root_id, "kind": kind,
+           "next": "Tell Will it started. The Opus orchestrator writes the plan and Astra reviews it "
+                   "before anything is built; notes arrive in this chat."}
+    if budget_minutes is not None:
+        out["budget_minutes"] = round(budget_minutes, 2)
+    return out
 
 
 def plan_review(*, root_id: str, plan: Any, context: str = "", board: Optional[str] = None,
@@ -990,11 +1038,13 @@ def plan_review(*, root_id: str, plan: Any, context: str = "", board: Optional[s
             "feature_system": measured, "usage": answer.get("usage") or {},
         })
     if decision["action"] == "approve":
-        regions = group_regions(canonical["items"])
+        regions, _rdeps, rwaves = group_regions_dag(canonical["items"])
+        wave_count = (max(rwaves) + 1) if rwaves else 0
+        wave_note = f" across {wave_count} wave(s)" if wave_count > 1 else ""
         aspect = "" if measured["feature_system"] else " Measured on the plan, this is one aspect, not a feature system."
         post_note(begin.get("conversation_id", ""),
                   f"Feature pipeline: Astra approved the plan in round {round_no}: "
-                  f"{len(canonical['items'])} items in {len(regions)} region(s). {canonical['summary']}{aspect}",
+                  f"{len(canonical['items'])} items in {len(regions)} region(s){wave_note}. {canonical['summary']}{aspect}",
                   board=begin.get("board", board or ""))
     guidance = {
         "approve": "Call feature_pipeline launch.",
@@ -1037,9 +1087,16 @@ def region_notes(notes: Sequence[Dict[str, str]], region: Sequence[str], item_id
 
 
 def _region_body(kind: str, request: str, plan: Dict[str, Any], region: List[str], number: int, total: int,
-                 events: Optional[List[Dict[str, Any]]] = None) -> str:
+                 events: Optional[List[Dict[str, Any]]] = None,
+                 parent_branches: Optional[Sequence[tuple[str, str]]] = None,
+                 wave: Optional[int] = None,
+                 wave_total: Optional[int] = None,
+                 max_runtime_seconds: Optional[int] = None) -> str:
+    from hermes_cli.kanban_work_budget import format_deadline_directive
+
     by_id = {item["id"]: item for item in plan["items"]}
-    lines = [f"Region {number} of {total} in a feature pipeline ({kind}). Will's request:",
+    wave_tag = f" (wave {wave + 1}/{wave_total})" if wave is not None and wave_total and wave_total > 1 else ""
+    lines = [f"Region {number} of {total}{wave_tag} in a feature pipeline ({kind}). Will's request:",
              request.strip(), *_decision_lines(events or []), "", "Your items, in order:"]
     for item_id in region:
         item = by_id[item_id]
@@ -1048,6 +1105,18 @@ def _region_body(kind: str, request: str, plan: Dict[str, Any], region: List[str
                   f"  check: {item['check']}"]
         if item["depends_on"]:
             lines.append(f"  after: {', '.join(item['depends_on'])}")
+    if parent_branches:
+        lines += ["", "Prerequisite regions (already reviewed and done before this card runs):"]
+        for p_card, p_branch in parent_branches:
+            if kind == "audit":
+                lines.append(f"- {p_card} (read its handoff via kanban_show {p_card})")
+            else:
+                lines.append(
+                    f"- {p_card} on branch `{p_branch}` — run `git merge --no-ff {p_branch}` into your worktree "
+                    "before editing so you build on top of its reviewed changes"
+                )
+    if max_runtime_seconds:
+        lines += ["", format_deadline_directive(max_runtime_seconds)]
     notes = region_notes(approval_notes(events or []), region, by_id)
     if notes:
         lines += ["", "Notes from Astra's plan review. Handle each one in the code; your Astra reviewer checks them:"]
@@ -1061,7 +1130,9 @@ def _region_body(kind: str, request: str, plan: Dict[str, Any], region: List[str
 
 
 def _work_card(conn: Any, *, key: str, repo: str, branch: str, base: str, title: str, body: str, root: Any,
-               conversation_id: str, board: Optional[str]) -> str:
+               conversation_id: str, board: Optional[str],
+               parents: Optional[Sequence[str]] = None,
+               max_runtime_seconds: Optional[int] = None) -> str:
     """An Opus card that Astra reviews and the root waits for.
 
     Safe to repeat: an interrupted attempt's card is found by its key and its
@@ -1075,16 +1146,94 @@ def _work_card(conn: Any, *, key: str, repo: str, branch: str, base: str, title:
         pin_branch(repo, branch, base)
         card = kb.create_task(
             conn, title=title, body=body, assignee=WORKER_PROFILE, created_by=STATE_AUTHOR,
+            parents=tuple(parents or ()),
             workspace_kind="worktree", workspace_path=repo, branch_name=branch, skills=[REGION_SKILL],
             model_override=BUILDER[0], provider_override=BUILDER[1], reasoning_effort=EFFORT,
             review_model_override=REVIEWER[0], review_provider_override=REVIEWER[1],
+            max_runtime_seconds=max_runtime_seconds,
             idempotency_key=key, tenant=getattr(root, "tenant", None), board=board,
         )
     else:
         kb.set_review_model_override(conn, card, REVIEWER[0], provider=REVIEWER[1])
+        for parent_id in (parents or ()):
+            kb.link_tasks(conn, parent_id, card)
     follow(conn, card, conversation_id)
     kb.link_tasks(conn, card, root.id)
     return card
+
+
+def _live_budget_reprojection(
+    conn: Any,
+    root_id: str,
+    begin: Dict[str, Any],
+    launch_ev: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Closed-loop budget reprojection from actual completed vs open region cards."""
+    import time as _time
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_work_budget import DEFAULT_SHARD_P85_MIN, reproject_budget
+
+    budget = launch_ev.get("budget") or {}
+    target = budget.get("target_minutes")
+    if target is None:
+        target = begin.get("budget_minutes")
+    if target is None or float(target) <= 0:
+        return None
+    root = kb.get_task(conn, root_id)
+    if root is None or not root.started_at:
+        return None
+
+    cards = list(launch_ev.get("cards") or [])
+    if not cards:
+        return None
+    regions = list(launch_ev.get("regions") or [])
+    per_region_shards = budget.get("region_work_shards")
+    if not isinstance(per_region_shards, list) or len(per_region_shards) != len(cards):
+        per_region_shards = [float(max(1, len(r))) for r in regions] if len(regions) == len(cards) else [1.0] * len(cards)
+
+    completed_units = 0.0
+    remaining_units = 0.0
+    completed_worker_min = 0.0
+    active_workers = 0
+    parallelizable_rem = 0
+    for cid, w_units in zip(cards, per_region_shards):
+        task = kb.get_task(conn, cid)
+        units = max(0.25, float(w_units))
+        if task is not None and task.status in CLOSED_STATUSES:
+            completed_units += units
+            runs = kb.list_runs(conn, cid)
+            dur = sum(
+                (r.ended_at - r.started_at) / 60.0
+                for r in runs
+                if r.started_at is not None and r.ended_at is not None and r.ended_at >= r.started_at
+            )
+            completed_worker_min += max(0.1, dur)
+        else:
+            remaining_units += units
+            if task is not None and task.status == "running":
+                active_workers += 1
+            if task is not None and task.status in ("ready", "running"):
+                parallelizable_rem += 1
+
+    now = int(_time.time())
+    elapsed_min = max(0.0, (now - int(root.started_at)) / 60.0)
+    reserve_min = float(budget.get("reserve_minutes") or max(1.5, float(target) * 0.25))
+    prior_rate = float(budget.get("shard_p85_min") or DEFAULT_SHARD_P85_MIN)
+    max_workers = int(budget.get("max_concurrent_workers") or max(1, budget.get("max_wave_width") or 4))
+
+    rep = reproject_budget(
+        target_minutes=float(target),
+        elapsed_minutes=elapsed_min,
+        reserve_minutes=reserve_min,
+        completed_units=completed_units,
+        remaining_units=remaining_units,
+        completed_worker_minutes=completed_worker_min,
+        prior_minutes_per_unit=prior_rate,
+        active_workers=max(1, active_workers),
+        max_workers=max_workers,
+        parallelizable_remaining=max(1, parallelizable_rem) if remaining_units > 0 else 0,
+    )
+    return rep.as_dict()
 
 
 def _park(conn: Any, root_id: str, reason: str, expected: Optional[int]) -> None:
@@ -1097,15 +1246,18 @@ def _park(conn: Any, root_id: str, reason: str, expected: Optional[int]) -> None
             raise PipelineError("the root card could not wait on its cards; call status and retry")
 
 
-def launch(*, root_id: str, board: Optional[str] = None, run_id: Optional[int] = None) -> Dict[str, Any]:
-    """One card per region (Opus builds, Astra reviews); the root waits for them."""
+def launch(*, root_id: str, board: Optional[str] = None, run_id: Optional[int] = None,
+           budget_minutes: Optional[float] = None) -> Dict[str, Any]:
+    """One card per file-disjoint region in DAG waves (Opus builds, Astra reviews); root waits."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_work_budget import calibrate_board, plan_dag_budget
 
     with kb.connect_closing(board=board) as conn:
         events = read_events(conn, root_id)
         begin = _start_event(events)
         expected = _expected_run(conn, root_id, run_id)
         earlier = next((e for e in events if e.get("type") == "launch"), None)
+        budget_summary: Optional[Dict[str, Any]] = None
         if earlier is not None:
             outstanding = (kb.get_task(conn, root_id).status == "running" and _open_cards(conn, [earlier])
                            and events[_last_marker(events)] is earlier)
@@ -1113,11 +1265,13 @@ def launch(*, root_id: str, board: Optional[str] = None, run_id: Optional[int] =
                 raise PipelineError("launch: regions are already launched")
             cards = list(earlier.get("cards") or [])  # a launch that stopped before parking the root
             regions = list(earlier.get("regions") or [])
+            region_waves = list(earlier.get("waves") or ([0] * len(regions)))
+            budget_summary = earlier.get("budget")
         else:
             _require(phase(conn, root_id, events), ("approved",), "launch")
             plan = _approved_plan(events)
             root = kb.get_task(conn, root_id)
-            regions = group_regions(plan["items"])
+            regions, region_deps, region_waves = group_regions_dag(plan["items"])
             kind = begin.get("kind", "build")
             digest = plan_digest(plan)
             # Regions start where the plan was reviewed: the integration
@@ -1126,27 +1280,91 @@ def launch(*, root_id: str, board: Optional[str] = None, run_id: Optional[int] =
             repo = begin.get("repo") or _board_repo(board)
             base = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{_branch(root, root_id)}") \
                 or (begin.get("target") or {}).get("base", "")
-            cards = []
-            for number, region in enumerate(regions, 1):
+            effective_budget = budget_minutes if budget_minutes is not None else begin.get("budget_minutes")
+            if effective_budget is not None:
+                effective_budget = float(effective_budget)
+                if effective_budget <= 0:
+                    raise PipelineError("budget_minutes must be a positive number")
+            cal = calibrate_board(conn, board=begin.get("board") or board or kb.get_current_board())
+            dag_budget = plan_dag_budget(
+                plan["items"],
+                calibration=cal,
+                repo=repo or None,
+                target_minutes=effective_budget,
+            )
+            wave_total = dag_budget.wave_count
+            # Create cards in wave order so parent region cards always exist before dependents.
+            order_indices = sorted(range(len(regions)), key=lambda idx: (region_waves[idx], idx))
+            cards_by_idx: Dict[int, str] = {}
+            branches_by_idx: Dict[int, str] = {}
+            for idx in order_indices:
+                region = regions[idx]
+                number = idx + 1
+                branch_name = f"fp/{begin.get('token') or root_id}/region-{number}-{digest[:8]}"
+                branches_by_idx[idx] = branch_name
+                parent_card_ids = [cards_by_idx[d] for d in region_deps[idx]]
+                parent_branches = [(cards_by_idx[d], branches_by_idx[d]) for d in region_deps[idx]]
                 first = next(item for item in plan["items"] if item["id"] == region[0])
-                cards.append(_work_card(
+                # Stamp max_runtime_seconds when an explicit budget was requested.
+                cap_sec = dag_budget.region_max_runtime_seconds[idx] if effective_budget is not None else None
+                cards_by_idx[idx] = _work_card(
                     conn, key=f"{STATE_AUTHOR}:{root_id}:{digest}:region:{number}",
                     repo=repo,
-                    branch=f"fp/{begin.get('token') or root_id}/region-{number}-{digest[:8]}",
+                    branch=branch_name,
                     base=base,
                     title=f"Region {number}/{len(regions)}: {_short(first['goal'], 60)}",
-                    body=_region_body(kind, begin.get("request", ""), plan, region, number, len(regions), events),
+                    body=_region_body(
+                        kind, begin.get("request", ""), plan, region, number, len(regions), events,
+                        parent_branches=parent_branches,
+                        wave=region_waves[idx],
+                        wave_total=wave_total,
+                        max_runtime_seconds=cap_sec,
+                    ),
                     root=root, conversation_id=begin.get("conversation_id", ""), board=board,
-                ))
-            record(conn, root_id, {"type": "launch", "cards": cards, "regions": regions})
+                    parents=parent_card_ids,
+                    max_runtime_seconds=cap_sec,
+                )
+            cards = [cards_by_idx[idx] for idx in range(len(regions))]
+            budget_summary = {
+                "target_minutes": dag_budget.target_minutes,
+                "reserve_minutes": round(dag_budget.reserve_minutes, 2),
+                "shard_p85_min": round(dag_budget.calibration.shard_p85_min, 2),
+                "max_concurrent_workers": dag_budget.max_concurrent_workers,
+                "wave_count": dag_budget.wave_count,
+                "max_wave_width": dag_budget.max_wave_width,
+                "total_work_shards": round(dag_budget.total_work_shards, 2),
+                "region_work_shards": [round(r.work_shards, 2) for r in dag_budget.regions],
+                "recommended_workers": dag_budget.recommended_workers,
+                "predicted_p50_min": round(dag_budget.predicted_p50_min, 2),
+                "predicted_p85_min": round(dag_budget.predicted_p85_min, 2),
+                "feasible": dag_budget.feasible,
+                "bottleneck": dag_budget.bottleneck,
+                "region_max_runtime_seconds": list(dag_budget.region_max_runtime_seconds) if effective_budget is not None else None,
+            }
+            record(conn, root_id, {
+                "type": "launch",
+                "cards": cards,
+                "regions": regions,
+                "region_deps": region_deps,
+                "waves": region_waves,
+                "budget": budget_summary,
+            })
         _park(conn, root_id, f"waiting for {len(cards)} region(s): {', '.join(cards)}", expected)
     if earlier is None:
+        wave_count = (max(region_waves) + 1) if region_waves else 0
+        wave_text = f" across {wave_count} wave(s)" if wave_count > 1 else ""
         post_note(begin.get("conversation_id", ""),
-                  f"Feature pipeline: {len(cards)} region(s) started. Opus builds each one and Astra reviews it "
+                  f"Feature pipeline: {len(cards)} region(s) started{wave_text}. Opus builds each one and Astra reviews it "
                   "before it counts as done.",
                   board=begin.get("board", board or ""))
-    return {"ok": True, "regions": [{"card": c, "items": r} for c, r in zip(cards, regions)],
-            "next": "Your run is over: reply with one line and stop. You wake when every region is done."}
+    out: Dict[str, Any] = {
+        "ok": True,
+        "regions": [{"card": c, "items": r, "wave": w} for c, r, w in zip(cards, regions, region_waves)],
+        "next": "Your run is over: reply with one line and stop. You wake when every region is done.",
+    }
+    if budget_summary is not None:
+        out["budget"] = budget_summary
+    return out
 
 
 def fix(*, root_id: str, findings: Any, board: Optional[str] = None, run_id: Optional[int] = None) -> Dict[str, Any]:
@@ -1360,10 +1578,23 @@ def status(*, root_id: str, board: Optional[str] = None) -> Dict[str, Any]:
                               "branch": _branch(task, card), "title": getattr(task, "title", "")})
         rounds = _plan_rounds(events)
         asked = [e for e in events if e.get("type") == "ask"]
-    return {"ok": True, "phase": current, "kind": begin.get("kind"), "board": begin.get("board"),
-            "conversation_id": begin.get("conversation_id"), "request": begin.get("request", ""),
-            "target": begin.get("target") or {}, "rounds": len(rounds),
-            "last_round": rounds[-1] if rounds else None, "approved_plan": _approved_plan(events),
-            "cards": cards, "fix_loops": sum(1 for e in events if e.get("type") == "fix"),
-            "question": asked[-1].get("question") if asked and current in ("asked", "answered") else None,
-            "decisions": decisions(events), "next": NEXT_STEP[current]}
+        launch_ev = next((e for e in events if e.get("type") == "launch"), None)
+        reproj = (
+            _live_budget_reprojection(conn, root_id, begin, launch_ev)
+            if launch_ev is not None
+            else None
+        )
+    out = {"ok": True, "phase": current, "kind": begin.get("kind"), "board": begin.get("board"),
+           "conversation_id": begin.get("conversation_id"), "request": begin.get("request", ""),
+           "target": begin.get("target") or {}, "rounds": len(rounds),
+           "last_round": rounds[-1] if rounds else None, "approved_plan": _approved_plan(events),
+           "cards": cards, "fix_loops": sum(1 for e in events if e.get("type") == "fix"),
+           "question": asked[-1].get("question") if asked and current in ("asked", "answered") else None,
+           "decisions": decisions(events), "next": NEXT_STEP[current]}
+    if begin.get("budget_minutes") is not None:
+        out["budget_minutes"] = begin["budget_minutes"]
+    if launch_ev and launch_ev.get("budget"):
+        out["budget"] = launch_ev["budget"]
+    if reproj is not None:
+        out["budget_reprojection"] = reproj
+    return out

@@ -412,7 +412,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="append",
         default=[],
         metavar="PROFILE:TITLE[:SKILL,SKILL]",
-        help="Parallel worker card (repeatable)",
+        help="Parallel worker card (repeatable; or use --surface-file + --budget-minutes to auto-size x)",
+    )
+    p_swarm.add_argument(
+        "--surface-file",
+        default=None,
+        help="Path to newline-separated (or JSON list) surface items to partition across auto-sized workers",
+    )
+    p_swarm.add_argument(
+        "--worker-profile",
+        default=None,
+        help="Worker profile when auto-sizing shards from --surface-file (default: default)",
+    )
+    p_swarm.add_argument(
+        "--budget-minutes",
+        type=float,
+        default=None,
+        help="Target wall-clock budget in minutes; sizes x workers from surface size and stamps max_runtime_seconds",
+    )
+    p_swarm.add_argument(
+        "--unit-minutes",
+        type=float,
+        default=0.45,
+        help="Estimated minutes per surface unit per worker (default: 0.45)",
+    )
+    p_swarm.add_argument(
+        "--max-agents",
+        type=int,
+        default=12,
+        help="Hard ceiling on parallel workers when auto-sizing (default: 12)",
     )
     p_swarm.add_argument("--verifier", required=True, help="Verifier profile")
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
@@ -983,6 +1011,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Also list tasks whose checkout and branch are both gone",
     )
 
+    # --- calibrate (read-only empirical shard timing from board history) ---
+    p_cal = sub.add_parser(
+        "calibrate",
+        help="Read-only empirical calibration of active task runtime (w -> y quantiles) from this board",
+    )
+    p_cal.add_argument("--json", action="store_true", help="Emit calibration report as JSON")
+
+    # --- estimate (read-only w/x/y solver for surface sweeps or DAG plans) ---
+    p_est = sub.add_parser(
+        "estimate",
+        help="Calculate required agents (x) and predicted time (y) from work quantity (w) — read-only",
+    )
+    p_est.add_argument("--units", type=int, default=None, help="Number of surface work units (e.g. 113 URLs)")
+    p_est.add_argument("--surface-file", default=None, help="Newline-separated or JSON-list file whose length sets --units")
+    p_est.add_argument("--plan-file", default=None, help="JSON plan file ({items:[{id,files,depends_on}]}) for DAG wave sizing")
+    p_est.add_argument("--repo", default=None, help="Repo path for reverse-import blast radius (defaults to board default_workdir)")
+    p_est.add_argument("--budget-minutes", type=float, default=None, help="Target wall-clock deadline y in minutes")
+    p_est.add_argument("--unit-minutes", type=float, default=0.45, help="Minutes per surface unit per worker (default: 0.45)")
+    p_est.add_argument("--serial-setup-minutes", type=float, default=1.0, help="Per-worker startup overhead in minutes (default: 1.0)")
+    p_est.add_argument("--reserve-minutes", type=float, default=None, help="Override protected synthesis/verification reserve minutes")
+    p_est.add_argument("--max-agents", type=int, default=12, help="Concurrency ceiling on parallel workers (default: 12)")
+    p_est.add_argument("--json", action="store_true", help="Emit sizing plan as JSON")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -1324,6 +1375,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
             "worktrees": _cmd_worktrees,
+            "calibrate": _cmd_calibrate,
+            "estimate": _cmd_estimate,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -1806,15 +1859,110 @@ def _cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_surface_items(path: str) -> list[str]:
+    raw = Path(path).expanduser().read_text(encoding="utf-8")
+    stripped = raw.strip()
+    if stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x or "").strip()]
+        except ValueError:
+            pass
+    return [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    surface_file = getattr(args, "surface_file", None)
+    budget_minutes = getattr(args, "budget_minutes", None)
+
+    if surface_file:
+        if budget_minutes is None:
+            print("kanban swarm: --surface-file requires --budget-minutes", file=sys.stderr)
+            return 2
+        try:
+            items = _load_surface_items(surface_file)
+        except OSError as exc:
+            print(f"kanban swarm: could not read --surface-file: {exc}", file=sys.stderr)
+            return 2
+        worker_profile = getattr(args, "worker_profile", None) or "default"
+        with kb.connect_closing() as conn:
+            created, budget = ks.create_timeboxed_surface_swarm(
+                conn,
+                goal=args.goal,
+                surface_items=items,
+                worker_profile=worker_profile,
+                verifier_assignee=args.verifier,
+                synthesizer_assignee=args.synthesizer,
+                target_minutes=float(budget_minutes),
+                unit_minutes=float(getattr(args, "unit_minutes", 0.45)),
+                max_agents=int(getattr(args, "max_agents", 12)),
+                tenant=args.tenant,
+                created_by=args.created_by or _profile_author(),
+                priority=args.priority,
+                idempotency_key=getattr(args, "idempotency_key", None),
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(created.as_dict() | {"budget": budget}, indent=2, ensure_ascii=False))
+        else:
+            print(f"Swarm root: {created.root_id}")
+            print(
+                f"Sized {len(created.worker_ids)} worker(s) for {budget['covered_units']}/{budget['total_units']} "
+                f"unit(s) in {budget['target_minutes']}m (reserve {budget['reserve_minutes']}m, "
+                f"worker cap {budget['worker_max_runtime_seconds']}s, feasible={budget['feasible']})"
+            )
+            if budget["deferred_units"]:
+                print(f"Deferred (cut list): {budget['deferred_units']} unit(s) due to {budget['bottleneck']}")
+            print("Workers: " + ", ".join(created.worker_ids))
+            print(f"Verifier: {created.verifier_id} (cap {budget['verifier_max_runtime_seconds']}s)")
+            print(f"Synthesizer: {created.synthesizer_id} (cap {budget['synthesizer_max_runtime_seconds']}s)")
+        return 0
+
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
         print(f"kanban swarm: {exc}", file=sys.stderr)
         return 2
     if not workers:
-        print("kanban swarm: at least one --worker is required", file=sys.stderr)
+        print("kanban swarm: at least one --worker (or --surface-file + --budget-minutes) is required", file=sys.stderr)
         return 2
+    verifier_cap = None
+    synth_cap = None
+    budget_meta = None
+    if budget_minutes is not None:
+        if budget_minutes <= 0:
+            print("kanban swarm: --budget-minutes must be positive", file=sys.stderr)
+            return 2
+        from hermes_cli.kanban_work_budget import (
+            DEFAULT_SYNTHESIS_RESERVE_FRACTION,
+            MIN_RESERVE_MIN,
+            MIN_WORKER_RUNTIME_SECONDS,
+            format_deadline_directive,
+        )
+        reserve = min(budget_minutes * 0.45, max(MIN_RESERVE_MIN, budget_minutes * DEFAULT_SYNTHESIS_RESERVE_FRACTION))
+        exec_min = max(0.0, budget_minutes - reserve)
+        worker_cap = max(MIN_WORKER_RUNTIME_SECONDS, int(round(exec_min * 60.0)))
+        verifier_cap = max(MIN_WORKER_RUNTIME_SECONDS, int(round(reserve * 0.40 * 60.0)))
+        synth_cap = max(MIN_WORKER_RUNTIME_SECONDS, int(round(reserve * 0.60 * 60.0)))
+        directive = format_deadline_directive(worker_cap)
+        workers = [
+            ks.SwarmWorkerSpec(
+                profile=w.profile,
+                title=w.title,
+                body=f"{w.body}\n\n{directive}",
+                skills=list(w.skills),
+                priority=w.priority,
+                max_runtime_seconds=w.max_runtime_seconds or worker_cap,
+            )
+            for w in workers
+        ]
+        budget_meta = {
+            "target_minutes": round(budget_minutes, 2),
+            "reserve_minutes": round(reserve, 2),
+            "worker_max_runtime_seconds": worker_cap,
+            "verifier_max_runtime_seconds": verifier_cap,
+            "synthesizer_max_runtime_seconds": synth_cap,
+        }
     with kb.connect_closing() as conn:
         created = ks.create_swarm(
             conn,
@@ -1826,9 +1974,15 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            verifier_max_runtime_seconds=verifier_cap,
+            synthesizer_max_runtime_seconds=synth_cap,
+            budget_metadata=budget_meta,
         )
     if getattr(args, "json", False):
-        print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
+        out = created.as_dict()
+        if budget_meta:
+            out["budget"] = budget_meta
+        print(json.dumps(out, indent=2, ensure_ascii=False))
     else:
         print(f"Swarm root: {created.root_id}")
         print("Workers: " + ", ".join(created.worker_ids))
@@ -3389,6 +3543,125 @@ def _cmd_worktrees(args: argparse.Namespace) -> int:
         counts[row.get("state") or "unknown"] = counts.get(row.get("state") or "unknown", 0) + 1
     if counts:
         print("\n" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    """Read-only empirical active-run calibration for the current board."""
+    from hermes_cli.kanban_work_budget import calibrate_board
+
+    board = kb.get_current_board()
+    with kb.connect_closing() as conn:
+        cal = calibrate_board(conn, board=board)
+    data = cal.as_dict()
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+    fallback = " (fallback defaults; <5 leaf tasks)" if cal.used_fallback else ""
+    print(f"Board {cal.board}: {cal.sample_count} calibrated leaf task(s){fallback}")
+    print(
+        f"  Shard active time:   p50={cal.shard_p50_min:.2f}m  p85={cal.shard_p85_min:.2f}m  "
+        f"(median {cal.median_runs_per_task:.1f} runs, review multiplier {cal.review_multiplier:.2f}x)"
+    )
+    print(f"  First-run time:      p50={cal.first_run_p50_min:.2f}m  p85={cal.first_run_p85_min:.2f}m")
+    if cal.by_class:
+        print("\nBy task class:")
+        for cls, info in cal.by_class.items():
+            act = info["active_min"]
+            first = info["first_run_min"]
+            print(
+                f"  {cls:24s} n={info['n']:3d}  active p50={act.get('p50', 0):5.1f}m "
+                f"p85={act.get('p85', 0):5.1f}m  first p50={first.get('p50', 0):5.1f}m  "
+                f"runs med={info['runs_median']:.1f}"
+            )
+    return 0
+
+
+def _cmd_estimate(args: argparse.Namespace) -> int:
+    """Read-only w/x/y estimator for surface sweeps or DAG feature plans."""
+    from hermes_cli.kanban_work_budget import calibrate_board, plan_dag_budget, plan_surface_swarm
+
+    plan_file = getattr(args, "plan_file", None)
+    surface_file = getattr(args, "surface_file", None)
+    units = getattr(args, "units", None)
+    budget_minutes = getattr(args, "budget_minutes", None)
+
+    if plan_file:
+        raw = json.loads(Path(plan_file).expanduser().read_text(encoding="utf-8"))
+        items = raw.get("items") if isinstance(raw, dict) else raw
+        if not isinstance(items, list) or not items:
+            print("kanban estimate: --plan-file must contain a non-empty items list", file=sys.stderr)
+            return 2
+        board = kb.get_current_board()
+        repo = getattr(args, "repo", None) or (kb.read_board_metadata(board).get("default_workdir") or None)
+        with kb.connect_closing() as conn:
+            cal = calibrate_board(conn, board=board)
+        dag = plan_dag_budget(
+            items,
+            calibration=cal,
+            repo=repo,
+            target_minutes=budget_minutes,
+            max_concurrent_workers=int(getattr(args, "max_agents", 12)),
+            reserve_minutes=getattr(args, "reserve_minutes", None),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(dag.as_dict(), indent=2, ensure_ascii=False))
+            return 0
+        print(
+            f"DAG plan ({len(dag.regions)} region(s), {dag.wave_count} wave(s), max width {dag.max_wave_width}, "
+            f"w={dag.total_work_shards:.2f} shards)"
+        )
+        print(
+            f"  Recommended workers x={dag.recommended_workers} (cap {dag.max_concurrent_workers})  "
+            f"predicted p50={dag.predicted_p50_min:.1f}m  p85={dag.predicted_p85_min:.1f}m  "
+            f"(reserve {dag.reserve_minutes:.1f}m, critical path p85={dag.critical_path_p85_min:.1f}m)"
+        )
+        if dag.target_minutes is not None:
+            print(f"  Target y={dag.target_minutes:.1f}m  feasible={dag.feasible}  bottleneck={dag.bottleneck}")
+        for r, cap in zip(dag.regions, dag.region_max_runtime_seconds):
+            deps = f" after={list(r.depends_on_regions)}" if r.depends_on_regions else ""
+            blast = f" blast={r.blast_radius_files}f/{r.blast_radius_tests}t" if r.blast_radius_files else ""
+            print(
+                f"  - region {r.index + 1} [wave {r.wave + 1}]: items={list(r.item_ids)} "
+                f"w={r.work_shards:.2f} p85={r.est_p85_min:.1f}m cap={cap}s{deps}{blast}"
+            )
+        return 0
+
+    if surface_file:
+        units = len(_load_surface_items(surface_file))
+    if units is None or budget_minutes is None:
+        print(
+            "kanban estimate: pass (--units N or --surface-file FILE) + --budget-minutes Y, or --plan-file FILE",
+            file=sys.stderr,
+        )
+        return 2
+    plan = plan_surface_swarm(
+        int(units),
+        float(budget_minutes),
+        unit_minutes=float(getattr(args, "unit_minutes", 0.45)),
+        serial_setup_minutes=float(getattr(args, "serial_setup_minutes", 1.0)),
+        reserve_minutes=getattr(args, "reserve_minutes", None),
+        max_agents=int(getattr(args, "max_agents", 12)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(plan.as_dict(), indent=2, ensure_ascii=False))
+        return 0
+    print(
+        f"Surface plan: w={plan.total_units} unit(s) in y={plan.target_minutes:.1f}m "
+        f"(exec={plan.exec_minutes:.1f}m, reserve={plan.reserve_minutes:.1f}m)"
+    )
+    print(
+        f"  Required x={plan.required_agents}, recommended x={plan.recommended_agents} (cap {plan.max_agents}), "
+        f"feasible={plan.feasible}, bottleneck={plan.bottleneck}"
+    )
+    print(
+        f"  Coverage: {plan.covered_units}/{plan.total_units} unit(s), deferred={plan.deferred_units}, "
+        f"predicted wall={plan.predicted_wall_minutes:.1f}m"
+    )
+    print(
+        f"  Caps: worker={plan.worker_max_runtime_seconds}s, verifier={plan.verifier_max_runtime_seconds}s, "
+        f"synthesizer={plan.synthesizer_max_runtime_seconds}s"
+    )
     return 0
 
 
